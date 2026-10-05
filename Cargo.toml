@@ -1,0 +1,29 @@
+[package]
+name = "sqlserver-replicated"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/youyuanwu/kuberic-mssql"
+description = "Observe-only SQL Server availability group runtime for Kuberic"
+rust-version = "1.85"
+publish = false
+
+[[bin]]
+name = "sqlserver-observer"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "rustls"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
