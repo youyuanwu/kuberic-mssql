@@ -1,0 +1,11 @@
+[store]
+dir = "target/nextest"
+
+[profile.default]
+fail-fast = false
+retries = 0
+test-threads = 1
+
+[profile.external]
+inherits = "default"
+default-filter = 'binary_id(=sqlserver-replicated::live_observation)'
