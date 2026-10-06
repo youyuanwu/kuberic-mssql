@@ -14,7 +14,8 @@ use super::admin::{
     AdminDeadlines, AdminEndpoint, AdminError, AdminSession, LoginFiles, MemberReadinessEvidence,
 };
 use super::availability_group::{
-    AvailabilityGroupError, ProvisionContext, ProvisionedAvailabilityGroup, provision,
+    AvailabilityGroupError, FrozenMemberVerifier, ProvisionContext, ProvisionedAvailabilityGroup,
+    provision,
 };
 use super::cleanup::{
     CLEANUP_BUDGET, CleanupBackend, CleanupClock, CleanupCoordinator, CleanupError, CleanupReport,
@@ -88,6 +89,11 @@ impl LaunchedMembers {
             .tls
             .as_ref()
             .ok_or(NativePhaseError::Unavailable)?;
+        let frozen_member_verifier = LaunchFrozenMemberVerifier {
+            docker: &self.context.docker,
+            containers: &self.context.containers,
+            image_id: &self.context.image_id,
+        };
         let provisioned = provision(ProvisionContext {
             run: &self.run,
             members: &self.members,
@@ -98,6 +104,7 @@ impl LaunchedMembers {
             store: &self.context.store,
             journal: &mut self.context.journal,
             runner: &self.context.runner,
+            frozen_member_verifier: &frozen_member_verifier,
         })
         .await
         .map_err(NativePhaseError::AvailabilityGroup)?;
@@ -174,6 +181,54 @@ struct OwnedContainer {
     request: ContainerRequest,
     id: Option<String>,
     frozen_running_inspection: Option<ContainerInspection>,
+}
+
+struct LaunchFrozenMemberVerifier<'a> {
+    docker: &'a DockerCli<BoundedProcessRunner>,
+    containers: &'a [OwnedContainer],
+    image_id: &'a str,
+}
+
+impl FrozenMemberVerifier for LaunchFrozenMemberVerifier<'_> {
+    fn verify(
+        &self,
+        parent_deadline: Instant,
+        operation_timeout: Duration,
+    ) -> Result<(), AvailabilityGroupError> {
+        if self.containers.len() != 3 {
+            return Err(AvailabilityGroupError::FrozenMember);
+        }
+        for container in self.containers {
+            let remaining = parent_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(AvailabilityGroupError::Deadline);
+            }
+            let id = container
+                .id
+                .as_deref()
+                .ok_or(AvailabilityGroupError::FrozenMember)?;
+            let current = self
+                .docker
+                .inspect_container(id, operation_timeout.min(remaining))
+                .map_err(|_| AvailabilityGroupError::FrozenMember)?
+                .ok_or(AvailabilityGroupError::FrozenMember)?;
+            container
+                .request
+                .verify_frozen_running_inspection(
+                    &current,
+                    container
+                        .frozen_running_inspection
+                        .as_ref()
+                        .ok_or(AvailabilityGroupError::FrozenMember)?,
+                    self.image_id,
+                )
+                .map_err(|_| AvailabilityGroupError::FrozenMember)?;
+            if Instant::now() >= parent_deadline {
+                return Err(AvailabilityGroupError::Deadline);
+            }
+        }
+        Ok(())
+    }
 }
 
 struct LaunchContext {

@@ -1,15 +1,16 @@
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant as StdInstant};
 
 use tiberius::ToSql;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 
 use super::admin::{
     AdminDeadlines, AdminEndpoint, AdminError, AdminSession, LoginFiles, required_text, single_row,
 };
 use super::config::StageDeadlines;
+use super::deadline::{BoundedOperationError, complete_before, earlier};
 use super::evidence::ValidatedNativeEvidence;
 use super::member::ReadyMember;
 use super::model::TopologyRun;
@@ -57,7 +58,7 @@ pub(crate) struct DataContext<'a> {
     pub credentials: &'a CredentialFiles,
     pub tls: &'a TlsAssets,
     pub deadlines: StageDeadlines,
-    pub complete_deadline: Instant,
+    pub complete_deadline: StdInstant,
 }
 
 pub(crate) async fn verify_direct_read_connectivity(
@@ -68,7 +69,7 @@ pub(crate) async fn verify_direct_read_connectivity(
     loop {
         let mut complete = true;
         for index in 1..3 {
-            match connect(context, index, &database, true).await {
+            match connect(context, index, &database, true, deadline).await {
                 Ok(mut session) => {
                     let query = r#"
 SET NOCOUNT ON;
@@ -79,7 +80,7 @@ SELECT
         WHEN DATABASEPROPERTYEX(DB_NAME(), N'Updateability') = N'READ_ONLY' THEN 1
         ELSE 0
     END);"#;
-                    match session.query_rows(query, &[]).await {
+                    match query_rows(context, &mut session, query, &[], deadline).await {
                         Ok(rows) => {
                             let row = single_row(rows).map_err(DataError::Admin)?;
                             if required_text(&row, 0).map_err(DataError::Admin)? != database
@@ -89,13 +90,18 @@ SELECT
                                 complete = false;
                             }
                         }
+                        Err(DataError::Deadline) => return Err(DataError::Deadline),
                         Err(_) => complete = false,
                     }
                 }
+                Err(DataError::Deadline) => return Err(DataError::Deadline),
                 Err(_) => complete = false,
             }
         }
         if complete {
+            if Instant::now() >= deadline {
+                return Err(DataError::Deadline);
+            }
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -116,43 +122,49 @@ pub(crate) async fn prove_replicated_marker(
     }
     let marker_id = random_guid()?;
     let marker_value = format!("three-replica-{}", context.run.run_id);
-    let mut primary = connect(context, primary_index, &database, false).await?;
-    primary
-        .execute(
-            r#"
+    let complete_deadline = Instant::from_std(context.complete_deadline);
+    let mut primary = connect(context, primary_index, &database, false, complete_deadline).await?;
+    execute(
+        context,
+        &mut primary,
+        r#"
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
 BEGIN TRANSACTION;
 INSERT INTO dbo.kuberic_marker(id, value)
 VALUES (CONVERT(uniqueidentifier, @P1), @P2);
 COMMIT TRANSACTION;"#,
-            &[
-                &marker_id.as_str() as &dyn ToSql,
-                &marker_value.as_str() as &dyn ToSql,
-            ],
-        )
-        .await
-        .map_err(DataError::Admin)?;
+        &[
+            &marker_id.as_str() as &dyn ToSql,
+            &marker_value.as_str() as &dyn ToSql,
+        ],
+        complete_deadline,
+    )
+    .await?;
     drop(primary);
 
-    let deadline = Instant::now() + remaining(context)?.min(context.deadlines.marker_convergence);
+    let deadline = earlier(
+        complete_deadline,
+        Instant::now() + context.deadlines.marker_convergence,
+    );
     loop {
         let mut readable = Vec::with_capacity(3);
         for index in 0..3 {
             let result = async {
-                let mut session = connect(context, index, &database, true).await?;
+                let mut session = connect(context, index, &database, true, deadline).await?;
                 let row = single_row(
-                    session
-                        .query_rows(
-                            r#"
+                    query_rows(
+                        context,
+                        &mut session,
+                        r#"
 SET NOCOUNT ON;
 SELECT CONVERT(nvarchar(128), value)
 FROM dbo.kuberic_marker
 WHERE id = CONVERT(uniqueidentifier, @P1);"#,
-                            &[&marker_id.as_str() as &dyn ToSql],
-                        )
-                        .await
-                        .map_err(DataError::Admin)?,
+                        &[&marker_id.as_str() as &dyn ToSql],
+                        deadline,
+                    )
+                    .await?,
                 )
                 .map_err(DataError::Admin)?;
                 let value = required_text(&row, 0).map_err(DataError::Admin)?;
@@ -162,12 +174,14 @@ WHERE id = CONVERT(uniqueidentifier, @P1);"#,
                 Ok::<u8, DataError>((index + 1) as u8)
             }
             .await;
-            if let Ok(ordinal) = result {
-                readable.push(ordinal);
+            match result {
+                Ok(ordinal) => readable.push(ordinal),
+                Err(DataError::Deadline) => return Err(DataError::Deadline),
+                Err(_) => {}
             }
         }
         if let Ok(readable_ordinals) =
-            validate_marker_observations(&readable, Instant::now(), deadline)
+            validate_marker_observations(&readable, StdInstant::now(), deadline.into_std())
         {
             return Ok(MarkerEvidence {
                 marker_id,
@@ -186,17 +200,16 @@ WHERE id = CONVERT(uniqueidentifier, @P1);"#,
 
 pub fn validate_marker_observations(
     readable_ordinals: &[u8],
-    now: Instant,
-    deadline: Instant,
+    now: StdInstant,
+    deadline: StdInstant,
 ) -> Result<[u8; 3], DataError> {
+    if now >= deadline {
+        return Err(DataError::Deadline);
+    }
     if readable_ordinals == [1, 2, 3] {
         return Ok([1, 2, 3]);
     }
-    if now >= deadline {
-        Err(DataError::Deadline)
-    } else {
-        Err(DataError::MarkerMismatch)
-    }
+    Err(DataError::MarkerMismatch)
 }
 
 async fn connect(
@@ -204,6 +217,7 @@ async fn connect(
     index: usize,
     database: &str,
     read_only: bool,
+    parent_deadline: Instant,
 ) -> Result<AdminSession, DataError> {
     let endpoint = AdminEndpoint {
         tcp_host: "127.0.0.1".to_owned(),
@@ -215,17 +229,72 @@ async fn connect(
         username: context.credentials.admin_username.path().to_path_buf(),
         password: context.credentials.admin_password.path().to_path_buf(),
     };
-    AdminSession::connect_database(
-        &endpoint,
-        &login,
-        AdminDeadlines {
-            connect: remaining(context)?.min(context.deadlines.sql_connect),
-            query: remaining(context)?.min(context.deadlines.sql_batch),
-        },
-        database,
-        read_only,
+    let remaining = remaining_until(parent_deadline)?;
+    let operation_timeout = context.deadlines.sql_connect.min(remaining);
+    complete_before(
+        parent_deadline,
+        context.deadlines.sql_connect,
+        AdminSession::connect_database(
+            &endpoint,
+            &login,
+            AdminDeadlines {
+                connect: operation_timeout,
+                query: context.deadlines.sql_batch.min(remaining),
+            },
+            database,
+            read_only,
+        ),
     )
     .await
+    .map_err(map_connect_limit)?
+    .map_err(DataError::Admin)
+}
+
+async fn execute(
+    context: &DataContext<'_>,
+    session: &mut AdminSession,
+    sql: &str,
+    parameters: &[&dyn ToSql],
+    parent_deadline: Instant,
+) -> Result<(), DataError> {
+    let timeout = context
+        .deadlines
+        .sql_batch
+        .min(remaining_until(parent_deadline)?);
+    session
+        .set_query_timeout(timeout)
+        .map_err(DataError::Admin)?;
+    complete_before(
+        parent_deadline,
+        context.deadlines.sql_batch,
+        session.execute(sql, parameters),
+    )
+    .await
+    .map_err(map_query_limit)?
+    .map_err(DataError::Admin)
+}
+
+async fn query_rows(
+    context: &DataContext<'_>,
+    session: &mut AdminSession,
+    sql: &str,
+    parameters: &[&dyn ToSql],
+    parent_deadline: Instant,
+) -> Result<Vec<tiberius::Row>, DataError> {
+    let timeout = context
+        .deadlines
+        .sql_batch
+        .min(remaining_until(parent_deadline)?);
+    session
+        .set_query_timeout(timeout)
+        .map_err(DataError::Admin)?;
+    complete_before(
+        parent_deadline,
+        context.deadlines.sql_batch,
+        session.query_rows(sql, parameters),
+    )
+    .await
+    .map_err(map_query_limit)?
     .map_err(DataError::Admin)
 }
 
@@ -261,13 +330,42 @@ fn random_guid() -> Result<String, DataError> {
     ))
 }
 
-fn remaining(context: &DataContext<'_>) -> Result<Duration, DataError> {
-    let remaining = context
-        .complete_deadline
-        .saturating_duration_since(Instant::now());
+fn remaining_until(deadline: Instant) -> Result<Duration, DataError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         Err(DataError::Deadline)
     } else {
         Ok(remaining)
+    }
+}
+
+fn map_connect_limit(error: BoundedOperationError) -> DataError {
+    match error {
+        BoundedOperationError::Deadline => DataError::Deadline,
+        BoundedOperationError::OperationTimeout => DataError::Admin(AdminError::ConnectDeadline),
+    }
+}
+
+fn map_query_limit(error: BoundedOperationError) -> DataError {
+    match error {
+        BoundedOperationError::Deadline => DataError::Deadline,
+        BoundedOperationError::OperationTimeout => DataError::Admin(AdminError::QueryDeadline),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn marker_poll_rejects_success_ready_at_parent_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let result = complete_before(deadline, Duration::from_secs(1), async {
+            sleep(Duration::from_millis(25)).await;
+            [1, 2, 3]
+        })
+        .await
+        .map_err(map_query_limit);
+        assert_eq!(result, Err(DataError::Deadline));
     }
 }

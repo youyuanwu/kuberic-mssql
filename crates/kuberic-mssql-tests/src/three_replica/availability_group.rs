@@ -2,26 +2,27 @@ use std::fmt;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant as StdInstant};
 
 use sha2::{Digest, Sha256};
 use tiberius::ToSql;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 
 use super::admin::{
-    AdminDeadlines, AdminEndpoint, AdminError, AdminSession, LoginFiles, required_text, single_row,
-    validated_identifier,
+    AdminDeadlines, AdminEndpoint, AdminError, AdminSession, LoginFiles, MemberReadinessEvidence,
+    required_text, single_row, validated_identifier,
 };
 use super::config::StageDeadlines;
 use super::data::{DataContext, verify_direct_read_connectivity};
+use super::deadline::{BoundedOperationError, complete_before, earlier};
 use super::evidence::{
     EvidenceError, ValidatedNativeEvidence, observe_direct_members, unix_millis,
     validate_native_evidence,
 };
 use super::member::ReadyMember;
 use super::model::{
-    NativeMemberBinding, NativeMemberIntent, NativeTopologyBinding, NativeTopologyIntent,
-    OwnershipJournal, TopologyRun,
+    IncarnationError, NativeMemberBinding, NativeMemberIntent, NativeTopologyBinding,
+    NativeTopologyIntent, OwnershipJournal, SqlMemberIncarnation, TopologyRun,
 };
 use super::ownership::JournalStore;
 use super::process::{CommandSpec, ProcessError, ProcessRunner};
@@ -57,7 +58,9 @@ pub enum AvailabilityGroupError {
     Secret(SecretError),
     CertificateExchange,
     Helper,
+    FrozenMember,
     Evidence(EvidenceError),
+    Incarnation(IncarnationError),
 }
 
 impl fmt::Display for AvailabilityGroupError {
@@ -70,7 +73,9 @@ impl fmt::Display for AvailabilityGroupError {
             Self::Secret(_) => "native availability-group credential changed",
             Self::CertificateExchange => "native endpoint certificate exchange failed",
             Self::Helper => "native endpoint certificate permission helper failed",
+            Self::FrozenMember => "native frozen SQL Server member evidence changed",
             Self::Evidence(_) => "native availability-group evidence validation failed",
+            Self::Incarnation(_) => "native SQL Server incarnation changed",
         })
     }
 }
@@ -83,10 +88,19 @@ pub(crate) struct ProvisionContext<'a, R> {
     pub credentials: &'a CredentialFiles,
     pub tls: &'a TlsAssets,
     pub deadlines: StageDeadlines,
-    pub complete_deadline: Instant,
+    pub complete_deadline: StdInstant,
     pub store: &'a JournalStore,
     pub journal: &'a mut OwnershipJournal,
     pub runner: &'a R,
+    pub frozen_member_verifier: &'a dyn FrozenMemberVerifier,
+}
+
+pub(crate) trait FrozenMemberVerifier {
+    fn verify(
+        &self,
+        parent_deadline: StdInstant,
+        operation_timeout: Duration,
+    ) -> Result<(), AvailabilityGroupError>;
 }
 
 pub(crate) async fn provision<R: ProcessRunner>(
@@ -102,26 +116,55 @@ pub(crate) async fn provision<R: ProcessRunner>(
         .save(context.journal)
         .map_err(|_| AvailabilityGroupError::Journal)?;
 
+    let formation_deadline = earlier(
+        Instant::from_std(context.complete_deadline),
+        Instant::now() + context.deadlines.availability_group,
+    );
     let mut endpoint_evidence = Vec::with_capacity(3);
     for index in 0..3 {
-        let mut session = connect_admin(&context, index, "master", false).await?;
-        create_endpoint(&mut session, context.run, index, context.credentials).await?;
-        endpoint_evidence.push(verify_endpoint(&mut session, context.run, index).await?);
+        let mut session =
+            connect_admin(&context, index, "master", false, formation_deadline).await?;
+        create_endpoint(
+            &context,
+            &mut session,
+            context.run,
+            index,
+            context.credentials,
+            formation_deadline,
+        )
+        .await?;
+        endpoint_evidence.push(
+            verify_endpoint(
+                &context,
+                &mut session,
+                context.run,
+                index,
+                formation_deadline,
+            )
+            .await?,
+        );
     }
-    exchange_endpoint_certificates(&context)?;
+    exchange_endpoint_certificates(&context, formation_deadline.into_std())?;
     for target in 0..3 {
-        let mut session = connect_admin(&context, target, "master", false).await?;
+        let mut session =
+            connect_admin(&context, target, "master", false, formation_deadline).await?;
         for peer in 0..3 {
             if peer != target {
-                authorize_peer(&mut session, context.run, target, peer).await?;
+                authorize_peer(
+                    &context,
+                    &mut session,
+                    context.run,
+                    target,
+                    peer,
+                    formation_deadline,
+                )
+                .await?;
             }
         }
     }
 
-    create_and_join_group(&context).await?;
-    create_database(&context).await?;
-    let formation_deadline =
-        Instant::now() + remaining(&context)?.min(context.deadlines.availability_group);
+    create_and_join_group(&context, formation_deadline).await?;
+    create_database(&context, formation_deadline).await?;
     verify_direct_read_connectivity(
         &DataContext {
             run: context.run,
@@ -134,9 +177,18 @@ pub(crate) async fn provision<R: ProcessRunner>(
         formation_deadline,
     )
     .await
-    .map_err(|_| AvailabilityGroupError::Evidence(EvidenceError::ObservationFailed))?;
+    .map_err(|error| match error {
+        super::data::DataError::Deadline => AvailabilityGroupError::Deadline,
+        _ => AvailabilityGroupError::Evidence(EvidenceError::ObservationFailed),
+    })?;
     let evidence = loop {
-        let observations = observe_direct_members(context.run, context.members).await;
+        let observations = observe_direct_members(
+            context.run,
+            context.members,
+            formation_deadline,
+            context.deadlines.sql_batch,
+        )
+        .await;
         let validation = match observations {
             Ok(observations) => {
                 let result = unix_millis().and_then(|now| {
@@ -158,7 +210,10 @@ pub(crate) async fn provision<R: ProcessRunner>(
             Err(error) => Err(error),
         };
         match validation {
-            Ok(evidence) => break evidence,
+            Ok(evidence) if Instant::now() < formation_deadline => break evidence,
+            Ok(_) | Err(EvidenceError::Deadline) => {
+                return Err(AvailabilityGroupError::Deadline);
+            }
             Err(error) if error.retryable() && Instant::now() < formation_deadline => {
                 sleep(
                     POLL_INTERVAL.min(formation_deadline.saturating_duration_since(Instant::now())),
@@ -174,7 +229,27 @@ pub(crate) async fn provision<R: ProcessRunner>(
     let endpoint_evidence: [EndpointEvidence; 3] = endpoint_evidence
         .try_into()
         .map_err(|_| AvailabilityGroupError::Intent)?;
-    let binding = build_binding(context.run, context.members, &endpoint_evidence, &evidence)?;
+    let fresh_instances = observe_fresh_instances(&context, formation_deadline).await?;
+    context.frozen_member_verifier.verify(
+        formation_deadline.into_std(),
+        context.deadlines.docker_command,
+    )?;
+    let frozen_incarnations = context
+        .journal
+        .sql_member_incarnations
+        .as_ref()
+        .ok_or(AvailabilityGroupError::Intent)?;
+    let binding_incarnations =
+        validate_binding_incarnations(context.members, frozen_incarnations, &fresh_instances)?;
+    let binding = build_binding(
+        context.run,
+        &binding_incarnations,
+        &endpoint_evidence,
+        &evidence,
+    )?;
+    if Instant::now() >= formation_deadline {
+        return Err(AvailabilityGroupError::Deadline);
+    }
     context.journal.native_binding = Some(binding.clone());
     context
         .store
@@ -220,10 +295,12 @@ fn native_intent(
 }
 
 async fn create_endpoint(
+    context: &ProvisionContext<'_, impl ProcessRunner>,
     session: &mut AdminSession,
     run: &TopologyRun,
     index: usize,
     credentials: &CredentialFiles,
+    parent_deadline: Instant,
 ) -> Result<(), AvailabilityGroupError> {
     let certificate = endpoint_certificate_name(run, index)?;
     let backup_path = endpoint_certificate_container_path(run, index)?;
@@ -253,16 +330,22 @@ CREATE ENDPOINT [{endpoint}]
         endpoint = HADR_ENDPOINT_NAME,
         port = HADR_ENDPOINT_PORT,
     );
-    session
-        .execute(&batch, &[&master_password.expose() as &dyn ToSql])
-        .await
-        .map_err(AvailabilityGroupError::Admin)
+    execute_admin(
+        context,
+        session,
+        &batch,
+        &[&master_password.expose() as &dyn ToSql],
+        parent_deadline,
+    )
+    .await
 }
 
 async fn verify_endpoint(
+    context: &ProvisionContext<'_, impl ProcessRunner>,
     session: &mut AdminSession,
     run: &TopologyRun,
     index: usize,
+    parent_deadline: Instant,
 ) -> Result<EndpointEvidence, AvailabilityGroupError> {
     const QUERY: &str = r#"
 SET NOCOUNT ON;
@@ -280,10 +363,14 @@ INNER JOIN sys.certificates AS certificate
     ON certificate.certificate_id = mirroring.certificate_id
 WHERE endpoint.name = @P1;"#;
     let row = single_row(
-        session
-            .query_rows(QUERY, &[&HADR_ENDPOINT_NAME as &dyn ToSql])
-            .await
-            .map_err(AvailabilityGroupError::Admin)?,
+        query_admin(
+            context,
+            session,
+            QUERY,
+            &[&HADR_ENDPOINT_NAME as &dyn ToSql],
+            parent_deadline,
+        )
+        .await?,
     )
     .map_err(AvailabilityGroupError::Admin)?;
     let evidence = EndpointEvidence {
@@ -322,6 +409,7 @@ pub fn validate_endpoint_evidence(
 
 fn exchange_endpoint_certificates<R: ProcessRunner>(
     context: &ProvisionContext<'_, R>,
+    parent_deadline: StdInstant,
 ) -> Result<(), AvailabilityGroupError> {
     for source in 0..3 {
         let source_path = endpoint_certificate_host_path(context.run, source)?;
@@ -343,18 +431,25 @@ fn exchange_endpoint_certificates<R: ProcessRunner>(
                 .map_err(|_| AvailabilityGroupError::CertificateExchange)?;
             fs::set_permissions(&target_path, fs::Permissions::from_mode(0o640))
                 .map_err(|_| AvailabilityGroupError::CertificateExchange)?;
+            let remaining = parent_deadline.saturating_duration_since(StdInstant::now());
+            if remaining.is_zero() {
+                return Err(AvailabilityGroupError::Deadline);
+            }
             context
                 .runner
                 .run(
                     &CommandSpec::new(
                         "setfacl",
                         "share endpoint public certificate with SQL Server",
-                        remaining(context)?.min(context.deadlines.tls_helper),
+                        remaining.min(context.deadlines.tls_helper),
                     )
                     .args(["-m", "u:10001:r,m:r"])
                     .arg(&target_path),
                 )
                 .map_err(map_helper)?;
+            if StdInstant::now() >= parent_deadline {
+                return Err(AvailabilityGroupError::Deadline);
+            }
             let copied =
                 fs::read(&target_path).map_err(|_| AvailabilityGroupError::CertificateExchange)?;
             if Sha256::digest(copied) != expected_digest {
@@ -366,10 +461,12 @@ fn exchange_endpoint_certificates<R: ProcessRunner>(
 }
 
 async fn authorize_peer(
+    context: &ProvisionContext<'_, impl ProcessRunner>,
     session: &mut AdminSession,
     run: &TopologyRun,
     target: usize,
     peer: usize,
+    parent_deadline: Instant,
 ) -> Result<(), AvailabilityGroupError> {
     let login = endpoint_login_name(run, peer)?;
     let user = endpoint_user_name(run, peer)?;
@@ -388,14 +485,19 @@ CREATE CERTIFICATE [{certificate}] AUTHORIZATION [{user}] FROM FILE = N'{path}';
 GRANT CONNECT ON ENDPOINT::[{endpoint}] TO [{login}];"#,
         endpoint = HADR_ENDPOINT_NAME,
     );
-    session
-        .execute(&batch, &[&password.expose() as &dyn ToSql])
-        .await
-        .map_err(AvailabilityGroupError::Admin)
+    execute_admin(
+        context,
+        session,
+        &batch,
+        &[&password.expose() as &dyn ToSql],
+        parent_deadline,
+    )
+    .await
 }
 
 async fn create_and_join_group<R: ProcessRunner>(
     context: &ProvisionContext<'_, R>,
+    parent_deadline: Instant,
 ) -> Result<(), AvailabilityGroupError> {
     let group = availability_group_name(context.run);
     validated_identifier(&group).map_err(AvailabilityGroupError::Admin)?;
@@ -426,32 +528,31 @@ FOR REPLICA ON
 {clauses};
 ALTER AVAILABILITY GROUP [{group}] GRANT CREATE ANY DATABASE;"#
     );
-    let mut primary = connect_admin(context, 0, "master", false).await?;
-    primary
-        .execute(&batch, &[])
-        .await
-        .map_err(AvailabilityGroupError::Admin)?;
+    let mut primary = connect_admin(context, 0, "master", false, parent_deadline).await?;
+    execute_admin(context, &mut primary, &batch, &[], parent_deadline).await?;
     drop(primary);
     for index in 1..3 {
-        let mut secondary = connect_admin(context, index, "master", false).await?;
-        secondary
-            .execute(
-                &format!(
-                    r#"
+        let mut secondary = connect_admin(context, index, "master", false, parent_deadline).await?;
+        execute_admin(
+            context,
+            &mut secondary,
+            &format!(
+                r#"
 SET NOCOUNT ON;
 ALTER AVAILABILITY GROUP [{group}] JOIN WITH (CLUSTER_TYPE = EXTERNAL);
 ALTER AVAILABILITY GROUP [{group}] GRANT CREATE ANY DATABASE;"#
-                ),
-                &[],
-            )
-            .await
-            .map_err(AvailabilityGroupError::Admin)?;
+            ),
+            &[],
+            parent_deadline,
+        )
+        .await?;
     }
     Ok(())
 }
 
 async fn create_database<R: ProcessRunner>(
     context: &ProvisionContext<'_, R>,
+    parent_deadline: Instant,
 ) -> Result<(), AvailabilityGroupError> {
     let group = availability_group_name(context.run);
     let database = database_name(context.run);
@@ -471,16 +572,13 @@ CREATE TABLE dbo.kuberic_marker(
 );');
 ALTER AVAILABILITY GROUP [{group}] ADD DATABASE [{database}];"#
     );
-    let mut primary = connect_admin(context, 0, "master", false).await?;
-    primary
-        .execute(&batch, &[])
-        .await
-        .map_err(AvailabilityGroupError::Admin)
+    let mut primary = connect_admin(context, 0, "master", false, parent_deadline).await?;
+    execute_admin(context, &mut primary, &batch, &[], parent_deadline).await
 }
 
 fn build_binding(
     run: &TopologyRun,
-    launched: &[ReadyMember; 3],
+    incarnations: &[SqlMemberIncarnation; 3],
     endpoints: &[EndpointEvidence; 3],
     evidence: &ValidatedNativeEvidence,
 ) -> Result<NativeTopologyBinding, AvailabilityGroupError> {
@@ -489,8 +587,16 @@ fn build_binding(
         .iter()
         .map(|member| {
             let index = usize::from(member.ordinal.saturating_sub(1));
-            let launched = launched.get(index).ok_or(AvailabilityGroupError::Intent)?;
+            let incarnation = incarnations
+                .get(index)
+                .ok_or(AvailabilityGroupError::Intent)?;
             let endpoint = endpoints.get(index).ok_or(AvailabilityGroupError::Intent)?;
+            if incarnation.ordinal != member.ordinal
+                || incarnation.server_name != member.server_name
+                || endpoint.ordinal != member.ordinal
+            {
+                return Err(AvailabilityGroupError::Intent);
+            }
             let profile = member
                 .replica_profiles
                 .iter()
@@ -499,8 +605,8 @@ fn build_binding(
             Ok(NativeMemberBinding {
                 ordinal: member.ordinal,
                 server_name: member.server_name.clone(),
-                container_id: launched.container_id.clone(),
-                sql_start_unix_millis: launched.sql_start_unix_millis,
+                container_id: incarnation.container_id.clone(),
+                sql_start_unix_millis: incarnation.sql_start_unix_millis,
                 native_replica_id: member.local_replica_id.clone(),
                 local_database_id: member.database.local_database_id,
                 database_guid: member.database.database_guid.clone(),
@@ -529,11 +635,67 @@ fn build_binding(
     })
 }
 
+pub fn validate_binding_incarnations(
+    launched: &[ReadyMember; 3],
+    frozen: &[SqlMemberIncarnation; 3],
+    fresh: &[MemberReadinessEvidence; 3],
+) -> Result<[SqlMemberIncarnation; 3], AvailabilityGroupError> {
+    (0..3)
+        .map(|index| {
+            let launched = &launched[index];
+            let frozen = &frozen[index];
+            let fresh = &fresh[index];
+            fresh
+                .verify(&launched.server_name)
+                .map_err(AvailabilityGroupError::Admin)?;
+            if launched.ordinal != (index + 1) as u8
+                || frozen.ordinal != launched.ordinal
+                || frozen.server_name != launched.server_name
+            {
+                return Err(AvailabilityGroupError::Intent);
+            }
+            frozen
+                .verify(&launched.container_id, launched.sql_start_unix_millis)
+                .map_err(AvailabilityGroupError::Incarnation)?;
+            frozen
+                .verify(&launched.container_id, fresh.sql_start_unix_millis)
+                .map_err(AvailabilityGroupError::Incarnation)?;
+            Ok(SqlMemberIncarnation {
+                ordinal: launched.ordinal,
+                server_name: fresh.server_name.clone(),
+                container_id: launched.container_id.clone(),
+                sql_start_unix_millis: fresh.sql_start_unix_millis,
+            })
+        })
+        .collect::<Result<Vec<_>, AvailabilityGroupError>>()?
+        .try_into()
+        .map_err(|_| AvailabilityGroupError::Intent)
+}
+
+async fn observe_fresh_instances<R: ProcessRunner>(
+    context: &ProvisionContext<'_, R>,
+    parent_deadline: Instant,
+) -> Result<[MemberReadinessEvidence; 3], AvailabilityGroupError> {
+    let mut observations = Vec::with_capacity(3);
+    for index in 0..3 {
+        let mut session = connect_admin(context, index, "master", false, parent_deadline).await?;
+        let observation = readiness_admin(context, &mut session, parent_deadline).await?;
+        observation
+            .verify(&context.run.members[index].server_name)
+            .map_err(AvailabilityGroupError::Admin)?;
+        observations.push(observation);
+    }
+    observations
+        .try_into()
+        .map_err(|_| AvailabilityGroupError::Intent)
+}
+
 async fn connect_admin<R: ProcessRunner>(
     context: &ProvisionContext<'_, R>,
     index: usize,
     database: &str,
     read_only: bool,
+    parent_deadline: Instant,
 ) -> Result<AdminSession, AvailabilityGroupError> {
     let endpoint = AdminEndpoint {
         tcp_host: "127.0.0.1".to_owned(),
@@ -545,17 +707,96 @@ async fn connect_admin<R: ProcessRunner>(
         username: context.credentials.admin_username.path().to_path_buf(),
         password: context.credentials.admin_password.path().to_path_buf(),
     };
-    AdminSession::connect_database(
-        &endpoint,
-        &login,
-        AdminDeadlines {
-            connect: remaining(context)?.min(context.deadlines.sql_connect),
-            query: remaining(context)?.min(context.deadlines.sql_batch),
-        },
-        database,
-        read_only,
+    let remaining = remaining_until(parent_deadline)?;
+    complete_before(
+        parent_deadline,
+        context.deadlines.sql_connect,
+        AdminSession::connect_database(
+            &endpoint,
+            &login,
+            AdminDeadlines {
+                connect: context.deadlines.sql_connect.min(remaining),
+                query: context.deadlines.sql_batch.min(remaining),
+            },
+            database,
+            read_only,
+        ),
     )
     .await
+    .map_err(map_connect_limit)?
+    .map_err(AvailabilityGroupError::Admin)
+}
+
+async fn execute_admin<R: ProcessRunner>(
+    context: &ProvisionContext<'_, R>,
+    session: &mut AdminSession,
+    sql: &str,
+    parameters: &[&dyn ToSql],
+    parent_deadline: Instant,
+) -> Result<(), AvailabilityGroupError> {
+    session
+        .set_query_timeout(
+            context
+                .deadlines
+                .sql_batch
+                .min(remaining_until(parent_deadline)?),
+        )
+        .map_err(AvailabilityGroupError::Admin)?;
+    complete_before(
+        parent_deadline,
+        context.deadlines.sql_batch,
+        session.execute(sql, parameters),
+    )
+    .await
+    .map_err(map_query_limit)?
+    .map_err(AvailabilityGroupError::Admin)
+}
+
+async fn query_admin<R: ProcessRunner>(
+    context: &ProvisionContext<'_, R>,
+    session: &mut AdminSession,
+    sql: &str,
+    parameters: &[&dyn ToSql],
+    parent_deadline: Instant,
+) -> Result<Vec<tiberius::Row>, AvailabilityGroupError> {
+    session
+        .set_query_timeout(
+            context
+                .deadlines
+                .sql_batch
+                .min(remaining_until(parent_deadline)?),
+        )
+        .map_err(AvailabilityGroupError::Admin)?;
+    complete_before(
+        parent_deadline,
+        context.deadlines.sql_batch,
+        session.query_rows(sql, parameters),
+    )
+    .await
+    .map_err(map_query_limit)?
+    .map_err(AvailabilityGroupError::Admin)
+}
+
+async fn readiness_admin<R: ProcessRunner>(
+    context: &ProvisionContext<'_, R>,
+    session: &mut AdminSession,
+    parent_deadline: Instant,
+) -> Result<MemberReadinessEvidence, AvailabilityGroupError> {
+    session
+        .set_query_timeout(
+            context
+                .deadlines
+                .sql_batch
+                .min(remaining_until(parent_deadline)?),
+        )
+        .map_err(AvailabilityGroupError::Admin)?;
+    complete_before(
+        parent_deadline,
+        context.deadlines.sql_batch,
+        session.readiness(),
+    )
+    .await
+    .map_err(map_query_limit)?
     .map_err(AvailabilityGroupError::Admin)
 }
 
@@ -633,12 +874,8 @@ fn peer_certificate_host_path(
         )))
 }
 
-fn remaining<R: ProcessRunner>(
-    context: &ProvisionContext<'_, R>,
-) -> Result<Duration, AvailabilityGroupError> {
-    let remaining = context
-        .complete_deadline
-        .saturating_duration_since(Instant::now());
+fn remaining_until(deadline: Instant) -> Result<Duration, AvailabilityGroupError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         Err(AvailabilityGroupError::Deadline)
     } else {
@@ -646,6 +883,41 @@ fn remaining<R: ProcessRunner>(
     }
 }
 
+fn map_connect_limit(error: BoundedOperationError) -> AvailabilityGroupError {
+    match error {
+        BoundedOperationError::Deadline => AvailabilityGroupError::Deadline,
+        BoundedOperationError::OperationTimeout => {
+            AvailabilityGroupError::Admin(AdminError::ConnectDeadline)
+        }
+    }
+}
+
+fn map_query_limit(error: BoundedOperationError) -> AvailabilityGroupError {
+    match error {
+        BoundedOperationError::Deadline => AvailabilityGroupError::Deadline,
+        BoundedOperationError::OperationTimeout => {
+            AvailabilityGroupError::Admin(AdminError::QueryDeadline)
+        }
+    }
+}
+
 fn map_helper(_: ProcessError) -> AvailabilityGroupError {
     AvailabilityGroupError::Helper
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn evidence_poll_rejects_success_ready_at_parent_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let result = complete_before(deadline, Duration::from_secs(1), async {
+            sleep(Duration::from_millis(25)).await;
+            7
+        })
+        .await
+        .map_err(map_query_limit);
+        assert!(matches!(result, Err(AvailabilityGroupError::Deadline)));
+    }
 }

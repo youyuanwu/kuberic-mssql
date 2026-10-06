@@ -71,6 +71,19 @@ async fn three_replica_mssql_happy_path() {
             || binding
                 .members
                 .iter()
+                .zip(launched.members.iter())
+                .zip(incarnations.iter())
+                .any(|((bound, ready), frozen)| {
+                    bound.ordinal != ready.ordinal
+                        || bound.server_name != ready.server_name
+                        || bound.container_id != ready.container_id
+                        || bound.sql_start_unix_millis != ready.sql_start_unix_millis
+                        || bound.container_id != frozen.container_id
+                        || bound.sql_start_unix_millis != frozen.sql_start_unix_millis
+                })
+            || binding
+                .members
+                .iter()
                 .map(|member| member.native_replica_id.as_str())
                 .collect::<BTreeSet<_>>()
                 .len()

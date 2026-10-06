@@ -3,6 +3,7 @@ mod availability_group;
 mod cleanup;
 mod config;
 mod data;
+mod deadline;
 mod docker;
 mod evidence;
 mod member;
@@ -19,7 +20,7 @@ pub use admin::{
 };
 pub use availability_group::{
     AvailabilityGroupError, EndpointEvidence, HADR_ENDPOINT_NAME, HADR_ENDPOINT_PORT,
-    ProvisionedAvailabilityGroup, validate_endpoint_evidence,
+    ProvisionedAvailabilityGroup, validate_binding_incarnations, validate_endpoint_evidence,
 };
 pub use cleanup::{
     CLEANUP_BUDGET, CleanupBackend, CleanupClock, CleanupCompletion, CleanupCoordinator,

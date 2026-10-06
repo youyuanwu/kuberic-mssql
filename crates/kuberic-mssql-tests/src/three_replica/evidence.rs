@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::Instant;
 
 use kuberic_mssql::instance::SqlServerInstanceManager;
 use kuberic_mssql::observation::{
@@ -10,6 +11,7 @@ use kuberic_mssql::runtime_config::ObserverConfig;
 use kuberic_mssql::tds::TdsExecutor;
 use kuberic_mssql::{NativeRole, Observation};
 
+use super::deadline::{BoundedOperationError, complete_before};
 use super::member::ReadyMember;
 use super::model::TopologyRun;
 
@@ -89,6 +91,7 @@ pub struct ValidatedNativeEvidence {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvidenceError {
+    Deadline,
     ObservationFailed,
     Stale,
     IdentityMismatch,
@@ -107,7 +110,8 @@ impl EvidenceError {
     pub fn retryable(self) -> bool {
         !matches!(
             self,
-            Self::IdentityMismatch
+            Self::Deadline
+                | Self::IdentityMismatch
                 | Self::ProfileMismatch
                 | Self::LineageMismatch
                 | Self::SeedingFailed
@@ -118,6 +122,7 @@ impl EvidenceError {
 impl fmt::Display for EvidenceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::Deadline => "direct production observation deadline exceeded",
             Self::ObservationFailed => "direct production observation failed",
             Self::Stale => "direct production evidence is stale",
             Self::IdentityMismatch => "native availability-group identity does not match",
@@ -139,17 +144,25 @@ impl std::error::Error for EvidenceError {}
 pub async fn observe_direct_members(
     run: &TopologyRun,
     members: &[ReadyMember; 3],
+    parent_deadline: Instant,
+    configuration_timeout: Duration,
 ) -> Result<[MemberEvidence; 3], EvidenceError> {
     let mut observed = Vec::with_capacity(3);
     for (member, expected) in members.iter().zip(&run.members) {
-        let config = ObserverConfig::read(&member.observer_config)
-            .await
-            .map_err(|_| EvidenceError::ObservationFailed)?;
+        let config = complete_before(
+            parent_deadline,
+            configuration_timeout,
+            ObserverConfig::read(&member.observer_config),
+        )
+        .await
+        .map_err(map_bounded_observation)?
+        .map_err(|_| EvidenceError::ObservationFailed)?;
+        let sample_timeout = config.sample_timeout();
         let manager =
             SqlServerInstanceManager::new(TdsExecutor::new(config.connection().clone()), config);
-        let outer = manager
-            .observe()
+        let outer = complete_before(parent_deadline, sample_timeout, manager.observe())
             .await
+            .map_err(map_bounded_observation)?
             .map_err(|_| EvidenceError::ObservationFailed)?;
         let snapshot = match outer {
             Observation::Present { value, .. } => value,
@@ -166,6 +179,13 @@ pub async fn observe_direct_members(
     observed
         .try_into()
         .map_err(|_| EvidenceError::ObservationFailed)
+}
+
+fn map_bounded_observation(error: BoundedOperationError) -> EvidenceError {
+    match error {
+        BoundedOperationError::Deadline => EvidenceError::Deadline,
+        BoundedOperationError::OperationTimeout => EvidenceError::ObservationFailed,
+    }
 }
 
 pub fn validate_native_evidence(

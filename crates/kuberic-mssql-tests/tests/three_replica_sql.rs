@@ -6,15 +6,16 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use kuberic_mssql_tests::three_replica::{
-    AdminDeadlines, AdminEndpoint, AdminError, AdminSession, BoundedProcessRunner,
-    ChildDisposition, CommandSpec, ContainerInspection, ContainerLimits, ContainerMount,
-    ContainerPort, ContainerRequest, DataError, DatabaseEvidence, DockerApi, DockerCli,
-    DockerError, EndpointEvidence, EnvironmentVariable, EvidenceError, KubericMember, LoginFiles,
-    MemberEvidence, MemberReadinessEvidence, OwnedLabels, PrivateFile, ProcessError, ProcessResult,
-    ProcessRunner, ReplicaProfileEvidence, ResourcePolicy, SQL_SERVER_UID, SecretValue,
-    SeedingEvidence, SqlMember, SqlMemberIncarnation, SqlServerContainerSpec, TlsAssets,
-    TopologyRun, validate_endpoint_evidence, validate_marker_observations,
-    validate_native_evidence, validated_identifier,
+    AdminDeadlines, AdminEndpoint, AdminError, AdminSession, AvailabilityGroupError,
+    BoundedProcessRunner, ChildDisposition, CommandSpec, ContainerInspection, ContainerLimits,
+    ContainerMount, ContainerPort, ContainerRequest, DataError, DatabaseEvidence, DockerApi,
+    DockerCli, DockerError, EndpointEvidence, EnvironmentVariable, EvidenceError, IncarnationError,
+    KubericMember, LoginFiles, MemberEvidence, MemberReadinessEvidence, OwnedLabels, PrivateFile,
+    ProcessError, ProcessResult, ProcessRunner, ReadyMember, ReplicaProfileEvidence,
+    ResourcePolicy, SQL_SERVER_UID, SecretValue, SeedingEvidence, SqlMember, SqlMemberIncarnation,
+    SqlServerContainerSpec, TlsAssets, TopologyRun, validate_binding_incarnations,
+    validate_endpoint_evidence, validate_marker_observations, validate_native_evidence,
+    validated_identifier,
 };
 
 #[derive(Default)]
@@ -315,6 +316,43 @@ fn logical_incarnation_is_bound_to_container_id_and_sql_start() {
             .verify("sha256:container-1", 1_800_000_000_001)
             .is_err()
     );
+}
+
+#[test]
+fn native_binding_rejects_sql_restart_after_member_readiness() {
+    let launched: [ReadyMember; 3] = std::array::from_fn(|index| ReadyMember {
+        ordinal: (index + 1) as u8,
+        server_name: format!("km0123456789n{}", index + 1),
+        container_id: format!("sha256:container-{}", index + 1),
+        host_port: 49_171 + index as u16,
+        sql_start_unix_millis: 1_800_000_000_000 + index as i64,
+        observer_config: PathBuf::from(format!("/fixture/member-{}/observer.json", index + 1)),
+    });
+    let frozen: [SqlMemberIncarnation; 3] = std::array::from_fn(|index| SqlMemberIncarnation {
+        ordinal: launched[index].ordinal,
+        server_name: launched[index].server_name.clone(),
+        container_id: launched[index].container_id.clone(),
+        sql_start_unix_millis: launched[index].sql_start_unix_millis,
+    });
+    let mut fresh: [MemberReadinessEvidence; 3] =
+        std::array::from_fn(|index| MemberReadinessEvidence {
+            server_name: launched[index].server_name.clone(),
+            product_version: "17.0.5005.3".to_owned(),
+            edition: "Enterprise Developer Edition (64-bit)".to_owned(),
+            engine_edition: 3,
+            hadr_enabled: true,
+            sql_start_unix_millis: launched[index].sql_start_unix_millis,
+        });
+    let rebound = validate_binding_incarnations(&launched, &frozen, &fresh).unwrap();
+    assert_eq!(rebound, frozen);
+
+    fresh[1].sql_start_unix_millis += 1;
+    assert!(matches!(
+        validate_binding_incarnations(&launched, &frozen, &fresh),
+        Err(AvailabilityGroupError::Incarnation(
+            IncarnationError::SqlRestarted
+        ))
+    ));
 }
 
 #[test]
@@ -740,7 +778,7 @@ fn marker_observation_reports_bounded_timeout_until_all_three_are_readable() {
         DataError::MarkerMismatch
     );
     assert_eq!(
-        validate_marker_observations(&[1, 2, 3], now, now).unwrap(),
-        [1, 2, 3]
+        validate_marker_observations(&[1, 2, 3], now, now).unwrap_err(),
+        DataError::Deadline
     );
 }
