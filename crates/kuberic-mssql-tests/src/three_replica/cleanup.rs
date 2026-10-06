@@ -40,6 +40,25 @@ pub trait CleanupClock {
     fn now(&self) -> Duration;
 }
 
+pub(crate) struct OperationBudget<'a, C> {
+    clock: &'a C,
+    deadline: Duration,
+}
+
+impl<'a, C: CleanupClock> OperationBudget<'a, C> {
+    pub(crate) fn new(clock: &'a C, budget: Duration) -> Self {
+        Self {
+            clock,
+            deadline: clock.now().saturating_add(budget),
+        }
+    }
+
+    pub(crate) fn remaining(&self) -> Option<Duration> {
+        let remaining = self.deadline.saturating_sub(self.clock.now());
+        (!remaining.is_zero()).then_some(remaining)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SystemCleanupClock {
     origin: Instant,

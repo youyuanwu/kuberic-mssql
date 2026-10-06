@@ -4,6 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::cleanup::{CleanupClock, OperationBudget, SystemCleanupClock};
 use super::docker::SQL_SERVER_UID;
 use super::process::{CommandSpec, ProcessRunner};
 use super::secrets::{PrivateFile, SecretError, create_private_directory};
@@ -102,6 +103,27 @@ impl TlsAssets {
         runner: &impl ProcessRunner,
         recorder: &mut impl TlsAssetRecorder,
     ) -> Result<Self, TlsError> {
+        Self::generate_recorded_with_clock(
+            root,
+            hostnames,
+            member_data_directories,
+            timeout,
+            runner,
+            recorder,
+            &SystemCleanupClock::default(),
+        )
+    }
+
+    fn generate_recorded_with_clock<C: CleanupClock>(
+        root: &Path,
+        hostnames: [&str; 3],
+        member_data_directories: [&Path; 3],
+        timeout: Duration,
+        runner: &impl ProcessRunner,
+        recorder: &mut impl TlsAssetRecorder,
+        clock: &C,
+    ) -> Result<Self, TlsError> {
+        let budget = OperationBudget::new(clock, timeout);
         for hostname in hostnames {
             validate_hostname(hostname)?;
         }
@@ -115,7 +137,7 @@ impl TlsAssets {
         let ca_key_record = recorder.dispatch_file("tls-ca-private-key", &ca_key)?;
         run_openssl(
             runner,
-            timeout,
+            &budget,
             "generate TLS CA private key",
             [
                 "genpkey",
@@ -133,7 +155,7 @@ impl TlsAssets {
             recorder.dispatch_file("tls-ca-certificate", &ca_certificate)?;
         run_openssl(
             runner,
-            timeout,
+            &budget,
             "generate TLS CA certificate",
             [
                 "req",
@@ -165,10 +187,10 @@ impl TlsAssets {
             let secrets = member_data_directories[index].join("secrets");
             recorder
                 .create_directory(&format!("member-{}-secrets-directory", index + 1), &secrets)?;
-            configure_sql_directory(&secrets, timeout, runner)?;
+            configure_sql_directory(&secrets, &budget, runner)?;
             let kuberic = secrets.join("kuberic");
             recorder.create_directory(&format!("member-{}-tls-directory", index + 1), &kuberic)?;
-            configure_sql_directory(&kuberic, timeout, runner)?;
+            configure_sql_directory(&kuberic, &budget, runner)?;
             let key = kuberic.join("server.key");
             let request = tls_root.join(format!("server-{}.csr", index + 1));
             let extensions = tls_root.join(format!("server-{}.ext", index + 1));
@@ -188,7 +210,7 @@ impl TlsAssets {
                 recorder.dispatch_file(&format!("tls-server-{}-private-key", index + 1), &key)?;
             run_openssl(
                 runner,
-                timeout,
+                &budget,
                 "generate SQL Server TLS private key",
                 [
                     "genpkey",
@@ -201,13 +223,13 @@ impl TlsAssets {
                 ],
             )?;
             make_private(&key)?;
-            share_file_with_sql(&key, timeout, runner)?;
+            share_file_with_sql(&key, &budget, runner)?;
             let key_file = recorder.bind_file(key_record, &key, true)?;
             let request_record =
                 recorder.dispatch_file(&format!("tls-server-{}-request", index + 1), &request)?;
             run_openssl(
                 runner,
-                timeout,
+                &budget,
                 "generate SQL Server TLS request",
                 [
                     "req",
@@ -253,12 +275,12 @@ impl TlsAssets {
             ]);
             run_openssl_vec(
                 runner,
-                timeout,
+                &budget,
                 "sign SQL Server TLS certificate",
                 &arguments,
             )?;
             make_private(&certificate)?;
-            share_file_with_sql(&certificate, timeout, runner)?;
+            share_file_with_sql(&certificate, &budget, runner)?;
             let certificate_file = recorder.bind_file(certificate_record, &certificate, true)?;
             drop(extension_file);
             let exchange = exchange_root.join(format!("member-{}", index + 1));
@@ -302,6 +324,7 @@ pub enum TlsError {
     InvalidHostname,
     InvalidPath,
     UnsafeRequest,
+    Deadline,
     Helper,
     Journal,
     Secret(SecretError),
@@ -313,6 +336,7 @@ impl fmt::Display for TlsError {
             Self::InvalidHostname => "TLS hostname is invalid",
             Self::InvalidPath => "TLS asset path is invalid",
             Self::UnsafeRequest => "OpenSSL request exceeds the fixed safety bounds",
+            Self::Deadline => "TLS helper deadline exceeded",
             Self::Helper => "OpenSSL TLS helper failed",
             Self::Journal => "TLS ownership journal update failed",
             Self::Secret(_) => "TLS private asset operation failed",
@@ -324,7 +348,7 @@ impl std::error::Error for TlsError {}
 
 fn run_openssl<I, S>(
     runner: &impl ProcessRunner,
-    timeout: Duration,
+    budget: &OperationBudget<'_, impl CleanupClock>,
     diagnostic: &str,
     arguments: I,
 ) -> Result<(), TlsError>
@@ -336,12 +360,12 @@ where
         .into_iter()
         .map(|argument| argument.as_ref().to_owned())
         .collect::<Vec<_>>();
-    run_openssl_vec(runner, timeout, diagnostic, &arguments)
+    run_openssl_vec(runner, budget, diagnostic, &arguments)
 }
 
 fn run_openssl_vec(
     runner: &impl ProcessRunner,
-    timeout: Duration,
+    budget: &OperationBudget<'_, impl CleanupClock>,
     diagnostic: &str,
     arguments: &[String],
 ) -> Result<(), TlsError> {
@@ -353,6 +377,7 @@ fn run_openssl_vec(
     {
         return Err(TlsError::UnsafeRequest);
     }
+    let timeout = budget.remaining().ok_or(TlsError::Deadline)?;
     runner
         .run(&CommandSpec::new("openssl", diagnostic, timeout).args(arguments))
         .map(|_| ())
@@ -383,9 +408,10 @@ fn make_private(path: &Path) -> Result<(), TlsError> {
 
 fn configure_sql_directory(
     path: &Path,
-    timeout: Duration,
+    budget: &OperationBudget<'_, impl CleanupClock>,
     runner: &impl ProcessRunner,
 ) -> Result<(), TlsError> {
+    let timeout = budget.remaining().ok_or(TlsError::Deadline)?;
     runner
         .run(
             &CommandSpec::new("setfacl", "configure SQL TLS directory ACL", timeout)
@@ -401,9 +427,10 @@ fn configure_sql_directory(
 
 fn share_file_with_sql(
     path: &Path,
-    timeout: Duration,
+    budget: &OperationBudget<'_, impl CleanupClock>,
     runner: &impl ProcessRunner,
 ) -> Result<(), TlsError> {
+    let timeout = budget.remaining().ok_or(TlsError::Deadline)?;
     runner
         .run(
             &CommandSpec::new("setfacl", "configure SQL TLS file ACL", timeout)
@@ -412,4 +439,70 @@ fn share_file_with_sql(
         )
         .map(|_| ())
         .map_err(|_| TlsError::Helper)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::three_replica::process::{ChildDisposition, ProcessError, ProcessResult};
+
+    #[derive(Clone)]
+    struct FakeClock {
+        now: Arc<Mutex<Duration>>,
+    }
+
+    impl CleanupClock for FakeClock {
+        fn now(&self) -> Duration {
+            *self.now.lock().unwrap()
+        }
+    }
+
+    struct AdvancingRunner {
+        clock: FakeClock,
+        elapsed_per_call: Duration,
+        timeouts: Arc<Mutex<Vec<Duration>>>,
+    }
+
+    impl ProcessRunner for AdvancingRunner {
+        fn run(&self, command: &CommandSpec) -> Result<ProcessResult, ProcessError> {
+            self.timeouts.lock().unwrap().push(command.timeout());
+            let mut now = self.clock.now.lock().unwrap();
+            *now += self.elapsed_per_call;
+            Ok(ProcessResult {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                child: ChildDisposition::default(),
+            })
+        }
+    }
+
+    #[test]
+    fn sequential_tls_helpers_receive_decreasing_parent_budget() {
+        let clock = FakeClock {
+            now: Arc::new(Mutex::new(Duration::ZERO)),
+        };
+        let timeouts = Arc::new(Mutex::new(Vec::new()));
+        let runner = AdvancingRunner {
+            clock: clock.clone(),
+            elapsed_per_call: Duration::from_secs(7),
+            timeouts: timeouts.clone(),
+        };
+        let budget = OperationBudget::new(&clock, Duration::from_secs(30));
+
+        for diagnostic in ["first", "second", "third"] {
+            run_openssl(&runner, &budget, diagnostic, ["version"]).unwrap();
+        }
+
+        assert_eq!(
+            timeouts.lock().unwrap().as_slice(),
+            [
+                Duration::from_secs(30),
+                Duration::from_secs(23),
+                Duration::from_secs(16),
+            ]
+        );
+    }
 }

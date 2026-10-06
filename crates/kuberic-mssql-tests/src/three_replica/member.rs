@@ -14,8 +14,8 @@ use super::admin::{
     AdminDeadlines, AdminEndpoint, AdminError, AdminSession, LoginFiles, MemberReadinessEvidence,
 };
 use super::cleanup::{
-    CLEANUP_BUDGET, CleanupBackend, CleanupCoordinator, CleanupError, CleanupReport,
-    SystemCleanupClock, combine_with_cleanup,
+    CLEANUP_BUDGET, CleanupBackend, CleanupClock, CleanupCoordinator, CleanupError, CleanupReport,
+    OperationBudget, SystemCleanupClock, combine_with_cleanup,
 };
 use super::config::FixtureConfig;
 use super::docker::{
@@ -888,15 +888,13 @@ impl LaunchContext {
     }
 
     fn cleanup_report(&mut self) -> CleanupReport {
-        let parent_remaining = self.deadline.saturating_duration_since(Instant::now());
-        let budget = CLEANUP_BUDGET
-            .min(self.config.deadlines().cleanup)
-            .min(parent_remaining);
-        let coordinator = CleanupCoordinator::new(SystemCleanupClock::default(), budget);
+        let clock = SystemCleanupClock::default();
+        let coordinator = CleanupCoordinator::new(clock.clone(), CLEANUP_BUDGET);
         let backend = NativeCleanupBackend {
             root: self.store.root(),
             docker: &self.docker,
             runner: &self.runner,
+            clock,
             image_id: &self.image_id,
             network: self.network.as_ref(),
             containers: &self.containers,
@@ -1032,29 +1030,38 @@ impl TlsAssetRecorder for LaunchAssetRecorder<'_> {
     }
 }
 
-struct NativeCleanupBackend<'a> {
+struct NativeCleanupBackend<'a, D, R, C> {
     root: &'a Path,
-    docker: &'a DockerCli<BoundedProcessRunner>,
-    runner: &'a BoundedProcessRunner,
+    docker: &'a D,
+    runner: &'a R,
+    clock: C,
     image_id: &'a str,
     network: Option<&'a OwnedNetwork>,
     containers: &'a [OwnedContainer],
 }
 
-impl NativeCleanupBackend<'_> {
-    fn timeout(&self, remaining: Duration, stage: Duration) -> Result<Duration, CleanupError> {
-        let timeout = remaining.min(stage);
-        if timeout.is_zero() {
-            Err(CleanupError {
-                resource: "cleanup-budget".to_owned(),
-                failure: SanitizedFailure::new(
-                    FailureStage::Cleanup,
-                    FailureCategory::DeadlineExceeded,
-                ),
-            })
-        } else {
-            Ok(timeout)
-        }
+impl<D, R, C> NativeCleanupBackend<'_, D, R, C>
+where
+    D: DockerApi,
+    R: ProcessRunner + Copy,
+    C: CleanupClock,
+{
+    fn operation_budget(&self, remaining: Duration) -> OperationBudget<'_, C> {
+        OperationBudget::new(&self.clock, remaining.min(Duration::from_secs(30)))
+    }
+
+    fn timeout(
+        &self,
+        resource: &ResourceRecord,
+        budget: &OperationBudget<'_, C>,
+    ) -> Result<Duration, CleanupError> {
+        budget.remaining().ok_or_else(|| CleanupError {
+            resource: resource.logical_name.clone(),
+            failure: SanitizedFailure::new(
+                FailureStage::Cleanup,
+                FailureCategory::DeadlineExceeded,
+            ),
+        })
     }
 
     fn inspect_path(
@@ -1117,13 +1124,23 @@ impl NativeCleanupBackend<'_> {
     }
 }
 
-impl OwnershipInspector for NativeCleanupBackend<'_> {
+impl<D, R, C> OwnershipInspector for NativeCleanupBackend<'_, D, R, C>
+where
+    D: DockerApi,
+    R: ProcessRunner + Copy,
+    C: CleanupClock,
+{
     fn inspect(&self, resource: &ResourceRecord) -> Result<ResourceObservation, ReconcileError> {
         CleanupBackend::inspect_cleanup(self, resource, Duration::from_secs(30))
     }
 }
 
-impl CleanupBackend for NativeCleanupBackend<'_> {
+impl<D, R, C> CleanupBackend for NativeCleanupBackend<'_, D, R, C>
+where
+    D: DockerApi,
+    R: ProcessRunner + Copy,
+    C: CleanupClock,
+{
     fn inspect_cleanup(
         &self,
         resource: &ResourceRecord,
@@ -1137,10 +1154,15 @@ impl CleanupBackend for NativeCleanupBackend<'_> {
                         resource.intent.as_ref() == Some(&network.request.intent_binding())
                     })
                     .ok_or(ReconcileError::OwnershipMismatch)?;
-                let identity = network
-                    .id
-                    .as_deref()
-                    .unwrap_or(network.request.name.as_str());
+                let identity = resource.binding.as_ref().map_or_else(
+                    || {
+                        network
+                            .id
+                            .as_deref()
+                            .unwrap_or(network.request.name.as_str())
+                    },
+                    |binding| binding.immutable_id.as_str(),
+                );
                 let inspection = self
                     .docker
                     .inspect_network(identity, remaining.min(Duration::from_secs(30)))
@@ -1186,10 +1208,15 @@ impl CleanupBackend for NativeCleanupBackend<'_> {
                         })
                     })
                     .ok_or(ReconcileError::OwnershipMismatch)?;
-                let identity = container
-                    .id
-                    .as_deref()
-                    .unwrap_or(container.request.name.as_str());
+                let identity = resource.binding.as_ref().map_or_else(
+                    || {
+                        container
+                            .id
+                            .as_deref()
+                            .unwrap_or(container.request.name.as_str())
+                    },
+                    |binding| binding.immutable_id.as_str(),
+                );
                 let inspection = self
                     .docker
                     .inspect_container(identity, remaining.min(Duration::from_secs(30)))
@@ -1205,11 +1232,7 @@ impl CleanupBackend for NativeCleanupBackend<'_> {
                     return Ok(ResourceObservation::Foreign);
                 }
                 let binding = if let Some(expected) = resource.binding.as_ref() {
-                    let mut normalized = inspection.clone();
-                    normalized.running = true;
-                    if inspection.id != expected.immutable_id
-                        || container.frozen_running_inspection.as_ref() != Some(&normalized)
-                    {
+                    if inspection.id != expected.immutable_id {
                         return Ok(ResourceObservation::Foreign);
                     }
                     expected.clone()
@@ -1240,45 +1263,38 @@ impl CleanupBackend for NativeCleanupBackend<'_> {
             .containers
             .iter()
             .find(|container| {
-                resource
-                    .intent
-                    .as_ref()
-                    .is_some_and(|intent| intent.immutable_id == container.request.name)
+                resource.intent.as_ref().is_some_and(|intent| {
+                    intent == &container.request.intent_binding(self.image_id)
+                })
             })
             .ok_or_else(|| cleanup_ownership_error(resource))?;
-        let identity = container
-            .id
-            .as_deref()
-            .unwrap_or(container.request.name.as_str());
-        let timeout = self.timeout(remaining, Duration::from_secs(30))?;
+        let expected = resource
+            .binding
+            .as_ref()
+            .ok_or_else(|| cleanup_ownership_error(resource))?;
+        let identity = expected.immutable_id.as_str();
+        let budget = self.operation_budget(remaining);
         if let Some(inspection) = self
             .docker
-            .inspect_container(identity, timeout)
+            .inspect_container(identity, self.timeout(resource, &budget)?)
             .map_err(|_| cleanup_operation_error(resource, FailureCategory::ContainerRemoval))?
         {
             container
                 .request
                 .verify_inspection(&inspection, self.image_id, inspection.running)
                 .map_err(|_| cleanup_ownership_error(resource))?;
-            let mut normalized = inspection.clone();
-            normalized.running = true;
-            if inspection.id
-                != resource
-                    .binding
-                    .as_ref()
-                    .ok_or_else(|| cleanup_ownership_error(resource))?
-                    .immutable_id
-                || container.frozen_running_inspection.as_ref() != Some(&normalized)
-            {
+            if inspection.id != expected.immutable_id {
                 return Err(cleanup_ownership_error(resource));
             }
             if inspection.running {
-                self.docker.stop_container(identity, timeout).map_err(|_| {
-                    cleanup_operation_error(resource, FailureCategory::ContainerRemoval)
-                })?;
+                self.docker
+                    .stop_container(identity, self.timeout(resource, &budget)?)
+                    .map_err(|_| {
+                        cleanup_operation_error(resource, FailureCategory::ContainerRemoval)
+                    })?;
             }
             self.docker
-                .remove_container(identity, timeout)
+                .remove_container(identity, self.timeout(resource, &budget)?)
                 .map_err(|_| {
                     cleanup_operation_error(resource, FailureCategory::ContainerRemoval)
                 })?;
@@ -1291,16 +1307,19 @@ impl CleanupBackend for NativeCleanupBackend<'_> {
         resource: &ResourceRecord,
         remaining: Duration,
     ) -> Result<(), CleanupError> {
-        let network = self
+        let _network = self
             .network
+            .filter(|network| resource.intent.as_ref() == Some(&network.request.intent_binding()))
             .ok_or_else(|| cleanup_ownership_error(resource))?;
-        let identity = network
-            .id
-            .as_deref()
-            .unwrap_or(network.request.name.as_str());
-        let timeout = self.timeout(remaining, Duration::from_secs(30))?;
+        let identity = resource
+            .binding
+            .as_ref()
+            .ok_or_else(|| cleanup_ownership_error(resource))?
+            .immutable_id
+            .as_str();
+        let budget = self.operation_budget(remaining);
         self.docker
-            .remove_network(identity, timeout)
+            .remove_network(identity, self.timeout(resource, &budget)?)
             .map_err(|_| cleanup_operation_error(resource, FailureCategory::NetworkRemoval))
     }
 
@@ -1313,8 +1332,9 @@ impl CleanupBackend for NativeCleanupBackend<'_> {
             .binding
             .as_ref()
             .ok_or_else(|| cleanup_ownership_error(resource))?;
+        let budget = self.operation_budget(remaining);
         let ResourceObservation::Owned { binding, .. } = self
-            .inspect_path(resource, remaining)
+            .inspect_path(resource, self.timeout(resource, &budget)?)
             .map_err(|_| cleanup_ownership_error(resource))?
         else {
             return Err(cleanup_ownership_error(resource));
@@ -1333,7 +1353,7 @@ impl CleanupBackend for NativeCleanupBackend<'_> {
                 restore_host_cleanup_acl(
                     path,
                     unsafe { libc::geteuid() },
-                    self.timeout(remaining, Duration::from_secs(30))?,
+                    self.timeout(resource, &budget)?,
                     self.runner,
                 )
                 .map_err(|_| cleanup_operation_error(resource, FailureCategory::PathRemoval))?;
@@ -1607,12 +1627,185 @@ fn stable_docker_binding(
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::os::unix::fs::PermissionsExt;
+    use std::rc::Rc;
 
     use tempfile::tempdir;
 
     use super::*;
     use crate::three_replica::docker::{DockerCapabilities, ImageInspection, NetworkInspection};
     use crate::three_replica::ownership::reconcile;
+
+    #[derive(Clone)]
+    struct FakeClock {
+        now: Rc<Cell<Duration>>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self {
+                now: Rc::new(Cell::new(Duration::ZERO)),
+            }
+        }
+    }
+
+    impl CleanupClock for FakeClock {
+        fn now(&self) -> Duration {
+            self.now.get()
+        }
+    }
+
+    struct CleanupDocker {
+        clock: FakeClock,
+        elapsed_per_call: Duration,
+        container: RefCell<Option<ContainerInspection>>,
+        network: RefCell<Option<NetworkInspection>>,
+        calls: RefCell<Vec<(String, String, Duration)>>,
+    }
+
+    impl CleanupDocker {
+        fn record(&self, operation: &str, identity: &str, timeout: Duration) {
+            self.calls
+                .borrow_mut()
+                .push((operation.to_owned(), identity.to_owned(), timeout));
+            self.clock
+                .now
+                .set(self.clock.now.get() + self.elapsed_per_call);
+        }
+    }
+
+    impl DockerApi for CleanupDocker {
+        fn capabilities(&self, _: Duration) -> Result<DockerCapabilities, DockerError> {
+            Err(DockerError::Command)
+        }
+
+        fn docker_root(&self, _: Duration) -> Result<PathBuf, DockerError> {
+            Err(DockerError::Command)
+        }
+
+        fn inspect_image(
+            &self,
+            _: &str,
+            _: Duration,
+        ) -> Result<Option<ImageInspection>, DockerError> {
+            Err(DockerError::Command)
+        }
+
+        fn pull_image(&self, _: &str, _: Duration) -> Result<(), DockerError> {
+            Err(DockerError::Command)
+        }
+
+        fn inspect_network(
+            &self,
+            identity: &str,
+            timeout: Duration,
+        ) -> Result<Option<NetworkInspection>, DockerError> {
+            self.record("inspect-network", identity, timeout);
+            Ok(self.network.borrow().clone())
+        }
+
+        fn create_network(&self, _: &NetworkRequest, _: Duration) -> Result<String, DockerError> {
+            Err(DockerError::Command)
+        }
+
+        fn remove_network(&self, id: &str, timeout: Duration) -> Result<(), DockerError> {
+            self.record("remove-network", id, timeout);
+            self.network.borrow_mut().take();
+            Ok(())
+        }
+
+        fn inspect_container(
+            &self,
+            identity: &str,
+            timeout: Duration,
+        ) -> Result<Option<ContainerInspection>, DockerError> {
+            self.record("inspect-container", identity, timeout);
+            Ok(self.container.borrow().clone())
+        }
+
+        fn create_container(
+            &self,
+            _: &ContainerRequest,
+            _: Duration,
+        ) -> Result<String, DockerError> {
+            Err(DockerError::Command)
+        }
+
+        fn start_container(&self, _: &str, _: Duration) -> Result<(), DockerError> {
+            Err(DockerError::Command)
+        }
+
+        fn stop_container(&self, id: &str, timeout: Duration) -> Result<(), DockerError> {
+            self.record("stop-container", id, timeout);
+            if let Some(container) = self.container.borrow_mut().as_mut() {
+                container.running = false;
+            }
+            Ok(())
+        }
+
+        fn remove_container(&self, id: &str, timeout: Duration) -> Result<(), DockerError> {
+            self.record("remove-container", id, timeout);
+            self.container.borrow_mut().take();
+            Ok(())
+        }
+    }
+
+    fn cleanup_container(
+        root: &Path,
+        running: bool,
+    ) -> (ContainerRequest, ContainerInspection, OwnedContainer) {
+        let data = root.join("member");
+        fs::create_dir(&data).unwrap();
+        let request = ContainerRequest::sql_server(
+            SqlServerContainerSpec {
+                name: "container-name".to_owned(),
+                hostname: "km0123456789n1".to_owned(),
+                network_name: "network-name".to_owned(),
+                data_directory: data.clone(),
+                environment_file: root.join("container.env"),
+                sa_password: SecretValue::from_test("Password-Aa1!"),
+            },
+            OwnedLabels::container("0123456789ab", 1),
+            super::super::config::ResourcePolicy::default(),
+            [("ACCEPT_EULA", "Y")],
+        )
+        .unwrap();
+        let inspection = ContainerInspection {
+            id: "journaled-container-id".to_owned(),
+            name: request.name.clone(),
+            hostname: request.hostname.clone(),
+            image_id: "image-id".to_owned(),
+            labels: request.labels.as_map(),
+            environment: request
+                .environment_file_contents()
+                .lines()
+                .map(str::to_owned)
+                .collect(),
+            user: "mssql".to_owned(),
+            running,
+            restart_policy: "no".to_owned(),
+            network_mode: request.network_name.clone(),
+            network_names: vec![request.network_name.clone()],
+            mounts: vec![super::super::docker::ContainerMount {
+                source: data.canonicalize().unwrap(),
+                destination: PathBuf::from("/var/opt/mssql"),
+                read_only: false,
+            }],
+            ports: vec![super::super::docker::ContainerPort {
+                container_port: 1433,
+                host_ip: "127.0.0.1".to_owned(),
+                host_port: 49171,
+            }],
+            limits: super::super::docker::ContainerLimits::from_policy(
+                super::super::config::ResourcePolicy::default(),
+            ),
+        };
+        let owned = OwnedContainer {
+            request: request.clone(),
+            id: None,
+            frozen_running_inspection: None,
+        };
+        (request, inspection, owned)
+    }
 
     struct LateNetworkDocker {
         inspection: RefCell<Result<Option<NetworkInspection>, DockerError>>,
@@ -1767,6 +1960,282 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_removes_exact_container_before_start_without_frozen_running_snapshot() {
+        let temporary = tempdir().unwrap();
+        let (request, inspection, owned) = cleanup_container(temporary.path(), false);
+        let binding = container_resource_binding(&request, "image-id", &inspection).unwrap();
+        let resource = ResourceRecord {
+            kind: ResourceKind::Container,
+            logical_name: "container-1".to_owned(),
+            path: None,
+            intent: Some(request.intent_binding("image-id")),
+            binding: Some(binding),
+            state: ResourceState::Bound,
+        };
+        let clock = FakeClock::new();
+        let docker = CleanupDocker {
+            clock: clock.clone(),
+            elapsed_per_call: Duration::ZERO,
+            container: RefCell::new(Some(inspection)),
+            network: RefCell::new(None),
+            calls: RefCell::new(Vec::new()),
+        };
+        let runner = BoundedProcessRunner;
+        let backend = NativeCleanupBackend {
+            root: temporary.path(),
+            docker: &docker,
+            runner: &runner,
+            clock,
+            image_id: "image-id",
+            network: None,
+            containers: &[owned],
+        };
+
+        backend
+            .remove_container(&resource, Duration::from_secs(180))
+            .unwrap();
+
+        assert_eq!(
+            docker.calls.borrow().as_slice(),
+            [
+                (
+                    "inspect-container".to_owned(),
+                    "journaled-container-id".to_owned(),
+                    Duration::from_secs(30),
+                ),
+                (
+                    "remove-container".to_owned(),
+                    "journaled-container-id".to_owned(),
+                    Duration::from_secs(30),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn sequential_container_cleanup_operations_receive_decreasing_budget() {
+        let temporary = tempdir().unwrap();
+        let (request, inspection, owned) = cleanup_container(temporary.path(), true);
+        let mut created = inspection.clone();
+        created.running = false;
+        created.ports[0].host_port = 0;
+        let binding = container_resource_binding(&request, "image-id", &created).unwrap();
+        let resource = ResourceRecord {
+            kind: ResourceKind::Container,
+            logical_name: "container-1".to_owned(),
+            path: None,
+            intent: Some(request.intent_binding("image-id")),
+            binding: Some(binding),
+            state: ResourceState::Bound,
+        };
+        let clock = FakeClock::new();
+        let docker = CleanupDocker {
+            clock: clock.clone(),
+            elapsed_per_call: Duration::from_secs(7),
+            container: RefCell::new(Some(inspection)),
+            network: RefCell::new(None),
+            calls: RefCell::new(Vec::new()),
+        };
+        let runner = BoundedProcessRunner;
+        let backend = NativeCleanupBackend {
+            root: temporary.path(),
+            docker: &docker,
+            runner: &runner,
+            clock,
+            image_id: "image-id",
+            network: None,
+            containers: &[owned],
+        };
+
+        backend
+            .remove_container(&resource, Duration::from_secs(180))
+            .unwrap();
+
+        assert_eq!(
+            docker
+                .calls
+                .borrow()
+                .iter()
+                .map(|(_, _, timeout)| *timeout)
+                .collect::<Vec<_>>(),
+            [
+                Duration::from_secs(30),
+                Duration::from_secs(23),
+                Duration::from_secs(16),
+            ]
+        );
+    }
+
+    #[test]
+    fn bound_network_removal_uses_journaled_immutable_id() {
+        let temporary = tempdir().unwrap();
+        let request = NetworkRequest {
+            name: "logical-network-name".to_owned(),
+            labels: OwnedLabels::network("0123456789ab"),
+        };
+        let network = OwnedNetwork {
+            request: request.clone(),
+            id: None,
+        };
+        let resource = ResourceRecord {
+            kind: ResourceKind::Network,
+            logical_name: "docker-network".to_owned(),
+            path: None,
+            intent: Some(request.intent_binding()),
+            binding: Some(ResourceBinding {
+                immutable_id: "journaled-network-id".to_owned(),
+                attributes_sha256: "attributes".to_owned(),
+            }),
+            state: ResourceState::Bound,
+        };
+        let clock = FakeClock::new();
+        let docker = CleanupDocker {
+            clock: clock.clone(),
+            elapsed_per_call: Duration::ZERO,
+            container: RefCell::new(None),
+            network: RefCell::new(None),
+            calls: RefCell::new(Vec::new()),
+        };
+        let runner = BoundedProcessRunner;
+        let backend = NativeCleanupBackend {
+            root: temporary.path(),
+            docker: &docker,
+            runner: &runner,
+            clock,
+            image_id: "image-id",
+            network: Some(&network),
+            containers: &[],
+        };
+
+        backend
+            .remove_network(&resource, Duration::from_secs(180))
+            .unwrap();
+
+        assert_eq!(
+            docker.calls.borrow().as_slice(),
+            [(
+                "remove-network".to_owned(),
+                "journaled-network-id".to_owned(),
+                Duration::from_secs(30),
+            )]
+        );
+    }
+
+    #[test]
+    fn late_reconciled_network_removal_switches_from_name_to_journaled_id() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("fixture");
+        let store = JournalStore::initialize(&root).unwrap();
+        let mut journal = store.create(run(&root)).unwrap();
+        let request = NetworkRequest {
+            name: "logical-network-name".to_owned(),
+            labels: OwnedLabels::network("0123456789ab"),
+        };
+        journal.resources.push(ResourceRecord {
+            kind: ResourceKind::Network,
+            logical_name: "docker-network".to_owned(),
+            path: None,
+            intent: Some(request.intent_binding()),
+            binding: None,
+            state: ResourceState::Dispatched,
+        });
+        store.save(&journal).unwrap();
+        let network = OwnedNetwork {
+            request: request.clone(),
+            id: None,
+        };
+        let inspection = NetworkInspection {
+            id: "late-network-id".to_owned(),
+            name: request.name.clone(),
+            driver: "bridge".to_owned(),
+            labels: request.labels.as_map(),
+            attached_container_ids: Vec::new(),
+        };
+        let clock = FakeClock::new();
+        let docker = CleanupDocker {
+            clock: clock.clone(),
+            elapsed_per_call: Duration::ZERO,
+            container: RefCell::new(None),
+            network: RefCell::new(Some(inspection)),
+            calls: RefCell::new(Vec::new()),
+        };
+        let runner = BoundedProcessRunner;
+        let backend = NativeCleanupBackend {
+            root: &root,
+            docker: &docker,
+            runner: &runner,
+            clock: clock.clone(),
+            image_id: "image-id",
+            network: Some(&network),
+            containers: &[],
+        };
+
+        let report =
+            CleanupCoordinator::new(clock, CLEANUP_BUDGET).cleanup(&store, &mut journal, &backend);
+
+        assert!(report.succeeded());
+        assert_eq!(
+            docker
+                .calls
+                .borrow()
+                .iter()
+                .map(|(operation, identity, _)| (operation.as_str(), identity.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("inspect-network", "logical-network-name"),
+                ("remove-network", "late-network-id"),
+                ("inspect-network", "late-network-id"),
+            ]
+        );
+    }
+
+    #[test]
+    fn cleanup_budget_is_independent_after_setup_deadline_expires() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("fixture");
+        let acknowledgement = temporary.path().join("acknowledgement.json");
+        fs::write(
+            &acknowledgement,
+            r#"{"schema_version":1,"sql_server_eula":{"accepted":true}}"#,
+        )
+        .unwrap();
+        let config = FixtureConfig::new(&root, acknowledgement).unwrap();
+        let lock = acquire_root_lock(&root).unwrap();
+        let store = JournalStore::initialize(&root).unwrap();
+        let mut journal = store.create(run(&root)).unwrap();
+        journal.resources.push(ResourceRecord {
+            kind: ResourceKind::SecretFile,
+            logical_name: "never-created".to_owned(),
+            path: Some(root.join("never-created")),
+            intent: None,
+            binding: None,
+            state: ResourceState::Intended,
+        });
+        store.save(&journal).unwrap();
+        let runner = BoundedProcessRunner;
+        let mut context = LaunchContext {
+            config,
+            _lock: lock,
+            store,
+            journal,
+            docker: DockerCli::new(runner),
+            runner,
+            image_id: "unused".to_owned(),
+            deadline: Instant::now(),
+            private_files: Vec::new(),
+            credentials: None,
+            tls: None,
+            network: None,
+            containers: Vec::new(),
+        };
+
+        let report = context.cleanup_report();
+
+        assert!(report.succeeded());
+        assert_eq!(context.journal.state, RunState::Removed);
+    }
+
+    #[test]
     fn colliding_launcher_directory_is_retained_and_blocks_actual_cleanup() {
         let temporary = tempdir().unwrap();
         let root = temporary.path().join("fixture");
@@ -1839,6 +2308,7 @@ mod tests {
             root: &root,
             docker: &docker,
             runner: &runner,
+            clock: SystemCleanupClock::default(),
             image_id: "unused",
             network: None,
             containers: &[],
