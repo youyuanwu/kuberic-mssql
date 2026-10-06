@@ -1,24 +1,34 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ffi::CString;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kuberic_mssql_tests::three_replica::{
-    ACKNOWLEDGEMENT_SCHEMA_VERSION, AclController, AclEvidence, AclProbe, ChildDisposition,
-    CleanupBackend, CleanupError, CommandSpec, ContainerInspection, ContainerLimits,
+    ACKNOWLEDGEMENT_SCHEMA_VERSION, AclController, AclEvidence, AclProbe, BoundedProcessRunner,
+    ChildDisposition, CleanupBackend, CleanupClock, CleanupCompletion, CleanupCoordinator,
+    CleanupError, CommandAclController, CommandSpec, ContainerInspection, ContainerLimits,
     ContainerMount, ContainerPort, ContainerRequest, DockerApi, DockerCapabilities, DockerCli,
-    DockerError, FailureCategory, FailureStage, FixtureConfig, HostPlatform, HostProbe,
-    ImageInspection, JournalStore, KubericMember, LockError, NetworkInspection, NetworkRequest,
-    OwnedLabels, OwnershipInspector, OwnershipJournal, PINNED_SQL_SERVER_IMAGE, PreflightError,
-    ProcessError, ProcessErrorKind, ProcessResult, ProcessRunner, ReconcileError, ResourceBinding,
-    ResourceKind, ResourceObservation, ResourcePolicy, ResourceRecord, ResourceState, RunState,
-    SQL_SERVER_UID, SanitizedFailure, SqlMember, TopologyRun, acquire_root_lock, available_memory,
-    cleanup, combine_with_cleanup, effective_cpu_count, inspect_member_directory, parse_cpu_list,
-    prepare_member_directory, reconcile, run_preflight, verify_member_directory,
+    DockerError, FailureCategory, FailureStage, FixtureConfig, HandledCancellationSignal,
+    HostPlatform, HostProbe, ImageInspection, JournalStore, KubericMember, LockError,
+    NetworkInspection, NetworkRequest, OwnedLabels, OwnershipInspector, OwnershipJournal,
+    PINNED_SQL_SERVER_IMAGE, PreflightError, ProcessError, ProcessErrorKind, ProcessResult,
+    ProcessRunner, ReconcileError, ResourceBinding, ResourceKind, ResourceObservation,
+    ResourcePolicy, ResourceRecord, ResourceState, RunState, SQL_SERVER_UID, SanitizedFailure,
+    SqlMember, TopologyRun, acquire_root_lock, available_memory, cgroup_v2_available_memory,
+    cgroup_v2_effective_cpu_quota, cleanup, combine_with_cleanup, effective_cpu_count,
+    inspect_member_directory, parse_acl_evidence, parse_cpu_list, prepare_member_directory,
+    reconcile, run_preflight, verify_member_directory,
 };
+
+fn effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
 
 fn write_acknowledgement(path: &Path) {
     fs::write(
@@ -102,8 +112,9 @@ impl FakeHost {
             spaces: RefCell::new(VecDeque::from([
                 policy.minimum_fixture_bytes,
                 policy.minimum_docker_root_after_image_bytes,
+                policy.minimum_fixture_bytes,
             ])),
-            uid: 1000,
+            uid: effective_uid(),
         }
     }
 }
@@ -288,6 +299,44 @@ fn cgroup_memory_and_cpu_thresholds_use_the_effective_minimum() {
 }
 
 #[test]
+fn cgroup_v2_limits_use_all_ancestors_and_fail_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let mount = directory.path().join("cgroup");
+    let team = mount.join("team");
+    let current = team.join("job");
+    fs::create_dir_all(&current).unwrap();
+    for (path, memory_max, memory_current, cpu_max) in [
+        (&mount, "20000", "1024", "400000 100000"),
+        (&team, "12000", "5000", "250000 100000"),
+        (&current, "max", "6000", "100000 100000"),
+    ] {
+        fs::write(path.join("memory.max"), memory_max).unwrap();
+        fs::write(path.join("memory.current"), memory_current).unwrap();
+        fs::write(path.join("cpu.max"), cpu_max).unwrap();
+    }
+    assert_eq!(
+        cgroup_v2_available_memory(&mount, &current, 50_000).unwrap(),
+        7_000
+    );
+    assert_eq!(
+        cgroup_v2_effective_cpu_quota(&mount, &current).unwrap(),
+        Some((100_000, 100_000))
+    );
+
+    fs::write(team.join("memory.max"), "not-a-limit").unwrap();
+    assert_eq!(
+        cgroup_v2_available_memory(&mount, &current, 50_000).unwrap_err(),
+        PreflightError::Unverifiable
+    );
+    fs::write(team.join("memory.max"), "12000").unwrap();
+    fs::remove_file(mount.join("cpu.max")).unwrap();
+    assert_eq!(
+        cgroup_v2_effective_cpu_quota(&mount, &current).unwrap_err(),
+        PreflightError::Unverifiable
+    );
+}
+
+#[test]
 fn preflight_enforces_exact_numeric_policy_and_deadlines() {
     let policy = ResourcePolicy::default();
     assert_eq!(policy.container_memory_bytes, 3 * 1024 * 1024 * 1024);
@@ -426,6 +475,7 @@ fn absent_image_requires_pre_pull_and_post_pull_capacity() {
             policy.minimum_fixture_bytes,
             policy.minimum_docker_root_before_pull_bytes,
             policy.minimum_docker_root_after_image_bytes,
+            policy.minimum_fixture_bytes,
         ])),
         ..FakeHost::sufficient()
     };
@@ -434,6 +484,30 @@ fn absent_image_requires_pre_pull_and_post_pull_capacity() {
     assert!(!report.image_was_cached);
     assert_eq!(docker.pulls.get(), 1);
     assert_eq!(docker.create_count(), 0);
+}
+
+#[test]
+fn fixture_capacity_is_rechecked_after_image_preparation() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = fixture_config(directory.path());
+    let policy = config.resources();
+    let host = FakeHost {
+        spaces: RefCell::new(VecDeque::from([
+            policy.minimum_fixture_bytes,
+            policy.minimum_docker_root_after_image_bytes,
+            policy.minimum_fixture_bytes - 1,
+        ])),
+        ..FakeHost::sufficient()
+    };
+    assert!(matches!(
+        run_preflight(
+            &config,
+            &host,
+            &FakeAclProbe::supported(),
+            &FakeDocker::cached()
+        ),
+        Err(PreflightError::InsufficientFixtureSpace { .. })
+    ));
 }
 
 #[test]
@@ -609,6 +683,20 @@ fn successful(stdout: impl Into<String>) -> Result<ProcessResult, ProcessError> 
     })
 }
 
+fn failed(diagnostic: &str) -> Result<ProcessResult, ProcessError> {
+    Err(ProcessError::new(
+        ProcessErrorKind::Exit,
+        "docker command",
+        Some(1),
+        diagnostic,
+        ChildDisposition {
+            pid: Some(10),
+            terminated: false,
+            reaped: true,
+        },
+    ))
+}
+
 #[test]
 fn docker_cli_parses_structured_inspection_and_never_invokes_a_shell() {
     let image_json = serde_json::json!([{
@@ -675,6 +763,91 @@ fn process_timeout_model_requires_exact_termination_and_reaping() {
             reaped: true,
         }
     );
+}
+
+#[test]
+fn bounded_process_runner_terminates_descendants_that_retain_pipes() {
+    let started = Instant::now();
+    let result = BoundedProcessRunner
+        .run(
+            &CommandSpec::new("/bin/sh", "fork descriptor holder", Duration::from_secs(2))
+                .args(["-c", "sleep 30 & echo $!; exit 0"]),
+        )
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(result.child.reaped);
+    let descendant = result.stdout.trim().parse::<i32>().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while unsafe { libc::kill(descendant, 0) } == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(unsafe { libc::kill(descendant, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+}
+
+#[test]
+fn docker_absence_is_classified_per_resource_and_not_by_generic_no_such_text() {
+    for (diagnostic, operation) in [
+        ("Error response from daemon: No such image: pinned", "image"),
+        (
+            "Error response from daemon: network owned-network not found",
+            "network",
+        ),
+        ("Error: No such container: owned-container", "container"),
+    ] {
+        let runner = ScriptedRunner::default();
+        runner.results.lock().unwrap().push_back(failed(diagnostic));
+        let docker = DockerCli::new(runner);
+        match operation {
+            "image" => assert!(
+                docker
+                    .inspect_image("pinned", Duration::from_secs(1))
+                    .unwrap()
+                    .is_none()
+            ),
+            "network" => assert!(
+                docker
+                    .inspect_network("owned-network", Duration::from_secs(1))
+                    .unwrap()
+                    .is_none()
+            ),
+            "container" => assert!(
+                docker
+                    .inspect_container("owned-container", Duration::from_secs(1))
+                    .unwrap()
+                    .is_none()
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    let runner = ScriptedRunner::default();
+    runner.results.lock().unwrap().push_back(failed(
+        "docker: failed to open config: No such file or directory",
+    ));
+    let docker = DockerCli::new(runner);
+    assert_eq!(
+        docker
+            .inspect_container("owned-container", Duration::from_secs(1))
+            .unwrap_err(),
+        DockerError::Command
+    );
+
+    let runner = ScriptedRunner::default();
+    runner.results.lock().unwrap().extend([
+        failed("Error response from daemon: network owned-network not found"),
+        failed("Error response from daemon: No such container: owned-container"),
+    ]);
+    let docker = DockerCli::new(runner);
+    docker
+        .remove_network("owned-network", Duration::from_secs(1))
+        .unwrap();
+    docker
+        .remove_container("owned-container", Duration::from_secs(1))
+        .unwrap();
 }
 
 #[test]
@@ -765,6 +938,32 @@ fn private_root_and_journal_updates_are_durable_and_same_directory() {
 }
 
 #[test]
+fn journal_store_rejects_renamed_root_and_symlink_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fixture");
+    let moved = directory.path().join("moved-fixture");
+    let attacker = directory.path().join("attacker");
+    let store = JournalStore::initialize(&root).unwrap();
+    let journal = store.create(sample_run(&root)).unwrap();
+
+    fs::rename(&root, &moved).unwrap();
+    fs::create_dir(&attacker).unwrap();
+    fs::set_permissions(&attacker, fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(&attacker, &root).unwrap();
+
+    assert!(matches!(
+        store.load(),
+        Err(ReconcileError::OwnershipMismatch | ReconcileError::Io)
+    ));
+    assert!(matches!(
+        store.save(&journal),
+        Err(ReconcileError::OwnershipMismatch | ReconcileError::Io)
+    ));
+    assert!(!attacker.join("ownership.json").exists());
+    assert!(moved.join("ownership.json").exists());
+}
+
+#[test]
 fn every_host_resource_create_boundary_persists_intent_then_dispatch() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("fixture");
@@ -849,7 +1048,48 @@ fn complete_acl() -> AclEvidence {
         sql_access: true,
         host_default: true,
         sql_default: true,
+        access_mask: true,
+        default_mask: true,
     }
+}
+
+#[test]
+fn acl_parser_requires_access_default_entries_and_effective_masks() {
+    let host_uid = effective_uid();
+    let complete = format!(
+        "user:{host_uid}:rwx\nuser:{SQL_SERVER_UID}:rwx\nmask::rwx\n\
+             default:user:{host_uid}:rwx\ndefault:user:{SQL_SERVER_UID}:rwx\n\
+             default:mask::rwx\n"
+    );
+    assert!(parse_acl_evidence(&complete, host_uid, SQL_SERVER_UID).complete());
+    let masked = complete.replace("mask::rwx", "mask::r-x");
+    assert!(!parse_acl_evidence(&masked, host_uid, SQL_SERVER_UID).complete());
+    let missing_default = complete.replace(&format!("default:user:{SQL_SERVER_UID}:rwx\n"), "");
+    assert!(!parse_acl_evidence(&missing_default, host_uid, SQL_SERVER_UID).complete());
+}
+
+#[test]
+fn command_acl_controller_validates_inheritance_and_masks_deterministically() {
+    let host_uid = effective_uid();
+    let output = format!(
+        "user:{host_uid}:rwx\nuser:{SQL_SERVER_UID}:rwx\nmask::rwx\n\
+             default:user:{host_uid}:rwx\ndefault:user:{SQL_SERVER_UID}:rwx\n\
+             default:mask::rwx\n"
+    );
+    let runner = ScriptedRunner::default();
+    runner.results.lock().unwrap().push_back(successful(output));
+    let controller = CommandAclController::new(runner);
+    assert!(
+        controller
+            .inspect(
+                Path::new("/fixture/member/nested"),
+                host_uid,
+                SQL_SERVER_UID,
+                Duration::from_secs(1),
+            )
+            .unwrap()
+            .complete()
+    );
 }
 
 #[test]
@@ -863,10 +1103,11 @@ fn member_directories_bind_host_and_sql_uid_access_and_default_acls() {
         apply_calls: RefCell::new(Vec::new()),
     };
     let path = root.join("member-1");
+    let host_uid = effective_uid();
     let expected = prepare_member_directory(
         &root,
         &path,
-        1000,
+        host_uid,
         SQL_SERVER_UID,
         Duration::from_secs(30),
         &acl,
@@ -874,13 +1115,13 @@ fn member_directories_bind_host_and_sql_uid_access_and_default_acls() {
     .unwrap();
     assert_eq!(
         acl.apply_calls.borrow().as_slice(),
-        &[(1000, SQL_SERVER_UID)]
+        &[(host_uid, SQL_SERVER_UID)]
     );
     assert!(expected.acl.complete());
     verify_member_directory(
         &root,
         &expected,
-        1000,
+        host_uid,
         SQL_SERVER_UID,
         Duration::from_secs(30),
         &acl,
@@ -894,7 +1135,7 @@ fn member_directories_bind_host_and_sql_uid_access_and_default_acls() {
         inspect_member_directory(
             &root,
             &path,
-            1000,
+            host_uid,
             SQL_SERVER_UID,
             Duration::from_secs(30),
             &acl,
@@ -924,7 +1165,7 @@ fn wrong_sql_uid_acl_symlinks_and_replaced_paths_fail_closed() {
         prepare_member_directory(
             &root,
             &root.join("member-bad"),
-            1000,
+            effective_uid(),
             SQL_SERVER_UID,
             Duration::from_secs(30),
             &incomplete,
@@ -937,10 +1178,11 @@ fn wrong_sql_uid_acl_symlinks_and_replaced_paths_fail_closed() {
         apply_calls: RefCell::new(Vec::new()),
     };
     let path = root.join("member-good");
+    let host_uid = effective_uid();
     let expected = prepare_member_directory(
         &root,
         &path,
-        1000,
+        host_uid,
         SQL_SERVER_UID,
         Duration::from_secs(30),
         &acl,
@@ -952,7 +1194,7 @@ fn wrong_sql_uid_acl_symlinks_and_replaced_paths_fail_closed() {
         verify_member_directory(
             &root,
             &expected,
-            1000,
+            host_uid,
             SQL_SERVER_UID,
             Duration::from_secs(30),
             &acl,
@@ -968,13 +1210,79 @@ fn wrong_sql_uid_acl_symlinks_and_replaced_paths_fail_closed() {
         prepare_member_directory(
             &root,
             &link,
-            1000,
+            host_uid,
             SQL_SERVER_UID,
             Duration::from_secs(30),
             &acl,
         )
         .is_err()
     );
+}
+
+#[test]
+#[ignore = "requires setfacl/getfacl and CAP_CHOWN as a non-root host user"]
+fn real_acl_allows_host_recursive_delete_of_uid_10001_nested_files() {
+    let host_uid = effective_uid();
+    if host_uid == 0 {
+        eprintln!("SKIPPED: root deletion would not prove host-user ACL authority");
+        return;
+    }
+    let runner = BoundedProcessRunner;
+    if runner
+        .run(&CommandSpec::new("setfacl", "check setfacl", Duration::from_secs(2)).arg("--version"))
+        .is_err()
+        || runner
+            .run(
+                &CommandSpec::new("getfacl", "check getfacl", Duration::from_secs(2))
+                    .arg("--version"),
+            )
+            .is_err()
+    {
+        eprintln!("SKIPPED: ACL tools are unavailable");
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fixture");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let member = root.join("member");
+    let controller = CommandAclController::new(BoundedProcessRunner);
+    prepare_member_directory(
+        &root,
+        &member,
+        host_uid,
+        SQL_SERVER_UID,
+        Duration::from_secs(5),
+        &controller,
+    )
+    .unwrap();
+    let nested = member.join("sql-created").join("deep");
+    fs::create_dir_all(&nested).unwrap();
+    let file = nested.join("database.mdf");
+    fs::write(&file, b"sql-owned").unwrap();
+    assert!(
+        controller
+            .inspect(&nested, host_uid, SQL_SERVER_UID, Duration::from_secs(5),)
+            .unwrap()
+            .complete()
+    );
+
+    let mut chowned = true;
+    for path in [&file, &nested, &member.join("sql-created")] {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        if unsafe { libc::chown(path.as_ptr(), SQL_SERVER_UID, u32::MAX) } != 0 {
+            chowned = false;
+            break;
+        }
+    }
+    if !chowned {
+        eprintln!("SKIPPED: current process lacks CAP_CHOWN");
+        fs::remove_dir_all(&member).unwrap();
+        return;
+    }
+    fs::remove_dir_all(&member).unwrap();
+    assert!(!member.exists());
 }
 
 #[derive(Default)]
@@ -1028,16 +1336,101 @@ impl OwnershipInspector for FakeLifecycle {
 }
 
 impl CleanupBackend for FakeLifecycle {
-    fn remove_container(&self, resource: &ResourceRecord) -> Result<(), CleanupError> {
+    fn remove_container(&self, resource: &ResourceRecord, _: Duration) -> Result<(), CleanupError> {
         self.remove(resource, FailureCategory::ContainerRemoval)
     }
 
-    fn remove_network(&self, resource: &ResourceRecord) -> Result<(), CleanupError> {
+    fn remove_network(&self, resource: &ResourceRecord, _: Duration) -> Result<(), CleanupError> {
         self.remove(resource, FailureCategory::NetworkRemoval)
     }
 
-    fn remove_path(&self, resource: &ResourceRecord) -> Result<(), CleanupError> {
+    fn remove_path(&self, resource: &ResourceRecord, _: Duration) -> Result<(), CleanupError> {
         self.remove(resource, FailureCategory::PathRemoval)
+    }
+}
+
+#[derive(Clone)]
+struct FakeCleanupClock {
+    now: Rc<Cell<Duration>>,
+}
+
+impl FakeCleanupClock {
+    fn new() -> Self {
+        Self {
+            now: Rc::new(Cell::new(Duration::ZERO)),
+        }
+    }
+
+    fn advance_within(&self, requested: Duration, cost: Duration) {
+        self.now.set(self.now.get() + requested.min(cost));
+    }
+}
+
+impl CleanupClock for FakeCleanupClock {
+    fn now(&self) -> Duration {
+        self.now.get()
+    }
+}
+
+struct BudgetLifecycle {
+    clock: FakeCleanupClock,
+    operation_cost: Duration,
+    observations: RefCell<HashMap<String, ResourceObservation>>,
+    remaining: RefCell<Vec<Duration>>,
+    removals: RefCell<Vec<String>>,
+}
+
+impl OwnershipInspector for BudgetLifecycle {
+    fn inspect(&self, resource: &ResourceRecord) -> Result<ResourceObservation, ReconcileError> {
+        self.observations
+            .borrow()
+            .get(&resource.logical_name)
+            .cloned()
+            .ok_or(ReconcileError::OwnershipMismatch)
+    }
+}
+
+impl CleanupBackend for BudgetLifecycle {
+    fn inspect_cleanup(
+        &self,
+        resource: &ResourceRecord,
+        remaining: Duration,
+    ) -> Result<ResourceObservation, ReconcileError> {
+        self.remaining.borrow_mut().push(remaining);
+        self.clock.advance_within(remaining, self.operation_cost);
+        self.inspect(resource)
+    }
+
+    fn remove_container(
+        &self,
+        resource: &ResourceRecord,
+        remaining: Duration,
+    ) -> Result<(), CleanupError> {
+        self.remaining.borrow_mut().push(remaining);
+        self.clock.advance_within(remaining, self.operation_cost);
+        self.removals
+            .borrow_mut()
+            .push(resource.logical_name.clone());
+        self.observations
+            .borrow_mut()
+            .insert(resource.logical_name.clone(), ResourceObservation::Absent);
+        Ok(())
+    }
+
+    fn remove_network(
+        &self,
+        resource: &ResourceRecord,
+        remaining: Duration,
+    ) -> Result<(), CleanupError> {
+        self.remove_container(resource, remaining)
+    }
+
+    fn remove_path(
+        &self,
+        resource: &ResourceRecord,
+        remaining: Duration,
+    ) -> Result<(), CleanupError> {
+        self.remove_container(resource, remaining)
     }
 }
 
@@ -1151,6 +1544,166 @@ fn cleanup_is_reverse_order_and_distinguishes_container_path_and_network() {
         backend.removals.borrow().as_slice(),
         ["container", "data", "network"]
     );
+}
+
+#[test]
+fn cleanup_budget_is_parent_scoped_and_propagates_only_remaining_time() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = JournalStore::initialize(&directory.path().join("fixture")).unwrap();
+    let mut journal = store.create(sample_run(store.root())).unwrap();
+    journal.resources = vec![
+        record(
+            ResourceKind::Container,
+            "first",
+            ResourceState::Bound,
+            Some(binding("first-id")),
+        ),
+        record(
+            ResourceKind::Container,
+            "second",
+            ResourceState::Bound,
+            Some(binding("second-id")),
+        ),
+    ];
+    store.save(&journal).unwrap();
+    let clock = FakeCleanupClock::new();
+    let backend = BudgetLifecycle {
+        clock: clock.clone(),
+        operation_cost: Duration::from_secs(100),
+        observations: RefCell::new(HashMap::from([
+            (
+                "first".to_owned(),
+                ResourceObservation::Owned {
+                    binding: binding("first-id"),
+                    foreign_attachments: Vec::new(),
+                },
+            ),
+            (
+                "second".to_owned(),
+                ResourceObservation::Owned {
+                    binding: binding("second-id"),
+                    foreign_attachments: Vec::new(),
+                },
+            ),
+        ])),
+        remaining: RefCell::new(Vec::new()),
+        removals: RefCell::new(Vec::new()),
+    };
+    let coordinator = CleanupCoordinator::new(clock.clone(), Duration::from_secs(180));
+    let report = coordinator.cleanup(&store, &mut journal, &backend);
+    assert!(!report.succeeded());
+    assert_eq!(clock.now(), Duration::from_secs(180));
+    assert_eq!(
+        backend.remaining.borrow().as_slice(),
+        [Duration::from_secs(180), Duration::from_secs(80)]
+    );
+    assert_eq!(backend.removals.borrow().as_slice(), ["second"]);
+    assert!(report.errors.iter().any(|error| {
+        error.failure
+            == SanitizedFailure::new(FailureStage::Cleanup, FailureCategory::DeadlineExceeded)
+    }));
+}
+
+#[test]
+fn coordinator_routes_results_errors_panics_and_cancellation_through_cleanup() {
+    for completion in [
+        CleanupCompletion::Result(Ok::<_, SanitizedFailure>("ok")),
+        CleanupCompletion::Result(Err(SanitizedFailure::new(
+            FailureStage::Test,
+            FailureCategory::Preflight,
+        ))),
+        CleanupCompletion::CaughtPanic(SanitizedFailure::new(
+            FailureStage::Test,
+            FailureCategory::OwnershipMismatch,
+        )),
+        CleanupCompletion::HandledSignal {
+            signal: HandledCancellationSignal::Interrupt,
+            failure: SanitizedFailure::new(FailureStage::Test, FailureCategory::DeadlineExceeded),
+        },
+        CleanupCompletion::HandledSignal {
+            signal: HandledCancellationSignal::Terminate,
+            failure: SanitizedFailure::new(FailureStage::Test, FailureCategory::DeadlineExceeded),
+        },
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JournalStore::initialize(&directory.path().join("fixture")).unwrap();
+        let mut journal = store.create(sample_run(store.root())).unwrap();
+        journal.resources.push(record(
+            ResourceKind::SecretFile,
+            "never-dispatched",
+            ResourceState::Intended,
+            None,
+        ));
+        store.save(&journal).unwrap();
+        let coordinator =
+            CleanupCoordinator::new(FakeCleanupClock::new(), Duration::from_secs(180));
+        let result =
+            coordinator.coordinate(completion, &store, &mut journal, &FakeLifecycle::default());
+        assert_eq!(journal.state, RunState::Removed);
+        assert_eq!(result.is_ok(), result.as_ref().ok() == Some(&"ok"));
+    }
+}
+
+#[test]
+fn failed_or_unresolved_containers_block_data_directory_and_network_deletion() {
+    for late_create in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JournalStore::initialize(&directory.path().join("fixture")).unwrap();
+        let mut journal = store.create(sample_run(store.root())).unwrap();
+        journal.resources = vec![
+            record(
+                ResourceKind::Network,
+                "network",
+                ResourceState::Bound,
+                Some(binding("network-id")),
+            ),
+            record(
+                ResourceKind::DataDirectory,
+                "data",
+                ResourceState::Bound,
+                Some(binding("data-id")),
+            ),
+            record(
+                ResourceKind::Container,
+                "container",
+                if late_create {
+                    ResourceState::Dispatched
+                } else {
+                    ResourceState::Bound
+                },
+                (!late_create).then(|| binding("container-id")),
+            ),
+        ];
+        store.save(&journal).unwrap();
+        let backend = FakeLifecycle::default();
+        backend.set(
+            "container",
+            if late_create {
+                vec![ResourceObservation::Absent]
+            } else {
+                vec![ResourceObservation::Owned {
+                    binding: binding("container-id"),
+                    foreign_attachments: Vec::new(),
+                }]
+            },
+        );
+        if !late_create {
+            backend
+                .fail_removal
+                .borrow_mut()
+                .insert("container".to_owned());
+        }
+        let report = cleanup(&store, &mut journal, &backend);
+        assert!(!report.succeeded());
+        let expected = if late_create {
+            Vec::new()
+        } else {
+            vec!["container".to_owned()]
+        };
+        assert_eq!(backend.removals.borrow().as_slice(), expected);
+        assert_eq!(journal.resources[0].state, ResourceState::Blocked);
+        assert_eq!(journal.resources[1].state, ResourceState::Blocked);
+    }
 }
 
 #[test]

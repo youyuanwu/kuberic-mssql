@@ -1,10 +1,13 @@
 use std::error::Error;
+use std::ffi::CString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::SystemTime;
@@ -21,6 +24,7 @@ use super::process::{CommandSpec, ProcessRunner};
 const JOURNAL_FILE: &str = "ownership.json";
 const DIRECTORY_MARKER: &str = ".kuberic-mssql-owner";
 static DIRECTORY_MARKER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static JOURNAL_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct RootLock {
@@ -100,14 +104,27 @@ pub fn acquire_root_lock(root: &Path) -> Result<RootLock, LockError> {
 pub struct JournalStore {
     root: PathBuf,
     path: PathBuf,
+    root_directory: Arc<File>,
+    root_device: u64,
+    root_inode: u64,
 }
 
 impl JournalStore {
     pub fn initialize(root: &Path) -> Result<Self, ReconcileError> {
         initialize_private_root(root)?;
+        let root = root.canonicalize().map_err(|_| ReconcileError::Io)?;
+        let root_directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&root)
+            .map_err(|_| ReconcileError::Io)?;
+        let metadata = root_directory.metadata().map_err(|_| ReconcileError::Io)?;
         Ok(Self {
-            root: root.to_path_buf(),
             path: root.join(JOURNAL_FILE),
+            root,
+            root_device: metadata.dev(),
+            root_inode: metadata.ino(),
+            root_directory: Arc::new(root_directory),
         })
     }
 
@@ -120,10 +137,20 @@ impl JournalStore {
     }
 
     pub fn load(&self) -> Result<Option<OwnershipJournal>, ReconcileError> {
-        match fs::read(&self.path) {
-            Ok(bytes) => OwnershipJournal::from_json(&bytes)
-                .map(Some)
-                .map_err(ReconcileError::Journal),
+        self.verify_root_identity()?;
+        match self.openat(
+            JOURNAL_FILE,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        ) {
+            Ok(mut file) => {
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)
+                    .map_err(|_| ReconcileError::Io)?;
+                OwnershipJournal::from_json(&bytes)
+                    .map(Some)
+                    .map_err(ReconcileError::Journal)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(_) => Err(ReconcileError::Io),
         }
@@ -136,28 +163,94 @@ impl JournalStore {
     }
 
     pub fn save(&self, journal: &OwnershipJournal) -> Result<(), ReconcileError> {
+        self.verify_root_identity()?;
         let bytes = journal.to_json().map_err(ReconcileError::Journal)?;
-        let temporary = self
-            .root
-            .join(format!(".{JOURNAL_FILE}.{}.new", std::process::id()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&temporary)
+        let temporary = format!(
+            ".{JOURNAL_FILE}.{}.{}.new",
+            std::process::id(),
+            JOURNAL_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let mut file = self
+            .openat(
+                &temporary,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
             .map_err(|_| ReconcileError::Io)?;
         let result = (|| {
             file.write_all(&bytes).map_err(|_| ReconcileError::Io)?;
             file.sync_all().map_err(|_| ReconcileError::Io)?;
-            fs::rename(&temporary, &self.path).map_err(|_| ReconcileError::Io)?;
-            let parent = File::open(&self.root).map_err(|_| ReconcileError::Io)?;
-            parent.sync_all().map_err(|_| ReconcileError::Io)
+            self.verify_root_identity()?;
+            self.renameat(&temporary, JOURNAL_FILE)?;
+            self.root_directory
+                .sync_all()
+                .map_err(|_| ReconcileError::Io)
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&temporary);
+            self.unlinkat(&temporary);
         }
         result
+    }
+
+    fn verify_root_identity(&self) -> Result<(), ReconcileError> {
+        let metadata = fs::symlink_metadata(&self.root).map_err(|_| ReconcileError::Io)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.dev() != self.root_device
+            || metadata.ino() != self.root_inode
+        {
+            return Err(ReconcileError::OwnershipMismatch);
+        }
+        let canonical = self.root.canonicalize().map_err(|_| ReconcileError::Io)?;
+        if canonical != self.root {
+            return Err(ReconcileError::OwnershipMismatch);
+        }
+        let bound = self
+            .root_directory
+            .metadata()
+            .map_err(|_| ReconcileError::Io)?;
+        if bound.dev() != self.root_device || bound.ino() != self.root_inode {
+            return Err(ReconcileError::OwnershipMismatch);
+        }
+        Ok(())
+    }
+
+    fn openat(&self, name: &str, flags: i32, mode: libc::mode_t) -> io::Result<File> {
+        let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let descriptor =
+            unsafe { libc::openat(self.root_directory.as_raw_fd(), name.as_ptr(), flags, mode) };
+        if descriptor < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { File::from_raw_fd(descriptor) })
+        }
+    }
+
+    fn renameat(&self, from: &str, to: &str) -> Result<(), ReconcileError> {
+        let from = CString::new(from).map_err(|_| ReconcileError::Io)?;
+        let to = CString::new(to).map_err(|_| ReconcileError::Io)?;
+        if unsafe {
+            libc::renameat(
+                self.root_directory.as_raw_fd(),
+                from.as_ptr(),
+                self.root_directory.as_raw_fd(),
+                to.as_ptr(),
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(ReconcileError::Io)
+        }
+    }
+
+    fn unlinkat(&self, name: &str) {
+        let Ok(name) = CString::new(name) else {
+            return;
+        };
+        unsafe {
+            libc::unlinkat(self.root_directory.as_raw_fd(), name.as_ptr(), 0);
+        }
     }
 
     pub fn record_intent(
@@ -330,11 +423,18 @@ pub struct AclEvidence {
     pub sql_access: bool,
     pub host_default: bool,
     pub sql_default: bool,
+    pub access_mask: bool,
+    pub default_mask: bool,
 }
 
 impl AclEvidence {
     pub fn complete(&self) -> bool {
-        self.host_access && self.sql_access && self.host_default && self.sql_default
+        self.host_access
+            && self.sql_access
+            && self.host_default
+            && self.sql_default
+            && self.access_mask
+            && self.default_mask
     }
 }
 
@@ -401,12 +501,7 @@ impl<R: ProcessRunner> AclController for CommandAclController<R> {
                     .arg(path),
             )
             .map_err(|_| MemberDirectoryError::Acl)?;
-        Ok(AclEvidence {
-            host_access: acl_line(&output.stdout, "user", host_uid),
-            sql_access: acl_line(&output.stdout, "user", sql_uid),
-            host_default: acl_line(&output.stdout, "default:user", host_uid),
-            sql_default: acl_line(&output.stdout, "default:user", sql_uid),
-        })
+        Ok(parse_acl_evidence(&output.stdout, host_uid, sql_uid))
     }
 }
 
@@ -671,6 +766,17 @@ fn acl_line(output: &str, prefix: &str, uid: u32) -> bool {
     output
         .lines()
         .any(|line| line == format!("{prefix}:{uid}:rwx"))
+}
+
+pub fn parse_acl_evidence(output: &str, host_uid: u32, sql_uid: u32) -> AclEvidence {
+    AclEvidence {
+        host_access: acl_line(output, "user", host_uid),
+        sql_access: acl_line(output, "user", sql_uid),
+        host_default: acl_line(output, "default:user", host_uid),
+        sql_default: acl_line(output, "default:user", sql_uid),
+        access_mask: output.lines().any(|line| line == "mask::rwx"),
+        default_mask: output.lines().any(|line| line == "default:mask::rwx"),
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {

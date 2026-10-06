@@ -1,7 +1,9 @@
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io::Read;
+use std::io::{self, Read};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -9,6 +11,9 @@ use std::time::{Duration, Instant};
 
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const WAIT_INTERVAL: Duration = Duration::from_millis(10);
+const TERMINATION_GRACE: Duration = Duration::from_millis(250);
+const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(250);
+const SHUTDOWN_RESERVE: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -175,75 +180,113 @@ pub struct BoundedProcessRunner;
 
 impl ProcessRunner for BoundedProcessRunner {
     fn run(&self, command: &CommandSpec) -> Result<ProcessResult, ProcessError> {
-        let mut child = Command::new(command.program())
+        let started_at = Instant::now();
+        let overall_deadline = started_at
+            .checked_add(command.timeout())
+            .unwrap_or(started_at);
+        let execution_deadline = overall_deadline
+            .checked_sub(SHUTDOWN_RESERVE)
+            .unwrap_or(started_at);
+        let mut process = Command::new(command.program());
+        process
             .args(command.arguments())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|_| {
-                ProcessError::new(
-                    ProcessErrorKind::Spawn,
-                    command.diagnostic_name(),
-                    None,
-                    "process could not be started",
-                    ChildDisposition::default(),
-                )
-            })?;
+            .stderr(Stdio::piped());
+        unsafe {
+            process.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            });
+        }
+        let mut child = process.spawn().map_err(|_| {
+            ProcessError::new(
+                ProcessErrorKind::Spawn,
+                command.diagnostic_name(),
+                None,
+                "process could not be started",
+                ChildDisposition::default(),
+            )
+        })?;
         let pid = child.id();
-        let stdout = child.stdout.take().expect("piped stdout must exist");
-        let stderr = child.stderr.take().expect("piped stderr must exist");
-        let stdout_reader = thread::spawn(move || read_bounded(stdout));
-        let stderr_reader = thread::spawn(move || read_bounded(stderr));
-        let deadline = Instant::now()
-            .checked_add(command.timeout())
-            .unwrap_or_else(Instant::now);
-
-        let (status, terminated) = loop {
+        let mut stdout = child.stdout.take().expect("piped stdout must exist");
+        let mut stderr = child.stderr.take().expect("piped stderr must exist");
+        if set_nonblocking(stdout.as_raw_fd()).is_err()
+            || set_nonblocking(stderr.as_raw_fd()).is_err()
+        {
+            let terminated = terminate_process_group(pid, overall_deadline);
+            let reaped = reap_until(&mut child, overall_deadline).is_some();
+            return Err(ProcessError::new(
+                ProcessErrorKind::Spawn,
+                command.diagnostic_name(),
+                None,
+                "process output could not be bounded",
+                ChildDisposition {
+                    pid: Some(pid),
+                    terminated,
+                    reaped,
+                },
+            ));
+        }
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let status = loop {
+            drain_pipe(&mut stdout, &mut stdout_bytes, &mut stdout_open);
+            drain_pipe(&mut stderr, &mut stderr_bytes, &mut stderr_open);
             match child.try_wait() {
-                Ok(Some(status)) => break (status, false),
-                Ok(None) if Instant::now() < deadline => thread::sleep(WAIT_INTERVAL),
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < execution_deadline => thread::sleep(WAIT_INTERVAL),
                 Ok(None) => {
-                    let terminated = child.kill().is_ok();
-                    let status = child.wait().map_err(|_| {
-                        ProcessError::new(
+                    let terminated = terminate_process_group(pid, overall_deadline);
+                    let status = reap_until(&mut child, overall_deadline);
+                    drain_until(
+                        &mut stdout,
+                        &mut stderr,
+                        &mut stdout_bytes,
+                        &mut stderr_bytes,
+                        &mut stdout_open,
+                        &mut stderr_open,
+                        overall_deadline,
+                    );
+                    let disposition = ChildDisposition {
+                        pid: Some(pid),
+                        terminated,
+                        reaped: status.is_some(),
+                    };
+                    if status.is_none() {
+                        return Err(ProcessError::new(
                             ProcessErrorKind::Reap,
                             command.diagnostic_name(),
                             None,
-                            "timed-out child could not be reaped",
-                            ChildDisposition {
-                                pid: Some(pid),
-                                terminated,
-                                reaped: false,
-                            },
-                        )
-                    })?;
-                    let stdout = join_reader(stdout_reader);
-                    let stderr = join_reader(stderr_reader);
-                    let diagnostic = command.sanitize_diagnostic(if stderr.is_empty() {
-                        &stdout
+                            "timed-out process group could not be reaped within its deadline",
+                            disposition,
+                        ));
+                    }
+                    let diagnostic = command.sanitize_diagnostic(if stderr_bytes.is_empty() {
+                        &stdout_bytes
                     } else {
-                        &stderr
+                        &stderr_bytes
                     });
                     return Err(ProcessError::new(
                         ProcessErrorKind::Timeout,
                         command.diagnostic_name(),
-                        status.code(),
+                        status.and_then(|status| status.code()),
                         if diagnostic.is_empty() {
                             "deadline exceeded".to_owned()
                         } else {
                             format!("deadline exceeded: {diagnostic}")
                         },
-                        ChildDisposition {
-                            pid: Some(pid),
-                            terminated,
-                            reaped: true,
-                        },
+                        disposition,
                     ));
                 }
                 Err(_) => {
-                    let terminated = child.kill().is_ok();
-                    let reaped = child.wait().is_ok();
+                    let terminated = terminate_process_group(pid, overall_deadline);
+                    let reaped = reap_until(&mut child, overall_deadline).is_some();
                     return Err(ProcessError::new(
                         ProcessErrorKind::Reap,
                         command.diagnostic_name(),
@@ -259,8 +302,22 @@ impl ProcessRunner for BoundedProcessRunner {
             }
         };
 
-        let stdout = command.sanitize_diagnostic(&join_reader(stdout_reader));
-        let stderr = command.sanitize_diagnostic(&join_reader(stderr_reader));
+        // A successfully exited group leader may leave descendants holding the
+        // inherited pipe descriptors. Terminate only this command's process
+        // group, then drain for a bounded interval before dropping our handles.
+        let terminated = terminate_process_group(pid, overall_deadline);
+        drain_until(
+            &mut stdout,
+            &mut stderr,
+            &mut stdout_bytes,
+            &mut stderr_bytes,
+            &mut stdout_open,
+            &mut stderr_open,
+            overall_deadline.min(Instant::now() + PIPE_DRAIN_GRACE),
+        );
+
+        let stdout = command.sanitize_diagnostic(&stdout_bytes);
+        let stderr = command.sanitize_diagnostic(&stderr_bytes);
         let disposition = ChildDisposition {
             pid: Some(pid),
             terminated,
@@ -289,23 +346,98 @@ impl ProcessRunner for BoundedProcessRunner {
     }
 }
 
-fn read_bounded(mut reader: impl Read) -> Vec<u8> {
-    let mut retained = Vec::new();
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn drain_pipe(reader: &mut impl Read, retained: &mut Vec<u8>, open: &mut bool) {
+    if !*open {
+        return;
+    }
     let mut buffer = [0_u8; 8192];
     loop {
         match reader.read(&mut buffer) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => {
+                *open = false;
+                break;
+            }
             Ok(count) => {
                 let remaining = MAX_DIAGNOSTIC_BYTES.saturating_sub(retained.len());
                 retained.extend_from_slice(&buffer[..count.min(remaining)]);
             }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(_) => {
+                *open = false;
+                break;
+            }
         }
     }
-    retained
 }
 
-fn join_reader(reader: thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
-    reader.join().unwrap_or_default()
+#[allow(clippy::too_many_arguments)]
+fn drain_until(
+    stdout: &mut impl Read,
+    stderr: &mut impl Read,
+    stdout_bytes: &mut Vec<u8>,
+    stderr_bytes: &mut Vec<u8>,
+    stdout_open: &mut bool,
+    stderr_open: &mut bool,
+    deadline: Instant,
+) {
+    while (*stdout_open || *stderr_open) && Instant::now() < deadline {
+        drain_pipe(stdout, stdout_bytes, stdout_open);
+        drain_pipe(stderr, stderr_bytes, stderr_open);
+        if *stdout_open || *stderr_open {
+            thread::sleep(WAIT_INTERVAL);
+        }
+    }
+}
+
+fn terminate_process_group(pid: u32, deadline: Instant) -> bool {
+    let Ok(group) = i32::try_from(pid) else {
+        return false;
+    };
+    let mut signalled = signal_process_group(group, libc::SIGTERM);
+    let graceful_deadline = deadline.min(Instant::now() + TERMINATION_GRACE);
+    while process_group_exists(group) && Instant::now() < graceful_deadline {
+        thread::sleep(WAIT_INTERVAL);
+    }
+    if process_group_exists(group) {
+        signalled |= signal_process_group(group, libc::SIGKILL);
+    }
+    signalled
+}
+
+fn signal_process_group(group: i32, signal: i32) -> bool {
+    (unsafe { libc::kill(-group, signal) }) == 0
+}
+
+fn process_group_exists(group: i32) -> bool {
+    if unsafe { libc::kill(-group, 0) } == 0 {
+        true
+    } else {
+        io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+}
+
+fn reap_until(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> Option<std::process::ExitStatus> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(WAIT_INTERVAL),
+            Ok(None) | Err(_) => return None,
+        }
+    }
 }
 
 fn sanitize(bytes: &[u8], secrets: &[Vec<u8>]) -> String {

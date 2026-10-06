@@ -424,13 +424,7 @@ impl<R: ProcessRunner> DockerApi for DockerCli<R> {
                 .args(["image", "inspect", image]),
         ) {
             Ok(result) => result,
-            Err(error)
-                if error.kind() == ProcessErrorKind::Exit
-                    && error
-                        .diagnostic()
-                        .to_ascii_lowercase()
-                        .contains("no such image") =>
-            {
+            Err(error) if is_resource_absent(&error, DockerResource::Image) => {
                 return Ok(None);
             }
             Err(_) => return Err(DockerError::Command),
@@ -458,6 +452,7 @@ impl<R: ProcessRunner> DockerApi for DockerCli<R> {
             &self.runner,
             self.command("inspect Docker network", timeout)
                 .args(["network", "inspect", identity]),
+            DockerResource::Network,
             parse_network_inspection,
         )
     }
@@ -480,10 +475,11 @@ impl<R: ProcessRunner> DockerApi for DockerCli<R> {
     }
 
     fn remove_network(&self, id: &str, timeout: Duration) -> Result<(), DockerError> {
-        run_empty(
+        run_remove(
             &self.runner,
             self.command("remove owned Docker network", timeout)
                 .args(["network", "rm", id]),
+            DockerResource::Network,
         )
     }
 
@@ -499,6 +495,7 @@ impl<R: ProcessRunner> DockerApi for DockerCli<R> {
                 "inspect",
                 identity,
             ]),
+            DockerResource::Container,
             parse_container_inspection,
         )
     }
@@ -570,10 +567,11 @@ impl<R: ProcessRunner> DockerApi for DockerCli<R> {
     }
 
     fn remove_container(&self, id: &str, timeout: Duration) -> Result<(), DockerError> {
-        run_empty(
+        run_remove(
             &self.runner,
             self.command("remove owned SQL Server container", timeout)
                 .args(["container", "rm", id]),
+            DockerResource::Container,
         )
     }
 }
@@ -585,21 +583,60 @@ fn run_empty(runner: &impl ProcessRunner, command: CommandSpec) -> Result<(), Do
         .map_err(|_| DockerError::Command)
 }
 
+fn run_remove(
+    runner: &impl ProcessRunner,
+    command: CommandSpec,
+    resource: DockerResource,
+) -> Result<(), DockerError> {
+    match runner.run(&command) {
+        Ok(_) => Ok(()),
+        Err(error) if is_resource_absent(&error, resource) => Ok(()),
+        Err(_) => Err(DockerError::Command),
+    }
+}
+
 fn inspect_optional<T>(
     runner: &impl ProcessRunner,
     command: CommandSpec,
+    resource: DockerResource,
     parse: impl FnOnce(&str) -> Result<T, DockerError>,
 ) -> Result<Option<T>, DockerError> {
     match runner.run(&command) {
         Ok(result) => parse(&result.stdout).map(Some),
-        Err(error)
-            if error.kind() == ProcessErrorKind::Exit
-                && error.diagnostic().to_ascii_lowercase().contains("no such") =>
-        {
-            Ok(None)
-        }
+        Err(error) if is_resource_absent(&error, resource) => Ok(None),
         Err(_) => Err(DockerError::Command),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DockerResource {
+    Image,
+    Network,
+    Container,
+}
+
+fn is_resource_absent(error: &super::process::ProcessError, resource: DockerResource) -> bool {
+    if error.kind() != ProcessErrorKind::Exit {
+        return false;
+    }
+    error.diagnostic().lines().any(|line| {
+        let line = line.trim();
+        match resource {
+            DockerResource::Image => {
+                line.starts_with("Error response from daemon: No such image:")
+                    || line.starts_with("Error: No such image:")
+            }
+            DockerResource::Network => {
+                line.starts_with("Error response from daemon: No such network:")
+                    || (line.starts_with("Error response from daemon: network ")
+                        && line.ends_with(" not found"))
+            }
+            DockerResource::Container => {
+                line.starts_with("Error response from daemon: No such container:")
+                    || line.starts_with("Error: No such container:")
+            }
+        }
+    })
 }
 
 fn parse_image_inspection(text: &str) -> Result<ImageInspection, DockerError> {
