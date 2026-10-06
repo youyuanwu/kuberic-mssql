@@ -89,7 +89,18 @@ impl AdminSession {
         login: &LoginFiles,
         deadlines: AdminDeadlines,
     ) -> Result<Self, AdminError> {
+        Self::connect_database(endpoint, login, deadlines, "master", false).await
+    }
+
+    pub async fn connect_database(
+        endpoint: &AdminEndpoint,
+        login: &LoginFiles,
+        deadlines: AdminDeadlines,
+        database: &str,
+        read_only: bool,
+    ) -> Result<Self, AdminError> {
         validate_endpoint(endpoint)?;
+        validated_identifier(database)?;
         if deadlines.connect.is_zero() || deadlines.query.is_zero() {
             return Err(AdminError::InvalidDeadline);
         }
@@ -99,7 +110,8 @@ impl AdminSession {
             let mut config = Config::new();
             config.host(&endpoint.tls_hostname);
             config.port(endpoint.port);
-            config.database("master");
+            config.database(database);
+            config.readonly(read_only);
             config.application_name("kuberic-mssql-three-replica-test-admin");
             config.encryption(EncryptionLevel::Required);
             config.trust_cert_ca(endpoint.ca_certificate.to_string_lossy());
@@ -221,7 +233,11 @@ SELECT
         }
     }
 
-    async fn execute(&mut self, sql: &str, parameters: &[&dyn ToSql]) -> Result<(), AdminError> {
+    pub(crate) async fn execute(
+        &mut self,
+        sql: &str,
+        parameters: &[&dyn ToSql],
+    ) -> Result<(), AdminError> {
         let timeout_value = self.query_timeout;
         timeout(timeout_value, async {
             let mut stream = self
@@ -241,7 +257,7 @@ SELECT
         .map_err(|_| AdminError::QueryDeadline)?
     }
 
-    async fn query_rows(
+    pub(crate) async fn query_rows(
         &mut self,
         sql: &str,
         parameters: &[&dyn ToSql],
@@ -364,14 +380,14 @@ async fn read_private_value(path: &Path) -> Result<SecretValue, AdminError> {
     Ok(SecretValue::from_test(value))
 }
 
-fn single_row(mut rows: Vec<Row>) -> Result<Row, AdminError> {
+pub(crate) fn single_row(mut rows: Vec<Row>) -> Result<Row, AdminError> {
     if rows.len() != 1 {
         return Err(AdminError::MalformedResult);
     }
     Ok(rows.remove(0))
 }
 
-fn required_text(row: &Row, index: usize) -> Result<String, AdminError> {
+pub(crate) fn required_text(row: &Row, index: usize) -> Result<String, AdminError> {
     row.get::<&str, _>(index)
         .map(str::to_owned)
         .ok_or(AdminError::MalformedResult)

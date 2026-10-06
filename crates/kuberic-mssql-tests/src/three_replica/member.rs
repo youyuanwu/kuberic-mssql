@@ -13,11 +13,15 @@ use kuberic_mssql::runtime_config::ObserverConfig;
 use super::admin::{
     AdminDeadlines, AdminEndpoint, AdminError, AdminSession, LoginFiles, MemberReadinessEvidence,
 };
+use super::availability_group::{
+    AvailabilityGroupError, ProvisionContext, ProvisionedAvailabilityGroup, provision,
+};
 use super::cleanup::{
     CLEANUP_BUDGET, CleanupBackend, CleanupClock, CleanupCoordinator, CleanupError, CleanupReport,
     OperationBudget, SystemCleanupClock, combine_with_cleanup,
 };
 use super::config::FixtureConfig;
+use super::data::{DataContext, DataError, MarkerEvidence, prove_replicated_marker};
 use super::docker::{
     ContainerInspection, ContainerRequest, DockerApi, DockerCli, DockerError, NetworkRequest,
     OwnedLabels, SQL_SERVER_UID, SqlServerContainerSpec,
@@ -72,7 +76,75 @@ impl LaunchedMembers {
     pub fn cleanup(mut self) -> Result<CleanupEvidence, CombinedFixtureError> {
         self.context.cleanup_exact()
     }
+
+    pub async fn provision_native_topology(&mut self) -> Result<NativeDataProof, NativePhaseError> {
+        let credentials = self
+            .context
+            .credentials
+            .as_ref()
+            .ok_or(NativePhaseError::Unavailable)?;
+        let tls = self
+            .context
+            .tls
+            .as_ref()
+            .ok_or(NativePhaseError::Unavailable)?;
+        let provisioned = provision(ProvisionContext {
+            run: &self.run,
+            members: &self.members,
+            credentials,
+            tls,
+            deadlines: self.context.config.deadlines(),
+            complete_deadline: self.context.deadline,
+            store: &self.context.store,
+            journal: &mut self.context.journal,
+            runner: &self.context.runner,
+        })
+        .await
+        .map_err(NativePhaseError::AvailabilityGroup)?;
+        let marker = prove_replicated_marker(
+            &DataContext {
+                run: &self.run,
+                members: &self.members,
+                credentials,
+                tls,
+                deadlines: self.context.config.deadlines(),
+                complete_deadline: self.context.deadline,
+            },
+            &provisioned.evidence,
+        )
+        .await
+        .map_err(NativePhaseError::Data)?;
+        Ok(NativeDataProof {
+            topology: provisioned,
+            marker,
+        })
+    }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeDataProof {
+    pub topology: ProvisionedAvailabilityGroup,
+    pub marker: MarkerEvidence,
+}
+
+#[derive(Debug)]
+pub enum NativePhaseError {
+    Unavailable,
+    AvailabilityGroup(AvailabilityGroupError),
+    Data(DataError),
+}
+
+impl fmt::Display for NativePhaseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "native phase requires the live member launch context",
+            Self::AvailabilityGroup(_) => "native availability-group phase failed",
+            Self::Data(_) => "native replicated-data phase failed",
+        })
+    }
+}
+
+impl std::error::Error for NativePhaseError {}
 
 pub async fn launch_three_members(
     config: FixtureConfig,

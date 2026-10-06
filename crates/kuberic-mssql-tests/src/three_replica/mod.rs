@@ -1,7 +1,10 @@
 mod admin;
+mod availability_group;
 mod cleanup;
 mod config;
+mod data;
 mod docker;
+mod evidence;
 mod member;
 mod model;
 mod ownership;
@@ -14,6 +17,10 @@ pub use admin::{
     AdminDeadlines, AdminEndpoint, AdminError, AdminSession, EXPECTED_SQL_SERVER_VERSION,
     LoginFiles, MemberReadinessEvidence, validated_identifier,
 };
+pub use availability_group::{
+    AvailabilityGroupError, EndpointEvidence, HADR_ENDPOINT_NAME, HADR_ENDPOINT_PORT,
+    ProvisionedAvailabilityGroup, validate_endpoint_evidence,
+};
 pub use cleanup::{
     CLEANUP_BUDGET, CleanupBackend, CleanupClock, CleanupCompletion, CleanupCoordinator,
     CleanupError, CleanupReport, HandledCancellationSignal, SystemCleanupClock, cleanup,
@@ -23,6 +30,7 @@ pub use config::{
     ACKNOWLEDGEMENT_SCHEMA_VERSION, AcknowledgementSource, FixtureConfig, FixtureConfigError,
     LaunchAuthorization, PINNED_SQL_SERVER_IMAGE, ResourcePolicy, StageDeadlines,
 };
+pub use data::{DataError, MarkerEvidence, validate_marker_observations};
 pub use docker::{
     CONTAINER_MEMORY_BYTES, CONTAINER_MEMORY_SWAP_BYTES, CONTAINER_NANO_CPUS, ContainerInspection,
     ContainerLimits, ContainerMount, ContainerPort, ContainerRequest, DockerApi,
@@ -30,15 +38,19 @@ pub use docker::{
     NetworkInspection, NetworkRequest, OwnedLabels, SQL_SERVER_MEMORY_MB, SQL_SERVER_UID,
     SqlServerContainerSpec,
 };
+pub use evidence::{
+    DatabaseEvidence, EvidenceError, MemberEvidence, ReplicaProfileEvidence, SeedingEvidence,
+    ValidatedNativeEvidence, validate_native_evidence,
+};
 pub use member::{
-    CleanupEvidence as NativeCleanupEvidence, LaunchedMembers, NativeLaunchError, ReadyMember,
-    launch_three_members,
+    CleanupEvidence as NativeCleanupEvidence, LaunchedMembers, NativeDataProof, NativeLaunchError,
+    NativePhaseError, ReadyMember, launch_three_members,
 };
 pub use model::{
     CombinedFixtureError, FailureCategory, FailureStage, IncarnationError, JOURNAL_SCHEMA_VERSION,
-    JournalError, KubericMember, NativeMemberBinding, NativeTopologyBinding, OwnershipJournal,
-    ResourceBinding, ResourceKind, ResourceRecord, ResourceState, RunState, SanitizedFailure,
-    SqlMember, SqlMemberIncarnation, TopologyRun,
+    JournalError, KubericMember, NativeMemberBinding, NativeMemberIntent, NativeTopologyBinding,
+    NativeTopologyIntent, OwnershipJournal, ResourceBinding, ResourceKind, ResourceRecord,
+    ResourceState, RunState, SanitizedFailure, SqlMember, SqlMemberIncarnation, TopologyRun,
 };
 pub use ownership::{
     AclController, AclEvidence, CommandAclController, DirectoryBinding, JournalStore, LockError,

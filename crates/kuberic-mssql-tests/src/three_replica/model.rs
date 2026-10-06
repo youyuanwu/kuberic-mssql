@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const JOURNAL_SCHEMA_VERSION: u32 = 3;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +42,14 @@ pub struct NativeMemberBinding {
     pub container_id: String,
     pub sql_start_unix_millis: i64,
     pub native_replica_id: String,
+    pub local_database_id: u32,
+    pub database_guid: String,
+    pub role: String,
+    pub endpoint_url: String,
+    pub endpoint_name: String,
+    pub endpoint_port: u16,
+    pub endpoint_certificate_name: String,
+    pub endpoint_certificate_thumbprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,10 +86,39 @@ pub enum IncarnationError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeTopologyBinding {
+    pub session_id: String,
+    pub availability_group_name: String,
     pub availability_group_id: String,
-    pub database_id: String,
+    pub configuration_sequence: i64,
+    pub database_name: String,
+    pub group_database_id: String,
+    pub family_guid: String,
     pub recovery_fork_id: String,
+    pub seeding_operation_ids: [String; 2],
     pub members: [NativeMemberBinding; 3],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTopologyIntent {
+    pub session_id: String,
+    pub availability_group_name: String,
+    pub database_name: String,
+    pub endpoint_name: String,
+    pub endpoint_port: u16,
+    pub members: [NativeMemberIntent; 3],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeMemberIntent {
+    pub ordinal: u8,
+    pub server_name: String,
+    pub container_id: String,
+    pub sql_start_unix_millis: i64,
+    pub endpoint_certificate_name: String,
+    pub peer_login_names: [String; 2],
+    pub peer_user_names: [String; 2],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +179,7 @@ pub struct OwnershipJournal {
     pub run: TopologyRun,
     pub state: RunState,
     pub sql_member_incarnations: Option<[SqlMemberIncarnation; 3]>,
+    pub native_intent: Option<NativeTopologyIntent>,
     pub native_binding: Option<NativeTopologyBinding>,
     pub resources: Vec<ResourceRecord>,
 }
@@ -271,6 +309,7 @@ impl OwnershipJournal {
             run,
             state: RunState::Preparing,
             sql_member_incarnations: None,
+            native_intent: None,
             native_binding: None,
             resources: Vec::new(),
         }

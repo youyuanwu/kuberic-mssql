@@ -8,10 +8,13 @@ use std::time::Duration;
 use kuberic_mssql_tests::three_replica::{
     AdminDeadlines, AdminEndpoint, AdminError, AdminSession, BoundedProcessRunner,
     ChildDisposition, CommandSpec, ContainerInspection, ContainerLimits, ContainerMount,
-    ContainerPort, ContainerRequest, DockerApi, DockerCli, DockerError, EnvironmentVariable,
-    LoginFiles, MemberReadinessEvidence, OwnedLabels, PrivateFile, ProcessError, ProcessResult,
-    ProcessRunner, ResourcePolicy, SQL_SERVER_UID, SecretValue, SqlMemberIncarnation,
-    SqlServerContainerSpec, TlsAssets, validated_identifier,
+    ContainerPort, ContainerRequest, DataError, DatabaseEvidence, DockerApi, DockerCli,
+    DockerError, EndpointEvidence, EnvironmentVariable, EvidenceError, KubericMember, LoginFiles,
+    MemberEvidence, MemberReadinessEvidence, OwnedLabels, PrivateFile, ProcessError, ProcessResult,
+    ProcessRunner, ReplicaProfileEvidence, ResourcePolicy, SQL_SERVER_UID, SecretValue,
+    SeedingEvidence, SqlMember, SqlMemberIncarnation, SqlServerContainerSpec, TlsAssets,
+    TopologyRun, validate_endpoint_evidence, validate_marker_observations,
+    validate_native_evidence, validated_identifier,
 };
 
 #[derive(Default)]
@@ -516,5 +519,228 @@ fn redacted_types_do_not_leak_through_nested_debug() {
             ("io.kuberic.mssql.member".to_owned(), "1".to_owned()),
             ("io.kuberic.mssql.run".to_owned(), "run".to_owned()),
         ])
+    );
+}
+
+fn native_run(root: &Path) -> TopologyRun {
+    TopologyRun {
+        run_id: "0123456789ab".to_owned(),
+        resource_uid: "resource".to_owned(),
+        members: std::array::from_fn(|index| SqlMember {
+            ordinal: (index + 1) as u8,
+            server_name: format!("km0123456789n{}", index + 1),
+            container_name: format!("container-{}", index + 1),
+            data_directory: root.join(format!("member-{}", index + 1)),
+        }),
+        kuberic_members: std::array::from_fn(|index| KubericMember {
+            ordinal: (index + 1) as u8,
+            replica_id: (index + 1) as i64,
+            instance_id: format!("instance-{}", index + 1),
+            pod_uid: format!("pod-{}", index + 1),
+            pvc_uid: format!("pvc-{}", index + 1),
+        }),
+    }
+}
+
+fn guid(index: u8) -> String {
+    format!("00000000-0000-4000-8000-{index:012x}")
+}
+
+fn healthy_native_evidence() -> [MemberEvidence; 3] {
+    let profiles = (0..3)
+        .map(|index| ReplicaProfileEvidence {
+            native_replica_id: guid(index + 1),
+            server_name: format!("km0123456789n{}", index + 1),
+            endpoint_url: format!("TCP://km0123456789n{}:5022", index + 1),
+            availability_mode: "SYNCHRONOUS_COMMIT".to_owned(),
+            failover_mode: "EXTERNAL".to_owned(),
+            seeding_mode: "AUTOMATIC".to_owned(),
+        })
+        .collect::<Vec<_>>();
+    std::array::from_fn(|index| MemberEvidence {
+        ordinal: (index + 1) as u8,
+        observed_at_unix_millis: 10_000,
+        server_name: format!("km0123456789n{}", index + 1),
+        availability_group_name: "km_ag_0123456789ab".to_owned(),
+        availability_group_id: guid(10),
+        configuration_sequence: 4_294_967_307,
+        cluster_type: "EXTERNAL".to_owned(),
+        required_synchronized_secondaries: 1,
+        basic_features: false,
+        distributed: false,
+        local_replica_id: guid((index + 1) as u8),
+        local_role: if index == 0 { "PRIMARY" } else { "SECONDARY" }.to_owned(),
+        replica_profiles: profiles.clone(),
+        database: DatabaseEvidence {
+            name: "km_db_0123456789ab".to_owned(),
+            group_database_id: guid(20),
+            local_database_id: 5,
+            local_replica_id: guid((index + 1) as u8),
+            database_guid: guid(21 + index as u8),
+            family_guid: guid(22),
+            recovery_fork_id: guid(23),
+            state: "ONLINE".to_owned(),
+            recovery_model: "FULL".to_owned(),
+            synchronization_state: "SYNCHRONIZED".to_owned(),
+            synchronization_health: "HEALTHY".to_owned(),
+            database_state: "ONLINE".to_owned(),
+            suspended: false,
+        },
+        automatic_seeding: if index == 0 {
+            vec![2_u8, 3_u8]
+                .into_iter()
+                .map(|remote| SeedingEvidence {
+                    group_database_id: guid(20),
+                    remote_replica_id: guid(remote),
+                    operation_id: guid(remote + 30),
+                    is_source: true,
+                    current_state: Some("COMPLETED".to_owned()),
+                    performed_seeding: Some(true),
+                    failure_state: Some(0),
+                    error_code: Some(0),
+                    completion_time: Some("2026-10-06T23:00:00".to_owned()),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+#[test]
+fn native_evidence_accepts_only_fresh_exact_healthy_three_member_topology() {
+    let directory = tempfile::tempdir().unwrap();
+    let validated = validate_native_evidence(
+        &native_run(directory.path()),
+        healthy_native_evidence(),
+        10_001,
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    assert_eq!(validated.primary_ordinal, 1);
+    assert_eq!(validated.seeding_operation_ids.len(), 2);
+}
+
+#[test]
+fn native_evidence_rejects_stale_mismatch_wrong_ids_profiles_and_roles() {
+    let directory = tempfile::tempdir().unwrap();
+    let run = native_run(directory.path());
+    let mut stale = healthy_native_evidence();
+    stale[0].observed_at_unix_millis = 1;
+    assert_eq!(
+        validate_native_evidence(&run, stale, 40_002, Duration::from_secs(30)).unwrap_err(),
+        EvidenceError::Stale
+    );
+
+    let mut mismatch = healthy_native_evidence();
+    mismatch[1].availability_group_id = guid(99);
+    assert_eq!(
+        validate_native_evidence(&run, mismatch, 10_001, Duration::from_secs(30)).unwrap_err(),
+        EvidenceError::IdentityMismatch
+    );
+
+    let mut sequence = healthy_native_evidence();
+    sequence[2].configuration_sequence += 1;
+    assert_eq!(
+        validate_native_evidence(&run, sequence, 10_001, Duration::from_secs(30)).unwrap_err(),
+        EvidenceError::SequenceMismatch
+    );
+
+    let mut wrong_profile_id = healthy_native_evidence();
+    wrong_profile_id[2].replica_profiles[1].native_replica_id = guid(98);
+    assert_eq!(
+        validate_native_evidence(&run, wrong_profile_id, 10_001, Duration::from_secs(30))
+            .unwrap_err(),
+        EvidenceError::IdentityMismatch
+    );
+
+    let mut roles = healthy_native_evidence();
+    roles[0].local_role = "SECONDARY".to_owned();
+    assert_eq!(
+        validate_native_evidence(&run, roles, 10_001, Duration::from_secs(30)).unwrap_err(),
+        EvidenceError::RoleMismatch
+    );
+}
+
+#[test]
+fn native_evidence_rejects_unsynchronized_suspended_wrong_lineage_and_database_ids() {
+    let directory = tempfile::tempdir().unwrap();
+    let run = native_run(directory.path());
+    let mut unsynchronized = healthy_native_evidence();
+    unsynchronized[2].database.synchronization_state = "SYNCHRONIZING".to_owned();
+    assert_eq!(
+        validate_native_evidence(&run, unsynchronized, 10_001, Duration::from_secs(30))
+            .unwrap_err(),
+        EvidenceError::Unsynchronized
+    );
+
+    let mut suspended = healthy_native_evidence();
+    suspended[1].database.suspended = true;
+    assert_eq!(
+        validate_native_evidence(&run, suspended, 10_001, Duration::from_secs(30)).unwrap_err(),
+        EvidenceError::Suspended
+    );
+
+    let mut lineage = healthy_native_evidence();
+    lineage[2].database.family_guid = guid(97);
+    assert_eq!(
+        validate_native_evidence(&run, lineage, 10_001, Duration::from_secs(30)).unwrap_err(),
+        EvidenceError::LineageMismatch
+    );
+
+    let mut database_id = healthy_native_evidence();
+    database_id[1].database.group_database_id = guid(96);
+    assert_eq!(
+        validate_native_evidence(&run, database_id, 10_001, Duration::from_secs(30)).unwrap_err(),
+        EvidenceError::IdentityMismatch
+    );
+}
+
+#[test]
+fn native_evidence_rejects_explicit_seeding_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let run = native_run(directory.path());
+    let mut evidence = healthy_native_evidence();
+    evidence[0].automatic_seeding[0].current_state = Some("FAILED".to_owned());
+    evidence[0].automatic_seeding[0].performed_seeding = Some(false);
+    evidence[0].automatic_seeding[0].failure_state = Some(108);
+    assert_eq!(
+        validate_native_evidence(&run, evidence, 10_001, Duration::from_secs(30)).unwrap_err(),
+        EvidenceError::SeedingFailed
+    );
+}
+
+#[test]
+fn stopped_or_misbound_endpoint_is_rejected() {
+    let mut endpoint = EndpointEvidence {
+        ordinal: 1,
+        endpoint_name: "kuberic_hadr".to_owned(),
+        state: "STARTED".to_owned(),
+        port: 5022,
+        certificate_name: "km_ep_01234567_1".to_owned(),
+        certificate_thumbprint: "a".repeat(40),
+    };
+    validate_endpoint_evidence(&endpoint, "km_ep_01234567_1").unwrap();
+    endpoint.state = "STOPPED".to_owned();
+    assert!(validate_endpoint_evidence(&endpoint, "km_ep_01234567_1").is_err());
+    endpoint.state = "STARTED".to_owned();
+    endpoint.certificate_name = "replacement".to_owned();
+    assert!(validate_endpoint_evidence(&endpoint, "km_ep_01234567_1").is_err());
+}
+
+#[test]
+fn marker_observation_reports_bounded_timeout_until_all_three_are_readable() {
+    let now = std::time::Instant::now();
+    assert_eq!(
+        validate_marker_observations(&[1, 2], now, now).unwrap_err(),
+        DataError::Deadline
+    );
+    assert_eq!(
+        validate_marker_observations(&[1, 2], now, now + Duration::from_secs(1)).unwrap_err(),
+        DataError::MarkerMismatch
+    );
+    assert_eq!(
+        validate_marker_observations(&[1, 2, 3], now, now).unwrap(),
+        [1, 2, 3]
     );
 }

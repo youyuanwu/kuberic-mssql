@@ -19,9 +19,10 @@ async fn three_replica_mssql_happy_path() {
             .expect("KUBERIC_MSSQL_THREE_REPLICA_EULA_FILE must be explicitly configured"),
     );
     let config = FixtureConfig::new(&root, acknowledgement).expect("validated fixture config");
-    let launched = launch_three_members(config)
+    let mut launched = launch_three_members(config)
         .await
         .expect("three exact SQL Server members must reach readiness");
+    let native = launched.provision_native_topology().await;
 
     let checkpoint = (|| {
         if launched.members.len() != 3 {
@@ -53,11 +54,57 @@ async fn three_replica_mssql_happy_path() {
                 return Err("observer configuration is missing");
             }
         }
+        let proof = native.as_ref().map_err(|error| {
+            eprintln!("native availability-group/data proof failed: {error:?}");
+            "native availability-group/data proof failed"
+        })?;
+        let binding = launched
+            .journal()
+            .native_binding
+            .as_ref()
+            .ok_or("native binding was not journaled")?;
+        if launched.journal().native_intent.is_none()
+            || binding.session_id != launched.run.run_id
+            || binding.availability_group_id != proof.topology.evidence.availability_group_id
+            || binding.group_database_id != proof.topology.evidence.group_database_id
+            || binding.members.len() != 3
+            || binding
+                .members
+                .iter()
+                .map(|member| member.native_replica_id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len()
+                != 3
+        {
+            return Err("native intent or exact IDs were not bound");
+        }
+        if proof.topology.evidence.primary_ordinal != proof.marker.primary_ordinal
+            || proof.marker.readable_ordinals != [1, 2, 3]
+            || proof.topology.evidence.members.len() != 3
+            || proof
+                .topology
+                .evidence
+                .members
+                .iter()
+                .filter(|member| member.local_role == "PRIMARY")
+                .count()
+                != 1
+            || proof
+                .topology
+                .evidence
+                .members
+                .iter()
+                .filter(|member| member.local_role == "SECONDARY")
+                .count()
+                != 2
+        {
+            return Err("native roles or replicated marker evidence are incomplete");
+        }
         Ok::<(), &'static str>(())
     })();
 
     let cleanup = launched.cleanup();
-    checkpoint.expect("three-member readiness checkpoint");
+    checkpoint.expect("complete native three-member checkpoint");
     let cleanup = cleanup.expect("exact three-member cleanup");
     assert_eq!(cleanup.removed_container_ids.len(), 3);
     let store = JournalStore::initialize(&root).expect("cleanup journal root");
