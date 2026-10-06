@@ -54,12 +54,12 @@ test-live fixture="":
 test-live-all fixture="":
     python3 -B scripts/sqlserver_fixture.py test-all {{quote(fixture)}}
 
-# Build the CLI, emit an observation, and verify it against the native fixture.
+# Build the CLI, emit an observation, and verify it against the container fixture.
 test-live-cli report: build && (verify-live-cli report)
     target/debug/sqlserver-observer \
         --config "${SQLSERVER_LIVE_ABSENT_CONFIG:?SQLSERVER_LIVE_ABSENT_CONFIG must reference a provisioned fixture}" \
         > {{quote(report)}}
 
-# Verify fresh CLI output from the CI-pinned Enterprise Developer engine.
+# Verify fresh CLI output from the pinned Enterprise Developer container.
 verify-live-cli report:
     python3 -B scripts/sqlserver_fixture.py verify-cli {{quote(report)}}
