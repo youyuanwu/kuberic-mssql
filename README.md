@@ -232,7 +232,8 @@ Ordinary tests need neither SQL Server nor Kubernetes:
 
 The same bootstrap script is used by CI and local runs. It reuses matching
 installed tools and installs only missing/mismatched prerequisites: the pinned
-Rust toolchain/components, compiler tools, Docker and checksum-pinned `just` 1.21.0.
+Rust toolchain/components, C and protobuf compiler tools, Docker and
+checksum-pinned `just` 1.21.0.
 CI retains `actions-rust-lang/setup-rust-toolchain@v2`; the bootstrap reuses its
 prepared toolchain.
 

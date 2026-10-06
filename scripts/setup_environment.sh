@@ -26,14 +26,19 @@ for component in rustfmt clippy; do
   fi
 done
 
+packages=()
 if ! command -v cc >/dev/null; then
-  sudo -n apt-get update -qq
-  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential
+  packages+=(build-essential)
 fi
-
+if ! command -v protoc >/dev/null; then
+  packages+=(protobuf-compiler)
+fi
 if ! command -v docker >/dev/null; then
+  packages+=(docker.io)
+fi
+if (( ${#packages[@]} )); then
   sudo -n apt-get update -qq
-  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io
+  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${packages[@]}"
 fi
 if ! sudo -n docker version >/dev/null 2>&1; then
   sudo -n systemctl enable --now docker
