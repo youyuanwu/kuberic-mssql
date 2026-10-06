@@ -6,7 +6,10 @@ use async_trait::async_trait;
 use kuberic_runtime::application::{
     OpenContext, RoleChange, StateProvider, StatefulServiceReplica,
 };
-use kuberic_runtime::protocol::types::{Epoch, PartitionId, ReplicaId, ReplicaRole, ResourceUid};
+use kuberic_runtime::protocol::types::{
+    ConfigurationDescriptor, EffectivePolicy, Epoch, PartitionId, ProcessSessionId, ReplicaId,
+    ReplicaIdentity as KubericReplicaIdentity, ReplicaRole, ResourceUid,
+};
 use kuberic_runtime::replicator::{
     PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode,
     Replicator, ReplicatorFactory, ReplicatorFactoryContext, ReplicatorInterfaces,
@@ -16,12 +19,16 @@ use kuberic_runtime::{Result as KubericResult, RuntimeError as KubericRuntimeErr
 
 use crate::executor::SqlExecutor;
 use crate::instance::{SqlServerInstanceManager, unix_millis};
-use crate::observation::{AvailabilityGroupSnapshot, InstanceSnapshot};
+use crate::observation::{
+    AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, InstanceSnapshot, NativeProvenance,
+    RecoveryLineageObservation,
+};
 use crate::runtime_config::ObserverConfig;
 use crate::runtime_error::RuntimeError;
 use crate::{
-    NativeRole, Observation, ObservationFailureKind, SUPPORTED_DATABASE_COUNT,
-    SUPPORTED_ENGINE_MAJOR, SUPPORTED_REPLICA_COUNT, SUPPORTED_REQUIRED_SECONDARIES,
+    AvailabilityGroupIdentity, DatabaseLineage, NativeRole, Observation, ObservationFailureKind,
+    ReplicaIdentity as SqlReplicaIdentity, SUPPORTED_DATABASE_COUNT, SUPPORTED_ENGINE_MAJOR,
+    SUPPORTED_REPLICA_COUNT, SUPPORTED_REQUIRED_SECONDARIES, ServerName,
 };
 
 const CREATED: u8 = 0;
@@ -68,6 +75,8 @@ pub enum KubericAdapterError {
         requested: ReplicaRole,
         observed: Option<NativeRole>,
     },
+    TopologyBindingMismatch(&'static str),
+    TopologyNotAdmitted,
     UnsupportedOperation(ObserveOnlyOperation),
     NotOpen,
     Closed,
@@ -111,6 +120,12 @@ impl fmt::Display for KubericAdapterError {
                 formatter,
                 "requested Kuberic role {requested:?} does not match observed SQL Server role {observed:?}"
             ),
+            Self::TopologyBindingMismatch(message) => {
+                write!(formatter, "healthy topology binding mismatch: {message}")
+            }
+            Self::TopologyNotAdmitted => {
+                formatter.write_str("healthy topology has not been admitted")
+            }
             Self::UnsupportedOperation(operation) => write!(
                 formatter,
                 "{operation} is disabled by the observe-only SQL Server adapter"
@@ -196,10 +211,287 @@ impl SqlServerServiceConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SqlServerStartIncarnation(String);
+
+impl SqlServerStartIncarnation {
+    pub fn new(value: impl Into<String>) -> Result<Self, KubericAdapterError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 256
+            || value.chars().any(char::is_control)
+            || value.trim() != value
+        {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "SQL Server start incarnation must be nonempty, bounded, and contain no control or surrounding whitespace",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthyTopologyMemberBinding {
+    kuberic_identity: KubericReplicaIdentity,
+    process_session_id: ProcessSessionId,
+    replication_address: String,
+    sql_replica_identity: SqlReplicaIdentity,
+    server_name: ServerName,
+    sql_server_start_incarnation: SqlServerStartIncarnation,
+    stable_role: ReplicaRole,
+}
+
+impl HealthyTopologyMemberBinding {
+    pub fn new(
+        kuberic_identity: KubericReplicaIdentity,
+        process_session_id: ProcessSessionId,
+        replication_address: impl Into<String>,
+        sql_replica_identity: SqlReplicaIdentity,
+        server_name: ServerName,
+        sql_server_start_incarnation: SqlServerStartIncarnation,
+        stable_role: ReplicaRole,
+    ) -> Result<Self, KubericAdapterError> {
+        let replication_address = replication_address.into();
+        if kuberic_identity.replica_id.value() <= 0
+            || kuberic_identity.instance_id.is_empty()
+            || kuberic_identity.agent_generation.is_empty()
+            || process_session_id.is_empty()
+        {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "Kuberic member identity and process session must be complete",
+            ));
+        }
+        validate_replication_address(&replication_address)?;
+        if sql_replica_identity.native_replica_id().is_none() {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "bound SQL replica identity must include its native replica GUID",
+            ));
+        }
+        if !matches!(
+            stable_role,
+            ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+        ) {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "bound members must be Primary or ActiveSecondary",
+            ));
+        }
+        Ok(Self {
+            kuberic_identity,
+            process_session_id,
+            replication_address,
+            sql_replica_identity,
+            server_name,
+            sql_server_start_incarnation,
+            stable_role,
+        })
+    }
+
+    pub fn kuberic_identity(&self) -> &KubericReplicaIdentity {
+        &self.kuberic_identity
+    }
+
+    pub fn process_session_id(&self) -> &ProcessSessionId {
+        &self.process_session_id
+    }
+
+    pub fn replication_address(&self) -> &str {
+        &self.replication_address
+    }
+
+    pub fn sql_replica_identity(&self) -> &SqlReplicaIdentity {
+        &self.sql_replica_identity
+    }
+
+    pub fn server_name(&self) -> &ServerName {
+        &self.server_name
+    }
+
+    pub fn sql_server_start_incarnation(&self) -> &SqlServerStartIncarnation {
+        &self.sql_server_start_incarnation
+    }
+
+    pub fn stable_role(&self) -> ReplicaRole {
+        self.stable_role
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthyTopologyBinding {
+    resource_uid: ResourceUid,
+    local_identity: KubericReplicaIdentity,
+    configuration: ConfigurationDescriptor,
+    effective_policy: EffectivePolicy,
+    availability_group: AvailabilityGroupIdentity,
+    database_lineage: DatabaseLineage,
+    members: Vec<HealthyTopologyMemberBinding>,
+}
+
+impl HealthyTopologyBinding {
+    pub fn new(
+        resource_uid: ResourceUid,
+        local_identity: KubericReplicaIdentity,
+        configuration: ConfigurationDescriptor,
+        effective_policy: EffectivePolicy,
+        availability_group: AvailabilityGroupIdentity,
+        database_lineage: DatabaseLineage,
+        mut members: Vec<HealthyTopologyMemberBinding>,
+    ) -> Result<Self, KubericAdapterError> {
+        if resource_uid.is_empty() {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "bound resource UID must not be empty",
+            ));
+        }
+        if configuration.configuration_id != configuration.expected_id() {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "bound configuration ID must match its descriptor",
+            ));
+        }
+        if configuration.members.len() != usize::from(SUPPORTED_REPLICA_COUNT)
+            || members.len() != usize::from(SUPPORTED_REPLICA_COUNT)
+            || configuration.write_quorum != 2
+            || effective_policy.replica_set_size != u32::from(SUPPORTED_REPLICA_COUNT)
+            || effective_policy.write_quorum != 2
+            || effective_policy.read_quorum != 2
+        {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "bound topology requires exactly three members and quorum two",
+            ));
+        }
+        let primary_count = configuration
+            .members
+            .iter()
+            .filter(|member| member.role == ReplicaRole::Primary)
+            .count();
+        let secondary_count = configuration
+            .members
+            .iter()
+            .filter(|member| member.role == ReplicaRole::ActiveSecondary)
+            .count();
+        if primary_count != 1
+            || secondary_count != 2
+            || configuration.members.iter().any(|member| {
+                !matches!(
+                    member.role,
+                    ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+                )
+            })
+        {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "bound configuration requires one Primary and two ActiveSecondary members",
+            ));
+        }
+        members.sort_by_key(|member| member.kuberic_identity.replica_id);
+        if members
+            .windows(2)
+            .any(|pair| pair[0].kuberic_identity.replica_id == pair[1].kuberic_identity.replica_id)
+            || members
+                .iter()
+                .filter(|member| member.kuberic_identity == local_identity)
+                .count()
+                != 1
+        {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "bound Kuberic member identities must be unique and include the local identity",
+            ));
+        }
+        if members.iter().enumerate().any(|(index, member)| {
+            members[..index].iter().any(|other| {
+                other.kuberic_identity == member.kuberic_identity
+                    || other.process_session_id == member.process_session_id
+                    || other.replication_address == member.replication_address
+                    || other.server_name == member.server_name
+                    || other.sql_replica_identity.native_replica_id()
+                        == member.sql_replica_identity.native_replica_id()
+            })
+        }) {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "bound identities, sessions, addresses, servers, and native replica GUIDs must be unique",
+            ));
+        }
+        for configuration_member in &configuration.members {
+            let Some(binding_member) = members
+                .iter()
+                .find(|member| member.kuberic_identity == configuration_member.identity)
+            else {
+                return Err(KubericAdapterError::InvalidConfiguration(
+                    "bound members must exactly match the frozen configuration",
+                ));
+            };
+            if binding_member.stable_role != configuration_member.role {
+                return Err(KubericAdapterError::InvalidConfiguration(
+                    "bound member roles must match the frozen configuration",
+                ));
+            }
+        }
+        let Some(primary) = members
+            .iter()
+            .find(|member| member.stable_role == ReplicaRole::Primary)
+        else {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "bound topology has no primary",
+            ));
+        };
+        if primary.kuberic_identity.replica_id != configuration.primary_id {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "bound primary must match the frozen configuration primary",
+            ));
+        }
+        Ok(Self {
+            resource_uid,
+            local_identity,
+            configuration,
+            effective_policy,
+            availability_group,
+            database_lineage,
+            members,
+        })
+    }
+
+    pub fn resource_uid(&self) -> &ResourceUid {
+        &self.resource_uid
+    }
+
+    pub fn local_identity(&self) -> &KubericReplicaIdentity {
+        &self.local_identity
+    }
+
+    pub fn configuration(&self) -> &ConfigurationDescriptor {
+        &self.configuration
+    }
+
+    pub fn effective_policy(&self) -> &EffectivePolicy {
+        &self.effective_policy
+    }
+
+    pub fn availability_group(&self) -> &AvailabilityGroupIdentity {
+        &self.availability_group
+    }
+
+    pub fn database_lineage(&self) -> &DatabaseLineage {
+        &self.database_lineage
+    }
+
+    pub fn members(&self) -> &[HealthyTopologyMemberBinding] {
+        &self.members
+    }
+
+    fn local_member(&self) -> &HealthyTopologyMemberBinding {
+        self.members
+            .iter()
+            .find(|member| member.kuberic_identity == self.local_identity)
+            .expect("binding constructor requires one local member")
+    }
+}
+
 pub struct SqlServerService {
     config: SqlServerServiceConfig,
     source: Arc<dyn SqlServerObservationSource>,
     clock: Arc<dyn ObservationClock>,
+    binding: Option<Arc<HealthyTopologyBinding>>,
     open_attempt: tokio::sync::Mutex<()>,
     lifecycle: Mutex<ServiceLifecycle>,
 }
@@ -219,15 +511,59 @@ impl SqlServerService {
         Self::with_observation_source(config, Arc::new(manager), Arc::new(SystemObservationClock))
     }
 
+    pub fn new_bound<E: SqlExecutor + 'static>(
+        config: SqlServerServiceConfig,
+        manager: SqlServerInstanceManager<E>,
+        binding: HealthyTopologyBinding,
+    ) -> Result<Self, KubericAdapterError> {
+        Self::with_observation_source_and_binding(
+            config,
+            Arc::new(manager),
+            Arc::new(SystemObservationClock),
+            binding,
+        )
+    }
+
     pub fn with_observation_source(
         config: SqlServerServiceConfig,
         source: Arc<dyn SqlServerObservationSource>,
         clock: Arc<dyn ObservationClock>,
     ) -> Self {
+        Self::with_optional_binding(config, source, clock, None)
+    }
+
+    pub fn with_observation_source_and_binding(
+        config: SqlServerServiceConfig,
+        source: Arc<dyn SqlServerObservationSource>,
+        clock: Arc<dyn ObservationClock>,
+        binding: HealthyTopologyBinding,
+    ) -> Result<Self, KubericAdapterError> {
+        if config.resource_uid != binding.resource_uid
+            || config.replication_address != binding.local_member().replication_address
+        {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "service resource UID and replication address must match the local topology binding",
+            ));
+        }
+        Ok(Self::with_optional_binding(
+            config,
+            source,
+            clock,
+            Some(Arc::new(binding)),
+        ))
+    }
+
+    fn with_optional_binding(
+        config: SqlServerServiceConfig,
+        source: Arc<dyn SqlServerObservationSource>,
+        clock: Arc<dyn ObservationClock>,
+        binding: Option<Arc<HealthyTopologyBinding>>,
+    ) -> Self {
         Self {
             config,
             source,
             clock,
+            binding,
             open_attempt: tokio::sync::Mutex::new(()),
             lifecycle: Mutex::new(ServiceLifecycle::Created),
         }
@@ -272,11 +608,14 @@ impl StatefulServiceReplica for SqlServerService {
         ) {
             return Err(KubericRuntimeError::Closed);
         }
-        let replicator = Arc::new(SqlServerReplicator::new(
-            self.config.replication_address.clone(),
-            self.source.clone(),
-            self.clock.clone(),
-        ));
+        let replicator = Arc::new(
+            SqlServerReplicator::new(
+                self.config.replication_address.clone(),
+                self.source.clone(),
+                self.clock.clone(),
+            )
+            .with_optional_binding(self.binding.clone()),
+        );
         let interfaces = context
             .partition
             .with_factory(Arc::new(SqlServerReplicatorFactory::new(
@@ -372,7 +711,7 @@ impl SqlServerReplicatorFactory {
 impl ReplicatorFactory for SqlServerReplicatorFactory {
     async fn create_replicator(
         &self,
-        _context: ReplicatorFactoryContext,
+        context: ReplicatorFactoryContext,
         state_provider: Option<Arc<dyn StateProvider>>,
         _settings: ReplicatorSettings,
     ) -> KubericResult<ReplicatorInterfaces> {
@@ -380,6 +719,14 @@ impl ReplicatorFactory for SqlServerReplicatorFactory {
             return Err(KubericRuntimeError::Application(
                 "SQL Server owns its native replication state".into(),
             ));
+        }
+        if let Some(binding) = &self.replicator.binding {
+            if context.identity()? != binding.local_identity {
+                return Err(KubericAdapterError::TopologyBindingMismatch(
+                    "runtime local identity differs from the frozen local member",
+                )
+                .into());
+            }
         }
         Ok(self.interfaces())
     }
@@ -389,9 +736,11 @@ pub struct SqlServerReplicator {
     replication_address: String,
     source: Arc<dyn SqlServerObservationSource>,
     clock: Arc<dyn ObservationClock>,
+    binding: Option<Arc<HealthyTopologyBinding>>,
     lifecycle: AtomicU8,
     role: Mutex<Option<ReplicaRole>>,
     epoch: Mutex<Option<Epoch>>,
+    admitted_configuration: Mutex<Option<ReplicaSetConfiguration>>,
 }
 
 impl SqlServerReplicator {
@@ -400,13 +749,48 @@ impl SqlServerReplicator {
         source: Arc<dyn SqlServerObservationSource>,
         clock: Arc<dyn ObservationClock>,
     ) -> Self {
+        Self::with_parts(replication_address, source, clock, None)
+    }
+
+    pub fn new_bound(
+        replication_address: String,
+        source: Arc<dyn SqlServerObservationSource>,
+        clock: Arc<dyn ObservationClock>,
+        binding: HealthyTopologyBinding,
+    ) -> Result<Self, KubericAdapterError> {
+        if replication_address != binding.local_member().replication_address {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "replicator address must match the local topology binding",
+            ));
+        }
+        Ok(Self::with_parts(
+            replication_address,
+            source,
+            clock,
+            Some(Arc::new(binding)),
+        ))
+    }
+
+    fn with_optional_binding(mut self, binding: Option<Arc<HealthyTopologyBinding>>) -> Self {
+        self.binding = binding;
+        self
+    }
+
+    fn with_parts(
+        replication_address: String,
+        source: Arc<dyn SqlServerObservationSource>,
+        clock: Arc<dyn ObservationClock>,
+        binding: Option<Arc<HealthyTopologyBinding>>,
+    ) -> Self {
         Self {
             replication_address,
             source,
             clock,
+            binding,
             lifecycle: AtomicU8::new(CREATED),
             role: Mutex::new(None),
             epoch: Mutex::new(None),
+            admitted_configuration: Mutex::new(None),
         }
     }
 
@@ -422,6 +806,7 @@ impl SqlServerReplicator {
     async fn observed_group(
         &self,
         require_progress_role: bool,
+        requested_role: Option<ReplicaRole>,
     ) -> Result<AvailabilityGroupSnapshot, KubericAdapterError> {
         self.require_open()?;
         let observation = self
@@ -479,7 +864,28 @@ impl SqlServerReplicator {
             &group,
             require_progress_role,
         )?;
-        if require_progress_role {
+        if let Some(binding) = &self.binding {
+            validate_bound_evidence(
+                binding,
+                self.source.observer_config(),
+                &snapshot.instance,
+                &group,
+                requested_role,
+            )?;
+            if require_progress_role {
+                if let Some(role) = *self
+                    .role
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                {
+                    if role != binding.local_member().stable_role {
+                        return Err(KubericAdapterError::TopologyBindingMismatch(
+                            "published local role differs from the frozen stable role",
+                        ));
+                    }
+                }
+            }
+        } else if require_progress_role {
             if let Some(role) = *self
                 .role
                 .lock()
@@ -492,13 +898,19 @@ impl SqlServerReplicator {
     }
 
     async fn validate_and_set_role(&self, role: ReplicaRole) -> KubericResult<()> {
-        let group = self.observed_group(false).await?;
-        validate_native_role(role, group.local_replica.role)?;
+        let group = self.observed_group(false, Some(role)).await?;
+        if self.binding.is_none() {
+            validate_native_role(role, group.local_replica.role)?;
+        }
+        self.set_role(role);
+        Ok(())
+    }
+
+    fn set_role(&self, role: ReplicaRole) {
         *self
             .role
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(role);
-        Ok(())
     }
 
     fn unsupported<T>(&self, operation: ObserveOnlyOperation) -> KubericResult<T> {
@@ -516,7 +928,18 @@ impl Replicator for SqlServerReplicator {
     }
 
     async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> KubericResult<()> {
-        self.validate_and_set_role(role).await?;
+        if let Some(binding) = &self.binding {
+            self.observed_group(false, Some(role)).await?;
+            if epoch != binding.configuration.epoch {
+                return Err(KubericAdapterError::TopologyBindingMismatch(
+                    "role-change epoch differs from the frozen epoch",
+                )
+                .into());
+            }
+            self.set_role(role);
+        } else {
+            self.validate_and_set_role(role).await?;
+        }
         *self
             .epoch
             .lock()
@@ -526,6 +949,15 @@ impl Replicator for SqlServerReplicator {
 
     async fn update_epoch(&self, epoch: Epoch) -> KubericResult<()> {
         self.require_open()?;
+        if let Some(binding) = &self.binding {
+            self.observed_group(false, None).await?;
+            if epoch != binding.configuration.epoch {
+                return Err(KubericAdapterError::TopologyBindingMismatch(
+                    "updated epoch differs from the frozen epoch",
+                )
+                .into());
+            }
+        }
         *self
             .epoch
             .lock()
@@ -544,14 +976,40 @@ impl Replicator for SqlServerReplicator {
 
     async fn current_progress(&self) -> KubericResult<i64> {
         Ok(self
-            .observed_group(true)
+            .observed_group(true, None)
             .await?
             .configuration_sequence
             .value())
     }
 
     async fn catch_up_capability(&self) -> KubericResult<i64> {
-        self.unsupported(ObserveOnlyOperation::CatchUpCapability)
+        let Some(binding) = &self.binding else {
+            return self.unsupported(ObserveOnlyOperation::CatchUpCapability);
+        };
+        if self
+            .admitted_configuration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+        {
+            return Err(KubericAdapterError::TopologyNotAdmitted.into());
+        }
+        if *self
+            .role
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            != Some(binding.local_member().stable_role)
+        {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "capability requires the frozen stable local role to be published",
+            )
+            .into());
+        }
+        Ok(self
+            .observed_group(true, None)
+            .await?
+            .configuration_sequence
+            .value())
     }
 }
 
@@ -575,9 +1033,28 @@ impl PrimaryReplicator for SqlServerReplicator {
 
     async fn update_current_replica_set_configuration(
         &self,
-        _current: ReplicaSetConfiguration,
+        current: ReplicaSetConfiguration,
     ) -> KubericResult<()> {
-        self.unsupported(ObserveOnlyOperation::CurrentConfiguration)
+        let Some(binding) = &self.binding else {
+            return self.unsupported(ObserveOnlyOperation::CurrentConfiguration);
+        };
+        self.observed_group(false, None).await?;
+        validate_current_configuration(binding, &current)?;
+        let mut admitted = self
+            .admitted_configuration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = &*admitted {
+            if previous != &current {
+                return Err(KubericAdapterError::TopologyBindingMismatch(
+                    "current configuration replay differs from the admitted value",
+                )
+                .into());
+            }
+        } else {
+            *admitted = Some(current);
+        }
+        Ok(())
     }
 
     async fn build_replica(&self, _replica: ReplicaInformation) -> KubericResult<()> {
@@ -586,6 +1063,232 @@ impl PrimaryReplicator for SqlServerReplicator {
 
     async fn remove_replica(&self, _replica_id: ReplicaId) -> KubericResult<()> {
         self.unsupported(ObserveOnlyOperation::RemoveReplica)
+    }
+}
+
+fn validate_replication_address(address: &str) -> Result<(), KubericAdapterError> {
+    if address.is_empty()
+        || address.len() > 1024
+        || address.chars().any(char::is_control)
+        || address.trim() != address
+    {
+        return Err(KubericAdapterError::InvalidConfiguration(
+            "replication address must be nonempty, bounded, and contain no control or surrounding whitespace",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_current_configuration(
+    binding: &HealthyTopologyBinding,
+    current: &ReplicaSetConfiguration,
+) -> Result<(), KubericAdapterError> {
+    if current.configuration != binding.configuration {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "current descriptor differs from the frozen descriptor",
+        ));
+    }
+    if current.replicas.len() != binding.members.len() {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "current replica descriptions are incomplete",
+        ));
+    }
+    for member in &binding.members {
+        let matching = current
+            .replicas
+            .iter()
+            .filter(|replica| replica.identity == member.kuberic_identity)
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "current replica identities differ from the frozen members",
+            ));
+        }
+        let replica = matching[0];
+        if replica.process_session_id != member.process_session_id
+            || replica.replication_address != member.replication_address
+            || replica.role != member.stable_role
+        {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "current replica session, address, or role differs from the frozen member",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_bound_evidence(
+    binding: &HealthyTopologyBinding,
+    config: &ObserverConfig,
+    instance: &crate::observation::InstanceMetadata,
+    group: &AvailabilityGroupSnapshot,
+    requested_role: Option<ReplicaRole>,
+) -> Result<(), KubericAdapterError> {
+    let local = binding.local_member();
+    let target = config.target();
+    if target.replica.logical_id() != local.sql_replica_identity.logical_id()
+        || target.replica.incarnation() != local.sql_replica_identity.incarnation()
+        || instance.server_name != local.server_name
+        || instance.property_server_name != local.server_name
+        || instance.sqlserver_start_time != local.sql_server_start_incarnation.as_str()
+    {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "local SQL server or incarnation evidence differs",
+        ));
+    }
+    if group.identity != binding.availability_group {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "availability-group identity differs",
+        ));
+    }
+    if group.local_replica.identity != local.sql_replica_identity {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "local SQL replica identity differs",
+        ));
+    }
+    if requested_role.is_some_and(|role| role != local.stable_role) {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "requested role differs from the frozen stable role",
+        ));
+    }
+    let expected_native_role = native_role_for(local.stable_role);
+    if group.local_replica.role.as_ref() != Some(&expected_native_role) {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "local native role differs from the frozen stable role",
+        ));
+    }
+    if group.replicas.len() != binding.members.len() {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "native replica membership differs",
+        ));
+    }
+    for member in &binding.members {
+        let native_id = member
+            .sql_replica_identity
+            .native_replica_id()
+            .expect("binding members require native IDs");
+        let matching = group
+            .replicas
+            .iter()
+            .filter(|replica| {
+                &replica.replica_id == native_id && replica.server_name == member.server_name
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "native replica GUID or SQL server membership differs",
+            ));
+        }
+    }
+    let local_native_id = local
+        .sql_replica_identity
+        .native_replica_id()
+        .expect("binding members require native IDs");
+    let local_replica = group
+        .replicas
+        .iter()
+        .find(|replica| {
+            &replica.replica_id == local_native_id && replica.server_name == local.server_name
+        })
+        .expect("native membership was validated");
+    let Some(state) = &local_replica.state else {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "local native replica state is unavailable",
+        ));
+    };
+    if state.provenance != NativeProvenance::Local
+        || state.role.as_ref() != Some(&expected_native_role)
+        || state.operational_state.as_deref() != Some("ONLINE")
+        || state.connected_state.as_deref() != Some("CONNECTED")
+        || state.recovery_health.as_deref() != Some("ONLINE")
+        || state.synchronization_health.as_deref() != Some("HEALTHY")
+        || state.last_connect_error_number != Some(0)
+    {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "local native replica role or health differs",
+        ));
+    }
+    if group.databases.len() != usize::from(SUPPORTED_DATABASE_COUNT) {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "exactly one managed database is required",
+        ));
+    }
+    let database = &group.databases[0];
+    if database.identity != binding.database_lineage.database {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "managed database identity differs",
+        ));
+    }
+    let Some(local_database) = &database.local else {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "local managed database evidence is unavailable",
+        ));
+    };
+    if &local_database.replica_id != local_native_id
+        || local_database.state.as_deref() != Some("ONLINE")
+        || local_database.recovery_model.as_deref() != Some("FULL")
+        || local_database
+            .recovery
+            .as_ref()
+            .and_then(|recovery| recovery.recovery_fork_guid.as_ref())
+            != Some(&binding.database_lineage.recovery_fork_id)
+    {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "local database identity, state, recovery model, or lineage differs",
+        ));
+    }
+    let matching_states = database
+        .replicas
+        .iter()
+        .filter(|state| {
+            &state.replica_id == local_native_id && state.provenance == NativeProvenance::Local
+        })
+        .collect::<Vec<_>>();
+    if matching_states.len() != 1 {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "local database replica evidence is incomplete",
+        ));
+    }
+    validate_bound_database_state(
+        matching_states[0],
+        &binding.database_lineage,
+        local.stable_role,
+    )
+}
+
+fn validate_bound_database_state(
+    state: &DatabaseReplicaSnapshot,
+    lineage: &DatabaseLineage,
+    role: ReplicaRole,
+) -> Result<(), KubericAdapterError> {
+    let lineage_matches = matches!(
+        &state.lineage,
+        RecoveryLineageObservation::Local { value } if value == lineage
+    );
+    if state.group_database_id != lineage.database.group_database_id
+        || !lineage_matches
+        || state.is_primary_replica != Some(role == ReplicaRole::Primary)
+        || state.synchronization_state.as_deref() != Some("SYNCHRONIZED")
+        || state.synchronization_health.as_deref() != Some("HEALTHY")
+        || state.database_state.as_deref() != Some("ONLINE")
+        || state.is_suspended != Some(false)
+        || state.suspend_reason.is_some()
+        || state.is_commit_participant != Some(true)
+    {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "local database lineage, synchronization, health, or role differs",
+        ));
+    }
+    Ok(())
+}
+
+fn native_role_for(role: ReplicaRole) -> NativeRole {
+    match role {
+        ReplicaRole::Primary => NativeRole::Primary,
+        ReplicaRole::ActiveSecondary => NativeRole::Secondary,
+        ReplicaRole::IdleSecondary | ReplicaRole::None => {
+            unreachable!("binding constructor rejects unstable roles")
+        }
     }
 }
 
