@@ -1,9 +1,9 @@
 use std::num::NonZeroU32;
 
 use crate::error::ContractError;
-use crate::types::{PinnedImage, SecretRef};
+use crate::types::{EngineArtifact, SecretRef};
 
-pub const SUPPORTED_ENGINE_MAJOR: u16 = 16;
+pub const SUPPORTED_ENGINE_MAJOR: u16 = 17;
 pub const SUPPORTED_REPLICA_COUNT: u8 = 3;
 pub const SUPPORTED_DATABASE_COUNT: u8 = 1;
 pub const SUPPORTED_REQUIRED_SECONDARIES: u8 = 1;
@@ -17,8 +17,9 @@ pub const SUPPORTED_REPLICA_COUNT_TEXT: &str = "3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Edition {
-    Developer,
+    EnterpriseDeveloper,
     Enterprise,
+    StandardDeveloper,
     Standard,
     Express,
 }
@@ -60,7 +61,7 @@ pub enum MutationMode {
 pub struct SqlServerSupportConfig {
     pub engine_major: u16,
     pub edition: Edition,
-    pub image: PinnedImage,
+    pub engine: EngineArtifact,
     pub eula_accepted: bool,
     pub cluster_type: ClusterType,
     pub failover_mode: FailoverMode,
@@ -81,15 +82,26 @@ impl SqlServerSupportConfig {
         require(
             "engine major version",
             self.engine_major == SUPPORTED_ENGINE_MAJOR,
-            "16 (SQL Server 2022)",
+            "17 (SQL Server 2025)",
             self.engine_major,
         )?;
         require(
             "edition",
-            matches!(self.edition, Edition::Developer | Edition::Enterprise),
-            "Developer or Enterprise",
+            matches!(
+                self.edition,
+                Edition::EnterpriseDeveloper | Edition::Enterprise
+            ),
+            "Enterprise Developer or Enterprise",
             format!("{:?}", self.edition),
         )?;
+        if let EngineArtifact::NativePackage(package) = &self.engine {
+            require(
+                "native package engine major version",
+                package.version().starts_with("17."),
+                "17 (SQL Server 2025)",
+                package.version(),
+            )?;
+        }
         require(
             "EULA acceptance",
             self.eula_accepted,

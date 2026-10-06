@@ -15,19 +15,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  server-free:
-    name: Server-free runtime tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  validation:
+    name: Shared CI validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           components: rustfmt, clippy
           build-warnings: ""
-      - name: Check SQL Server formatting
-        run: cargo fmt -- --check
-      - name: Check SQL Server runtime
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Run SQL Server contract and runtime tests
-        run: cargo test --locked --all-features
+      - name: Bootstrap shared tools
+        run: bash scripts/setup_environment.sh
+      - name: Run the same complete pipeline used locally
+        id: validation
+        run: just ci
+      - name: Release owned fixture resources after failure or cancellation
+        if: always() && steps.validation.outcome != 'skipped' && steps.validation.outcome != ''
+        run: just cleanup

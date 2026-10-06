@@ -30,6 +30,7 @@ pub enum ContractError {
     InvalidEndpointHost,
     InvalidPort,
     InvalidImageDigest,
+    InvalidPackagePin,
     InvalidSecretReference {
         field: &'static str,
     },
@@ -93,6 +94,12 @@ impl fmt::Display for ContractError {
             Self::InvalidPort => write!(f, "endpoint port must be nonzero"),
             Self::InvalidImageDigest => {
                 write!(f, "SQL Server image must be pinned with a sha256 digest")
+            }
+            Self::InvalidPackagePin => {
+                write!(
+                    f,
+                    "SQL Server package requires an exact build-revision version and sha256 digest"
+                )
             }
             Self::InvalidSecretReference { field } => {
                 write!(f, "{field} is not a valid Kubernetes Secret reference")

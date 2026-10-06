@@ -56,7 +56,7 @@ impl SqlSession for AbsentSession {
         assert_eq!(availability_group.as_str(), "test-ag");
         let row = match query {
             ReadQuery::Permissions => json!({
-                "product_major_version": "16",
+                "product_major_version": "17",
                 "view_server_state": "1",
                 "view_server_performance_state": "1",
                 "view_any_definition": "1",
@@ -65,9 +65,9 @@ impl SqlSession for AbsentSession {
             ReadQuery::Anchor => json!({
                 "server_name": "sql-0",
                 "property_server_name": "sql-0",
-                "product_version": "16.0.4225.2",
-                "product_major_version": "16",
-                "edition": "Developer Edition (64-bit)",
+                "product_version": "17.0.4006.2",
+                "product_major_version": "17",
+                "edition": "Enterprise Developer Edition (64-bit)",
                 "engine_edition": "3",
                 "is_hadr_enabled": "1",
                 "host_platform": "Linux",

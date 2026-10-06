@@ -18,9 +18,9 @@ The first supported target is deliberately narrow:
 
 | Area | Initial contract |
 |---|---|
-| Engine | SQL Server 2022, major version 16 |
-| Platform | Linux x86-64 containers |
-| Edition | Developer for tests; Enterprise for a future production profile |
+| Engine | SQL Server 2025, major version 17; older majors are rejected |
+| Platform | Linux x86-64 containers, or native Ubuntu 24.04 with SQL Server 2025 CU1+ |
+| Edition | Enterprise Developer for tests; Enterprise for a future production profile |
 | Availability group | Full AG, one managed user database |
 | AG naming | `EXTERNAL` limit of 64 characters, enforced as 64 UTF-16 code units |
 | Cluster type | `EXTERNAL` |
@@ -31,8 +31,18 @@ The first supported target is deliberately narrow:
 | Write fencing | SQL Server external write lease plus a verified fence receipt |
 | Default behavior | Observe only |
 
-Images must be pinned by digest. Accepting the SQL Server EULA remains an
-explicit deployer action and is never implied by the adapter.
+Images must be pinned by digest; native `mssql-server` packages must have an exact
+build-revision version and a recorded archive SHA-256. `EngineArtifact` keeps
+these provisioning profiles distinct; a native fixture does not invent an image
+reference. Accepting the SQL Server EULA remains an explicit deployer action and
+is never implied by the adapter. Native package installation, edition setup,
+HADR/TLS configuration and credential provisioning remain external operations.
+The runtime neither installs packages nor manages the host service.
+
+SQL Server 2025 separates Enterprise Developer and Standard Developer editions.
+Only the Enterprise-feature profile is accepted: EngineEdition 3 and an
+Enterprise Developer or Enterprise display name. Standard Developer, Standard,
+Express and Evaluation remain unsupported.
 
 The AG name limit is narrower than the general `sysname` limit.
 `CREATE AVAILABILITY GROUP` documents 128 characters for `cluster_type = WSFC`
@@ -58,7 +68,7 @@ This repository implements the safety contract and a standalone observe-only
 runtime:
 
 - validation of the supported SQL Server profile;
-- immutable image and Kubernetes Secret references;
+- immutable container/native-package artifacts and Kubernetes Secret references;
 - native AG, database, replica, and incarnation identities;
 - separate desired replica identities for bootstrap, before SQL Server generates
   native replica GUIDs;
@@ -259,7 +269,7 @@ Only Kubernetes Secret references belong in desired state. Passwords,
 certificate private keys, connection strings containing credentials, and SQL
 batches containing secrets must not be stored in CRD status, operation
 signatures, logs, or command-line arguments. Observation permissions and
-mutation permissions must use distinct Secret keys. SQL Server 2022 observation
+mutation permissions must use distinct Secret keys. SQL Server 2025 observation
 permissions, including `VIEW SERVER PERFORMANCE STATE`, must be validated
 explicitly; metadata hidden by insufficient permission must not be treated as
 absence.
@@ -319,8 +329,21 @@ permissions, transport and sample deadlines, freshness, cancellation, CLI
 output, and credential redaction. A dedicated server-free observer workflow
 runs these without provisioning PostgreSQL or Kubernetes.
 
-Live tests require a separate explicit job because hosted CI is server-free.
-That job must pin the engine, tools, and helper
+Live tests run in a separate native observation job alongside server-free checks.
+The native job runs on PRs, main-branch pushes and manual dispatches, with
+CI-configured automatic EULA acceptance for one disposable Ubuntu 24.04
+Enterprise Developer fixture for absence, denied permissions, invalid TLS and
+CLI output validation. Shared `just ci`/`provision`/`validate-live`/`cleanup`
+commands own installation, HADR/TLS/principal setup and cleanup outside the observer;
+they refuse unrelated existing installations and
+creates no AG. This does not enable runtime mutation or validate HA.
+The same ensure-ready operation is used locally: it preserves an already-running
+project fixture, starts/stops a verified stopped fixture under a captured systemd
+invocation/process generation, or bootstraps an empty host. Configured fixtures
+are never reset. A private ownership record lets cleanup distinguish borrowed,
+started and newly created resources. Local lifecycle checks are
+test-environment safeguards, not production fencing attestation.
+That job must pin the engine image or native package, tools, and helper
 artifacts; accept the EULA explicitly; isolate credentials; and fail rather
 than skip when requested prerequisites are missing. Mutation support cannot be
 declared complete until live tests cover crash points before and after intent
@@ -329,6 +352,8 @@ reply, and routing publication.
 
 ## References
 
+- [Install SQL Server 2025 on Ubuntu](https://learn.microsoft.com/en-us/sql/linux/install-upgrade/quickstart-install-ubuntu?view=sql-server-ver17) — native Ubuntu 24.04 support starts at CU1
+- [`SERVERPROPERTY`](https://learn.microsoft.com/en-us/sql/t-sql/functions/serverproperty-transact-sql?view=sql-server-ver17) — SQL Server 2025 edition and EngineEdition identities
 - [Issue #80](https://github.com/youyuanwu/kuberic/issues/80)
 - [Level-triggered operator proposal](https://github.com/youyuanwu/kuberic/blob/main/docs/proposal/level-triggered-operator-design.md)
 - [SQL Server availability groups on Linux](https://learn.microsoft.com/en-us/sql/linux/business-continuity/availability-groups/overview)
