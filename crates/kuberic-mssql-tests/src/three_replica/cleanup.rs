@@ -201,7 +201,16 @@ fn cleanup_with_coordinator(
         return report;
     }
 
-    for index in (0..journal.resources.len()).rev() {
+    let mut cleanup_order = (0..journal.resources.len())
+        .rev()
+        .filter(|index| journal.resources[*index].kind == ResourceKind::Container)
+        .collect::<Vec<_>>();
+    cleanup_order.extend(
+        (0..journal.resources.len())
+            .rev()
+            .filter(|index| journal.resources[*index].kind != ResourceKind::Container),
+    );
+    for index in cleanup_order {
         let record = journal.resources[index].clone();
         if record.state == ResourceState::Removed {
             continue;
@@ -220,8 +229,20 @@ fn cleanup_with_coordinator(
         }
         if matches!(
             record.kind,
-            ResourceKind::DataDirectory | ResourceKind::Network
+            ResourceKind::DataDirectory
+                | ResourceKind::Directory
+                | ResourceKind::SecretFile
+                | ResourceKind::Network
         ) && !containers_proven_absent(journal)
+        {
+            block(journal, index, &record, &mut report);
+            let _ = store.save(journal);
+            continue;
+        }
+        if matches!(
+            record.kind,
+            ResourceKind::DataDirectory | ResourceKind::Directory
+        ) && !descendants_proven_removed(journal, &record)
         {
             block(journal, index, &record, &mut report);
             let _ = store.save(journal);
@@ -366,7 +387,7 @@ fn remove(
     match resource.kind {
         ResourceKind::Container => backend.remove_container(resource, remaining),
         ResourceKind::Network => backend.remove_network(resource, remaining),
-        ResourceKind::DataDirectory | ResourceKind::SecretFile => {
+        ResourceKind::DataDirectory | ResourceKind::Directory | ResourceKind::SecretFile => {
             backend.remove_path(resource, remaining)
         }
         ResourceKind::AvailabilityGroup | ResourceKind::Database => Err(CleanupError {
@@ -379,6 +400,18 @@ fn remove(
 fn containers_proven_absent(journal: &OwnershipJournal) -> bool {
     journal.resources.iter().all(|resource| {
         resource.kind != ResourceKind::Container || resource.state == ResourceState::Removed
+    })
+}
+
+fn descendants_proven_removed(journal: &OwnershipJournal, directory: &ResourceRecord) -> bool {
+    let Some(directory_path) = directory.path.as_ref() else {
+        return false;
+    };
+    journal.resources.iter().all(|resource| {
+        resource.logical_name == directory.logical_name
+            || resource.path.as_ref().is_none_or(|path| {
+                !path.starts_with(directory_path) || resource.state == ResourceState::Removed
+            })
     })
 }
 

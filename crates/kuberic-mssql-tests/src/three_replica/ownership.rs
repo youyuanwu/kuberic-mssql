@@ -518,6 +518,12 @@ pub struct DirectoryBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateDirectoryBinding {
+    pub canonical_path: PathBuf,
+    pub binding: ResourceBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemberDirectoryError {
     Escape,
     Symlink,
@@ -591,6 +597,103 @@ pub fn prepare_member_directory(
         let _ = fs::remove_dir_all(path);
     }
     result
+}
+
+pub fn create_private_owned_directory(
+    root: &Path,
+    path: &Path,
+) -> Result<PrivateDirectoryBinding, MemberDirectoryError> {
+    let canonical_root = root.canonicalize().map_err(|_| MemberDirectoryError::Io)?;
+    verify_private_root(&canonical_root)?;
+    let parent = path.parent().ok_or(MemberDirectoryError::Escape)?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|_| MemberDirectoryError::Io)?;
+    if parent != canonical_parent
+        || !canonical_parent.starts_with(&canonical_root)
+        || canonical_parent == canonical_root && path == canonical_root
+    {
+        return Err(MemberDirectoryError::Escape);
+    }
+    if path.exists() {
+        return Err(MemberDirectoryError::Replaced);
+    }
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(path).map_err(|_| MemberDirectoryError::Io)?;
+    let marker_path = path.join(DIRECTORY_MARKER);
+    let marker_value = directory_marker_value(path);
+    let mut marker = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&marker_path)
+        .map_err(|_| MemberDirectoryError::Io)?;
+    marker
+        .write_all(marker_value.as_bytes())
+        .map_err(|_| MemberDirectoryError::Io)?;
+    marker.sync_all().map_err(|_| MemberDirectoryError::Io)?;
+    inspect_private_owned_directory(&canonical_root, path)
+}
+
+pub fn inspect_private_owned_directory(
+    root: &Path,
+    path: &Path,
+) -> Result<PrivateDirectoryBinding, MemberDirectoryError> {
+    let binding = inspect_owned_directory(root, path)?;
+    let metadata = fs::symlink_metadata(&binding.canonical_path)
+        .map_err(|_| MemberDirectoryError::Replaced)?;
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(MemberDirectoryError::Permissions);
+    }
+    Ok(binding)
+}
+
+pub fn inspect_owned_directory(
+    root: &Path,
+    path: &Path,
+) -> Result<PrivateDirectoryBinding, MemberDirectoryError> {
+    let canonical_root = root.canonicalize().map_err(|_| MemberDirectoryError::Io)?;
+    verify_private_root(&canonical_root)?;
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|_| MemberDirectoryError::Replaced)?;
+    if canonical_path != path
+        || !canonical_path.starts_with(&canonical_root)
+        || canonical_path == canonical_root
+    {
+        return Err(MemberDirectoryError::Escape);
+    }
+    let metadata =
+        fs::symlink_metadata(&canonical_path).map_err(|_| MemberDirectoryError::Replaced)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(MemberDirectoryError::Replaced);
+    }
+    let mut digest = Sha256::new();
+    let marker_path = canonical_path.join(DIRECTORY_MARKER);
+    let marker_metadata =
+        fs::symlink_metadata(&marker_path).map_err(|_| MemberDirectoryError::Replaced)?;
+    if !marker_metadata.is_file() || marker_metadata.file_type().is_symlink() {
+        return Err(MemberDirectoryError::Replaced);
+    }
+    let marker = fs::read(&marker_path).map_err(|_| MemberDirectoryError::Replaced)?;
+    digest.update(canonical_path.as_os_str().as_bytes());
+    digest.update(metadata.dev().to_le_bytes());
+    digest.update(metadata.ino().to_le_bytes());
+    digest.update(marker_metadata.dev().to_le_bytes());
+    digest.update(marker_metadata.ino().to_le_bytes());
+    digest.update(Sha256::digest(marker));
+    Ok(PrivateDirectoryBinding {
+        canonical_path,
+        binding: ResourceBinding {
+            immutable_id: format!("device:{}/inode:{}", metadata.dev(), metadata.ino()),
+            attributes_sha256: hex(&digest.finalize()),
+        },
+    })
 }
 
 pub fn verify_member_directory(

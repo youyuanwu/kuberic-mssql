@@ -86,6 +86,7 @@ fn record(
         logical_name: name.to_owned(),
         path: matches!(kind, ResourceKind::DataDirectory | ResourceKind::SecretFile)
             .then(|| PathBuf::from(format!("/owned/{name}"))),
+        intent: None,
         binding: resource_binding,
         state,
     }

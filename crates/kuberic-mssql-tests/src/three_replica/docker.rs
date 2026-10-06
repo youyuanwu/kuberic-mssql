@@ -6,8 +6,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::config::{PINNED_SQL_SERVER_IMAGE, ResourcePolicy};
+use super::model::ResourceBinding;
 use super::process::{CommandSpec, ProcessErrorKind, ProcessRunner};
 use super::secrets::SecretValue;
 
@@ -193,6 +195,15 @@ impl NetworkRequest {
             return Err(DockerError::OwnershipMismatch);
         }
         Ok(())
+    }
+
+    pub fn intent_binding(&self) -> ResourceBinding {
+        let attributes = serde_json::to_vec(&(self.name.as_str(), "bridge", self.labels.as_map()))
+            .expect("network intent is serializable");
+        ResourceBinding {
+            immutable_id: self.name.clone(),
+            attributes_sha256: hex(&Sha256::digest(attributes)),
+        }
     }
 }
 
@@ -405,6 +416,47 @@ impl ContainerRequest {
             || inspection.ports[0].host_ip != "127.0.0.1"
             || (expected_running && inspection.ports[0].host_port == 0)
         {
+            return Err(DockerError::OwnershipMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn intent_binding(&self, expected_image_id: &str) -> ResourceBinding {
+        let environment = self
+            .environment
+            .iter()
+            .map(EnvironmentVariable::line)
+            .map(|line| hex(&Sha256::digest(line.as_bytes())))
+            .collect::<Vec<_>>();
+        let attributes = serde_json::to_vec(&(
+            self.name.as_str(),
+            self.hostname.as_str(),
+            expected_image_id,
+            self.labels.as_map(),
+            environment,
+            "mssql",
+            "no",
+            self.network_name.as_str(),
+            self.data_directory.as_path(),
+            self.limits,
+            "127.0.0.1",
+            1433_u16,
+        ))
+        .expect("container intent is serializable");
+        ResourceBinding {
+            immutable_id: self.name.clone(),
+            attributes_sha256: hex(&Sha256::digest(attributes)),
+        }
+    }
+
+    pub fn verify_frozen_running_inspection(
+        &self,
+        inspection: &ContainerInspection,
+        frozen: &ContainerInspection,
+        expected_image_id: &str,
+    ) -> Result<(), DockerError> {
+        self.verify_inspection(inspection, expected_image_id, true)?;
+        if inspection != frozen {
             return Err(DockerError::OwnershipMismatch);
         }
         Ok(())
@@ -894,6 +946,7 @@ fn validate_environment(environment: &[EnvironmentVariable]) -> Result<(), Docke
     if environment.len() != expected.len() {
         return Err(DockerError::InvalidRequest);
     }
+
     for key in expected {
         if environment
             .iter()
@@ -905,6 +958,10 @@ fn validate_environment(environment: &[EnvironmentVariable]) -> Result<(), Docke
         }
     }
     Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn first_inspection(text: &str) -> Result<Value, DockerError> {

@@ -143,6 +143,14 @@ FROM sys.dm_os_sys_info AS info;"#;
         })
     }
 
+    pub fn set_query_timeout(&mut self, timeout: Duration) -> Result<(), AdminError> {
+        if timeout.is_zero() {
+            return Err(AdminError::InvalidDeadline);
+        }
+        self.query_timeout = timeout;
+        Ok(())
+    }
+
     pub async fn bootstrap_admin(
         &mut self,
         username: &str,

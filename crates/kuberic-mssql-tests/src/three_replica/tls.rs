@@ -25,6 +25,57 @@ pub struct TlsAssets {
     pub members: [MemberTlsAssets; 3],
 }
 
+pub trait TlsAssetRecorder {
+    fn create_directory(&mut self, logical_name: &str, path: &Path) -> Result<(), TlsError>;
+    fn create_text_file(
+        &mut self,
+        logical_name: &str,
+        path: &Path,
+        contents: &str,
+    ) -> Result<PrivateFile, TlsError>;
+    fn dispatch_file(&mut self, logical_name: &str, path: &Path) -> Result<usize, TlsError>;
+    fn bind_file(
+        &mut self,
+        record_index: usize,
+        path: &Path,
+        sql_shared: bool,
+    ) -> Result<PrivateFile, TlsError>;
+}
+
+struct DirectTlsAssetRecorder;
+
+impl TlsAssetRecorder for DirectTlsAssetRecorder {
+    fn create_directory(&mut self, _: &str, path: &Path) -> Result<(), TlsError> {
+        create_private_directory(path).map_err(TlsError::Secret)
+    }
+
+    fn create_text_file(
+        &mut self,
+        _: &str,
+        path: &Path,
+        contents: &str,
+    ) -> Result<PrivateFile, TlsError> {
+        PrivateFile::create_text(path, contents).map_err(TlsError::Secret)
+    }
+
+    fn dispatch_file(&mut self, _: &str, _: &Path) -> Result<usize, TlsError> {
+        Ok(0)
+    }
+
+    fn bind_file(
+        &mut self,
+        _: usize,
+        path: &Path,
+        sql_shared: bool,
+    ) -> Result<PrivateFile, TlsError> {
+        if sql_shared {
+            PrivateFile::inspect_sql_shared(path).map_err(TlsError::Secret)
+        } else {
+            PrivateFile::inspect(path).map_err(TlsError::Secret)
+        }
+    }
+}
+
 impl TlsAssets {
     pub fn generate(
         root: &Path,
@@ -33,16 +84,35 @@ impl TlsAssets {
         timeout: Duration,
         runner: &impl ProcessRunner,
     ) -> Result<Self, TlsError> {
+        Self::generate_recorded(
+            root,
+            hostnames,
+            member_data_directories,
+            timeout,
+            runner,
+            &mut DirectTlsAssetRecorder,
+        )
+    }
+
+    pub fn generate_recorded(
+        root: &Path,
+        hostnames: [&str; 3],
+        member_data_directories: [&Path; 3],
+        timeout: Duration,
+        runner: &impl ProcessRunner,
+        recorder: &mut impl TlsAssetRecorder,
+    ) -> Result<Self, TlsError> {
         for hostname in hostnames {
             validate_hostname(hostname)?;
         }
         let tls_root = root.join("tls");
-        create_private_directory(&tls_root).map_err(TlsError::Secret)?;
+        recorder.create_directory("tls-directory", &tls_root)?;
         let exchange_root = root.join("endpoint-exchange");
-        create_private_directory(&exchange_root).map_err(TlsError::Secret)?;
+        recorder.create_directory("endpoint-exchange-directory", &exchange_root)?;
 
         let ca_key = tls_root.join("ca.key");
         let ca_certificate = tls_root.join("ca.crt");
+        let ca_key_record = recorder.dispatch_file("tls-ca-private-key", &ca_key)?;
         run_openssl(
             runner,
             timeout,
@@ -57,6 +127,10 @@ impl TlsAssets {
                 path_text(&ca_key)?,
             ],
         )?;
+        make_private(&ca_key)?;
+        let ca_private_key = recorder.bind_file(ca_key_record, &ca_key, false)?;
+        let ca_certificate_record =
+            recorder.dispatch_file("tls-ca-certificate", &ca_certificate)?;
         run_openssl(
             runner,
             timeout,
@@ -80,30 +154,38 @@ impl TlsAssets {
                 path_text(&ca_certificate)?,
             ],
         )?;
-        make_private(&ca_key)?;
         make_private(&ca_certificate)?;
+        let ca_certificate_file =
+            recorder.bind_file(ca_certificate_record, &ca_certificate, false)?;
 
+        let serial = tls_root.join("ca.srl");
+        let serial_record = recorder.dispatch_file("tls-ca-serial", &serial)?;
         let mut members = Vec::with_capacity(3);
         for index in 0..3 {
             let secrets = member_data_directories[index].join("secrets");
-            create_sql_directory(&secrets, timeout, runner)?;
+            recorder
+                .create_directory(&format!("member-{}-secrets-directory", index + 1), &secrets)?;
+            configure_sql_directory(&secrets, timeout, runner)?;
             let kuberic = secrets.join("kuberic");
-            create_sql_directory(&kuberic, timeout, runner)?;
+            recorder.create_directory(&format!("member-{}-tls-directory", index + 1), &kuberic)?;
+            configure_sql_directory(&kuberic, timeout, runner)?;
             let key = kuberic.join("server.key");
             let request = tls_root.join(format!("server-{}.csr", index + 1));
             let extensions = tls_root.join(format!("server-{}.ext", index + 1));
             let certificate = kuberic.join("server.crt");
-            PrivateFile::create_text(
+            let extension_file = recorder.create_text_file(
+                &format!("tls-server-{}-extensions", index + 1),
                 &extensions,
-                format!(
+                &format!(
                     "subjectAltName=DNS:localhost,IP:127.0.0.1,DNS:{}\n\
                      extendedKeyUsage=serverAuth\n\
                      keyUsage=critical,digitalSignature,keyEncipherment\n\
                      basicConstraints=critical,CA:FALSE\n",
                     hostnames[index]
                 ),
-            )
-            .map_err(TlsError::Secret)?;
+            )?;
+            let key_record =
+                recorder.dispatch_file(&format!("tls-server-{}-private-key", index + 1), &key)?;
             run_openssl(
                 runner,
                 timeout,
@@ -118,6 +200,11 @@ impl TlsAssets {
                     path_text(&key)?,
                 ],
             )?;
+            make_private(&key)?;
+            share_file_with_sql(&key, timeout, runner)?;
+            let key_file = recorder.bind_file(key_record, &key, true)?;
+            let request_record =
+                recorder.dispatch_file(&format!("tls-server-{}-request", index + 1), &request)?;
             run_openssl(
                 runner,
                 timeout,
@@ -134,7 +221,12 @@ impl TlsAssets {
                     path_text(&request)?,
                 ],
             )?;
-            let serial = tls_root.join("ca.srl");
+            make_private(&request)?;
+            let _request_file = recorder.bind_file(request_record, &request, false)?;
+            let certificate_record = recorder.dispatch_file(
+                &format!("tls-server-{}-certificate", index + 1),
+                &certificate,
+            )?;
             let mut arguments = vec![
                 "x509".to_owned(),
                 "-req".to_owned(),
@@ -165,25 +257,27 @@ impl TlsAssets {
                 "sign SQL Server TLS certificate",
                 &arguments,
             )?;
-            make_private(&key)?;
             make_private(&certificate)?;
-            make_private(&request)?;
-            share_file_with_sql(&key, timeout, runner)?;
             share_file_with_sql(&certificate, timeout, runner)?;
+            let certificate_file = recorder.bind_file(certificate_record, &certificate, true)?;
+            drop(extension_file);
             let exchange = exchange_root.join(format!("member-{}", index + 1));
-            create_private_directory(&exchange).map_err(TlsError::Secret)?;
+            recorder.create_directory(
+                &format!("endpoint-exchange-member-{}", index + 1),
+                &exchange,
+            )?;
             members.push(MemberTlsAssets {
-                server_certificate: PrivateFile::inspect_sql_shared(certificate)
-                    .map_err(TlsError::Secret)?,
-                server_private_key: PrivateFile::inspect_sql_shared(key)
-                    .map_err(TlsError::Secret)?,
+                server_certificate: certificate_file,
+                server_private_key: key_file,
                 endpoint_exchange_directory: exchange,
             });
         }
+        make_private(&serial)?;
+        let _serial_file = recorder.bind_file(serial_record, &serial, false)?;
         let members = members.try_into().map_err(|_| TlsError::Helper)?;
         Ok(Self {
-            ca_certificate: PrivateFile::inspect(ca_certificate).map_err(TlsError::Secret)?,
-            ca_private_key: PrivateFile::inspect(ca_key).map_err(TlsError::Secret)?,
+            ca_certificate: ca_certificate_file,
+            ca_private_key,
             members,
         })
     }
@@ -209,6 +303,7 @@ pub enum TlsError {
     InvalidPath,
     UnsafeRequest,
     Helper,
+    Journal,
     Secret(SecretError),
 }
 
@@ -219,6 +314,7 @@ impl fmt::Display for TlsError {
             Self::InvalidPath => "TLS asset path is invalid",
             Self::UnsafeRequest => "OpenSSL request exceeds the fixed safety bounds",
             Self::Helper => "OpenSSL TLS helper failed",
+            Self::Journal => "TLS ownership journal update failed",
             Self::Secret(_) => "TLS private asset operation failed",
         })
     }
@@ -285,12 +381,11 @@ fn make_private(path: &Path) -> Result<(), TlsError> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|_| TlsError::Helper)
 }
 
-fn create_sql_directory(
+fn configure_sql_directory(
     path: &Path,
     timeout: Duration,
     runner: &impl ProcessRunner,
 ) -> Result<(), TlsError> {
-    fs::create_dir(path).map_err(|_| TlsError::Helper)?;
     runner
         .run(
             &CommandSpec::new("setfacl", "configure SQL TLS directory ACL", timeout)

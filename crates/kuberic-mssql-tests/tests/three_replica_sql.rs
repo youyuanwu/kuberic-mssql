@@ -6,11 +6,12 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use kuberic_mssql_tests::three_replica::{
-    AdminDeadlines, AdminEndpoint, AdminError, BoundedProcessRunner, ChildDisposition, CommandSpec,
-    ContainerInspection, ContainerLimits, ContainerMount, ContainerPort, ContainerRequest,
-    DockerApi, DockerCli, DockerError, EnvironmentVariable, MemberReadinessEvidence, OwnedLabels,
-    PrivateFile, ProcessError, ProcessResult, ProcessRunner, ResourcePolicy, SQL_SERVER_UID,
-    SecretValue, SqlMemberIncarnation, SqlServerContainerSpec, TlsAssets, validated_identifier,
+    AdminDeadlines, AdminEndpoint, AdminError, AdminSession, BoundedProcessRunner,
+    ChildDisposition, CommandSpec, ContainerInspection, ContainerLimits, ContainerMount,
+    ContainerPort, ContainerRequest, DockerApi, DockerCli, DockerError, EnvironmentVariable,
+    LoginFiles, MemberReadinessEvidence, OwnedLabels, PrivateFile, ProcessError, ProcessResult,
+    ProcessRunner, ResourcePolicy, SQL_SERVER_UID, SecretValue, SqlMemberIncarnation,
+    SqlServerContainerSpec, TlsAssets, validated_identifier,
 };
 
 #[derive(Default)]
@@ -222,6 +223,22 @@ fn structured_inspection_parses_every_launch_property() {
 }
 
 #[test]
+fn frozen_running_inspection_rejects_exact_port_binding_drift() {
+    let directory = tempfile::tempdir().unwrap();
+    let request = request(directory.path());
+    let mut frozen = inspection(&request);
+    frozen.running = true;
+    let mut changed = frozen.clone();
+    changed.ports[0].host_port += 1;
+    assert_eq!(
+        request
+            .verify_frozen_running_inspection(&changed, &frozen, "sha256:image")
+            .unwrap_err(),
+        DockerError::OwnershipMismatch
+    );
+}
+
+#[test]
 fn readiness_rejects_wrong_identity_version_edition_hadr_and_start() {
     let valid = MemberReadinessEvidence {
         server_name: "km0123456789n1".to_owned(),
@@ -372,8 +389,8 @@ fn tls_generation_is_bounded_private_verified_and_no_overwrite() {
     );
 }
 
-#[test]
-fn admin_validation_and_errors_never_echo_credentials_or_paths() {
+#[tokio::test]
+async fn admin_deadline_and_endpoint_rejection_paths_are_exercised() {
     assert!(validated_identifier("km_admin_01234567").is_ok());
     assert_eq!(
         validated_identifier("bad];DROP LOGIN sa--").unwrap_err(),
@@ -395,21 +412,62 @@ fn admin_validation_and_errors_never_echo_credentials_or_paths() {
         );
         assert!(!error.to_string().contains(secret));
     }
+    let directory = tempfile::tempdir().unwrap();
+    let ca = PrivateFile::create_text(directory.path().join("ca.crt"), "test-ca").unwrap();
+    let username = PrivateFile::create_text(directory.path().join("username"), "sa").unwrap();
+    let password =
+        PrivateFile::create_text(directory.path().join("password"), "admin-super-secret-Aa1!")
+            .unwrap();
+    let login = LoginFiles {
+        username: username.path().to_path_buf(),
+        password: password.path().to_path_buf(),
+    };
     let endpoint = AdminEndpoint {
         tcp_host: "0.0.0.0".to_owned(),
-        tls_hostname: "unverified".to_owned(),
+        tls_hostname: "localhost".to_owned(),
         port: 1433,
-        ca_certificate: PathBuf::from("/not/used.crt"),
+        ca_certificate: ca.path().to_path_buf(),
     };
-    assert_ne!(endpoint.tcp_host, "127.0.0.1");
-    assert_eq!(
+    let error = AdminSession::connect(
+        &endpoint,
+        &login,
         AdminDeadlines {
-            connect: Duration::ZERO,
+            connect: Duration::from_secs(1),
             query: Duration::from_secs(1),
-        }
-        .connect,
-        Duration::ZERO
-    );
+        },
+    )
+    .await
+    .err()
+    .expect("endpoint mismatch must be rejected");
+    assert_eq!(error, AdminError::InvalidEndpoint);
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+    let endpoint = AdminEndpoint {
+        tcp_host: "127.0.0.1".to_owned(),
+        tls_hostname: "localhost".to_owned(),
+        port,
+        ca_certificate: ca.path().to_path_buf(),
+    };
+    let error = AdminSession::connect(
+        &endpoint,
+        &login,
+        AdminDeadlines {
+            connect: Duration::from_millis(25),
+            query: Duration::from_secs(1),
+        },
+    )
+    .await
+    .err()
+    .expect("controlled peer must exceed the connect deadline");
+    assert_eq!(error, AdminError::ConnectDeadline);
+    server.abort();
 }
 
 #[test]

@@ -97,6 +97,11 @@ impl PrivateFile {
         Self::inspect_mode(path.into(), true)
     }
 
+    pub fn inspect_owned(path: impl Into<PathBuf>) -> Result<Self, SecretError> {
+        let path = path.into();
+        Self::inspect_mode(path.clone(), false).or_else(|_| Self::inspect_mode(path, true))
+    }
+
     fn inspect_mode(path: PathBuf, sql_shared: bool) -> Result<Self, SecretError> {
         let metadata = fs::symlink_metadata(&path).map_err(|_| SecretError::Io)?;
         if !metadata.is_file()

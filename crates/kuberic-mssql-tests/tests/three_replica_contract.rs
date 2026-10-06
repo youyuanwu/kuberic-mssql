@@ -234,6 +234,7 @@ fn journal_round_trips_without_secret_values() {
         kind: ResourceKind::SecretFile,
         logical_name: "sa-password".into(),
         path: Some(directory.path().join("sa-password")),
+        intent: None,
         binding: Some(ResourceBinding {
             immutable_id: "device:1/inode:2".into(),
             attributes_sha256: "a".repeat(64),
@@ -276,6 +277,7 @@ fn nested_binding_unknown_fields_are_rejected_without_echoing_values() {
         kind: ResourceKind::Container,
         logical_name: "sql-1".into(),
         path: None,
+        intent: None,
         binding: Some(ResourceBinding {
             immutable_id: "container-id".into(),
             attributes_sha256: "b".repeat(64),
@@ -299,6 +301,7 @@ fn binding_survives_cleaning_and_combined_errors_are_sanitized() {
         kind: ResourceKind::Container,
         logical_name: "sql-1".into(),
         path: None,
+        intent: None,
         binding: Some(binding.clone()),
         state: ResourceState::Cleaning,
     };

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const JOURNAL_SCHEMA_VERSION: u32 = 2;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,6 +100,7 @@ pub enum ResourceKind {
     Network,
     Container,
     DataDirectory,
+    Directory,
     SecretFile,
     AvailabilityGroup,
     Database,
@@ -129,6 +130,7 @@ pub struct ResourceRecord {
     pub kind: ResourceKind,
     pub logical_name: String,
     pub path: Option<PathBuf>,
+    pub intent: Option<ResourceBinding>,
     pub binding: Option<ResourceBinding>,
     pub state: ResourceState,
 }
