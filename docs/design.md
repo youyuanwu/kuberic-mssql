@@ -329,21 +329,20 @@ permissions, transport and sample deadlines, freshness, cancellation, CLI
 output, and credential redaction. A dedicated server-free observer workflow
 runs these without provisioning PostgreSQL or Kubernetes.
 
-Live tests run in a separate native observation job alongside server-free checks.
-The native job runs on PRs, main-branch pushes and manual dispatches, with
-CI-configured automatic EULA acceptance for one disposable Ubuntu 24.04
-Enterprise Developer fixture for absence, denied permissions, invalid TLS and
+Live tests run in the shared validation job alongside server-free checks.
+The job runs on PRs, main-branch pushes and manual dispatches, with automatic
+EULA acceptance for one digest-pinned SQL Server 2025 Enterprise Developer
+container fixture for absence, denied permissions, invalid TLS and
 CLI output validation. Shared `just ci`/`provision`/`validate-live`/`cleanup`
-commands own installation, HADR/TLS/principal setup and cleanup outside the observer;
-they refuse unrelated existing installations and
-creates no AG. This does not enable runtime mutation or validate HA.
-The same ensure-ready operation is used locally: it preserves an already-running
-project fixture, starts/stops a verified stopped fixture under a captured systemd
-invocation/process generation, or bootstraps an empty host. Configured fixtures
-are never reset. A private ownership record lets cleanup distinguish borrowed,
-started and newly created resources. Local lifecycle checks are
+commands own image verification, container creation, HADR/TLS/principal setup
+and cleanup outside the observer. Tests and CLI remain host processes. The helper
+refuses unrelated or modified containers and creates no AG. This does not enable
+runtime mutation or validate HA. The same ensure-ready operation is used locally:
+it preserves an already-running exact fixture, starts/stops a verified stopped
+container, or creates/removes an absent one. A private ownership record lets
+cleanup distinguish borrowed, started and newly created containers. Lifecycle checks are
 test-environment safeguards, not production fencing attestation.
-That job must pin the engine image or native package, tools, and helper
+That job must pin the engine image, tools, and helper
 artifacts; accept the EULA explicitly; isolate credentials; and fail rather
 than skip when requested prerequisites are missing. Mutation support cannot be
 declared complete until live tests cover crash points before and after intent
@@ -352,7 +351,7 @@ reply, and routing publication.
 
 ## References
 
-- [Install SQL Server 2025 on Ubuntu](https://learn.microsoft.com/en-us/sql/linux/install-upgrade/quickstart-install-ubuntu?view=sql-server-ver17) — native Ubuntu 24.04 support starts at CU1
+- [Run SQL Server 2025 containers](https://learn.microsoft.com/en-us/sql/linux/install-upgrade/quickstart-install-docker?view=sql-server-ver17)
 - [`SERVERPROPERTY`](https://learn.microsoft.com/en-us/sql/t-sql/functions/serverproperty-transact-sql?view=sql-server-ver17) — SQL Server 2025 edition and EngineEdition identities
 - [Issue #80](https://github.com/youyuanwu/kuberic/issues/80)
 - [Level-triggered operator proposal](https://github.com/youyuanwu/kuberic/blob/main/docs/proposal/level-triggered-operator-design.md)

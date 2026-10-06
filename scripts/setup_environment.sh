@@ -31,6 +31,15 @@ if ! command -v cc >/dev/null; then
   sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential
 fi
 
+if ! command -v docker >/dev/null; then
+  sudo -n apt-get update -qq
+  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io
+fi
+if ! sudo -n docker version >/dev/null 2>&1; then
+  sudo -n systemctl enable --now docker
+  sudo -n docker version >/dev/null
+fi
+
 if ! command -v just >/dev/null || [[ "$(just --version)" != "just 1.21.0" ]]; then
   curl --fail --silent --show-error --location --retry 3 \
     https://github.com/casey/just/releases/download/1.21.0/just-1.21.0-x86_64-unknown-linux-musl.tar.gz \
