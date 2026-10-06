@@ -34,6 +34,25 @@ pub struct KubericMember {
     pub pvc_uid: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeMemberBinding {
+    pub ordinal: u8,
+    pub server_name: String,
+    pub container_id: String,
+    pub sql_start_unix_millis: i64,
+    pub native_replica_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTopologyBinding {
+    pub availability_group_id: String,
+    pub database_id: String,
+    pub recovery_fork_id: String,
+    pub members: [NativeMemberBinding; 3],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
@@ -56,12 +75,19 @@ pub enum ResourceKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "state")]
+#[serde(rename_all = "snake_case")]
 pub enum ResourceState {
     Intended,
-    Bound { immutable_id: String },
+    Bound,
     Cleaning,
     Removed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceBinding {
+    pub immutable_id: String,
+    pub attributes_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +96,7 @@ pub struct ResourceRecord {
     pub kind: ResourceKind,
     pub logical_name: String,
     pub path: Option<PathBuf>,
+    pub binding: Option<ResourceBinding>,
     pub state: ResourceState,
 }
 
@@ -79,6 +106,7 @@ pub struct OwnershipJournal {
     pub schema_version: u32,
     pub run: TopologyRun,
     pub state: RunState,
+    pub native_binding: Option<NativeTopologyBinding>,
     pub resources: Vec<ResourceRecord>,
 }
 
@@ -87,6 +115,48 @@ pub enum JournalError {
     Malformed,
     UnsupportedSchema(u32),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SanitizedFailure {
+    stage: &'static str,
+    category: &'static str,
+}
+
+impl SanitizedFailure {
+    pub const fn new(stage: &'static str, category: &'static str) -> Self {
+        Self { stage, category }
+    }
+}
+
+impl fmt::Display for SanitizedFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.stage, self.category)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CombinedFixtureError {
+    primary: SanitizedFailure,
+    cleanup: Vec<SanitizedFailure>,
+}
+
+impl CombinedFixtureError {
+    pub fn new(primary: SanitizedFailure, cleanup: Vec<SanitizedFailure>) -> Self {
+        Self { primary, cleanup }
+    }
+}
+
+impl fmt::Display for CombinedFixtureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.primary)?;
+        for cleanup in &self.cleanup {
+            write!(formatter, "; {cleanup}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Error for CombinedFixtureError {}
 
 impl fmt::Display for JournalError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -110,6 +180,7 @@ impl OwnershipJournal {
             schema_version: JOURNAL_SCHEMA_VERSION,
             run,
             state: RunState::Preparing,
+            native_binding: None,
             resources: Vec::new(),
         }
     }

@@ -1,13 +1,18 @@
+use std::ffi::CString;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::path::Path;
+use std::sync::Mutex;
 
 use kuberic_mssql_tests::three_replica::{
-    ACKNOWLEDGEMENT_SCHEMA_VERSION, FixtureConfig, FixtureConfigError, JOURNAL_SCHEMA_VERSION,
-    JournalError, KubericMember, LaunchAuthorization, OwnershipJournal, ResourceKind,
-    ResourcePolicy, ResourceRecord, ResourceState, RunState, SqlMember, StageDeadlines,
-    TopologyRun,
+    ACKNOWLEDGEMENT_SCHEMA_VERSION, CombinedFixtureError, FixtureConfig, FixtureConfigError,
+    JOURNAL_SCHEMA_VERSION, JournalError, KubericMember, LaunchAuthorization, OwnershipJournal,
+    PINNED_SQL_SERVER_IMAGE, ResourceBinding, ResourceKind, ResourcePolicy, ResourceRecord,
+    ResourceState, RunState, SanitizedFailure, SqlMember, StageDeadlines, TopologyRun,
 };
+
+static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
 fn write_acknowledgement(path: &Path, accepted: bool) {
     fs::write(
@@ -139,6 +144,11 @@ fn symlinks_and_changed_files_fail_closed() {
 
 #[test]
 fn ambient_legacy_acceptance_cannot_replace_the_required_file() {
+    let _guard = ENVIRONMENT_LOCK.lock().unwrap();
+    let previous = std::env::var_os("SQLSERVER_TEST_EULA_ACCEPTED");
+    unsafe {
+        std::env::set_var("SQLSERVER_TEST_EULA_ACCEPTED", "true");
+    }
     assert_eq!(
         FixtureConfig::new(
             Path::new("/tmp/kuberic-mssql-three-replica"),
@@ -146,6 +156,25 @@ fn ambient_legacy_acceptance_cannot_replace_the_required_file() {
         )
         .unwrap_err(),
         FixtureConfigError::AcknowledgementUnavailable
+    );
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("SQLSERVER_TEST_EULA_ACCEPTED", value),
+            None => std::env::remove_var("SQLSERVER_TEST_EULA_ACCEPTED"),
+        }
+    }
+}
+
+#[test]
+fn fifo_input_is_rejected_without_blocking() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("acknowledgement.fifo");
+    let path_bytes = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let result = unsafe { libc::mkfifo(path_bytes.as_ptr(), 0o600) };
+    assert_eq!(result, 0);
+    assert_eq!(
+        LaunchAuthorization::load(&path).unwrap_err(),
+        FixtureConfigError::AcknowledgementNotRegular
     );
 }
 
@@ -176,7 +205,16 @@ fn fixture_root_must_be_absolute() {
         FixtureConfig::new("relative/root", &path).unwrap_err(),
         FixtureConfigError::InvalidFixtureRoot
     );
-    FixtureConfig::new(directory.path().join("fixture"), &path).unwrap();
+    let config = FixtureConfig::new(directory.path().join("missing/fixture"), &path).unwrap();
+    assert!(config.root().is_absolute());
+    assert!(config.root().ends_with("missing/fixture"));
+    assert_eq!(config.image(), PINNED_SQL_SERVER_IMAGE);
+    assert_eq!(config.resources(), ResourcePolicy::default());
+    assert_eq!(config.deadlines(), StageDeadlines::default());
+    assert_eq!(
+        config.authorization().sql_server_environment(),
+        [("ACCEPT_EULA", "Y")]
+    );
 }
 
 #[test]
@@ -187,9 +225,11 @@ fn journal_round_trips_without_secret_values() {
         kind: ResourceKind::SecretFile,
         logical_name: "sa-password".into(),
         path: Some(directory.path().join("sa-password")),
-        state: ResourceState::Bound {
+        binding: Some(ResourceBinding {
             immutable_id: "device:1/inode:2".into(),
-        },
+            attributes_sha256: "a".repeat(64),
+        }),
+        state: ResourceState::Bound,
     });
     journal.state = RunState::Ready;
 
@@ -216,4 +256,51 @@ fn journal_rejects_unknown_or_unsupported_schemas() {
         OwnershipJournal::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err(),
         JournalError::Malformed
     );
+}
+
+#[test]
+fn nested_binding_unknown_fields_are_rejected_without_echoing_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut journal = OwnershipJournal::new(sample_run(directory.path()));
+    journal.resources.push(ResourceRecord {
+        kind: ResourceKind::Container,
+        logical_name: "sql-1".into(),
+        path: None,
+        binding: Some(ResourceBinding {
+            immutable_id: "container-id".into(),
+            attributes_sha256: "b".repeat(64),
+        }),
+        state: ResourceState::Cleaning,
+    });
+    let mut value: serde_json::Value = serde_json::from_slice(&journal.to_json().unwrap()).unwrap();
+    value["resources"][0]["binding"]["secret"] = serde_json::json!("actual-secret-value");
+    let error = OwnershipJournal::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+    assert_eq!(error, JournalError::Malformed);
+    assert!(!error.to_string().contains("actual-secret-value"));
+}
+
+#[test]
+fn binding_survives_cleaning_and_combined_errors_are_sanitized() {
+    let binding = ResourceBinding {
+        immutable_id: "container-id".into(),
+        attributes_sha256: "c".repeat(64),
+    };
+    let record = ResourceRecord {
+        kind: ResourceKind::Container,
+        logical_name: "sql-1".into(),
+        path: None,
+        binding: Some(binding.clone()),
+        state: ResourceState::Cleaning,
+    };
+    assert_eq!(record.binding, Some(binding));
+
+    let error = CombinedFixtureError::new(
+        SanitizedFailure::new("setup", "container creation failed"),
+        vec![SanitizedFailure::new("cleanup", "container removal failed")],
+    );
+    assert_eq!(
+        error.to_string(),
+        "setup: container creation failed; cleanup: container removal failed"
+    );
+    assert!(!error.to_string().contains("actual-secret-value"));
 }

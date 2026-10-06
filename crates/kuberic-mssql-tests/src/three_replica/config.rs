@@ -11,6 +11,10 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 pub const ACKNOWLEDGEMENT_SCHEMA_VERSION: u32 = 1;
+pub const PINNED_SQL_SERVER_IMAGE: &str = concat!(
+    "mcr.microsoft.com/mssql/server@",
+    "sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726"
+);
 const MAX_ACKNOWLEDGEMENT_BYTES: u64 = 4096;
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -194,10 +198,11 @@ impl Default for StageDeadlines {
 
 #[derive(Debug, Clone)]
 pub struct FixtureConfig {
-    pub root: PathBuf,
-    pub authorization: LaunchAuthorization,
-    pub resources: ResourcePolicy,
-    pub deadlines: StageDeadlines,
+    root: PathBuf,
+    authorization: LaunchAuthorization,
+    image: &'static str,
+    resources: ResourcePolicy,
+    deadlines: StageDeadlines,
 }
 
 impl FixtureConfig {
@@ -205,16 +210,34 @@ impl FixtureConfig {
         root: impl Into<PathBuf>,
         acknowledgement: impl AsRef<Path>,
     ) -> Result<Self, FixtureConfigError> {
-        let root = root.into();
-        if !root.is_absolute() {
-            return Err(FixtureConfigError::InvalidFixtureRoot);
-        }
+        let root = canonical_fixture_root(root.into())?;
         Ok(Self {
             root,
             authorization: LaunchAuthorization::load(acknowledgement)?,
+            image: PINNED_SQL_SERVER_IMAGE,
             resources: ResourcePolicy::default(),
             deadlines: StageDeadlines::default(),
         })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn authorization(&self) -> &LaunchAuthorization {
+        &self.authorization
+    }
+
+    pub fn image(&self) -> &'static str {
+        self.image
+    }
+
+    pub fn resources(&self) -> ResourcePolicy {
+        self.resources
+    }
+
+    pub fn deadlines(&self) -> StageDeadlines {
+        self.deadlines
     }
 }
 
@@ -263,7 +286,7 @@ fn read_acknowledgement(path: &Path) -> Result<(AcknowledgementSource, bool), Fi
 fn open_regular(path: &Path) -> Result<File, FixtureConfigError> {
     OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|error| {
             if error.raw_os_error() == Some(libc::ELOOP) {
@@ -272,4 +295,28 @@ fn open_regular(path: &Path) -> Result<File, FixtureConfigError> {
                 FixtureConfigError::AcknowledgementUnavailable
             }
         })
+}
+
+fn canonical_fixture_root(root: PathBuf) -> Result<PathBuf, FixtureConfigError> {
+    if !root.is_absolute() {
+        return Err(FixtureConfigError::InvalidFixtureRoot);
+    }
+    let mut missing = Vec::new();
+    let mut existing = root.as_path();
+    while !existing.exists() {
+        let name = existing
+            .file_name()
+            .ok_or(FixtureConfigError::InvalidFixtureRoot)?;
+        missing.push(name.to_os_string());
+        existing = existing
+            .parent()
+            .ok_or(FixtureConfigError::InvalidFixtureRoot)?;
+    }
+    let mut canonical = existing
+        .canonicalize()
+        .map_err(|_| FixtureConfigError::InvalidFixtureRoot)?;
+    for component in missing.into_iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
 }
