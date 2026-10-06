@@ -303,14 +303,20 @@ fn canonical_fixture_root(root: PathBuf) -> Result<PathBuf, FixtureConfigError> 
     }
     let mut missing = Vec::new();
     let mut existing = root.as_path();
-    while !existing.exists() {
-        let name = existing
-            .file_name()
-            .ok_or(FixtureConfigError::InvalidFixtureRoot)?;
-        missing.push(name.to_os_string());
-        existing = existing
-            .parent()
-            .ok_or(FixtureConfigError::InvalidFixtureRoot)?;
+    loop {
+        match existing.symlink_metadata() {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing
+                    .file_name()
+                    .ok_or(FixtureConfigError::InvalidFixtureRoot)?;
+                missing.push(name.to_os_string());
+                existing = existing
+                    .parent()
+                    .ok_or(FixtureConfigError::InvalidFixtureRoot)?;
+            }
+            Err(_) => return Err(FixtureConfigError::InvalidFixtureRoot),
+        }
     }
     let mut canonical = existing
         .canonicalize()

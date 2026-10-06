@@ -6,10 +6,11 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use kuberic_mssql_tests::three_replica::{
-    ACKNOWLEDGEMENT_SCHEMA_VERSION, CombinedFixtureError, FixtureConfig, FixtureConfigError,
-    JOURNAL_SCHEMA_VERSION, JournalError, KubericMember, LaunchAuthorization, OwnershipJournal,
-    PINNED_SQL_SERVER_IMAGE, ResourceBinding, ResourceKind, ResourcePolicy, ResourceRecord,
-    ResourceState, RunState, SanitizedFailure, SqlMember, StageDeadlines, TopologyRun,
+    ACKNOWLEDGEMENT_SCHEMA_VERSION, CombinedFixtureError, FailureCategory, FailureStage,
+    FixtureConfig, FixtureConfigError, JOURNAL_SCHEMA_VERSION, JournalError, KubericMember,
+    LaunchAuthorization, OwnershipJournal, PINNED_SQL_SERVER_IMAGE, ResourceBinding, ResourceKind,
+    ResourcePolicy, ResourceRecord, ResourceState, RunState, SanitizedFailure, SqlMember,
+    StageDeadlines, TopologyRun,
 };
 
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
@@ -215,6 +216,14 @@ fn fixture_root_must_be_absolute() {
         config.authorization().sql_server_environment(),
         [("ACCEPT_EULA", "Y")]
     );
+
+    let target = directory.path().join("missing-target");
+    let dangling = directory.path().join("dangling");
+    symlink(&target, &dangling).unwrap();
+    assert_eq!(
+        FixtureConfig::new(dangling.join("fixture"), &path).unwrap_err(),
+        FixtureConfigError::InvalidFixtureRoot
+    );
 }
 
 #[test]
@@ -235,7 +244,8 @@ fn journal_round_trips_without_secret_values() {
 
     let encoded = journal.to_json().unwrap();
     let text = String::from_utf8(encoded.clone()).unwrap();
-    assert!(!text.contains("actual-secret-value"));
+    assert!(text.contains("sa-password"));
+    assert!(!text.contains("\"secret_value\""));
     assert_eq!(OwnershipJournal::from_json(&encoded).unwrap(), journal);
 }
 
@@ -295,12 +305,14 @@ fn binding_survives_cleaning_and_combined_errors_are_sanitized() {
     assert_eq!(record.binding, Some(binding));
 
     let error = CombinedFixtureError::new(
-        SanitizedFailure::new("setup", "container creation failed"),
-        vec![SanitizedFailure::new("cleanup", "container removal failed")],
+        SanitizedFailure::new(FailureStage::Setup, FailureCategory::ContainerCreation),
+        vec![SanitizedFailure::new(
+            FailureStage::Cleanup,
+            FailureCategory::ContainerRemoval,
+        )],
     );
     assert_eq!(
         error.to_string(),
         "setup: container creation failed; cleanup: container removal failed"
     );
-    assert!(!error.to_string().contains("actual-secret-value"));
 }

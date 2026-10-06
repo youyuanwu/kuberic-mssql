@@ -117,13 +117,51 @@ pub enum JournalError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureStage {
+    Setup,
+    Test,
+    Cleanup,
+}
+
+impl fmt::Display for FailureStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Setup => "setup",
+            Self::Test => "test",
+            Self::Cleanup => "cleanup",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureCategory {
+    ContainerCreation,
+    ContainerRemoval,
+    OwnershipMismatch,
+    DeadlineExceeded,
+    SqlUnavailable,
+}
+
+impl fmt::Display for FailureCategory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ContainerCreation => "container creation failed",
+            Self::ContainerRemoval => "container removal failed",
+            Self::OwnershipMismatch => "ownership validation failed",
+            Self::DeadlineExceeded => "stage deadline exceeded",
+            Self::SqlUnavailable => "SQL Server unavailable",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SanitizedFailure {
-    stage: &'static str,
-    category: &'static str,
+    stage: FailureStage,
+    category: FailureCategory,
 }
 
 impl SanitizedFailure {
-    pub const fn new(stage: &'static str, category: &'static str) -> Self {
+    pub const fn new(stage: FailureStage, category: FailureCategory) -> Self {
         Self { stage, category }
     }
 }

@@ -6,7 +6,8 @@ pub use config::{
     LaunchAuthorization, PINNED_SQL_SERVER_IMAGE, ResourcePolicy, StageDeadlines,
 };
 pub use model::{
-    CombinedFixtureError, JOURNAL_SCHEMA_VERSION, JournalError, KubericMember, NativeMemberBinding,
-    NativeTopologyBinding, OwnershipJournal, ResourceBinding, ResourceKind, ResourceRecord,
-    ResourceState, RunState, SanitizedFailure, SqlMember, TopologyRun,
+    CombinedFixtureError, FailureCategory, FailureStage, JOURNAL_SCHEMA_VERSION, JournalError,
+    KubericMember, NativeMemberBinding, NativeTopologyBinding, OwnershipJournal, ResourceBinding,
+    ResourceKind, ResourceRecord, ResourceState, RunState, SanitizedFailure, SqlMember,
+    TopologyRun,
 };
