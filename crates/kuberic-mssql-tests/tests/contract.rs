@@ -6,7 +6,7 @@ use kuberic_mssql::{
     ObservationFailureKind, OperationEnvelope, OperationPayload, OperationRecord, OperationRequest,
     PinnedImage, PinnedPackage, ReplayDisposition, ReplicaDescriptor, ReplicaIdentity,
     SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT, SecretRef, SeedingMode, ServerName,
-    SqlIdentifier, SqlServerSupportConfig,
+    SqlIdentifier, SqlServerEulaAcknowledgement, SqlServerSupportConfig,
 };
 
 use std::num::NonZeroU32;
@@ -136,6 +136,28 @@ fn supported_profile_is_explicit_and_observe_only_by_default() {
     let config = supported_config();
     assert_eq!(config.mutation_mode, MutationMode::ObserveOnly);
     assert_eq!(config.validate(), Ok(()));
+}
+
+#[test]
+fn eula_acknowledgement_requires_an_explicit_affirmative_value() {
+    assert!(SqlServerEulaAcknowledgement::new(true).unwrap().accepted());
+    assert!(matches!(
+        SqlServerEulaAcknowledgement::new(false),
+        Err(ContractError::UnsupportedProfile {
+            field: "EULA acceptance",
+            ..
+        })
+    ));
+
+    let mut config = supported_config();
+    config.eula_accepted = false;
+    assert!(matches!(
+        config.validate(),
+        Err(ContractError::UnsupportedProfile {
+            field: "EULA acceptance",
+            ..
+        })
+    ));
 }
 
 #[test]
