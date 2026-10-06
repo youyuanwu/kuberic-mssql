@@ -23,6 +23,19 @@ class FixtureTests(unittest.TestCase):
     AG_NAME = fixture.AVAILABILITY_GROUP_PREFIX + "1" * 32
 
     def setUp(self):
+        environment = patch.dict(os.environ)
+        environment.start()
+        for name in [
+            "GITHUB_ACTIONS",
+            "GITHUB_ENV",
+            "GITHUB_PATH",
+            "RUNNER_ARCH",
+            "RUNNER_ENVIRONMENT",
+            "RUNNER_OS",
+            "RUNNER_TEMP",
+        ]:
+            os.environ.pop(name, None)
+        self.addCleanup(environment.stop)
         output = patch("sys.stdout", new=io.StringIO())
         output.start()
         self.addCleanup(output.stop)
