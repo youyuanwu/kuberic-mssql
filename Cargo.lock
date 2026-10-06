@@ -763,6 +763,7 @@ name = "kuberic-mssql-tests"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "futures",
  "kuberic-mssql",
  "kuberic-runtime",
  "libc",
@@ -771,8 +772,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tiberius",
  "tokio",
  "tokio-util",
+ "zeroize",
 ]
 
 [[package]]

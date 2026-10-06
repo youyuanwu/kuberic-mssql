@@ -85,6 +85,8 @@ pub struct AcknowledgementSource {
     device: u64,
     inode: u64,
     length: u64,
+    change_time_seconds: i64,
+    change_time_nanoseconds: i64,
     sha256: [u8; 32],
 }
 
@@ -277,6 +279,8 @@ fn read_acknowledgement(path: &Path) -> Result<(AcknowledgementSource, bool), Fi
             device: metadata.dev(),
             inode: metadata.ino(),
             length: metadata.len(),
+            change_time_seconds: metadata.ctime(),
+            change_time_nanoseconds: metadata.ctime_nsec(),
             sha256: digest.into(),
         },
         document.sql_server_eula.accepted,

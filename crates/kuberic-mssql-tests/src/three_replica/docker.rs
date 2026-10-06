@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use super::config::{PINNED_SQL_SERVER_IMAGE, ResourcePolicy};
 use super::process::{CommandSpec, ProcessErrorKind, ProcessRunner};
+use super::secrets::SecretValue;
 
 pub const SQL_SERVER_UID: u32 = 10001;
 pub const CONTAINER_MEMORY_BYTES: u64 = 3 * 1024 * 1024 * 1024;
@@ -123,6 +124,7 @@ impl ImageInspection {
 pub struct NetworkInspection {
     pub id: String,
     pub name: String,
+    pub driver: String,
     pub labels: BTreeMap<String, String>,
     pub attached_container_ids: Vec<String>,
 }
@@ -162,12 +164,15 @@ impl ContainerLimits {
 pub struct ContainerInspection {
     pub id: String,
     pub name: String,
+    pub hostname: String,
     pub image_id: String,
     pub labels: BTreeMap<String, String>,
     pub environment: Vec<String>,
     pub user: String,
     pub running: bool,
     pub restart_policy: String,
+    pub network_mode: String,
+    pub network_names: Vec<String>,
     pub mounts: Vec<ContainerMount>,
     pub ports: Vec<ContainerPort>,
     pub limits: ContainerLimits,
@@ -179,61 +184,186 @@ pub struct NetworkRequest {
     pub labels: OwnedLabels,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl NetworkRequest {
+    pub fn verify_inspection(&self, inspection: &NetworkInspection) -> Result<(), DockerError> {
+        if inspection.name != self.name
+            || inspection.driver != "bridge"
+            || !self.labels.matches(&inspection.labels)
+        {
+            return Err(DockerError::OwnershipMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct EnvironmentVariable {
+    key: String,
+    value: SecretValue,
+}
+
+impl fmt::Debug for EnvironmentVariable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EnvironmentVariable")
+            .field("key", &self.key)
+            .field("value", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl EnvironmentVariable {
+    pub fn new(key: impl Into<String>, value: SecretValue) -> Result<Self, DockerError> {
+        let key = key.into();
+        if key.is_empty()
+            || key.contains('=')
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(DockerError::InvalidRequest);
+        }
+        if value.expose().contains(['\0', '\n', '\r']) {
+            return Err(DockerError::InvalidRequest);
+        }
+        Ok(Self { key, value })
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub(crate) fn line(&self) -> String {
+        format!("{}={}", self.key, self.value.expose())
+    }
+
+    fn matches(&self, actual: &str) -> bool {
+        actual == self.line()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct ContainerRequest {
     pub name: String,
     pub hostname: String,
     pub image: String,
     pub network_name: String,
     pub labels: OwnedLabels,
-    pub environment: Vec<(String, String)>,
+    pub environment_file: PathBuf,
+    environment: Vec<EnvironmentVariable>,
     pub data_directory: PathBuf,
     pub limits: ContainerLimits,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlServerContainerSpec {
+    pub name: String,
+    pub hostname: String,
+    pub network_name: String,
+    pub data_directory: PathBuf,
+    pub environment_file: PathBuf,
+    pub sa_password: SecretValue,
+}
+
+impl fmt::Debug for ContainerRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContainerRequest")
+            .field("name", &self.name)
+            .field("hostname", &self.hostname)
+            .field("image", &self.image)
+            .field("network_name", &self.network_name)
+            .field("labels", &self.labels)
+            .field("environment_file", &self.environment_file)
+            .field(
+                "environment_keys",
+                &self
+                    .environment
+                    .iter()
+                    .map(EnvironmentVariable::key)
+                    .collect::<Vec<_>>(),
+            )
+            .field("data_directory", &self.data_directory)
+            .field("limits", &self.limits)
+            .finish()
+    }
+}
+
 impl ContainerRequest {
     pub fn sql_server(
-        name: impl Into<String>,
-        hostname: impl Into<String>,
-        network_name: impl Into<String>,
+        spec: SqlServerContainerSpec,
         labels: OwnedLabels,
-        data_directory: impl Into<PathBuf>,
         policy: ResourcePolicy,
         acceptance_environment: [(&'static str, &'static str); 1],
-    ) -> Self {
+    ) -> Result<Self, DockerError> {
         let mut environment = acceptance_environment
             .into_iter()
-            .map(|(key, value)| (key.to_owned(), value.to_owned()))
-            .collect::<Vec<_>>();
+            .map(|(key, value)| {
+                EnvironmentVariable::new(key, SecretValue::from_test(value.to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         environment.extend([
-            ("MSSQL_ENABLE_HADR".to_owned(), "1".to_owned()),
-            (
-                "MSSQL_MEMORY_LIMIT_MB".to_owned(),
-                policy.sql_server_memory_mb.to_string(),
-            ),
+            EnvironmentVariable::new("MSSQL_PID", SecretValue::from_test("EnterpriseDeveloper"))?,
+            EnvironmentVariable::new("MSSQL_SA_PASSWORD", spec.sa_password)?,
+            EnvironmentVariable::new("MSSQL_ENABLE_HADR", SecretValue::from_test("1"))?,
+            EnvironmentVariable::new(
+                "MSSQL_MEMORY_LIMIT_MB",
+                SecretValue::from_test(policy.sql_server_memory_mb.to_string()),
+            )?,
         ]);
-        Self {
-            name: name.into(),
-            hostname: hostname.into(),
+        validate_environment(&environment)?;
+        let hostname = spec.hostname;
+        if hostname.is_empty()
+            || hostname.len() > 15
+            || !hostname
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(DockerError::InvalidRequest);
+        }
+        Ok(Self {
+            name: spec.name,
+            hostname,
             image: PINNED_SQL_SERVER_IMAGE.to_owned(),
-            network_name: network_name.into(),
+            network_name: spec.network_name,
             labels,
             environment,
-            data_directory: data_directory.into(),
+            environment_file: spec.environment_file,
+            data_directory: spec.data_directory,
             limits: ContainerLimits::from_policy(policy),
-        }
+        })
+    }
+
+    pub fn environment_keys(&self) -> impl Iterator<Item = &str> {
+        self.environment.iter().map(EnvironmentVariable::key)
+    }
+
+    pub fn environment_file_contents(&self) -> String {
+        let mut value = self
+            .environment
+            .iter()
+            .map(EnvironmentVariable::line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        value.push('\n');
+        value
     }
 
     pub fn verify_inspection(
         &self,
         inspection: &ContainerInspection,
         expected_image_id: &str,
+        expected_running: bool,
     ) -> Result<(), DockerError> {
         if inspection.name != self.name
+            || inspection.hostname != self.hostname
             || inspection.image_id != expected_image_id
             || !self.labels.matches(&inspection.labels)
             || inspection.user != "mssql"
+            || inspection.running != expected_running
             || inspection.restart_policy != "no"
+            || inspection.network_mode != self.network_name
+            || inspection.network_names.as_slice() != [self.network_name.as_str()]
             || inspection.limits != self.limits
         {
             return Err(DockerError::OwnershipMismatch);
@@ -249,12 +379,11 @@ impl ContainerRequest {
         if inspection.mounts.as_slice() != [expected_mount] {
             return Err(DockerError::OwnershipMismatch);
         }
-        for (key, value) in &self.environment {
-            let expected = format!("{key}={value}");
+        for expected in &self.environment {
             if inspection
                 .environment
                 .iter()
-                .filter(|item| *item == &expected)
+                .filter(|item| expected.matches(item))
                 .count()
                 != 1
             {
@@ -264,7 +393,7 @@ impl ContainerRequest {
                 .environment
                 .iter()
                 .filter_map(|item| item.split_once('='))
-                .filter(|(actual_key, _)| actual_key == key)
+                .filter(|(actual_key, _)| actual_key == &expected.key())
                 .count()
                 != 1
             {
@@ -274,7 +403,7 @@ impl ContainerRequest {
         if inspection.ports.len() != 1
             || inspection.ports[0].container_port != 1433
             || inspection.ports[0].host_ip != "127.0.0.1"
-            || inspection.ports[0].host_port == 0
+            || (expected_running && inspection.ports[0].host_port == 0)
         {
             return Err(DockerError::OwnershipMismatch);
         }
@@ -289,6 +418,7 @@ pub enum DockerError {
     ImageMismatch,
     OwnershipMismatch,
     NotFound,
+    InvalidRequest,
 }
 
 impl fmt::Display for DockerError {
@@ -301,6 +431,7 @@ impl fmt::Display for DockerError {
             }
             Self::OwnershipMismatch => "Docker resource ownership does not match",
             Self::NotFound => "Docker resource was not found",
+            Self::InvalidRequest => "Docker launch request is invalid",
         })
     }
 }
@@ -530,6 +661,8 @@ impl<R: ProcessRunner> DockerApi for DockerCli<R> {
                 &request.limits.memory_swap_bytes.to_string(),
                 "--cpus",
                 "2",
+                "--env-file",
+                &request.environment_file.to_string_lossy(),
                 "--publish",
                 "127.0.0.1::1433",
                 "--mount",
@@ -540,9 +673,6 @@ impl<R: ProcessRunner> DockerApi for DockerCli<R> {
             ]);
         for (key, value) in request.labels.as_map() {
             command = command.args(["--label", &format!("{key}={value}")]);
-        }
-        for (key, value) in &request.environment {
-            command = command.args(["--env", &format!("{key}={value}")]);
         }
         self.runner
             .run(&command.arg(&request.image))
@@ -562,7 +692,7 @@ impl<R: ProcessRunner> DockerApi for DockerCli<R> {
         run_empty(
             &self.runner,
             self.command("stop owned SQL Server container", timeout)
-                .args(["container", "stop", "--time", "30", id]),
+                .args(["container", "stop", "--time", "10", id]),
         )
     }
 
@@ -659,6 +789,7 @@ fn parse_network_inspection(text: &str) -> Result<NetworkInspection, DockerError
     Ok(NetworkInspection {
         id: string_at(&value, &["Id"])?,
         name: string_at(&value, &["Name"])?,
+        driver: string_at(&value, &["Driver"])?,
         labels: map_at(&value, &["Labels"])?,
         attached_container_ids,
     })
@@ -700,15 +831,48 @@ fn parse_container_inspection(text: &str) -> Result<ContainerInspection, DockerE
             });
         }
     }
+    if ports.is_empty() {
+        for (container_port, bindings) in object_at(&value, &["HostConfig", "PortBindings"])? {
+            let container_port = container_port
+                .split('/')
+                .next()
+                .ok_or(DockerError::MalformedInspection)?
+                .parse()
+                .map_err(|_| DockerError::MalformedInspection)?;
+            let bindings = bindings
+                .as_array()
+                .ok_or(DockerError::MalformedInspection)?;
+            for binding in bindings {
+                let host_port = string_at(binding, &["HostPort"])?;
+                ports.push(ContainerPort {
+                    container_port,
+                    host_ip: string_at(binding, &["HostIp"])?,
+                    host_port: if host_port.is_empty() {
+                        0
+                    } else {
+                        host_port
+                            .parse()
+                            .map_err(|_| DockerError::MalformedInspection)?
+                    },
+                });
+            }
+        }
+    }
     Ok(ContainerInspection {
         id: string_at(&value, &["Id"])?,
         name,
+        hostname: string_at(&value, &["Config", "Hostname"])?,
         image_id: string_at(&value, &["Image"])?,
         labels: map_at(&value, &["Config", "Labels"])?,
         environment: strings_at(&value, &["Config", "Env"])?,
         user: string_at(&value, &["Config", "User"])?,
         running: bool_at(&value, &["State", "Running"])?,
         restart_policy: string_at(&value, &["HostConfig", "RestartPolicy", "Name"])?,
+        network_mode: string_at(&value, &["HostConfig", "NetworkMode"])?,
+        network_names: object_at(&value, &["NetworkSettings", "Networks"])?
+            .keys()
+            .cloned()
+            .collect(),
         mounts,
         ports,
         limits: ContainerLimits {
@@ -717,6 +881,30 @@ fn parse_container_inspection(text: &str) -> Result<ContainerInspection, DockerE
             nano_cpus: u64_at(&value, &["HostConfig", "NanoCpus"])?,
         },
     })
+}
+
+fn validate_environment(environment: &[EnvironmentVariable]) -> Result<(), DockerError> {
+    let expected = [
+        "ACCEPT_EULA",
+        "MSSQL_PID",
+        "MSSQL_SA_PASSWORD",
+        "MSSQL_ENABLE_HADR",
+        "MSSQL_MEMORY_LIMIT_MB",
+    ];
+    if environment.len() != expected.len() {
+        return Err(DockerError::InvalidRequest);
+    }
+    for key in expected {
+        if environment
+            .iter()
+            .filter(|variable| variable.key() == key)
+            .count()
+            != 1
+        {
+            return Err(DockerError::InvalidRequest);
+        }
+    }
+    Ok(())
 }
 
 fn first_inspection(text: &str) -> Result<Value, DockerError> {

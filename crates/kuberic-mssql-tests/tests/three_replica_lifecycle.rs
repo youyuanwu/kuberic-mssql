@@ -20,10 +20,11 @@ use kuberic_mssql_tests::three_replica::{
     PINNED_SQL_SERVER_IMAGE, PreflightError, ProcessError, ProcessErrorKind, ProcessResult,
     ProcessRunner, ReconcileError, ResourceBinding, ResourceKind, ResourceObservation,
     ResourcePolicy, ResourceRecord, ResourceState, RunState, SQL_SERVER_UID, SanitizedFailure,
-    SqlMember, TopologyRun, acquire_root_lock, cgroup_v2_available_memory,
-    cgroup_v2_effective_cpu_quota, cgroup_v2_path_from, cleanup, combine_with_cleanup,
-    effective_cpu_count, inspect_member_directory, parse_acl_evidence, parse_cpu_list,
-    prepare_member_directory, reconcile, run_preflight, verify_member_directory,
+    SecretValue, SqlMember, SqlServerContainerSpec, TopologyRun, acquire_root_lock,
+    cgroup_v2_available_memory, cgroup_v2_effective_cpu_quota, cgroup_v2_effective_cpuset,
+    cgroup_v2_path_from, cleanup, combine_with_cleanup, effective_cpu_count,
+    inspect_member_directory, parse_acl_evidence, parse_cpu_list, prepare_member_directory,
+    reconcile, run_preflight, verify_member_directory,
 };
 
 fn effective_uid() -> u32 {
@@ -313,6 +314,11 @@ fn cgroup_v2_limits_use_all_ancestors_and_fail_closed() {
     assert_eq!(
         cgroup_v2_effective_cpu_quota(&mount, &current).unwrap(),
         Some((100_000, 100_000))
+    );
+    fs::write(mount.join("cpuset.cpus.effective"), "0-7").unwrap();
+    assert_eq!(
+        cgroup_v2_effective_cpuset(&mount, &current).unwrap(),
+        Some(8)
     );
 
     fs::write(mount.join("memory.max"), "6000").unwrap();
@@ -620,15 +626,21 @@ fn container_request_freezes_limits_mount_labels_and_acceptance() {
     let data = directory.path().join("data");
     fs::create_dir(&data).unwrap();
     let labels = OwnedLabels::container("run-1", 1);
+    let environment_file = directory.path().join("container.env");
     let request = ContainerRequest::sql_server(
-        "sql-1",
-        "sql-1",
-        "network-1",
+        SqlServerContainerSpec {
+            name: "sql-1".to_owned(),
+            hostname: "sql-1".to_owned(),
+            network_name: "network-1".to_owned(),
+            data_directory: data.clone(),
+            environment_file,
+            sa_password: SecretValue::from_test("unit-test-password-Aa1!"),
+        },
         labels.clone(),
-        &data,
         ResourcePolicy::default(),
         [("ACCEPT_EULA", "Y")],
-    );
+    )
+    .unwrap();
     assert_eq!(request.limits.memory_bytes, 3 * 1024 * 1024 * 1024);
     assert_eq!(
         request.limits.memory_swap_bytes,
@@ -637,25 +649,27 @@ fn container_request_freezes_limits_mount_labels_and_acceptance() {
     assert_eq!(request.limits.nano_cpus, 2_000_000_000);
     assert_eq!(
         request
-            .environment
-            .iter()
-            .filter(|(key, value)| key == "ACCEPT_EULA" && value == "Y")
+            .environment_keys()
+            .filter(|key| *key == "ACCEPT_EULA")
             .count(),
         1
     );
     let inspection = ContainerInspection {
         id: "container-id".to_owned(),
         name: "sql-1".to_owned(),
+        hostname: "sql-1".to_owned(),
         image_id: "image-id".to_owned(),
         labels: labels.as_map(),
         environment: request
-            .environment
-            .iter()
-            .map(|(key, value)| format!("{key}={value}"))
+            .environment_file_contents()
+            .lines()
+            .map(str::to_owned)
             .collect(),
         user: "mssql".to_owned(),
         running: false,
         restart_policy: "no".to_owned(),
+        network_mode: "network-1".to_owned(),
+        network_names: vec!["network-1".to_owned()],
         mounts: vec![ContainerMount {
             source: data.canonicalize().unwrap(),
             destination: PathBuf::from("/var/opt/mssql"),
@@ -668,12 +682,16 @@ fn container_request_freezes_limits_mount_labels_and_acceptance() {
         }],
         limits: ContainerLimits::from_policy(ResourcePolicy::default()),
     };
-    request.verify_inspection(&inspection, "image-id").unwrap();
+    request
+        .verify_inspection(&inspection, "image-id", false)
+        .unwrap();
 
     let mut wrong = inspection;
     wrong.limits.memory_swap_bytes += 1;
     assert_eq!(
-        request.verify_inspection(&wrong, "image-id").unwrap_err(),
+        request
+            .verify_inspection(&wrong, "image-id", false)
+            .unwrap_err(),
         DockerError::OwnershipMismatch
     );
 }

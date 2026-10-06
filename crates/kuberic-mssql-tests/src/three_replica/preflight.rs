@@ -286,11 +286,9 @@ impl HostProbe for LocalHostProbe {
             .and_then(|value| parse_cpu_list(value).ok())
             .ok_or(PreflightError::Unverifiable)?;
         let cgroup = cgroup_v2_path()?;
-        let cpuset = fs::read_to_string(cgroup.join("cpuset.cpus.effective"))
-            .map_err(|_| PreflightError::Unverifiable)
-            .and_then(|value| parse_cpu_list(value.trim()))?;
+        let cpuset = cgroup_v2_effective_cpuset(Path::new("/sys/fs/cgroup"), &cgroup)?;
         let quota = cgroup_v2_effective_cpu_quota(Path::new("/sys/fs/cgroup"), &cgroup)?;
-        Ok(effective_cpu_count(affinity, Some(cpuset), quota))
+        Ok(effective_cpu_count(affinity, cpuset, quota))
     }
 
     fn available_space_bytes(&self, path: &Path) -> Result<u64, PreflightError> {
@@ -532,6 +530,7 @@ pub fn cgroup_v2_effective_cpu_quota(
             Err(error) if path == mount && error.kind() == std::io::ErrorKind::NotFound => {
                 continue;
             }
+
             Err(_) => return Err(PreflightError::Unverifiable),
         };
         let value = value.trim();
@@ -563,6 +562,21 @@ pub fn cgroup_v2_effective_cpu_quota(
         }
     }
     Ok(effective)
+}
+
+pub fn cgroup_v2_effective_cpuset(
+    mount: &Path,
+    current: &Path,
+) -> Result<Option<u32>, PreflightError> {
+    for path in cgroup_v2_hierarchy(mount, current)? {
+        match fs::read_to_string(path.join("cpuset.cpus.effective")) {
+            Ok(value) if !value.trim().is_empty() => return parse_cpu_list(value.trim()).map(Some),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(PreflightError::Unverifiable),
+        }
+    }
+    Ok(None)
 }
 
 fn cgroup_v2_hierarchy(mount: &Path, current: &Path) -> Result<Vec<PathBuf>, PreflightError> {

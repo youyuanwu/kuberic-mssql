@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +42,37 @@ pub struct NativeMemberBinding {
     pub container_id: String,
     pub sql_start_unix_millis: i64,
     pub native_replica_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SqlMemberIncarnation {
+    pub ordinal: u8,
+    pub server_name: String,
+    pub container_id: String,
+    pub sql_start_unix_millis: i64,
+}
+
+impl SqlMemberIncarnation {
+    pub fn verify(
+        &self,
+        container_id: &str,
+        sql_start_unix_millis: i64,
+    ) -> Result<(), IncarnationError> {
+        if self.container_id != container_id {
+            return Err(IncarnationError::ContainerReplaced);
+        }
+        if self.sql_start_unix_millis != sql_start_unix_millis {
+            return Err(IncarnationError::SqlRestarted);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncarnationError {
+    ContainerReplaced,
+    SqlRestarted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +139,7 @@ pub struct OwnershipJournal {
     pub schema_version: u32,
     pub run: TopologyRun,
     pub state: RunState,
+    pub sql_member_incarnations: Option<[SqlMemberIncarnation; 3]>,
     pub native_binding: Option<NativeTopologyBinding>,
     pub resources: Vec<ResourceRecord>,
 }
@@ -236,6 +268,7 @@ impl OwnershipJournal {
             schema_version: JOURNAL_SCHEMA_VERSION,
             run,
             state: RunState::Preparing,
+            sql_member_incarnations: None,
             native_binding: None,
             resources: Vec::new(),
         }
