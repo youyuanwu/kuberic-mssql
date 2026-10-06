@@ -20,10 +20,10 @@ use kuberic_mssql_tests::three_replica::{
     PINNED_SQL_SERVER_IMAGE, PreflightError, ProcessError, ProcessErrorKind, ProcessResult,
     ProcessRunner, ReconcileError, ResourceBinding, ResourceKind, ResourceObservation,
     ResourcePolicy, ResourceRecord, ResourceState, RunState, SQL_SERVER_UID, SanitizedFailure,
-    SqlMember, TopologyRun, acquire_root_lock, available_memory, cgroup_v2_available_memory,
-    cgroup_v2_effective_cpu_quota, cleanup, combine_with_cleanup, effective_cpu_count,
-    inspect_member_directory, parse_acl_evidence, parse_cpu_list, prepare_member_directory,
-    reconcile, run_preflight, verify_member_directory,
+    SqlMember, TopologyRun, acquire_root_lock, cgroup_v2_available_memory,
+    cgroup_v2_effective_cpu_quota, cgroup_v2_path_from, cleanup, combine_with_cleanup,
+    effective_cpu_count, inspect_member_directory, parse_acl_evidence, parse_cpu_list,
+    prepare_member_directory, reconcile, run_preflight, verify_member_directory,
 };
 
 fn effective_uid() -> u32 {
@@ -285,14 +285,6 @@ impl DockerApi for FakeDocker {
 
 #[test]
 fn cgroup_memory_and_cpu_thresholds_use_the_effective_minimum() {
-    assert_eq!(
-        available_memory(20 * 1024, Some(12 * 1024), Some(3 * 1024)),
-        9 * 1024
-    );
-    assert_eq!(
-        available_memory(8 * 1024, Some(20 * 1024), Some(1)),
-        8 * 1024
-    );
     assert_eq!(parse_cpu_list("0-2,5,8-9").unwrap(), 6);
     assert_eq!(effective_cpu_count(8, Some(4), Some((250_000, 100_000))), 2);
     assert_eq!(effective_cpu_count(8, Some(1), None), 1);
@@ -305,8 +297,8 @@ fn cgroup_v2_limits_use_all_ancestors_and_fail_closed() {
     let team = mount.join("team");
     let current = team.join("job");
     fs::create_dir_all(&current).unwrap();
+    fs::write(mount.join("cgroup.controllers"), "cpu memory").unwrap();
     for (path, memory_max, memory_current, cpu_max) in [
-        (&mount, "20000", "1024", "400000 100000"),
         (&team, "12000", "5000", "250000 100000"),
         (&current, "max", "6000", "100000 100000"),
     ] {
@@ -323,6 +315,18 @@ fn cgroup_v2_limits_use_all_ancestors_and_fail_closed() {
         Some((100_000, 100_000))
     );
 
+    fs::write(mount.join("memory.max"), "6000").unwrap();
+    fs::write(mount.join("memory.current"), "1000").unwrap();
+    fs::write(mount.join("cpu.max"), "50000 100000").unwrap();
+    assert_eq!(
+        cgroup_v2_available_memory(&mount, &current, 50_000).unwrap(),
+        5_000
+    );
+    assert_eq!(
+        cgroup_v2_effective_cpu_quota(&mount, &current).unwrap(),
+        Some((50_000, 100_000))
+    );
+
     fs::write(team.join("memory.max"), "not-a-limit").unwrap();
     assert_eq!(
         cgroup_v2_available_memory(&mount, &current, 50_000).unwrap_err(),
@@ -330,9 +334,42 @@ fn cgroup_v2_limits_use_all_ancestors_and_fail_closed() {
     );
     fs::write(team.join("memory.max"), "12000").unwrap();
     fs::remove_file(mount.join("cpu.max")).unwrap();
+    fs::create_dir(mount.join("cpu.max")).unwrap();
     assert_eq!(
         cgroup_v2_effective_cpu_quota(&mount, &current).unwrap_err(),
         PreflightError::Unverifiable
+    );
+    fs::remove_dir(mount.join("cpu.max")).unwrap();
+    fs::remove_file(team.join("cpu.max")).unwrap();
+    assert_eq!(
+        cgroup_v2_effective_cpu_quota(&mount, &current).unwrap_err(),
+        PreflightError::Unverifiable
+    );
+}
+
+#[test]
+fn cgroup_v1_and_unknown_hierarchies_fail_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let mount = directory.path().join("cgroup");
+    fs::create_dir(&mount).unwrap();
+    let v1 = "5:memory:/docker/job\n4:cpu,cpuacct:/docker/job\n";
+    assert_eq!(
+        cgroup_v2_path_from(v1, &mount).unwrap_err(),
+        PreflightError::UnsupportedCgroupV1
+    );
+
+    fs::write(mount.join("cgroup.controllers"), "cpu memory").unwrap();
+    assert_eq!(
+        cgroup_v2_path_from(v1, &mount).unwrap_err(),
+        PreflightError::UnsupportedCgroupV1
+    );
+    assert_eq!(
+        cgroup_v2_path_from("malformed", &mount).unwrap_err(),
+        PreflightError::Unverifiable
+    );
+    assert_eq!(
+        cgroup_v2_path_from("0::/team/job", &mount).unwrap(),
+        mount.join("team/job")
     );
 }
 
@@ -782,6 +819,40 @@ fn bounded_process_runner_terminates_descendants_that_retain_pipes() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(unsafe { libc::kill(descendant, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+}
+
+#[test]
+fn bounded_process_runner_times_out_continuous_descendant_output() {
+    let started = Instant::now();
+    let error = BoundedProcessRunner
+        .run(
+            &CommandSpec::new(
+                "/bin/sh",
+                "continuous descendant writer",
+                Duration::from_secs(2),
+            )
+            .args([
+                "-c",
+                "while :; do printf 'continuous-writer-output-0123456789\\n' >&2; done & wait",
+            ]),
+        )
+        .unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(error.kind(), ProcessErrorKind::Timeout);
+    assert!(error.diagnostic().len() <= 65 * 1024);
+    assert!(error.child().terminated);
+    assert!(error.child().reaped);
+
+    let group = i32::try_from(error.child().pid.unwrap()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while unsafe { libc::kill(-group, 0) } == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(unsafe { libc::kill(-group, 0) }, -1);
     assert_eq!(
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::ESRCH)

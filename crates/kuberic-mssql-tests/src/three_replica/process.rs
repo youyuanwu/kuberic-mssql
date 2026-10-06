@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+const MAX_DRAIN_BYTES_PER_PASS: usize = 64 * 1024;
 const WAIT_INTERVAL: Duration = Duration::from_millis(10);
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(250);
@@ -236,8 +237,18 @@ impl ProcessRunner for BoundedProcessRunner {
         let mut stdout_open = true;
         let mut stderr_open = true;
         let status = loop {
-            drain_pipe(&mut stdout, &mut stdout_bytes, &mut stdout_open);
-            drain_pipe(&mut stderr, &mut stderr_bytes, &mut stderr_open);
+            drain_pipe(
+                &mut stdout,
+                &mut stdout_bytes,
+                &mut stdout_open,
+                execution_deadline,
+            );
+            drain_pipe(
+                &mut stderr,
+                &mut stderr_bytes,
+                &mut stderr_open,
+                execution_deadline,
+            );
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() < execution_deadline => thread::sleep(WAIT_INTERVAL),
@@ -357,18 +368,20 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-fn drain_pipe(reader: &mut impl Read, retained: &mut Vec<u8>, open: &mut bool) {
+fn drain_pipe(reader: &mut impl Read, retained: &mut Vec<u8>, open: &mut bool, deadline: Instant) {
     if !*open {
         return;
     }
     let mut buffer = [0_u8; 8192];
-    loop {
+    let mut drained = 0;
+    while drained < MAX_DRAIN_BYTES_PER_PASS && Instant::now() < deadline {
         match reader.read(&mut buffer) {
             Ok(0) => {
                 *open = false;
                 break;
             }
             Ok(count) => {
+                drained += count;
                 let remaining = MAX_DIAGNOSTIC_BYTES.saturating_sub(retained.len());
                 retained.extend_from_slice(&buffer[..count.min(remaining)]);
             }
@@ -392,8 +405,8 @@ fn drain_until(
     deadline: Instant,
 ) {
     while (*stdout_open || *stderr_open) && Instant::now() < deadline {
-        drain_pipe(stdout, stdout_bytes, stdout_open);
-        drain_pipe(stderr, stderr_bytes, stderr_open);
+        drain_pipe(stdout, stdout_bytes, stdout_open, deadline);
+        drain_pipe(stderr, stderr_bytes, stderr_open, deadline);
         if *stdout_open || *stderr_open {
             thread::sleep(WAIT_INTERVAL);
         }

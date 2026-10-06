@@ -49,6 +49,7 @@ pub enum PreflightError {
     DockerUnavailable,
     DockerNotLocal,
     DockerCapabilities,
+    UnsupportedCgroupV1,
     ImageUnavailable,
     ImageMismatch,
     InsufficientMemory { available: u64, required: u64 },
@@ -73,6 +74,9 @@ impl fmt::Display for PreflightError {
             Self::DockerNotLocal => formatter.write_str("Docker engine must be local"),
             Self::DockerCapabilities => {
                 formatter.write_str("Docker cannot enforce exact memory, no-swap, and CPU limits")
+            }
+            Self::UnsupportedCgroupV1 => {
+                formatter.write_str("cgroup v1 is unsupported for resource verification")
             }
             Self::ImageUnavailable => formatter.write_str("pinned SQL Server image is unavailable"),
             Self::ImageMismatch => {
@@ -268,23 +272,8 @@ impl HostProbe for LocalHostProbe {
                     .and_then(|kilobytes| kilobytes.checked_mul(1024))
             })
             .ok_or(PreflightError::Unverifiable)?;
-        if let Some(cgroup) = cgroup_v2_path()? {
-            return cgroup_v2_available_memory(
-                Path::new("/sys/fs/cgroup"),
-                &cgroup,
-                host_available,
-            );
-        }
-        let memory = cgroup_v1_path("memory");
-        let (limit, current) = if memory.is_some() {
-            (
-                read_optional_number(memory.as_deref(), "memory.limit_in_bytes"),
-                read_optional_number(memory.as_deref(), "memory.usage_in_bytes"),
-            )
-        } else {
-            (None, None)
-        };
-        Ok(available_memory(host_available, limit, current))
+        let cgroup = cgroup_v2_path()?;
+        cgroup_v2_available_memory(Path::new("/sys/fs/cgroup"), &cgroup, host_available)
     }
 
     fn effective_cpus(&self) -> Result<u32, PreflightError> {
@@ -296,28 +285,12 @@ impl HostProbe for LocalHostProbe {
             .map(str::trim)
             .and_then(|value| parse_cpu_list(value).ok())
             .ok_or(PreflightError::Unverifiable)?;
-        let (cpuset, quota) = if let Some(cgroup) = cgroup_v2_path()? {
-            let cpuset = fs::read_to_string(cgroup.join("cpuset.cpus.effective"))
-                .map_err(|_| PreflightError::Unverifiable)
-                .and_then(|value| parse_cpu_list(value.trim()))?;
-            (
-                Some(cpuset),
-                cgroup_v2_effective_cpu_quota(Path::new("/sys/fs/cgroup"), &cgroup)?,
-            )
-        } else {
-            let cpuset = cgroup_v1_path("cpuset")
-                .and_then(|path| fs::read_to_string(path.join("cpuset.cpus")).ok())
-                .and_then(|value| parse_cpu_list(value.trim()).ok());
-            let cpu = cgroup_v1_path("cpu");
-            let quota = read_signed_number(cpu.as_deref(), "cpu.cfs_quota_us")
-                .filter(|quota| *quota >= 0)
-                .and_then(|quota| {
-                    read_optional_number(cpu.as_deref(), "cpu.cfs_period_us")
-                        .map(|period| (quota as u64, period))
-                });
-            (cpuset, quota)
-        };
-        Ok(effective_cpu_count(affinity, cpuset, quota))
+        let cgroup = cgroup_v2_path()?;
+        let cpuset = fs::read_to_string(cgroup.join("cpuset.cpus.effective"))
+            .map_err(|_| PreflightError::Unverifiable)
+            .and_then(|value| parse_cpu_list(value.trim()))?;
+        let quota = cgroup_v2_effective_cpu_quota(Path::new("/sys/fs/cgroup"), &cgroup)?;
+        Ok(effective_cpu_count(affinity, Some(cpuset), quota))
     }
 
     fn available_space_bytes(&self, path: &Path) -> Result<u64, PreflightError> {
@@ -404,17 +377,6 @@ impl<R: ProcessRunner> AclProbe for CommandAclProbe<R> {
     }
 }
 
-pub fn available_memory(
-    host_available: u64,
-    cgroup_limit: Option<u64>,
-    cgroup_current: Option<u64>,
-) -> u64 {
-    match (cgroup_limit, cgroup_current) {
-        (Some(limit), Some(current)) => host_available.min(limit.saturating_sub(current)),
-        _ => host_available,
-    }
-}
-
 pub fn effective_cpu_count(
     affinity_count: u32,
     cpuset_count: Option<u32>,
@@ -471,58 +433,48 @@ fn existing_ancestor(path: &Path) -> Result<PathBuf, PreflightError> {
     }
 }
 
-fn cgroup_v2_path() -> Result<Option<PathBuf>, PreflightError> {
+fn cgroup_v2_path() -> Result<PathBuf, PreflightError> {
     let cgroup =
         fs::read_to_string("/proc/self/cgroup").map_err(|_| PreflightError::Unverifiable)?;
+    cgroup_v2_path_from(&cgroup, Path::new("/sys/fs/cgroup"))
+}
+
+pub fn cgroup_v2_path_from(cgroup: &str, mount: &Path) -> Result<PathBuf, PreflightError> {
     let mut relative = None;
+    let mut legacy = false;
     for line in cgroup.lines() {
         let mut fields = line.splitn(3, ':');
         let hierarchy = fields.next().ok_or(PreflightError::Unverifiable)?;
         let controllers = fields.next().ok_or(PreflightError::Unverifiable)?;
         let path = fields.next().ok_or(PreflightError::Unverifiable)?;
-        if hierarchy == "0"
-            && (!controllers.is_empty() || path.is_empty() || relative.replace(path).is_some())
-        {
+        if hierarchy.is_empty() || path.is_empty() || !path.starts_with('/') {
             return Err(PreflightError::Unverifiable);
         }
+        if hierarchy == "0" {
+            if !controllers.is_empty() || relative.replace(path).is_some() {
+                return Err(PreflightError::Unverifiable);
+            }
+        } else {
+            if controllers.is_empty() {
+                return Err(PreflightError::Unverifiable);
+            }
+            legacy = true;
+        }
     }
-    if Path::new("/sys/fs/cgroup/cgroup.controllers").exists() && relative.is_none() {
+    let unified_mount = mount.join("cgroup.controllers").exists();
+    if legacy {
+        return Err(PreflightError::UnsupportedCgroupV1);
+    }
+    if let Some(relative) = relative {
+        if !unified_mount {
+            return Err(PreflightError::Unverifiable);
+        }
+        return Ok(mount.join(relative.trim_start_matches('/')));
+    }
+    if unified_mount {
         return Err(PreflightError::Unverifiable);
     }
-    Ok(relative.map(|relative| Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'))))
-}
-
-fn cgroup_v1_path(controller: &str) -> Option<PathBuf> {
-    let cgroup = fs::read_to_string("/proc/self/cgroup").ok()?;
-    let relative = cgroup.lines().find_map(|line| {
-        let (_, rest) = line.split_once(':')?;
-        let (controllers, path) = rest.split_once(':')?;
-        controllers
-            .split(',')
-            .any(|candidate| candidate == controller)
-            .then_some(path)
-    })?;
-    Some(
-        Path::new("/sys/fs/cgroup")
-            .join(controller)
-            .join(relative.trim_start_matches('/')),
-    )
-}
-
-fn read_optional_number(path: Option<&Path>, file: &str) -> Option<u64> {
-    fs::read_to_string(path?.join(file))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-}
-
-fn read_signed_number(path: Option<&Path>, file: &str) -> Option<i64> {
-    fs::read_to_string(path?.join(file))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+    Err(PreflightError::Unverifiable)
 }
 
 fn acl_output_has_users(output: &str, host_uid: u32, sql_uid: u32) -> bool {
@@ -542,9 +494,26 @@ pub fn cgroup_v2_available_memory(
 ) -> Result<u64, PreflightError> {
     let mut available = host_available;
     for path in cgroup_v2_hierarchy(mount, current)? {
-        let maximum = read_cgroup_limit(&path.join("memory.max"))?;
+        let maximum_path = path.join("memory.max");
+        let current_path = path.join("memory.current");
+        let maximum = if path == mount {
+            match read_optional_cgroup_limit(&maximum_path)? {
+                Some(maximum) => maximum,
+                None => {
+                    if current_path
+                        .try_exists()
+                        .map_err(|_| PreflightError::Unverifiable)?
+                    {
+                        return Err(PreflightError::Unverifiable);
+                    }
+                    continue;
+                }
+            }
+        } else {
+            read_cgroup_limit(&maximum_path)?
+        };
+        let current = read_required_u64(&current_path)?;
         if let Some(maximum) = maximum {
-            let current = read_required_u64(&path.join("memory.current"))?;
             available = available.min(maximum.saturating_sub(current));
         }
     }
@@ -557,8 +526,14 @@ pub fn cgroup_v2_effective_cpu_quota(
 ) -> Result<Option<(u64, u64)>, PreflightError> {
     let mut effective = None;
     for path in cgroup_v2_hierarchy(mount, current)? {
-        let value =
-            fs::read_to_string(path.join("cpu.max")).map_err(|_| PreflightError::Unverifiable)?;
+        let cpu_max = path.join("cpu.max");
+        let value = match fs::read_to_string(&cpu_max) {
+            Ok(value) => value,
+            Err(error) if path == mount && error.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(_) => return Err(PreflightError::Unverifiable),
+        };
         let value = value.trim();
         let mut fields = value.split_whitespace();
         let quota = fields.next().ok_or(PreflightError::Unverifiable)?;
@@ -611,6 +586,18 @@ fn cgroup_v2_hierarchy(mount: &Path, current: &Path) -> Result<Vec<PathBuf>, Pre
 
 fn read_cgroup_limit(path: &Path) -> Result<Option<u64>, PreflightError> {
     let value = fs::read_to_string(path).map_err(|_| PreflightError::Unverifiable)?;
+    parse_cgroup_limit(&value)
+}
+
+fn read_optional_cgroup_limit(path: &Path) -> Result<Option<Option<u64>>, PreflightError> {
+    match fs::read_to_string(path) {
+        Ok(value) => parse_cgroup_limit(&value).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(PreflightError::Unverifiable),
+    }
+}
+
+fn parse_cgroup_limit(value: &str) -> Result<Option<u64>, PreflightError> {
     let value = value.trim();
     if value == "max" {
         Ok(None)

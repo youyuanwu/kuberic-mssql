@@ -707,9 +707,7 @@ fn verify_private_root(root: &Path) -> Result<(), MemberDirectoryError> {
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(MemberDirectoryError::Symlink);
     }
-    if metadata.uid() != rustix::process::getuid().as_raw()
-        || metadata.permissions().mode() & 0o077 != 0
-    {
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
         return Err(MemberDirectoryError::Permissions);
     }
     Ok(())

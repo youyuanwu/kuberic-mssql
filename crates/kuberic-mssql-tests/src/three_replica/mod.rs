@@ -35,8 +35,8 @@ pub use ownership::{
 };
 pub use preflight::{
     AclProbe, CommandAclProbe, HostPlatform, HostProbe, LocalHostProbe, PreflightError,
-    PreflightReport, available_memory, cgroup_v2_available_memory, cgroup_v2_effective_cpu_quota,
-    effective_cpu_count, parse_cpu_list, run_preflight,
+    PreflightReport, cgroup_v2_available_memory, cgroup_v2_effective_cpu_quota,
+    cgroup_v2_path_from, effective_cpu_count, parse_cpu_list, run_preflight,
 };
 pub use process::{
     BoundedProcessRunner, ChildDisposition, CommandSpec, ProcessError, ProcessErrorKind,
