@@ -6,11 +6,11 @@
 
 use std::path::PathBuf;
 
-use sqlserver_replicated::instance::SqlServerInstanceManager;
-use sqlserver_replicated::observation::InstanceSnapshot;
-use sqlserver_replicated::runtime_config::ObserverConfig;
-use sqlserver_replicated::tds::TdsExecutor;
-use sqlserver_replicated::{NativeRole, Observation, ObservationFailureKind, PinnedImage};
+use kuberic_mssql::instance::SqlServerInstanceManager;
+use kuberic_mssql::observation::InstanceSnapshot;
+use kuberic_mssql::runtime_config::ObserverConfig;
+use kuberic_mssql::tds::TdsExecutor;
+use kuberic_mssql::{NativeRole, Observation, ObservationFailureKind, PinnedImage};
 
 const LOCAL_SERVER: &str = "kuberic-mssql-observer";
 const PEER_SERVERS: [&str; 2] = ["kuberic-mssql-peer-1", "kuberic-mssql-peer-2"];

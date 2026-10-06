@@ -1,0 +1,23 @@
+[package]
+name = "kuberic-mssql-tests"
+description = "Integration and live-test infrastructure for kuberic-mssql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "sqlserver-observer-test"
+path = "src/bin/sqlserver-observer.rs"
+test = false
+
+[dependencies]
+async-trait.workspace = true
+kuberic-mssql = { workspace = true, features = ["kuberic-testing"] }
+kuberic-runtime = { workspace = true, features = ["testing"] }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-util = { workspace = true, features = ["compat", "rt"] }

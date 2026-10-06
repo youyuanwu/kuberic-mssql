@@ -2,6 +2,22 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use kuberic_mssql::kuberic::{
+    ObservationClock, SqlServerObservationSource, SqlServerReplicator, SqlServerReplicatorFactory,
+    SqlServerService, SqlServerServiceConfig,
+};
+use kuberic_mssql::observation::{
+    AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, DatabaseSnapshot, InstanceMetadata,
+    InstanceSnapshot, LocalReplicaSnapshot, NativeProvenance, RecoveryLineageObservation,
+    ReplicaSnapshot,
+};
+use kuberic_mssql::runtime_config::ObserverConfig;
+use kuberic_mssql::runtime_error::RuntimeError;
+use kuberic_mssql::{
+    AvailabilityGroupIdentity, AvailabilityGroupName, ConfigurationSequence, DatabaseIdentity,
+    DecimalProgress, Guid, NativeProgress, NativeRole, Observation, ObservationFailure,
+    ObservationFailureKind, ReplicaIdentity, ServerName, SqlIdentifier,
+};
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::application::{OpenMode, StatefulServiceReplica};
 use kuberic_runtime::protocol::types::{
@@ -16,22 +32,6 @@ use kuberic_runtime::replicator::{
 use kuberic_runtime::testing::hosting::PodRuntime;
 use kuberic_runtime::testing::sqlite_store::SqliteStore;
 use kuberic_runtime::testing::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
-use sqlserver_replicated::kuberic::{
-    ObservationClock, SqlServerObservationSource, SqlServerReplicator, SqlServerReplicatorFactory,
-    SqlServerService, SqlServerServiceConfig,
-};
-use sqlserver_replicated::observation::{
-    AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, DatabaseSnapshot, InstanceMetadata,
-    InstanceSnapshot, LocalReplicaSnapshot, NativeProvenance, RecoveryLineageObservation,
-    ReplicaSnapshot,
-};
-use sqlserver_replicated::runtime_config::ObserverConfig;
-use sqlserver_replicated::runtime_error::RuntimeError;
-use sqlserver_replicated::{
-    AvailabilityGroupIdentity, AvailabilityGroupName, ConfigurationSequence, DatabaseIdentity,
-    DecimalProgress, Guid, NativeProgress, NativeRole, Observation, ObservationFailure,
-    ObservationFailureKind, ReplicaIdentity, ServerName, SqlIdentifier,
-};
 
 const OBSERVED_AT: u64 = 1_000;
 const MAX_AGE: u64 = 100;

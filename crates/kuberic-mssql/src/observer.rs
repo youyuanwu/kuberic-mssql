@@ -1,20 +1,16 @@
-mod output;
-#[cfg(test)]
-mod watch_tests;
-
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use crate::ObservationFailureKind;
+use crate::executor::SqlExecutor;
+use crate::instance::{SqlServerInstanceManager, unix_millis};
+use crate::monitor::{ObservationReport, SqlServerMonitor};
+use crate::output::OutputWriter;
+use crate::runtime_config::ObserverConfig;
+use crate::runtime_error::RuntimeError;
+use crate::tds::TdsExecutor;
 use clap::Parser;
-use output::OutputWriter;
-use sqlserver_replicated::ObservationFailureKind;
-use sqlserver_replicated::executor::SqlExecutor;
-use sqlserver_replicated::instance::{SqlServerInstanceManager, unix_millis};
-use sqlserver_replicated::monitor::{ObservationReport, SqlServerMonitor};
-use sqlserver_replicated::runtime_config::ObserverConfig;
-use sqlserver_replicated::runtime_error::RuntimeError;
-use sqlserver_replicated::tds::TdsExecutor;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -29,8 +25,7 @@ struct Args {
     watch: bool,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+pub async fn run_from_env() -> ExitCode {
     match run(Args::parse()).await {
         Ok(code) => code,
         Err(error) => {
@@ -69,7 +64,8 @@ async fn run(args: Args) -> Result<ExitCode, RuntimeError> {
     .await
 }
 
-async fn run_watch<E: SqlExecutor + 'static>(
+#[doc(hidden)]
+pub async fn run_watch<E: SqlExecutor + 'static>(
     manager: SqlServerInstanceManager<E>,
     mut write: impl AsyncFnMut(ObservationReport) -> Result<(), RuntimeError>,
     shutdown: impl Future<Output = Result<(), RuntimeError>>,

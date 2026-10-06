@@ -1,4 +1,4 @@
-use sqlserver_replicated::{
+use kuberic_mssql::{
     AvailabilityGroupIdentity, AvailabilityGroupName, AvailabilityMode, ClusterType,
     ConfigurationSequence, ContractError, DatabaseIdentity, DatabaseLineage, DecimalProgress,
     DestructiveApproval, Edition, Endpoint, EngineArtifact, FailoverMode, FenceReference, Guid,

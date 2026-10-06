@@ -1,30 +1,26 @@
-mod common;
-#[path = "common/tds.rs"]
-mod tds_peer;
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use kuberic_mssql::executor::{SqlExecutor, SqlSession};
+use kuberic_mssql::instance::SqlServerInstanceManager;
+use kuberic_mssql::monitor::{ObservationReport, SqlServerMonitor};
+use kuberic_mssql::observation::InstanceSnapshot;
+use kuberic_mssql::runtime_config::ObserverConfig;
+use kuberic_mssql::runtime_error::RuntimeError;
+use kuberic_mssql::tds::TdsExecutor;
+use kuberic_mssql::{DecimalProgress, Observation, ObservationFailureKind};
+use kuberic_mssql_tests::{Fixture, tds as tds_peer};
 use serde_json::json;
-use sqlserver_replicated::executor::{SqlExecutor, SqlSession};
-use sqlserver_replicated::instance::SqlServerInstanceManager;
-use sqlserver_replicated::monitor::{ObservationReport, SqlServerMonitor};
-use sqlserver_replicated::observation::InstanceSnapshot;
-use sqlserver_replicated::runtime_config::ObserverConfig;
-use sqlserver_replicated::runtime_error::RuntimeError;
-use sqlserver_replicated::tds::TdsExecutor;
-use sqlserver_replicated::{DecimalProgress, Observation, ObservationFailureKind};
 use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use common::Fixture;
-
 #[test]
 fn documented_example_is_a_valid_observe_only_configuration() {
-    let config = ObserverConfig::from_json(include_bytes!("../observer.example.json")).unwrap();
+    let config =
+        ObserverConfig::from_json(include_bytes!("../../../observer.example.json")).unwrap();
     assert_eq!(config.target().availability_group.as_str(), "kuberic-ag");
     assert_eq!(config.connection().endpoint().port(), 1433);
 }

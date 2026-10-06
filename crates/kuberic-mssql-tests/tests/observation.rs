@@ -1,18 +1,18 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use async_trait::async_trait;
-use serde_json::Value;
-use sqlserver_replicated::executor::{QueryRow, SqlSession};
-use sqlserver_replicated::observation::{
+use kuberic_mssql::executor::{QueryRow, SqlSession};
+use kuberic_mssql::observation::{
     AvailabilityGroupSnapshot, InstanceSnapshot, NativeProvenance, ObservationTarget,
     RecoveryLineageObservation, observe_session,
 };
-use sqlserver_replicated::query::ReadQuery;
-use sqlserver_replicated::runtime_error::RuntimeError;
-use sqlserver_replicated::{
+use kuberic_mssql::query::ReadQuery;
+use kuberic_mssql::runtime_error::RuntimeError;
+use kuberic_mssql::{
     AvailabilityGroupName, NativeRole, Observation, ObservationFailureKind, ReplicaIdentity,
     ServerName,
 };
+use serde_json::Value;
 
 const AG: &str = "11111111-1111-4111-8111-111111111111";
 const LOCAL: &str = "22222222-2222-4222-8222-222222222222";

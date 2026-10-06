@@ -731,7 +731,9 @@ class FixtureTests(unittest.TestCase):
             args = command.call_args.args[1]
             env = command.call_args.kwargs["env"]
             self.assertEqual(args[0], "/custom/cargo")
-            self.assertEqual(args[1:3], ["test", "--locked"])
+            self.assertEqual(
+                args[1:5], ["test", "--locked", "-p", "kuberic-mssql-tests"]
+            )
             self.assertEqual(env["SQLSERVER_TEST_IMAGE"], fixture.IMAGE)
             self.assertNotIn("SQLSERVER_LIVE_AG_CONFIG", env)
             self.assertNotIn("SQLSERVER_TEST_PACKAGE_VERSION", env)
@@ -832,6 +834,8 @@ class FixtureTests(unittest.TestCase):
                     "/custom/cargo",
                     "build",
                     "--locked",
+                    "-p",
+                    "kuberic-mssql",
                     "--bin",
                     "sqlserver-observer",
                 ],
