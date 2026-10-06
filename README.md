@@ -1,6 +1,6 @@
 # Kuberic MSSQL
 
-The observe-only runtime connects to an **already provisioned** SQL Server 2022
+The observe-only runtime connects to an **already provisioned** SQL Server 2025
 Linux x86-64 instance and reports native HA evidence. It does not deploy a
 container, accept an EULA, start or restart `sqlservr`, create an AG, change a
 role, renew a write lease, or execute any mutation command.
@@ -14,8 +14,12 @@ Kubernetes HA integration or an automatic failover implementation. The
 ## Run the observer
 
 Provision the instance separately, explicitly accepting the SQL Server EULA
-and using a digest-pinned SQL Server 2022 image. Developer edition is for
-non-production use only. Enable HADR and install a TLS server certificate whose
+and using a digest-pinned SQL Server 2025 image or an exact native package
+version with its SHA-256 recorded. Use Enterprise Developer edition
+(`MSSQL_PID=EnterpriseDeveloper`) for non-production fixtures; Standard Developer
+does not provide the full-AG profile. Enterprise is the future production profile.
+SQL Server 2022 and other engine major versions are rejected.
+Enable HADR and install a TLS server certificate whose
 SAN matches the configured connection host. Connect directly to each instance,
 not an AG listener, load balancer, or read-only routing endpoint.
 
@@ -59,6 +63,28 @@ failure records at the `TLS/TDS login` stage; the connection is discarded and
 watch mode retries. Check both the peer protocol and TLS trust configuration
 when that record reports a driver panic. No trust or encryption check is bypassed.
 
+### Native Ubuntu 24.04 fixtures
+
+SQL Server 2025 CU1 or later supports native installation on Ubuntu 24.04
+x86-64. Microsoft's [Ubuntu installation guide](https://learn.microsoft.com/en-us/sql/linux/install-upgrade/quickstart-install-ubuntu?view=sql-server-ver17)
+provides the signed `mssql-server-2025` repository. Install a selected exact
+`mssql-server` package version, record the package archive's SHA-256, and use
+`/opt/mssql/bin/mssql-conf setup` for explicit edition/EULA setup.
+The engine executable is `/opt/mssql/bin/sqlservr`; no container is required.
+
+Provisioning remains external to this crate. Configure HADR, verified TLS,
+separate observation credentials and permissions before running the observer.
+An absent-AG fixture needs no AG creation, join, seeding or failover. A present-AG
+fixture must be separately provisioned by its owner. Native installation does
+not add process management or Kuberic controller integration to the observer.
+
+Keep local fixture listeners on loopback and restrict credentials/private keys.
+SQL Server needs at least 2 GiB of memory to start; set an explicit engine memory
+limit and stop laboratory fixtures when not in use. Do not take over an existing
+host SQL Server service or assume different database directories alone isolate
+multiple instances. A native fixture uses the same JSON configuration, dedicated
+principal and verified-TLS observation path as a container fixture.
+
 ### Configuration
 
 The example contains all configuration fields. Optional values default to:
@@ -89,7 +115,7 @@ required metadata permissions. Insufficient permissions are a failed attempt,
 not evidence that an AG or database does not exist.
 
 The observation principal needs server-level access to the selected HA,
-database recovery, host, and seeding DMVs. In particular, SQL Server 2022
+database recovery, host, and seeding DMVs. In particular, SQL Server 2025
 requires `VIEW SERVER PERFORMANCE STATE`; metadata visibility also requires
 `VIEW ANY DEFINITION`, `VIEW ANY DATABASE`, and `VIEW SERVER STATE`. Grant
 only the observation permissions listed by the capability query, not AG
@@ -199,14 +225,86 @@ authenticated command protocol.
 
 Ordinary tests need neither SQL Server nor Kubernetes:
 
+The same bootstrap script is used by CI and local runs. It reuses matching
+installed tools and installs only missing/mismatched prerequisites: the pinned
+Rust toolchain/components, compiler tools and checksum-pinned `just` 1.21.0.
+CI retains `actions-rust-lang/setup-rust-toolchain@v2`; the bootstrap reuses its
+prepared toolchain.
+
+```bash
+bash scripts/setup_environment.sh
+```
+
+On Ubuntu 24.04, `sudo apt-get install just` is also supported. Recipes put the
+standard user-local Rust/just directories on `PATH`.
+
+```bash
+just --list
+just build
+just check
+just test
+just test-ci-helpers
+```
+
+Plain `just` runs `check`: formatting, strict Clippy, ordinary Rust tests and
+server-free CI helper tests. Builds default to one job; an explicitly supplied
+`CARGO_BUILD_JOBS` is preserved. The underlying Cargo commands remain available:
+
 ```bash
 cargo fmt -- --check
 cargo test --locked --all-features
 cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
-The dedicated SQL Server observer CI workflow runs these server-free checks.
-It does not claim live SQL Server validation.
+The `justfile` is the shared interface for every repository-owned CI step.
+The workflow checks out the repository, prepares Rust, runs the shared bootstrap,
+then invokes `just ci`. Local runs use that same command:
+
+```bash
+just ci /absolute/path/to/fixture-directory
+# Alternatively configure once:
+export SQLSERVER_FIXTURE_DIR=/absolute/path/to/fixture-directory
+just ci
+```
+
+`ci` runs shared setup, server-free checks, build, fixture readiness, live cases,
+CLI verification and ownership-aware cleanup. `just check` remains the
+server-free-only command. Individual phases are also shared:
+
+```bash
+just provision /absolute/path/to/fixture-directory  # ensure readiness; no tests
+just test-live /absolute/path/to/fixture-directory
+just validate-live /absolute/path/to/fixture-directory  # ensure + tests + cleanup
+just cleanup /absolute/path/to/fixture-directory
+```
+
+### Native CI validation
+
+The native SQL Server 2025 observation job runs on every pull request,
+main-branch push and manual `CI` dispatch. The shared fixture helper supplies
+`SQLSERVER_TEST_EULA_ACCEPTED=true` to live tests and sets `ACCEPT_EULA=Y`
+when provisioning its disposable non-production Enterprise Developer fixture.
+This CI deployment policy does not enable EULA acceptance or provisioning in the
+observer, and does not grant production licensing rights.
+
+The shared job uses a disposable GitHub-hosted `ubuntu-24.04` x86-64 runner, a pinned
+`mssql-server` package version/SHA-256 and a checksum-pinned SQL client.
+The same provisioning operation runs locally and in CI. An empty host/fixture
+can be provisioned; unrelated existing SQL Server installation/storage or an
+occupied SQL port is refused. It provisions one loopback-only, 2 GiB-limited engine with
+HADR, verified TLS and separate allowed/denied observation principals.
+Credentials are generated per run, kept in private temporary files, and never
+passed in arguments or published as artifacts.
+
+The job exercises absent-AG observation, permission denial, invalid-CA rejection
+and the actual CLI's fresh SQL Server 2025 output. It creates no AG and makes
+no join, seeding, role, lease-renewal or failover changes. An always-run cleanup
+step stops the owned fixture and removes its credentials; the disposable runner
+is the final containment boundary. This is native observation validation, not
+three-replica AG or HA validation. CI uses its generated runner-temporary fixture
+directory and disposes only files it created there. Local runs retain fixture files
+for reuse. The command implementation and test selection are identical; only
+lifecycle retention policy differs.
 
 Live observation tests are explicitly ignored by default. They require
 externally provisioned, isolated SQL Server fixtures, mounted credentials,
@@ -216,20 +314,97 @@ never credential contents):
 
 | Variable | Required fixture or acknowledgement |
 |---|---|
-| `SQLSERVER_TEST_EULA_ACCEPTED` | `true`, attesting the fixture owner accepted the EULA |
-| `SQLSERVER_TEST_IMAGE` | The actual fixture engine image reference with `@sha256:` digest |
+| `SQLSERVER_TEST_EULA_ACCEPTED` | `true`, supplied automatically by shared `just` recipes and the fixture helper; set explicitly only for direct Cargo invocation |
+| `SQLSERVER_TEST_IMAGE` | Container fixture engine image reference with `@sha256:` digest; unset for native fixtures |
+| `SQLSERVER_TEST_PACKAGE_VERSION` | Native fixture's exact `mssql-server` package version, e.g. `17.0.4006.2-1`; unset for containers |
+| `SQLSERVER_TEST_PACKAGE_SHA256` | Native package archive's 64-character lowercase SHA-256; unset for containers |
 | `SQLSERVER_LIVE_ABSENT_CONFIG` | Absolute config path for a supported HADR-enabled instance without the requested AG |
 | `SQLSERVER_LIVE_AG_CONFIG` | Absolute config path for a preconfigured supported EXTERNAL AG |
 | `SQLSERVER_LIVE_DENIED_CONFIG` | Config with a valid login/TLS connection but missing observation permissions |
 | `SQLSERVER_LIVE_BAD_TLS_CONFIG` | Config for a reachable instance with a mismatched CA or TLS hostname |
 
-The image acknowledgement is fixture-owner metadata, not container attestation
-through TDS. Image pinning and EULA acceptance are the provisioning owner's
-responsibility. Once those fixtures are configured:
+Set exactly one image reference or complete native-package version/SHA-256 pair.
+The artifact acknowledgement is fixture-owner metadata, not installation
+attestation through TDS. Artifact pinning and EULA acceptance are the provisioning
+owner's responsibility. Once those fixtures are configured:
+
+```bash
+just test-live      # absent AG, permission denial, invalid CA
+just test-live-all  # also requires a preconfigured EXTERNAL AG
+just test-live-cli /absolute/path/to/observation.json
+just verify-live-cli /absolute/path/to/fresh-observation.json
+```
+
+These recipes use the exported fixture variables above and automatically supply
+the test EULA acknowledgement under the repository's fixture policy. They do not
+install, start or stop SQL Server, change its license setup, or create an AG. Start the fixture
+separately and wait for verified TLS/login readiness before running them;
+stop laboratory instances afterward. Missing prerequisites fail the requested
+live tests instead of silently skipping them.
+
+`test-live-cli` builds the observer, reads `SQLSERVER_LIVE_ABSENT_CONFIG`, writes
+the report to the supplied path and runs `verify-live-cli` only after a successful
+observation. Both CLI recipes verify the CI-pinned Enterprise Developer engine's
+exact version and native output shape; they are not generic verifiers for other
+builds. They work locally without GitHub runner variables.
+
+### Reuse a configured local fixture
+
+For an already provisioned native Ubuntu 24.04 fixture, one command runs the same
+live cases and CLI validation without GitHub environment variables:
+
+```bash
+just validate-live /absolute/path/to/fixture-directory
+```
+
+The private fixture directory must contain `absent.json`, `denied.json`,
+`bad-tls.json`, their separate credential files, `ca.crt`, `bad-ca.crt`,
+`server.crt`, and the pinned `sqlcmd` executable. Configurations must target
+`localhost:1433` and reference files within that directory.
+The helper supplies the test EULA acknowledgement automatically; no caller
+environment-variable prefix is needed. The already provisioned engine's edition,
+license setup and credentials are unchanged.
+
+The shared provisioning operation verifies the installed package, service's loopback/HADR/TLS/memory
+settings, and the server certificate's binding to this project fixture before any
+service change. It then verifies native identity and TLS/login readiness.
+If SQL Server is already running, installation, setup, certificate generation and
+credential changes are skipped, and the service is left running afterward.
+If the verified fixture is stopped, provision starts it and records its captured
+systemd invocation/process generation. Validation cleanup stops only that captured
+generation after testing, including test failure or
+interruption. Replacement generations are refused during cleanup. Credentials,
+configuration and database storage are retained.
+
+Concurrent local fixture runners are refused. Trusted administrators must not change
+the SQL Server service while validation runs; these fixture checks are not a
+production fencing protocol. Already configured fixtures are never reinstalled,
+reinitialized or given new credentials. Fresh provisioning on an empty host accepts
+the EULA for Enterprise Developer and creates only the observation fixture, never an AG.
+Incomplete setup and unrelated installations fail explicitly rather than being
+silently adopted or reset.
+
+Without an explicit directory or `SQLSERVER_FIXTURE_DIR`, CI uses
+`$RUNNER_TEMP/sqlserver-observer`; local runs use
+`~/.local/state/kuberic-mssql/fixture`. If a local engine was previously configured
+elsewhere, supply its existing private fixture directory; it is not discovered or
+adopted automatically.
+
+Direct test commands remain available:
 
 ```bash
 cargo nextest list --profile external --run-ignored only
 cargo test --locked --test live_observation -- --ignored
+```
+
+For a native instance without an AG, run only its provisioned case:
+
+```bash
+SQLSERVER_TEST_EULA_ACCEPTED=true \
+SQLSERVER_TEST_PACKAGE_VERSION=17.0.4006.2-1 \
+SQLSERVER_TEST_PACKAGE_SHA256="$FIXTURE_PACKAGE_SHA256" \
+SQLSERVER_LIVE_ABSENT_CONFIG=/absolute/path/to/observer.json \
+cargo test --locked --test live_observation live_absent_availability_group -- --ignored
 ```
 
 An explicitly requested live test fails if any of its prerequisites are

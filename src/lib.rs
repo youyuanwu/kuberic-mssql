@@ -24,7 +24,7 @@ pub use operation::{
 };
 pub use types::{
     AvailabilityGroupIdentity, AvailabilityGroupName, DatabaseIdentity, DatabaseLineage,
-    DecimalProgress, Endpoint, Guid, NativeProgress, NativeRole, Observation, ObservationFailure,
-    ObservationFailureKind, OpaqueId, PinnedImage, ReplicaDescriptor, ReplicaIdentity, SecretRef,
-    ServerName, SqlIdentifier,
+    DecimalProgress, Endpoint, EngineArtifact, Guid, NativeProgress, NativeRole, Observation,
+    ObservationFailure, ObservationFailureKind, OpaqueId, PinnedImage, PinnedPackage,
+    ReplicaDescriptor, ReplicaIdentity, SecretRef, ServerName, SqlIdentifier,
 };

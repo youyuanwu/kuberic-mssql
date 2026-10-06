@@ -19,7 +19,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
-#[command(about = "Observe an existing SQL Server 2022 instance; never modifies AG state")]
+#[command(about = "Observe an existing SQL Server 2025 instance; never modifies AG state")]
 struct Args {
     /// JSON configuration containing target identity and mounted Secret file paths.
     #[arg(long)]

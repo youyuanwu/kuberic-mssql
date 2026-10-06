@@ -96,7 +96,7 @@ fn set(row: &mut QueryRow, name: &str, value: Option<&str>) {
 
 fn permissions() -> QueryRow {
     row(&[
-        ("product_major_version", Some("16")),
+        ("product_major_version", Some("17")),
         ("view_server_state", Some("1")),
         ("view_server_performance_state", Some("1")),
         ("view_any_definition", Some("1")),
@@ -124,9 +124,9 @@ fn anchor(present: bool) -> QueryRow {
     let mut result = row(&[
         ("server_name", Some("SQL-0")),
         ("property_server_name", Some("sql-0")),
-        ("product_version", Some("16.0.4225.2")),
-        ("product_major_version", Some("16")),
-        ("edition", Some("Developer Edition (64-bit)")),
+        ("product_version", Some("17.0.4006.2")),
+        ("product_major_version", Some("17")),
+        ("edition", Some("Enterprise Developer Edition (64-bit)")),
         ("engine_edition", Some("3")),
         ("is_hadr_enabled", Some("1")),
         ("host_platform", Some("Linux")),
@@ -484,8 +484,12 @@ fn group(snapshot: &InstanceSnapshot) -> &AvailabilityGroupSnapshot {
 async fn observes_supported_instance_native_identities_and_unhealthy_replica_facts() {
     let snapshot = success(present_script()).await;
     assert_eq!(snapshot.instance.server_name.as_str(), "sql-0");
-    assert_eq!(snapshot.instance.product_version, "16.0.4225.2");
-    assert_eq!(snapshot.instance.edition, "Developer Edition (64-bit)");
+    assert_eq!(snapshot.instance.product_version, "17.0.4006.2");
+    assert_eq!(snapshot.instance.product_major_version, 17);
+    assert_eq!(
+        snapshot.instance.edition,
+        "Enterprise Developer Edition (64-bit)"
+    );
     assert_eq!(snapshot.instance.host_platform, "Linux");
     assert_eq!(snapshot.instance.architecture, "x86_64");
     assert!(snapshot.instance.hadr_enabled);
@@ -578,11 +582,14 @@ async fn external_cluster_descriptors_cannot_override_an_unsupported_numeric_typ
 }
 
 #[tokio::test]
-async fn supports_real_developer_and_enterprise_display_names_with_engine_edition_cross_check() {
+async fn supports_enterprise_developer_and_enterprise_names_with_engine_edition_cross_check() {
     for edition in [
-        "Developer",
-        "Developer Edition",
-        "Developer Edition (64-bit)",
+        "Developer Enterprise",
+        "Developer Enterprise Edition",
+        "Developer Enterprise Edition (64-bit)",
+        "Enterprise Developer",
+        "Enterprise Developer Edition",
+        "Enterprise Developer Edition (64-bit)",
         "Enterprise",
         "Enterprise Edition",
         "Enterprise Edition (64-bit)",
@@ -596,9 +603,16 @@ async fn supports_real_developer_and_enterprise_display_names_with_engine_editio
     }
     for (edition, engine_edition) in [
         ("Standard Edition (64-bit)", "2"),
+        ("Standard Developer Edition (64-bit)", "2"),
+        ("Developer Standard Edition (64-bit)", "2"),
         ("Enterprise Evaluation Edition (64-bit)", "3"),
         ("Express Edition (64-bit)", "4"),
         ("Developer Edition (64-bit)", "2"),
+        ("Developer Edition (64-bit)", "3"),
+        ("Enterprise Developer Edition (64-bit)", "2"),
+        ("Developer Enterprise Edition (64-bit)", "2"),
+        ("Standard Developer Edition (64-bit)", "3"),
+        ("Developer Standard Edition (64-bit)", "3"),
         ("Enterprise Edition (64-bit)", "5"),
         ("Enterprise Edition unrecognized suffix", "3"),
     ] {
@@ -619,13 +633,20 @@ async fn supports_real_developer_and_enterprise_display_names_with_engine_editio
 
 #[tokio::test]
 async fn rejects_unsupported_capabilities_even_when_the_ag_is_absent() {
-    for major in ["15", "17"] {
+    for major in ["15", "16", "18"] {
         let mut script = absent_script();
         set(
             &mut rows_mut(&mut script, ReadQuery::Permissions, 0)[0],
             "product_major_version",
             Some(major),
         );
+        failure(script, ObservationFailureKind::Unsupported).await;
+        let mut script = absent_script();
+        change_rows(&mut script, ReadQuery::Anchor, |row| {
+            let version = format!("{major}.0.4006.2");
+            set(row, "product_version", Some(&version));
+            set(row, "product_major_version", Some(major));
+        });
         failure(script, ObservationFailureKind::Unsupported).await;
     }
     for (column, value) in [
@@ -1078,7 +1099,7 @@ async fn every_anchor_change_including_role_server_restart_or_native_guid_is_inc
         ("server_name", "sql-other"),
         ("property_server_name", "sql-other"),
         ("sqlserver_start_time", "2026-08-01T10:00:01"),
-        ("product_version", "16.0.4225.3"),
+        ("product_version", "17.0.4006.3"),
         ("edition", "Enterprise Edition (64-bit)"),
         ("is_hadr_enabled", "0"),
         ("group_name", "renamed-ag"),
@@ -1275,9 +1296,9 @@ async fn malformed_rows_null_required_fields_and_nil_guids_are_not_absence() {
         (
             ReadQuery::Anchor,
             "product_version",
-            Some("16.not-a-version"),
+            Some("17.not-a-version"),
         ),
-        (ReadQuery::Anchor, "product_major_version", Some("17")),
+        (ReadQuery::Anchor, "product_major_version", Some("16")),
         (
             ReadQuery::Anchor,
             "sqlserver_start_time",

@@ -265,10 +265,7 @@ impl PinnedImage {
         if repository.is_empty()
             || repository.contains('@')
             || repository.chars().any(char::is_whitespace)
-            || digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            || !is_sha256(digest)
             || value.chars().any(char::is_control)
         {
             return Err(ContractError::InvalidImageDigest);
@@ -285,6 +282,63 @@ impl fmt::Display for PinnedImage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PinnedPackage {
+    version: String,
+    sha256: String,
+}
+
+impl PinnedPackage {
+    pub fn new(
+        version: impl Into<String>,
+        sha256: impl Into<String>,
+    ) -> Result<Self, ContractError> {
+        let version = version.into();
+        let sha256 = sha256.into();
+        let Some((build, revision)) = version.split_once('-') else {
+            return Err(ContractError::InvalidPackagePin);
+        };
+        let components: Vec<_> = build.split('.').collect();
+        if version.len() > 64
+            || components.len() != 4
+            || components.iter().any(|part| !is_package_number(part))
+            || !is_package_number(revision)
+            || !is_sha256(&sha256)
+        {
+            return Err(ContractError::InvalidPackagePin);
+        }
+        Ok(Self { version, sha256 })
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+fn is_package_number(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
+        && value.parse::<u32>().is_ok()
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum EngineArtifact {
+    ContainerImage(PinnedImage),
+    NativePackage(PinnedPackage),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

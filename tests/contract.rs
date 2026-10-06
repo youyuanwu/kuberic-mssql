@@ -1,11 +1,12 @@
 use sqlserver_replicated::{
     AvailabilityGroupIdentity, AvailabilityGroupName, AvailabilityMode, ClusterType, ContractError,
     DatabaseIdentity, DatabaseLineage, DecimalProgress, DestructiveApproval, Edition, Endpoint,
-    FailoverMode, FenceReference, Guid, MutationMode, NativeRole, OPERATION_CONTRACT_VERSION,
-    Observation, ObservationFailure, ObservationFailureKind, OperationEnvelope, OperationPayload,
-    OperationRecord, OperationRequest, PinnedImage, ReplayDisposition, ReplicaDescriptor,
-    ReplicaIdentity, SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT, SecretRef, SeedingMode,
-    ServerName, SqlIdentifier, SqlServerSupportConfig,
+    EngineArtifact, FailoverMode, FenceReference, Guid, MutationMode, NativeRole,
+    OPERATION_CONTRACT_VERSION, Observation, ObservationFailure, ObservationFailureKind,
+    OperationEnvelope, OperationPayload, OperationRecord, OperationRequest, PinnedImage,
+    PinnedPackage, ReplayDisposition, ReplicaDescriptor, ReplicaIdentity, SUPPORTED_REPLICA_COUNT,
+    SUPPORTED_REPLICA_COUNT_TEXT, SecretRef, SeedingMode, ServerName, SqlIdentifier,
+    SqlServerSupportConfig,
 };
 
 use std::num::NonZeroU32;
@@ -41,7 +42,7 @@ fn descriptor(value: u32) -> ReplicaDescriptor {
 
 fn pinned_image() -> PinnedImage {
     PinnedImage::new(format!(
-        "mcr.microsoft.com/mssql/server:2022-CU@sha256:{}",
+        "mcr.microsoft.com/mssql/server:2025-CU@sha256:{}",
         "a".repeat(64)
     ))
     .unwrap()
@@ -53,9 +54,9 @@ fn secret(name: &str, key: &str) -> SecretRef {
 
 fn supported_config() -> SqlServerSupportConfig {
     SqlServerSupportConfig {
-        engine_major: 16,
-        edition: Edition::Developer,
-        image: pinned_image(),
+        engine_major: 17,
+        edition: Edition::EnterpriseDeveloper,
+        engine: EngineArtifact::ContainerImage(pinned_image()),
         eula_accepted: true,
         cluster_type: ClusterType::External,
         failover_mode: FailoverMode::External,
@@ -138,6 +139,93 @@ fn supported_profile_is_explicit_and_observe_only_by_default() {
 }
 
 #[test]
+fn sql_server_2025_enterprise_profiles_accept_container_and_native_artifacts() {
+    for edition in [Edition::EnterpriseDeveloper, Edition::Enterprise] {
+        let mut config = supported_config();
+        config.edition = edition;
+        assert_eq!(config.validate(), Ok(()));
+        let package = PinnedPackage::new("17.0.4006.2-1", "a".repeat(64)).unwrap();
+        assert_eq!(package.version(), "17.0.4006.2-1");
+        assert_eq!(package.sha256(), "a".repeat(64));
+        config.engine = EngineArtifact::NativePackage(package);
+        assert_eq!(config.validate(), Ok(()));
+    }
+}
+
+#[test]
+fn older_engines_and_standard_profiles_are_not_accepted() {
+    for major in [15, 16, 18] {
+        let mut config = supported_config();
+        config.engine_major = major;
+        assert!(matches!(
+            config.validate(),
+            Err(ContractError::UnsupportedProfile {
+                field: "engine major version",
+                ..
+            })
+        ));
+    }
+    for edition in [
+        Edition::StandardDeveloper,
+        Edition::Standard,
+        Edition::Express,
+    ] {
+        let mut config = supported_config();
+        config.edition = edition;
+        assert!(matches!(
+            config.validate(),
+            Err(ContractError::UnsupportedProfile {
+                field: "edition",
+                ..
+            })
+        ));
+    }
+    let mut config = supported_config();
+    config.engine =
+        EngineArtifact::NativePackage(PinnedPackage::new("16.0.4225.2-1", "a".repeat(64)).unwrap());
+    assert!(matches!(
+        config.validate(),
+        Err(ContractError::UnsupportedProfile {
+            field: "native package engine major version",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn native_packages_require_exact_versions_and_sha256_digests() {
+    for version in [
+        "",
+        "latest",
+        "17",
+        "17.0.4006.2",
+        "17.0.4006.2-*",
+        "17.0.4006.2-1\n",
+        "17.0.4006.2-1-2",
+        "017.0.4006.2-1",
+        "17.0.4006.2-01",
+        "17.0.4294967296.2-1",
+    ] {
+        assert_eq!(
+            PinnedPackage::new(version, "a".repeat(64)),
+            Err(ContractError::InvalidPackagePin)
+        );
+    }
+    for digest in [
+        "".to_owned(),
+        "a".repeat(63),
+        "a".repeat(65),
+        "A".repeat(64),
+        "g".repeat(64),
+    ] {
+        assert_eq!(
+            PinnedPackage::new("17.0.4006.2-1", digest),
+            Err(ContractError::InvalidPackagePin)
+        );
+    }
+}
+
+#[test]
 fn read_scale_cluster_type_is_not_accepted_as_ha() {
     let mut config = supported_config();
     config.cluster_type = ClusterType::None;
@@ -192,12 +280,12 @@ fn mutation_credentials_are_separate_and_explicit() {
 #[test]
 fn image_must_be_immutable_and_eula_must_be_explicit() {
     assert_eq!(
-        PinnedImage::new("mcr.microsoft.com/mssql/server:2022-latest"),
+        PinnedImage::new("mcr.microsoft.com/mssql/server:2025-latest"),
         Err(ContractError::InvalidImageDigest)
     );
     assert!(
         PinnedImage::new(format!(
-            "mcr.microsoft.com/mssql/server:2022 CU@sha256:{}",
+            "mcr.microsoft.com/mssql/server:2025 CU@sha256:{}",
             "a".repeat(64)
         ))
         .is_err()

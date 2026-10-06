@@ -370,7 +370,7 @@ impl Anchor {
         if instance.product_major_version != SUPPORTED_ENGINE_MAJOR {
             return Err(unsupported(
                 "anchor",
-                "only SQL Server 2022 major version 16 is supported",
+                "only SQL Server 2025 major version 17 is supported",
             ));
         }
         let edition = instance
@@ -380,8 +380,10 @@ impl Anchor {
         if instance.engine_edition != 3
             || !matches!(
                 edition,
-                "Developer"
-                    | "Developer Edition"
+                "Developer Enterprise"
+                    | "Developer Enterprise Edition"
+                    | "Enterprise Developer"
+                    | "Enterprise Developer Edition"
                     | "Enterprise"
                     | "Enterprise Edition"
                     | "Enterprise Edition: Core-based Licensing"
@@ -389,7 +391,7 @@ impl Anchor {
         {
             return Err(unsupported(
                 "anchor",
-                "only Developer or Enterprise edition with EngineEdition 3 is supported",
+                "only Enterprise Developer or Enterprise edition with EngineEdition 3 is supported",
             ));
         }
         if !instance.hadr_enabled {
@@ -465,7 +467,7 @@ fn check_permissions(rows: &[QueryRow]) -> Result<(), RuntimeError> {
     if row.unsigned::<u16>("product_major_version")? != SUPPORTED_ENGINE_MAJOR {
         return Err(unsupported(
             row.stage,
-            "only SQL Server 2022 major version 16 is supported",
+            "only SQL Server 2025 major version 17 is supported",
         ));
     }
     for permission in [
