@@ -3,14 +3,19 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
+use kuberic_runtime::application::{OpenMode, StatefulServiceReplica};
 use kuberic_runtime::protocol::types::{
-    AgentGeneration, ConfigurationDescriptor, Epoch, OperationId, PartitionId, ReplicaId,
+    AccessStatus, AgentGeneration, ConfigurationDescriptor, EffectivePolicy, Epoch,
+    InitializationId, OperationId, PartitionId, PodUid, PvcUid, ReplicaId,
     ReplicaIdentity as KubericReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
 };
 use kuberic_runtime::replicator::{
     PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode,
     Replicator,
 };
+use kuberic_runtime::testing::hosting::PodRuntime;
+use kuberic_runtime::testing::sqlite_store::SqliteStore;
+use kuberic_runtime::testing::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
 use sqlserver_replicated::kuberic::{
     ObservationClock, SqlServerObservationSource, SqlServerReplicator, SqlServerReplicatorFactory,
     SqlServerService, SqlServerServiceConfig,
@@ -164,6 +169,17 @@ fn present(snapshot: InstanceSnapshot) -> Observation<InstanceSnapshot> {
     }
 }
 
+fn database(id: &str, name: &str) -> DatabaseSnapshot {
+    DatabaseSnapshot {
+        identity: DatabaseIdentity {
+            name: SqlIdentifier::new(name).unwrap(),
+            group_database_id: guid(id),
+        },
+        local: None,
+        replicas: Vec::new(),
+    }
+}
+
 fn replicator_with(
     samples: Vec<Result<Observation<InstanceSnapshot>, RuntimeError>>,
     times: Vec<u64>,
@@ -178,6 +194,33 @@ fn replicator_with(
             times: Mutex::new(times.into()),
         }),
     ))
+}
+
+fn testing_runtime(
+    service: Arc<SqlServerService>,
+    resource: ResourceUid,
+) -> (tempfile::TempDir, PodRuntime) {
+    let directory = tempfile::tempdir().expect("create isolated Kuberic testing directory");
+    let identity = KubericReplicaIdentity {
+        replica_id: ReplicaId::new(1),
+        instance_id: ReplicaInstanceId::new("contract-instance"),
+        agent_generation: AgentGeneration::new("contract-generation"),
+    };
+    let state = AgentState::new(StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: resource,
+        pod_uid: PodUid::new("contract-pod"),
+        pvc_uid: PvcUid::new("contract-pvc"),
+        initialization_id: InitializationId::new("contract-initialization"),
+        local_identity: identity.clone(),
+        effective_policy: EffectivePolicy::fixed(1, 0).expect("valid singleton policy"),
+    });
+    let database = SqliteStore::metadata_database_path(directory.path());
+    drop(SqliteStore::create_authorized(&database, state).expect("create testing store"));
+    let store = Arc::new(
+        SqliteStore::open_existing(&database, None).expect("reopen Kuberic testing store"),
+    );
+    (directory, PodRuntime::new(identity, service, store))
 }
 
 async fn opened_replicator(
@@ -312,6 +355,29 @@ async fn freshness_uses_request_time_and_accepts_the_exact_age_boundary() {
 }
 
 #[tokio::test]
+async fn inconsistent_observation_timestamps_are_rejected() {
+    let mut mismatched_snapshot = snapshot(NativeRole::Primary);
+    mismatched_snapshot.observed_at_unix_millis += 1;
+
+    let mut mismatched_group = snapshot(NativeRole::Primary);
+    if let Observation::Present {
+        observed_at_unix_millis,
+        ..
+    } = &mut mismatched_group.availability_group
+    {
+        *observed_at_unix_millis += 1;
+    }
+
+    for sample in [mismatched_snapshot, mismatched_group] {
+        let replicator = opened_replicator(vec![Ok(present(sample))], vec![OBSERVED_AT]).await;
+        assert!(
+            application_error(replicator.current_progress().await.unwrap_err())
+                .contains("timestamps differ")
+        );
+    }
+}
+
+#[tokio::test]
 async fn adapter_rejects_identity_and_strict_profile_mismatches() {
     let mut cases = Vec::new();
 
@@ -379,6 +445,27 @@ async fn adapter_rejects_identity_and_strict_profile_mismatches() {
     wrong_engine.instance.product_version = "16.0.1000.1".into();
     cases.push(wrong_engine);
 
+    let mut non_linux = snapshot(NativeRole::Primary);
+    non_linux.instance.host_platform = "Windows".into();
+    cases.push(non_linux);
+
+    let mut wrong_architecture = snapshot(NativeRole::Primary);
+    wrong_architecture.instance.architecture = "aarch64".into();
+    cases.push(wrong_architecture);
+
+    let mut hadr_disabled = snapshot(NativeRole::Primary);
+    hadr_disabled.instance.hadr_enabled = false;
+    cases.push(hadr_disabled);
+
+    let mut two_databases = snapshot(NativeRole::Primary);
+    if let Observation::Present { value, .. } = &mut two_databases.availability_group {
+        value.databases = vec![
+            database("55555555-5555-4555-8555-555555555555", "db-one"),
+            database("66666666-6666-4666-8666-666666666666", "db-two"),
+        ];
+    }
+    cases.push(two_databases);
+
     let mut unavailable_local = snapshot(NativeRole::Primary);
     if let Observation::Present { value, .. } = &mut unavailable_local.availability_group {
         value.local_replica.state_available = false;
@@ -438,7 +525,114 @@ async fn resource_identity_and_native_roles_are_exact() {
 }
 
 #[tokio::test]
-async fn close_and_abort_make_progress_unavailable() {
+async fn service_roles_never_publish_routing_and_lifecycle_errors_are_distinct() {
+    let resource = ResourceUid::new("partition-contract-generation");
+    let source = Arc::new(ScriptedSource {
+        config: observer_config(),
+        samples: Mutex::new(
+            (0..8)
+                .map(|_| Ok(present(snapshot(NativeRole::Primary))))
+                .collect(),
+        ),
+    });
+    let clock = Arc::new(ScriptedClock {
+        times: Mutex::new(vec![OBSERVED_AT; 8].into()),
+    });
+    let service = Arc::new(SqlServerService::with_observation_source(
+        SqlServerServiceConfig::new(resource.clone(), "sql-replication.example:5022").unwrap(),
+        source.clone(),
+        clock.clone(),
+    ));
+    assert!(matches!(
+        service.change_role(ReplicaRole::Primary).await,
+        Err(KubericRuntimeError::NotOpen)
+    ));
+
+    let (_directory, runtime) = testing_runtime(service.clone(), resource);
+    runtime
+        .reconstruct(
+            OpenMode::Existing,
+            ReplicaRole::None,
+            AccessStatus::NotPrimary,
+            AccessStatus::NotPrimary,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(service.replicator().is_some());
+    *source.samples.lock().unwrap() = vec![
+        Ok(present(snapshot(NativeRole::Primary))),
+        Ok(present(snapshot(NativeRole::Secondary))),
+        Ok(present(snapshot(NativeRole::Secondary))),
+        Ok(present(snapshot(NativeRole::NotJoined))),
+    ]
+    .into();
+    *clock.times.lock().unwrap() = vec![OBSERVED_AT; 4].into();
+
+    for role in [
+        ReplicaRole::Primary,
+        ReplicaRole::ActiveSecondary,
+        ReplicaRole::IdleSecondary,
+        ReplicaRole::None,
+    ] {
+        assert_eq!(
+            service.change_role(role).await.unwrap().service_address,
+            None
+        );
+    }
+
+    service.close().await.unwrap();
+    assert!(service.replicator().is_none());
+    assert!(matches!(
+        service.change_role(ReplicaRole::None).await,
+        Err(KubericRuntimeError::Closed)
+    ));
+}
+
+#[tokio::test]
+async fn service_close_and_abort_before_open_prevent_registration() {
+    for abort in [false, true] {
+        let resource = ResourceUid::new("partition-contract-generation");
+        let service = Arc::new(SqlServerService::with_observation_source(
+            SqlServerServiceConfig::new(resource.clone(), "sql-replication.example:5022").unwrap(),
+            Arc::new(ScriptedSource {
+                config: observer_config(),
+                samples: Mutex::new(VecDeque::new()),
+            }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(VecDeque::new()),
+            }),
+        ));
+        if abort {
+            service.abort();
+        } else {
+            service.close().await.unwrap();
+        }
+        let (_directory, runtime) = testing_runtime(service.clone(), resource);
+        assert!(matches!(
+            runtime
+                .reconstruct(
+                    OpenMode::Existing,
+                    ReplicaRole::None,
+                    AccessStatus::NotPrimary,
+                    AccessStatus::NotPrimary,
+                    None,
+                )
+                .await,
+            Err(KubericRuntimeError::Closed)
+        ));
+        assert!(service.replicator().is_none());
+    }
+}
+
+#[tokio::test]
+async fn unopened_closed_and_aborted_progress_have_distinct_errors() {
+    let unopened = replicator_with(Vec::new(), Vec::new());
+    assert!(matches!(
+        unopened.current_progress().await,
+        Err(KubericRuntimeError::NotOpen)
+    ));
+
     let closed = opened_replicator(Vec::new(), Vec::new()).await;
     closed.close().await.unwrap();
     assert!(matches!(

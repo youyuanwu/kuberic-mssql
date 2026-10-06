@@ -32,9 +32,10 @@ LABEL_MANAGED = "io.kuberic.mssql.fixture"
 LABEL_ROOT = "io.kuberic.mssql.fixture-root"
 LABEL_IMAGE = "io.kuberic.mssql.image-digest"
 OWNER = "kuberic-sqlserver-observer-container-v1\n"
-CONTEXT_SCHEMA_VERSION = 4
+CONTEXT_SCHEMA_VERSION = 5
 ENDPOINT_PORT = 5022
-AVAILABILITY_GROUP_NAME = "kuberic-progress-ag"
+AVAILABILITY_GROUP_PREFIX = "kuberic-progress-"
+LEGACY_AVAILABILITY_GROUP_NAME = "kuberic-progress-ag"
 PEER_SERVER_NAMES = ("kuberic-mssql-peer-1", "kuberic-mssql-peer-2")
 
 
@@ -200,10 +201,12 @@ def write_configs(root):
         (root / f"{name}.json").write_text(json.dumps(current) + "\n")
 
 
-def write_present_config(root):
+def write_present_config(root, availability_group_name):
+    if not valid_availability_group_name(availability_group_name):
+        raise FixtureError("fixture availability-group name is invalid")
     absent = json.loads((root / "absent.json").read_text())
     config = base_config(root)
-    config["availability_group"] = AVAILABILITY_GROUP_NAME
+    config["availability_group"] = availability_group_name
     config["incarnation"] = absent["incarnation"]
     path = root / "present.json"
     temporary = root / ".present.json"
@@ -599,9 +602,20 @@ def one_optional_row(rows, object_name):
     return rows[0] if rows else None
 
 
-def availability_group_record():
+def new_availability_group_name():
+    return AVAILABILITY_GROUP_PREFIX + secrets.token_hex(16)
+
+
+def valid_availability_group_name(name):
+    if not isinstance(name, str) or not name.startswith(AVAILABILITY_GROUP_PREFIX):
+        return False
+    nonce = name[len(AVAILABILITY_GROUP_PREFIX):]
+    return len(nonce) == 32 and all(character in "0123456789abcdef" for character in nonce)
+
+
+def availability_group_record(name=None):
     return {
-        "name": AVAILABILITY_GROUP_NAME,
+        "name": name or new_availability_group_name(),
         "group_id": None,
         "profile": None,
         "created": False,
@@ -639,7 +653,9 @@ def expected_ag_profile():
     }
 
 
-def inspect_availability_group(root):
+def inspect_availability_group(root, name):
+    if not valid_availability_group_name(name):
+        raise FixtureError("fixture availability-group name is invalid")
     group = one_optional_row(
         sql_rows(
             root,
@@ -648,7 +664,7 @@ def inspect_availability_group(root):
             "CONVERT(varchar(1), basic_features), CONVERT(varchar(1), is_distributed), "
             "CONVERT(varchar(20), sequence_number) "
             "FROM sys.availability_groups "
-            f"WHERE name = N'{AVAILABILITY_GROUP_NAME}';",
+            f"WHERE name = N'{name}';",
             "inspect availability group",
         ),
         "availability group",
@@ -659,7 +675,7 @@ def inspect_availability_group(root):
         "failover_mode_desc, seeding_mode_desc "
         "FROM sys.availability_replicas "
         f"WHERE group_id = (SELECT group_id FROM sys.availability_groups "
-        f"WHERE name = N'{AVAILABILITY_GROUP_NAME}') ORDER BY replica_server_name;",
+        f"WHERE name = N'{name}') ORDER BY replica_server_name;",
         "inspect availability-group replicas",
     )
     database_count = one_optional_row(
@@ -668,7 +684,7 @@ def inspect_availability_group(root):
             "SELECT CONVERT(varchar(10), COUNT(*)) "
             "FROM sys.availability_databases_cluster "
             f"WHERE group_id = (SELECT group_id FROM sys.availability_groups "
-            f"WHERE name = N'{AVAILABILITY_GROUP_NAME}');",
+            f"WHERE name = N'{name}');",
             "inspect availability-group databases",
         ),
         "availability-group database count",
@@ -714,7 +730,9 @@ def validate_availability_group(snapshot):
     )
 
 
-def create_availability_group(root):
+def create_availability_group(root, name):
+    if not valid_availability_group_name(name):
+        raise FixtureError("fixture availability-group name is invalid")
     replicas = [
         (CONTAINER_HOSTNAME, f"TCP://{CONTAINER_HOSTNAME}:{ENDPOINT_PORT}"),
         *[(server, f"TCP://{server}:{ENDPOINT_PORT}") for server in PEER_SERVER_NAMES],
@@ -727,7 +745,7 @@ def create_availability_group(root):
     )
     admin_sql(
         root,
-        f"CREATE AVAILABILITY GROUP [{AVAILABILITY_GROUP_NAME}] "
+        f"CREATE AVAILABILITY GROUP [{name}] "
         "WITH (CLUSTER_TYPE = EXTERNAL, "
         "REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 1) "
         "FOR REPLICA ON\n"
@@ -757,17 +775,18 @@ def availability_group_matches_record(observed, record):
 
 
 def provision_availability_group(root, context):
-    observed = inspect_availability_group(root)
     record = context["availability_group"]
+    name = record["name"]
+    observed = inspect_availability_group(root, name)
     if record["state"] == "not_started":
         if observed is not None:
             raise FixtureError(f"refusing same-name unowned availability group: {record['name']}")
         record.update(created=True, state="creating")
         save_context(root, context)
-        create_availability_group(root)
+        create_availability_group(root, name)
     elif record["state"] == "creating":
         if observed is None:
-            create_availability_group(root)
+            create_availability_group(root, name)
         elif not validate_availability_group(observed):
             raise FixtureError("fixture availability-group profile changed during creation")
     elif record["state"] in ["created", "verified"]:
@@ -776,11 +795,11 @@ def provision_availability_group(root, context):
     else:
         raise FixtureError("availability-group ownership state requires cleanup")
 
-    bind_created_availability_group(root, context, inspect_availability_group(root))
-    final = inspect_availability_group(root)
+    bind_created_availability_group(root, context, inspect_availability_group(root, name))
+    final = inspect_availability_group(root, name)
     if not availability_group_matches_record(final, record):
         raise FixtureError("owned availability-group identity changed")
-    write_present_config(root)
+    write_present_config(root, name)
     return final
 
 
@@ -826,7 +845,7 @@ def validate_availability_group_record(record):
     if (
         not isinstance(record, dict)
         or set(record) != {"name", "group_id", "profile", "created", "state"}
-        or record["name"] != AVAILABILITY_GROUP_NAME
+        or not valid_availability_group_name(record["name"])
         or type(record["created"]) is not bool
         or not valid_object_state(record["state"])
     ):
@@ -843,7 +862,7 @@ def validate_availability_group_record(record):
             and group_id is None
             and record["profile"] is None
         )
-    if record["state"] == "creating":
+    if record["state"] in ["creating", "cleaned"]:
         return (
             group_id is None
             and record["profile"] is None
@@ -851,6 +870,16 @@ def validate_availability_group_record(record):
             and record["profile"] == expected_ag_profile()
         )
     return valid_group_id and record["profile"] == expected_ag_profile()
+
+
+def validate_legacy_availability_group_record(record):
+    return (
+        isinstance(record, dict)
+        and set(record) == {"name", "group_id", "profile", "created", "state"}
+        and record["name"] == LEGACY_AVAILABILITY_GROUP_NAME
+        and type(record["created"]) is bool
+        and valid_object_state(record["state"])
+    )
 
 
 def load_context(root):
@@ -872,7 +901,7 @@ def load_context(root):
     if (
         not isinstance(context, dict)
         or set(context) not in [legacy_fields, current_fields]
-        or context.get("schema_version") not in [2, CONTEXT_SCHEMA_VERSION]
+        or context.get("schema_version") not in [2, 4, CONTEXT_SCHEMA_VERSION]
         or context.get("root") != str(root)
         or any(
             type(context.get(key)) is not bool
@@ -888,11 +917,25 @@ def load_context(root):
         )
     ):
         raise FixtureError("fixture ownership record does not match this container fixture")
+    migrated = False
     if context["schema_version"] == 2:
         if set(context) != legacy_fields:
             raise FixtureError("legacy fixture ownership record has incompatible fields")
         context["schema_version"] = CONTEXT_SCHEMA_VERSION
         context["availability_group"] = availability_group_record()
+        migrated = True
+    elif context["schema_version"] == 4:
+        record = context.get("availability_group")
+        if set(context) != current_fields or not validate_legacy_availability_group_record(record):
+            raise FixtureError("legacy fixture availability-group record is incompatible")
+        if record["created"] and record["state"] not in ["cleaned"]:
+            raise FixtureError(
+                "active legacy fixed-name availability-group ownership must be cleaned "
+                "before schema migration"
+            )
+        context["schema_version"] = CONTEXT_SCHEMA_VERSION
+        context["availability_group"] = availability_group_record()
+        migrated = True
     elif (
         set(context) != current_fields
         or not validate_availability_group_record(context["availability_group"])
@@ -900,6 +943,8 @@ def load_context(root):
         raise FixtureError("fixture availability-group ownership record is incompatible")
     if context["availability_group"]["created"] and context["container_id"] is None:
         raise FixtureError("availability-group ownership requires an exact container ID")
+    if migrated:
+        save_context(root, context)
     return context
 
 
@@ -972,15 +1017,37 @@ def provision(directory=None):
         return ensure_fixture(root)
 
 
+def cargo_binary():
+    configured = os.environ.get("CARGO")
+    if configured:
+        resolved = shutil.which(configured)
+        if resolved:
+            return resolved
+        candidate = Path(configured).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        raise FixtureError("CARGO does not identify an executable Cargo binary")
+    resolved = shutil.which("cargo")
+    if resolved:
+        return resolved
+    fallback = Path.home() / ".cargo" / "bin" / "cargo"
+    if fallback.is_file() and os.access(fallback, os.X_OK):
+        return str(fallback)
+    raise FixtureError("Cargo is unavailable through CARGO, PATH, or the user-local fallback")
+
+
 def live_test_command(*, include_ag, include_kuberic):
-    args = [str(Path.home() / ".cargo" / "bin" / "cargo"), "test", "--locked"]
+    args = [cargo_binary(), "test", "--locked"]
     if include_kuberic:
         args += ["--all-features", "--tests"]
     else:
         args += ["--test", "live_observation"]
     args += ["--", "--ignored"]
     if not include_ag:
-        args += ["--skip", "live_present_availability_group"]
+        args += [
+            "--skip", "live_present_availability_group",
+            "--skip", "live_kuberic_progress_matches_fresh_direct_observation",
+        ]
     args += ["--test-threads=1"]
     return args
 
@@ -997,7 +1064,7 @@ def run_test_cases(directory=None, *, include_ag=False, include_kuberic=False):
     env = os.environ.copy()
     for name in ["SQLSERVER_TEST_PACKAGE_VERSION", "SQLSERVER_TEST_PACKAGE_SHA256"]:
         env.pop(name, None)
-    env.update(fixture_environment(root, include_ag=True))
+    env.update(fixture_environment(root, include_ag=include_ag))
     args = live_test_command(include_ag=include_ag, include_kuberic=include_kuberic)
     result = command("run host live cases", args, env=env, check=False, timeout=900)
     print(result.stdout, end="")
@@ -1035,10 +1102,51 @@ def remove_fixture_files(root):
     shutil.rmtree(root)
 
 
-def drop_availability_group(root):
+def drop_availability_group(root, name, group_id):
+    if not valid_availability_group_name(name):
+        raise FixtureError("fixture availability-group name is invalid")
+    if (
+        not isinstance(group_id, str)
+        or len(group_id) != 36
+        or any(character not in "0123456789abcdef-" for character in group_id)
+    ):
+        raise FixtureError("fixture availability-group ID is invalid")
+    expected_replicas = [
+        (CONTAINER_HOSTNAME, f"TCP://{CONTAINER_HOSTNAME}:{ENDPOINT_PORT}"),
+        *[(server, f"TCP://{server}:{ENDPOINT_PORT}") for server in PEER_SERVER_NAMES],
+    ]
+    replica_checks = "\n".join(
+        "AND EXISTS (SELECT 1 FROM sys.availability_replicas AS replica "
+        "WHERE replica.group_id = ag.group_id "
+        f"AND replica.replica_server_name COLLATE Latin1_General_100_BIN2 = N'{server}' "
+        f"AND replica.endpoint_url COLLATE Latin1_General_100_BIN2 = N'{endpoint}' "
+        "AND replica.availability_mode_desc COLLATE Latin1_General_100_BIN2 "
+        "= N'SYNCHRONOUS_COMMIT' "
+        "AND replica.failover_mode_desc COLLATE Latin1_General_100_BIN2 = N'EXTERNAL' "
+        "AND replica.seeding_mode_desc COLLATE Latin1_General_100_BIN2 = N'AUTOMATIC')"
+        for server, endpoint in expected_replicas
+    )
     admin_sql(
         root,
-        f"DROP AVAILABILITY GROUP [{AVAILABILITY_GROUP_NAME}];",
+        "DECLARE @expected_group_id uniqueidentifier = "
+        f"CONVERT(uniqueidentifier, N'{group_id}');\n"
+        "IF NOT EXISTS (\n"
+        "SELECT 1 FROM sys.availability_groups AS ag\n"
+        f"WHERE ag.name COLLATE Latin1_General_100_BIN2 = N'{name}' "
+        "AND ag.group_id = @expected_group_id\n"
+        "AND ag.cluster_type_desc COLLATE Latin1_General_100_BIN2 = N'EXTERNAL'\n"
+        "AND ag.required_synchronized_secondaries_to_commit = 1\n"
+        "AND ag.basic_features = 0 AND ag.is_distributed = 0\n"
+        "AND (SELECT COUNT(*) FROM sys.availability_databases_cluster AS database_entry "
+        "WHERE database_entry.group_id = ag.group_id) = 0\n"
+        "AND (SELECT COUNT(*) FROM sys.availability_replicas AS replica "
+        "WHERE replica.group_id = ag.group_id) = 3\n"
+        f"{replica_checks}\n"
+        ")\n"
+        "BEGIN\n"
+        "THROW 51000, 'fixture availability-group identity or profile changed', 1;\n"
+        "END;\n"
+        f"DROP AVAILABILITY GROUP [{name}];",
         stage="drop fixture availability group",
     )
 
@@ -1048,12 +1156,20 @@ def cleanup_availability_group(root, context):
     if not record["created"] or record["state"] in ["not_started", "cleaned"]:
         (root / "present.json").unlink(missing_ok=True)
         return
-    observed = inspect_availability_group(root)
-    if observed is None:
+    observed = inspect_availability_group(root, record["name"])
+    if (
+        record["state"] == "creating"
+        and record["group_id"] is None
+        and observed is None
+    ):
         record["state"] = "cleaned"
         save_context(root, context)
         (root / "present.json").unlink(missing_ok=True)
         return
+    if observed is None:
+        raise FixtureError(
+            f"refusing absent owned availability group during cleanup: {record['name']}"
+        )
     if record["state"] == "creating":
         bind_created_availability_group(root, context, observed)
     if not availability_group_matches_record(observed, record):
@@ -1062,8 +1178,8 @@ def cleanup_availability_group(root, context):
         )
     record["state"] = "cleaning"
     save_context(root, context)
-    drop_availability_group(root)
-    if inspect_availability_group(root) is not None:
+    drop_availability_group(root, record["name"], record["group_id"])
+    if inspect_availability_group(root, record["name"]) is not None:
         raise FixtureError("owned availability group still exists after cleanup")
     record["state"] = "cleaned"
     save_context(root, context)
@@ -1156,10 +1272,19 @@ def validate_fixture(directory=None):
                 print(result.stderr, end="", file=sys.stderr)
                 if result.returncode:
                     raise FixtureError(f"{stage} failed with exit code {result.returncode}")
+            observer = Path("target/debug/sqlserver-observer")
+            if not observer.is_file():
+                command(
+                    "build observer binary",
+                    [cargo_binary(), "build", "--locked", "--bin", "sqlserver-observer"],
+                    env=env,
+                    timeout=600,
+                    process_group=True,
+                )
             cli = command(
                 "run shared host CLI observation",
                 [
-                    "target/debug/sqlserver-observer",
+                    str(observer),
                     "--config",
                     env["SQLSERVER_LIVE_ABSENT_CONFIG"],
                 ],

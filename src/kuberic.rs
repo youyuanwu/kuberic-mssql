@@ -1,6 +1,6 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use kuberic_runtime::application::{
@@ -69,6 +69,7 @@ pub enum KubericAdapterError {
         observed: Option<NativeRole>,
     },
     UnsupportedOperation(ObserveOnlyOperation),
+    NotOpen,
     Closed,
 }
 
@@ -114,6 +115,7 @@ impl fmt::Display for KubericAdapterError {
                 formatter,
                 "{operation} is disabled by the observe-only SQL Server adapter"
             ),
+            Self::NotOpen => formatter.write_str("SQL Server adapter is not open"),
             Self::Closed => formatter.write_str("SQL Server adapter is closed"),
         }
     }
@@ -124,6 +126,7 @@ impl std::error::Error for KubericAdapterError {}
 impl From<KubericAdapterError> for KubericRuntimeError {
     fn from(error: KubericAdapterError) -> Self {
         match error {
+            KubericAdapterError::NotOpen => Self::NotOpen,
             KubericAdapterError::Closed => Self::Closed,
             other => Self::Application(other.to_string()),
         }
@@ -197,8 +200,15 @@ pub struct SqlServerService {
     config: SqlServerServiceConfig,
     source: Arc<dyn SqlServerObservationSource>,
     clock: Arc<dyn ObservationClock>,
-    replicator: OnceLock<Arc<SqlServerReplicator>>,
-    lifecycle: AtomicU8,
+    open_attempt: tokio::sync::Mutex<()>,
+    lifecycle: Mutex<ServiceLifecycle>,
+}
+
+enum ServiceLifecycle {
+    Created,
+    Open(Arc<SqlServerReplicator>),
+    Closed,
+    Aborted,
 }
 
 impl SqlServerService {
@@ -218,8 +228,8 @@ impl SqlServerService {
             config,
             source,
             clock,
-            replicator: OnceLock::new(),
-            lifecycle: AtomicU8::new(CREATED),
+            open_attempt: tokio::sync::Mutex::new(()),
+            lifecycle: Mutex::new(ServiceLifecycle::Created),
         }
     }
 
@@ -235,7 +245,14 @@ impl SqlServerService {
     }
 
     pub fn replicator(&self) -> Option<Arc<SqlServerReplicator>> {
-        self.replicator.get().cloned()
+        match &*self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            ServiceLifecycle::Open(replicator) => Some(replicator.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -245,17 +262,21 @@ impl StatefulServiceReplica for SqlServerService {
         self.validate_resource_identity(
             &context.partition.get_partition_information().partition_id,
         )?;
-        self.lifecycle
-            .compare_exchange(CREATED, OPEN, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| KubericRuntimeError::Closed)?;
+        let _attempt = self.open_attempt.lock().await;
+        if !matches!(
+            *self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ServiceLifecycle::Created
+        ) {
+            return Err(KubericRuntimeError::Closed);
+        }
         let replicator = Arc::new(SqlServerReplicator::new(
             self.config.replication_address.clone(),
             self.source.clone(),
             self.clock.clone(),
         ));
-        self.replicator
-            .set(replicator.clone())
-            .map_err(|_| KubericRuntimeError::Closed)?;
         let interfaces = context
             .partition
             .with_factory(Arc::new(SqlServerReplicatorFactory::new(
@@ -264,31 +285,72 @@ impl StatefulServiceReplica for SqlServerService {
             .create_replicator(None, None)
             .await?;
         debug_assert!(interfaces.state_replicator().is_none());
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(*lifecycle, ServiceLifecycle::Created) {
+            replicator.abort();
+            return Err(KubericRuntimeError::Closed);
+        }
+        *lifecycle = ServiceLifecycle::Open(replicator);
         Ok(interfaces.replicator())
     }
 
     async fn change_role(&self, role: ReplicaRole) -> KubericResult<RoleChange> {
-        let replicator = self.replicator.get().ok_or(KubericRuntimeError::NotOpen)?;
+        let replicator = match &*self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            ServiceLifecycle::Created => return Err(KubericRuntimeError::NotOpen),
+            ServiceLifecycle::Open(replicator) => replicator.clone(),
+            ServiceLifecycle::Closed | ServiceLifecycle::Aborted => {
+                return Err(KubericRuntimeError::Closed);
+            }
+        };
         replicator.validate_and_set_role(role).await?;
         Ok(RoleChange {
-            service_address: matches!(role, ReplicaRole::Primary | ReplicaRole::ActiveSecondary)
-                .then(|| self.config.replication_address.clone()),
+            service_address: None,
         })
     }
 
     async fn close(&self) -> KubericResult<()> {
-        if let Some(replicator) = self.replicator.get() {
+        let replicator = {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let replicator = match &*lifecycle {
+                ServiceLifecycle::Open(replicator) => Some(replicator.clone()),
+                _ => None,
+            };
+            *lifecycle = ServiceLifecycle::Closed;
+            replicator
+        };
+        let _attempt = self.open_attempt.lock().await;
+        if let Some(replicator) = replicator {
             replicator.close().await?;
         }
-        self.lifecycle.store(CLOSED, Ordering::Release);
         Ok(())
     }
 
     fn abort(&self) {
-        if let Some(replicator) = self.replicator.get() {
+        let replicator = {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let replicator = match &*lifecycle {
+                ServiceLifecycle::Open(replicator) => Some(replicator.clone()),
+                _ => None,
+            };
+            *lifecycle = ServiceLifecycle::Aborted;
+            replicator
+        };
+        if let Some(replicator) = replicator {
             replicator.abort();
         }
-        self.lifecycle.store(ABORTED, Ordering::Release);
     }
 }
 
@@ -349,10 +411,11 @@ impl SqlServerReplicator {
     }
 
     fn require_open(&self) -> Result<(), KubericAdapterError> {
-        if self.lifecycle.load(Ordering::Acquire) == OPEN {
-            Ok(())
-        } else {
-            Err(KubericAdapterError::Closed)
+        match self.lifecycle.load(Ordering::Acquire) {
+            OPEN => Ok(()),
+            CREATED => Err(KubericAdapterError::NotOpen),
+            CLOSED | ABORTED => Err(KubericAdapterError::Closed),
+            _ => unreachable!("SQL Server replicator lifecycle is invalid"),
         }
     }
 

@@ -12,6 +12,8 @@ not wired into the level-triggered controller. This is not a complete
 Kubernetes HA integration or an automatic failover implementation. See the
 [progress integration guide](docs/kuberic-progress.md); the
 [support and safety design](docs/design.md) remains authoritative.
+Role validation never publishes a client service address; the configured
+replication address is returned only by the custom replicator's open callback.
 
 ## Run the observer
 
@@ -300,8 +302,10 @@ passed in arguments or published as artifacts.
 
 The job exercises absent and present AG observation, permission denial,
 invalid-CA rejection, Kuberic progress publication, and the actual CLI's fresh
-SQL Server 2025 output. The fixture-created AG contains metadata only and makes
-no endpoint, database, join, seeding, role, lease-renewal or failover changes.
+SQL Server 2025 output. Each fixture records a private nonce-bearing AG name
+before creation and later binds its exact SQL Server group ID. The fixture AG
+contains metadata only and makes no endpoint, database, join, seeding, role,
+lease-renewal or failover changes.
 An always-run cleanup
 step removes the owned container and its SQL data; the disposable runner
 is the final containment boundary. This is real-engine observation validation, not

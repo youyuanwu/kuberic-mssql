@@ -86,6 +86,9 @@ only at the Kuberic progress-publication boundary.
 Role callbacks validate observation rather than changing SQL Server. PRIMARY
 must match native PRIMARY; active or idle secondary must match native SECONDARY.
 The initial no-role state may be observed before Kuberic authority admission.
+Successful role validation always returns no client service address. The
+configured replication address belongs only to `Replicator::open`; it is not a
+listener, routing endpoint, or application address.
 
 All topology callbacks return explicit observe-only errors. No callback returns
 a dummy success or a fabricated catch-up value.
@@ -120,7 +123,8 @@ durable Kuberic authority.
 The Rust tests, Kuberic testing runtime, observer, and SQL client remain host
 processes.
 
-The fixture creates one metadata-only EXTERNAL availability group:
+The fixture creates one metadata-only EXTERNAL availability group under a
+private per-fixture nonce-bearing name:
 
 - one local PRIMARY replica definition;
 - two configured but unstarted peer definitions;
@@ -134,11 +138,14 @@ SQL Server accepts endpoint URL metadata without a running endpoint. This is
 enough to expose and test the AG configuration sequence, but it proves no data
 replication or HA behavior.
 
-The fixture ownership record binds the exact container ID and created AG group
-ID/profile. A same-name AG without that record is refused. Cleanup removes the
-exact AG before preserving a borrowed container. Removing a fixture-created
-container removes its writable SQL metadata. Interrupted cleanup retains the
-record and fails rather than adopting or deleting ambiguous state.
+Before create dispatch, the fixture ownership record persists the private AG
+name. Only that unguessable recorded name plus the exact expected profile may be
+bound, after which the exact SQL Server group ID is also recorded. Cleanup
+revalidates the name, group ID, and profile in the destructive SQL batch before
+dropping the AG. Absence, replacement, interruption, or ambiguous cleanup keeps
+the record and fails closed. A pre-dispatch interruption with no AG is the sole
+case that can be recorded as clean without a group ID. Removing a
+fixture-created container removes its writable SQL metadata.
 
 The required live Kuberic test:
 

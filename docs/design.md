@@ -345,13 +345,18 @@ denied permissions, invalid TLS and CLI output validation. Shared
 commands own image verification, container creation, HADR/TLS/principal setup
 and cleanup outside the observer. Tests and CLI remain host processes. The helper
 refuses unrelated or modified containers. The fixture helper creates and owns
-one metadata-only AG with three configured replicas, no database and no
-mirroring endpoint. Production runtime code creates no AG. This does not enable
-runtime mutation or validate HA. The same ensure-ready operation is used locally:
+one metadata-only AG with a private per-fixture nonce-bearing name, three
+configured replicas, no database and no mirroring endpoint. Its ownership
+record persists that name before create dispatch, binds the exact group ID and
+profile after creation, and revalidates all three in the destructive drop
+batch. Production runtime code creates no AG. This does not enable runtime
+mutation or validate HA. The same ensure-ready operation is used locally:
 it preserves an already-running exact fixture, starts/stops a verified stopped
 container, or creates/removes an absent one. A private ownership record lets
 cleanup distinguish borrowed, started and newly created containers. Lifecycle checks are
 test-environment safeguards, not production fencing attestation.
+The Kuberic adapter likewise publishes no client service address from role
+changes; its replication address is confined to replicator open metadata.
 That job must pin the engine image, tools, and helper
 artifacts; accept the EULA explicitly; isolate credentials; and fail rather
 than skip when requested prerequisites are missing. Mutation support cannot be
