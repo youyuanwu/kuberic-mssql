@@ -78,8 +78,10 @@ pub enum ResourceKind {
 #[serde(rename_all = "snake_case")]
 pub enum ResourceState {
     Intended,
+    Dispatched,
     Bound,
     Cleaning,
+    Blocked,
     Removed,
 }
 
@@ -135,21 +137,29 @@ impl fmt::Display for FailureStage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureCategory {
+    Preflight,
     ContainerCreation,
     ContainerRemoval,
+    NetworkRemoval,
+    PathRemoval,
     OwnershipMismatch,
     DeadlineExceeded,
     SqlUnavailable,
+    Journal,
 }
 
 impl fmt::Display for FailureCategory {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::Preflight => "preflight failed",
             Self::ContainerCreation => "container creation failed",
             Self::ContainerRemoval => "container removal failed",
+            Self::NetworkRemoval => "network removal failed",
+            Self::PathRemoval => "path removal failed",
             Self::OwnershipMismatch => "ownership validation failed",
             Self::DeadlineExceeded => "stage deadline exceeded",
             Self::SqlUnavailable => "SQL Server unavailable",
+            Self::Journal => "ownership journal update failed",
         })
     }
 }
@@ -181,6 +191,14 @@ pub struct CombinedFixtureError {
 impl CombinedFixtureError {
     pub fn new(primary: SanitizedFailure, cleanup: Vec<SanitizedFailure>) -> Self {
         Self { primary, cleanup }
+    }
+
+    pub fn primary(&self) -> SanitizedFailure {
+        self.primary
+    }
+
+    pub fn cleanup(&self) -> &[SanitizedFailure] {
+        &self.cleanup
     }
 }
 

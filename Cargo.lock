@@ -766,6 +766,7 @@ dependencies = [
  "kuberic-mssql",
  "kuberic-runtime",
  "libc",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
