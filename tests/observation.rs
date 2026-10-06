@@ -547,6 +547,21 @@ async fn observes_supported_instance_native_identities_and_unhealthy_replica_fac
 }
 
 #[tokio::test]
+async fn configuration_sequence_accepts_zero_and_signed_bigint_maximum() {
+    for sequence in ["0", "9223372036854775807"] {
+        let mut script = present_script();
+        change_rows(&mut script, ReadQuery::Anchor, |row| {
+            set(row, "sequence_number", Some(sequence));
+        });
+        let snapshot = success(script).await;
+        assert_eq!(
+            group(&snapshot).configuration_sequence.to_string(),
+            sequence
+        );
+    }
+}
+
+#[tokio::test]
 async fn observes_absence_only_after_permissions_capabilities_and_matching_anchors() {
     let snapshot = success(absent_script()).await;
     assert!(matches!(
@@ -1319,6 +1334,7 @@ async fn malformed_rows_null_required_fields_and_nil_guids_are_not_absence() {
             "sequence_number",
             Some("9223372036854775808"),
         ),
+        (ReadQuery::Anchor, "sequence_number", Some("not-a-number")),
         (ReadQuery::Anchor, "sequence_number", Some("-1")),
         (ReadQuery::Anchor, "sequence_number", None),
         (ReadQuery::Replicas, "state_group_id", None),

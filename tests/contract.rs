@@ -1,12 +1,12 @@
 use sqlserver_replicated::{
-    AvailabilityGroupIdentity, AvailabilityGroupName, AvailabilityMode, ClusterType, ContractError,
-    DatabaseIdentity, DatabaseLineage, DecimalProgress, DestructiveApproval, Edition, Endpoint,
-    EngineArtifact, FailoverMode, FenceReference, Guid, MutationMode, NativeRole,
-    OPERATION_CONTRACT_VERSION, Observation, ObservationFailure, ObservationFailureKind,
-    OperationEnvelope, OperationPayload, OperationRecord, OperationRequest, PinnedImage,
-    PinnedPackage, ReplayDisposition, ReplicaDescriptor, ReplicaIdentity, SUPPORTED_REPLICA_COUNT,
-    SUPPORTED_REPLICA_COUNT_TEXT, SecretRef, SeedingMode, ServerName, SqlIdentifier,
-    SqlServerSupportConfig,
+    AvailabilityGroupIdentity, AvailabilityGroupName, AvailabilityMode, ClusterType,
+    ConfigurationSequence, ContractError, DatabaseIdentity, DatabaseLineage, DecimalProgress,
+    DestructiveApproval, Edition, Endpoint, EngineArtifact, FailoverMode, FenceReference, Guid,
+    MutationMode, NativeRole, OPERATION_CONTRACT_VERSION, Observation, ObservationFailure,
+    ObservationFailureKind, OperationEnvelope, OperationPayload, OperationRecord, OperationRequest,
+    PinnedImage, PinnedPackage, ReplayDisposition, ReplicaDescriptor, ReplicaIdentity,
+    SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT, SecretRef, SeedingMode, ServerName,
+    SqlIdentifier, SqlServerSupportConfig,
 };
 
 use std::num::NonZeroU32;
@@ -322,6 +322,21 @@ fn native_progress_preserves_values_larger_than_i64() {
         DecimalProgress::parse("-1"),
         Err(ContractError::InvalidProgress)
     );
+}
+
+#[test]
+fn configuration_sequence_is_a_nonnegative_signed_bigint_string() {
+    for value in ["0", "1", "9223372036854775807"] {
+        let sequence = ConfigurationSequence::parse(value).unwrap();
+        assert_eq!(sequence.to_string(), value);
+        assert_eq!(serde_json::to_value(sequence).unwrap(), value);
+    }
+    for value in ["", "-1", "9223372036854775808", "not-a-number"] {
+        assert_eq!(
+            ConfigurationSequence::parse(value),
+            Err(ContractError::InvalidProgress)
+        );
+    }
 }
 
 #[test]

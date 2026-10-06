@@ -8,14 +8,25 @@ description = "Observe-only SQL Server availability group runtime for Kuberic"
 rust-version = "1.85"
 publish = false
 
+[features]
+default = []
+kuberic = ["dep:kuberic-runtime", "kuberic-runtime/host"]
+kuberic-testing = ["kuberic", "kuberic-runtime/testing"]
+
 [[bin]]
 name = "sqlserver-observer"
 path = "src/main.rs"
+
+[[test]]
+name = "kuberic_contract"
+path = "tests/kuberic_contract.rs"
+required-features = ["kuberic-testing"]
 
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
+kuberic-runtime = { version = "=0.0.1", optional = true, default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
