@@ -46,13 +46,21 @@ test:
 test-ci-helpers:
     python3 -B -m unittest discover -s scripts -p 'test_*.py'
 
-# Run the three single-instance cases against explicitly provisioned fixtures.
+# Run the three non-AG cases against explicitly provisioned fixtures.
 test-live fixture="":
     python3 -B scripts/sqlserver_fixture.py test {{quote(fixture)}}
 
-# Run every live case, including a separately provisioned EXTERNAL AG.
+# Run every direct-observation live case against the fixture-owned EXTERNAL AG.
 test-live-all fixture="":
     python3 -B scripts/sqlserver_fixture.py test-all {{quote(fixture)}}
+
+# Run the feature-enabled Kuberic happy path against the same ready fixture.
+test-live-kuberic fixture="":
+    python3 -B scripts/sqlserver_fixture.py test-kuberic {{quote(fixture)}}
+
+# Compile once and run direct observation plus Kuberic against one fixture lifetime.
+test-live-shared fixture="":
+    python3 -B scripts/sqlserver_fixture.py test-shared {{quote(fixture)}}
 
 # Build the CLI, emit an observation, and verify it against the container fixture.
 test-live-cli report: build && (verify-live-cli report)

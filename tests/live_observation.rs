@@ -10,7 +10,11 @@ use sqlserver_replicated::instance::SqlServerInstanceManager;
 use sqlserver_replicated::observation::InstanceSnapshot;
 use sqlserver_replicated::runtime_config::ObserverConfig;
 use sqlserver_replicated::tds::TdsExecutor;
-use sqlserver_replicated::{Observation, ObservationFailureKind, PinnedImage};
+use sqlserver_replicated::{NativeRole, Observation, ObservationFailureKind, PinnedImage};
+
+const AG_NAME: &str = "kuberic-progress-ag";
+const LOCAL_SERVER: &str = "kuberic-mssql-observer";
+const PEER_SERVERS: [&str; 2] = ["kuberic-mssql-peer-1", "kuberic-mssql-peer-2"];
 
 fn fixture_image(image: Option<String>) -> Result<PinnedImage, &'static str> {
     PinnedImage::new(image.ok_or("the fixture image reference is missing")?)
@@ -83,10 +87,56 @@ async fn live_present_availability_group() {
     let observation = observe("SQLSERVER_LIVE_AG_CONFIG").await;
     match observation {
         Observation::Present { value, .. } => {
-            assert!(matches!(
-                value.availability_group,
-                Observation::Present { .. }
-            ));
+            let group = match value.availability_group {
+                Observation::Present { value, .. } => value,
+                other => panic!("expected fixture AG, got {other:?}"),
+            };
+            assert_eq!(group.identity.name.as_str(), AG_NAME);
+            assert!(group.configuration_sequence.value() > 0);
+            assert!(group.cluster_type.eq_ignore_ascii_case("EXTERNAL"));
+            assert_eq!(group.required_synchronized_secondaries_to_commit, 1);
+            assert!(!group.basic_features);
+            assert!(!group.is_distributed);
+            assert_eq!(group.local_replica.role, Some(NativeRole::Primary));
+            assert!(group.local_replica.state_available);
+            assert!(group.databases.is_empty());
+            assert_eq!(group.replicas.len(), 3);
+            let mut replicas = group
+                .replicas
+                .iter()
+                .map(|replica| {
+                    assert_eq!(replica.availability_mode, "SYNCHRONOUS_COMMIT");
+                    assert_eq!(replica.failover_mode, "EXTERNAL");
+                    assert_eq!(replica.seeding_mode, "AUTOMATIC");
+                    (
+                        replica.server_name.as_str().to_owned(),
+                        replica.endpoint_url.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            replicas.sort();
+            let mut expected = [LOCAL_SERVER, PEER_SERVERS[0], PEER_SERVERS[1]]
+                .into_iter()
+                .map(|server| (server.to_owned(), Some(format!("TCP://{server}:5022"))))
+                .collect::<Vec<_>>();
+            expected.sort();
+            assert_eq!(replicas, expected);
+            for replica in &group.replicas {
+                let state = replica
+                    .state
+                    .as_ref()
+                    .expect("fixture replica state row must be visible");
+                if replica.server_name.as_str() == LOCAL_SERVER {
+                    assert_eq!(state.role, Some(NativeRole::Primary));
+                    assert_eq!(state.connected_state.as_deref(), Some("CONNECTED"));
+                    assert_eq!(state.operational_state.as_deref(), Some("ONLINE"));
+                } else {
+                    assert_eq!(state.role, Some(NativeRole::Secondary));
+                    assert_eq!(state.connected_state.as_deref(), Some("DISCONNECTED"));
+                    assert!(state.operational_state.is_none());
+                }
+                assert_eq!(state.synchronization_health.as_deref(), Some("NOT_HEALTHY"));
+            }
         }
         other => panic!("expected supported instance and present AG, got {other:?}"),
     }

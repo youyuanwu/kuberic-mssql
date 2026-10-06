@@ -1,4 +1,5 @@
 import copy
+from contextlib import nullcontext
 import hashlib
 import importlib.util
 import io
@@ -26,7 +27,7 @@ class FixtureTests(unittest.TestCase):
 
     def context(self, root, **overrides):
         value = {
-            "schema_version": 2,
+            "schema_version": fixture.CONTEXT_SCHEMA_VERSION,
             "root": str(root),
             "created_files": False,
             "created_container": False,
@@ -34,6 +35,7 @@ class FixtureTests(unittest.TestCase):
             "ephemeral": False,
             "container_id": "a" * 64,
             "ready": True,
+            "availability_group": fixture.availability_group_record(),
         }
         value.update(overrides)
         return value
@@ -46,6 +48,7 @@ class FixtureTests(unittest.TestCase):
             "Image": "sha256:image",
             "Config": {
                 "Hostname": fixture.CONTAINER_HOSTNAME,
+                "User": "mssql",
                 "Env": [
                     "ACCEPT_EULA=Y",
                     "MSSQL_PID=EnterpriseDeveloper",
@@ -71,6 +74,24 @@ class FixtureTests(unittest.TestCase):
                 for source, (destination, writable) in fixture.expected_mounts(root).items()
             ],
         }
+
+    def availability_group(self):
+        return {
+            "group_id": "11111111-1111-4111-8111-111111111111",
+            "configuration_sequence": 4294967297,
+            "profile": fixture.expected_ag_profile(),
+        }
+
+    def owned_ag_context(self, root, **overrides):
+        context = self.context(root)
+        context["availability_group"].update(
+            group_id="11111111-1111-4111-8111-111111111111",
+            profile=fixture.expected_ag_profile(),
+            created=True,
+            state="created",
+        )
+        context.update(overrides)
+        return context
 
     def test_runner_root_is_restricted_to_disposable_hosted_runners(self):
         env = {
@@ -99,6 +120,7 @@ class FixtureTests(unittest.TestCase):
         self.assertNotIn("SQLSERVER_TEST_PACKAGE_VERSION", env)
         self.assertNotIn("SQLSERVER_TEST_PACKAGE_SHA256", env)
         self.assertEqual(env["SQLSERVER_TEST_EULA_ACCEPTED"], "true")
+        self.assertNotIn("SQLSERVER_LIVE_AG_CONFIG", env)
 
     def test_artifact_checksum_mismatch_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -116,6 +138,40 @@ class FixtureTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             with self.assertRaises(FileExistsError):
                 fixture.secret_file(path, "replacement")
+
+    def test_admin_sql_keeps_passwords_out_of_process_arguments_and_errors(self):
+        completed = subprocess.CompletedProcess([], 1, "", "contains-secret")
+        with patch.object(fixture.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(fixture.FixtureError, "exit code 1") as raised:
+                fixture.sql(
+                    Path("/private"),
+                    "SELECT N'private-fixture-value';",
+                    "sa",
+                    "private-sa-password",
+                )
+        self.assertNotIn("private", str(raised.exception))
+
+    def test_availability_group_creation_is_metadata_only(self):
+        with patch.object(fixture, "admin_sql") as admin:
+            fixture.create_availability_group(Path("/private"))
+        command = admin.call_args.args[1]
+        self.assertIn("CLUSTER_TYPE = EXTERNAL", command)
+        self.assertEqual(command.count("ENDPOINT_URL"), 3)
+        self.assertEqual(command.count("SYNCHRONOUS_COMMIT"), 3)
+        self.assertEqual(command.count("FAILOVER_MODE = EXTERNAL"), 3)
+        self.assertEqual(command.count("SEEDING_MODE = AUTOMATIC"), 3)
+        self.assertIn("REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 1", command)
+        self.assertNotIn("FOR DATABASE", command)
+        self.assertNotIn("CREATE ENDPOINT", command)
+        self.assertNotIn("CREATE CERTIFICATE", command)
+        self.assertNotIn("CREATE MASTER KEY", command)
+
+    def test_exact_ag_profile_rejects_any_changed_field(self):
+        snapshot = self.availability_group()
+        self.assertTrue(fixture.validate_availability_group(snapshot))
+        changed = copy.deepcopy(snapshot)
+        changed["profile"]["replicas"][0]["seeding_mode"] = "MANUAL"
+        self.assertFalse(fixture.validate_availability_group(changed))
 
     def test_container_name_is_stable_and_fixture_specific(self):
         left = fixture.container_name(Path("/tmp/left"))
@@ -136,6 +192,20 @@ class FixtureTests(unittest.TestCase):
             self.assertNotEqual(absent["observer_password_file"], denied["observer_password_file"])
             self.assertNotEqual(absent["ca_certificate_file"], bad_tls["ca_certificate_file"])
             self.assertEqual(absent["incarnation"], denied["incarnation"])
+
+    def test_present_config_and_environment_exist_only_after_readiness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture.write_configs(root)
+            with self.assertRaises(fixture.FixtureError):
+                fixture.fixture_environment(root, include_ag=True)
+            fixture.write_present_config(root)
+            present = json.loads((root / "present.json").read_text())
+            absent = json.loads((root / "absent.json").read_text())
+            self.assertEqual(present["availability_group"], fixture.AVAILABILITY_GROUP_NAME)
+            self.assertEqual(present["incarnation"], absent["incarnation"])
+            environment = fixture.fixture_environment(root, include_ag=True)
+            self.assertEqual(environment["SQLSERVER_LIVE_AG_CONFIG"], str(root / "present.json"))
 
     def test_image_metadata_requires_exact_digest_version_architecture_and_os(self):
         good = [{
@@ -172,9 +242,14 @@ class FixtureTests(unittest.TestCase):
             metadata = self.container(root)
             with patch.object(fixture, "image_id", return_value="sha256:image"):
                 self.assertEqual(fixture.verify_container(root, metadata), ("a" * 64, True))
+                self.assertEqual(metadata["Config"]["User"], "mssql")
+                self.assertNotIn("/etc/machine-id", {
+                    destination for destination, _ in fixture.expected_mounts(root).values()
+                })
                 changes = [
                     (["Config", "Labels", fixture.LABEL_ROOT], "wrong"),
                     (["Config", "Hostname"], "wrong"),
+                    (["Config", "User"], "0"),
                     (["Image"], "sha256:other"),
                     (["HostConfig", "Memory"], 0),
                     (["HostConfig", "PortBindings", "1433/tcp", 0, "HostIp"], "0.0.0.0"),
@@ -188,6 +263,33 @@ class FixtureTests(unittest.TestCase):
                     target[keys[-1]] = value
                     with self.assertRaises(fixture.FixtureError):
                         fixture.verify_container(root, changed)
+                changed = copy.deepcopy(metadata)
+                changed["Mounts"].append(
+                    {"Source": "/host/machine-id", "Destination": "/etc/machine-id", "RW": False}
+                )
+                with self.assertRaises(fixture.FixtureError):
+                    fixture.verify_container(root, changed)
+
+    def test_container_creation_uses_direct_docker_and_image_default_user(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            completed = subprocess.CompletedProcess([], 0, "a" * 64 + "\n", "")
+            with patch.object(fixture, "command") as command:
+                fixture.docker("inspect", ["inspect", "fixture"])
+            self.assertEqual(command.call_args.args[1], ["docker", "inspect", "fixture"])
+            with patch.object(
+                fixture, "command", return_value=subprocess.CompletedProcess([], 0, "", "")
+            ), patch.object(fixture, "image_id", return_value="sha256:image"), patch.object(
+                fixture, "docker", return_value=completed
+            ) as docker, patch.object(
+                fixture, "docker_inspect", return_value=self.container(root)
+            ), patch.object(
+                fixture, "verify_container", return_value=("a" * 64, True)
+            ):
+                fixture.create_container(root)
+            args = docker.call_args.args[1]
+            self.assertNotIn("--user", args)
+            self.assertEqual(args[args.index("--hostname") + 1], "kuberic-mssql-observer")
 
     def test_context_is_private_exact_and_rejects_unknown_fields_or_bad_ids(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -199,6 +301,84 @@ class FixtureTests(unittest.TestCase):
             fixture.save_context(root, changed)
             with self.assertRaises(fixture.FixtureError):
                 fixture.load_context(root)
+
+    def test_provision_binds_exact_ag_and_refuses_same_name_unowned_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context = self.context(root, ready=False)
+            state = {"group": None}
+
+            def inspect(_root):
+                return state["group"]
+
+            with patch.object(fixture, "inspect_availability_group", side_effect=inspect), patch.object(
+                fixture,
+                "create_availability_group",
+                side_effect=lambda _root: state.update(group=self.availability_group()),
+            ), patch.object(
+                fixture, "write_present_config"
+            ):
+                fixture.provision_availability_group(root, context)
+            self.assertEqual(
+                context["availability_group"]["group_id"],
+                "11111111-1111-4111-8111-111111111111",
+            )
+            self.assertEqual(
+                context["availability_group"]["profile"], fixture.expected_ag_profile()
+            )
+            self.assertTrue(context["availability_group"]["created"])
+            self.assertEqual(context["availability_group"]["state"], "created")
+
+            conflict = self.context(root, ready=False)
+            with patch.object(
+                fixture, "inspect_availability_group", return_value=self.availability_group()
+            ), patch.object(fixture, "create_availability_group") as create:
+                with self.assertRaisesRegex(fixture.FixtureError, "same-name unowned"):
+                    fixture.provision_availability_group(root, conflict)
+                create.assert_not_called()
+
+    def test_owned_ag_identity_or_profile_mismatch_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context = self.owned_ag_context(root)
+            changed = self.availability_group()
+            changed["group_id"] = "22222222-2222-4222-8222-222222222222"
+            with patch.object(fixture, "inspect_availability_group", return_value=changed):
+                with self.assertRaisesRegex(fixture.FixtureError, "absent or mismatched"):
+                    fixture.provision_availability_group(root, context)
+
+    def test_ag_cleanup_is_retryable_and_retains_interrupted_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context = self.owned_ag_context(root)
+            fixture.save_context(root, context)
+            with patch.object(
+                fixture, "inspect_availability_group", return_value=self.availability_group()
+            ), patch.object(
+                fixture,
+                "drop_availability_group",
+                side_effect=fixture.FixtureError("interrupted AG cleanup"),
+            ):
+                with self.assertRaisesRegex(fixture.FixtureError, "interrupted"):
+                    fixture.cleanup_availability_group(root, context)
+            retained = fixture.load_context(root)
+            self.assertEqual(retained["availability_group"]["state"], "cleaning")
+            with patch.object(
+                fixture, "inspect_availability_group", return_value=None
+            ):
+                fixture.cleanup_availability_group(root, retained)
+            self.assertEqual(retained["availability_group"]["state"], "cleaned")
+
+    def test_legacy_context_is_upgraded_without_claiming_an_ag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy = self.context(root)
+            legacy["schema_version"] = 2
+            legacy.pop("availability_group")
+            fixture.save_context(root, legacy)
+            loaded = fixture.load_context(root)
+            self.assertEqual(loaded["schema_version"], fixture.CONTEXT_SCHEMA_VERSION)
+            self.assertEqual(loaded["availability_group"], fixture.availability_group_record())
             changed = self.context(root, container_id="invalid")
             fixture.save_context(root, changed)
             with self.assertRaises(fixture.FixtureError):
@@ -219,6 +399,8 @@ class FixtureTests(unittest.TestCase):
                 fixture, "wait_for_container"
             ), patch.object(
                 fixture, "image_id", return_value="sha256:image"
+            ), patch.object(
+                fixture, "provision_availability_group"
             ):
                 context = fixture.ensure_fixture(root)
             files.assert_called_once_with(root)
@@ -237,12 +419,20 @@ class FixtureTests(unittest.TestCase):
                 fixture, "docker_inspect", side_effect=[self.container(root), self.container(root)]
             ), patch.object(fixture, "verify_container", return_value=("a" * 64, True)), patch.object(
                 fixture, "wait_for_container"
-            ), patch.object(fixture, "start_container") as start:
+            ), patch.object(fixture, "start_container") as start, patch.object(
+                fixture, "provision_availability_group"
+            ):
                 context = fixture.ensure_fixture(root)
                 start.assert_not_called()
                 self.assertFalse(context["created_container"])
                 self.assertFalse(context["started_container"])
-            with patch.object(fixture, "stop_exact_container") as stop, patch.object(
+            with patch.object(
+                fixture, "docker_inspect", return_value=self.container(root)
+            ), patch.object(
+                fixture, "verify_container", return_value=("a" * 64, True)
+            ), patch.object(
+                fixture, "cleanup_availability_group"
+            ), patch.object(fixture, "stop_exact_container") as stop, patch.object(
                 fixture, "remove_exact_container"
             ) as remove:
                 fixture.release_fixture(root)
@@ -260,10 +450,17 @@ class FixtureTests(unittest.TestCase):
             ), patch.object(fixture, "verify_container", side_effect=[("a" * 64, False), ("a" * 64, True)]), patch.object(
                 fixture, "start_container"
             ) as start, patch.object(fixture, "wait_for_container"):
-                context = fixture.ensure_fixture(root)
+                with patch.object(fixture, "provision_availability_group"):
+                    context = fixture.ensure_fixture(root)
                 start.assert_called_once_with(root, "a" * 64)
                 self.assertTrue(context["started_container"])
-            with patch.object(fixture, "stop_exact_container") as stop:
+            with patch.object(
+                fixture, "docker_inspect", return_value=running
+            ), patch.object(
+                fixture, "verify_container", return_value=("a" * 64, True)
+            ), patch.object(
+                fixture, "cleanup_availability_group"
+            ), patch.object(fixture, "stop_exact_container") as stop:
                 fixture.release_fixture(root)
                 stop.assert_called_once_with(root, "a" * 64)
 
@@ -274,10 +471,84 @@ class FixtureTests(unittest.TestCase):
                 root,
                 self.context(root, created_container=True, started_container=True),
             )
-            with patch.object(fixture, "remove_exact_container") as remove:
+            with patch.object(
+                fixture, "docker_inspect", return_value=self.container(root)
+            ), patch.object(
+                fixture, "verify_container", return_value=("a" * 64, True)
+            ), patch.object(fixture, "remove_exact_container") as remove:
                 fixture.release_fixture(root)
                 remove.assert_called_once_with(root, "a" * 64)
             self.assertFalse((root / "fixture-run.json").exists())
+
+    def test_exact_created_container_removal_satisfies_ag_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture.save_context(
+                root,
+                self.owned_ag_context(
+                    root, created_container=True, started_container=True
+                ),
+            )
+            with patch.object(
+                fixture, "docker_inspect", return_value=self.container(root)
+            ), patch.object(
+                fixture, "verify_container", return_value=("a" * 64, True)
+            ), patch.object(
+                fixture,
+                "cleanup_availability_group",
+                side_effect=fixture.FixtureError("SQL unavailable"),
+            ) as cleanup, patch.object(
+                fixture, "remove_exact_container"
+            ) as remove:
+                fixture.release_fixture(root)
+            cleanup.assert_not_called()
+            remove.assert_called_once_with(root, "a" * 64)
+            self.assertFalse((root / "fixture-run.json").exists())
+
+    def test_interrupted_created_container_cleanup_retains_ownership_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture.save_context(
+                root,
+                self.owned_ag_context(
+                    root, created_container=True, started_container=True
+                ),
+            )
+            with patch.object(
+                fixture, "docker_inspect", return_value=self.container(root)
+            ), patch.object(
+                fixture, "verify_container", return_value=("a" * 64, True)
+            ), patch.object(
+                fixture,
+                "remove_exact_container",
+                side_effect=fixture.FixtureError("interrupted container removal"),
+            ):
+                with self.assertRaisesRegex(fixture.FixtureError, "interrupted"):
+                    fixture.release_fixture(root)
+            retained = fixture.load_context(root)
+            self.assertEqual(retained["container_id"], "a" * 64)
+            self.assertEqual(retained["availability_group"]["state"], "created")
+
+    def test_borrowed_container_cleanup_failure_retains_actionable_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture.save_context(root, self.owned_ag_context(root))
+            with patch.object(
+                fixture, "docker_inspect", return_value=self.container(root)
+            ), patch.object(
+                fixture, "verify_container", return_value=("a" * 64, True)
+            ), patch.object(
+                fixture,
+                "cleanup_availability_group",
+                side_effect=fixture.FixtureError("interrupted AG cleanup"),
+            ), patch.object(fixture, "remove_exact_container") as remove, patch.object(
+                fixture, "stop_exact_container"
+            ) as stop:
+                with self.assertRaisesRegex(fixture.FixtureError, "interrupted"):
+                    fixture.release_fixture(root)
+            self.assertTrue((root / "fixture-run.json").is_file())
+            remove.assert_not_called()
+            stop.assert_not_called()
 
     def test_replacement_container_id_is_refused_before_stop_or_remove(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -294,6 +565,7 @@ class FixtureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fixture.save_context(root, self.context(root))
+            (root / "present.json").write_text("{}")
             completed = subprocess.CompletedProcess([], 0, "tests ran\n", "")
             with patch.object(fixture, "local_fixture", return_value=root), patch.object(
                 fixture, "docker_inspect", return_value=self.container(root)
@@ -303,9 +575,53 @@ class FixtureTests(unittest.TestCase):
                 fixture.run_test_cases(root)
             args = command.call_args.args[1]
             env = command.call_args.kwargs["env"]
-            self.assertEqual(args[0:3], ["cargo", "test", "--locked"])
+            self.assertEqual(args[0], str(Path.home() / ".cargo" / "bin" / "cargo"))
+            self.assertEqual(args[1:3], ["test", "--locked"])
             self.assertEqual(env["SQLSERVER_TEST_IMAGE"], fixture.IMAGE)
+            self.assertEqual(env["SQLSERVER_LIVE_AG_CONFIG"], str(root / "present.json"))
             self.assertNotIn("SQLSERVER_TEST_PACKAGE_VERSION", env)
+
+    def test_live_command_selection_combines_feature_targets_once(self):
+        shared = fixture.live_test_command(include_ag=True, include_kuberic=True)
+        self.assertEqual(shared.count("test"), 1)
+        self.assertIn("--all-features", shared)
+        self.assertIn("--tests", shared)
+        self.assertNotIn("--test", shared)
+        self.assertNotIn("--skip", shared)
+        ordinary = fixture.live_test_command(include_ag=False, include_kuberic=False)
+        self.assertNotIn("--all-features", ordinary)
+        self.assertNotIn("live_kuberic", ordinary)
+        self.assertIn("live_present_availability_group", ordinary)
+
+    def test_validate_uses_one_shared_live_command_and_prebuilt_cli(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            completed = subprocess.CompletedProcess([], 0, "{}", "")
+            with patch.object(fixture, "lifecycle_lock", return_value=nullcontext()), patch.object(
+                fixture, "ensure_fixture"
+            ), patch.object(
+                fixture,
+                "fixture_environment",
+                return_value={"SQLSERVER_LIVE_ABSENT_CONFIG": str(root / "absent.json")},
+            ), patch.object(
+                fixture, "command", return_value=completed
+            ) as command, patch.object(
+                fixture, "verify_cli"
+            ) as verify, patch.object(
+                fixture, "release_fixture"
+            ):
+                fixture.validate_fixture(root)
+            commands = [call.args[1] for call in command.call_args_list]
+            self.assertEqual(commands[0], ["just", "test-live-shared", str(root)])
+            self.assertEqual(
+                commands[1],
+                [
+                    "target/debug/sqlserver-observer",
+                    "--config",
+                    str(root / "absent.json"),
+                ],
+            )
+            verify.assert_called_once_with(root / "observation.json")
 
     def test_interruption_kills_and_drains_the_owned_host_test_process_group(self):
         process = MagicMock()

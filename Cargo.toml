@@ -22,6 +22,11 @@ name = "kuberic_contract"
 path = "tests/kuberic_contract.rs"
 required-features = ["kuberic-testing"]
 
+[[test]]
+name = "live_kuberic"
+path = "tests/live_kuberic.rs"
+required-features = ["kuberic-testing"]
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
