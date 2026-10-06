@@ -2,6 +2,8 @@ pub mod config;
 pub mod error;
 pub mod executor;
 pub mod instance;
+#[cfg(feature = "kuberic")]
+pub mod kuberic;
 pub mod monitor;
 pub mod observation;
 pub mod operation;
@@ -23,8 +25,8 @@ pub use operation::{
     OperationRequest, ReplayDisposition,
 };
 pub use types::{
-    AvailabilityGroupIdentity, AvailabilityGroupName, DatabaseIdentity, DatabaseLineage,
-    DecimalProgress, Endpoint, EngineArtifact, Guid, NativeProgress, NativeRole, Observation,
-    ObservationFailure, ObservationFailureKind, OpaqueId, PinnedImage, PinnedPackage,
+    AvailabilityGroupIdentity, AvailabilityGroupName, ConfigurationSequence, DatabaseIdentity,
+    DatabaseLineage, DecimalProgress, Endpoint, EngineArtifact, Guid, NativeProgress, NativeRole,
+    Observation, ObservationFailure, ObservationFailureKind, OpaqueId, PinnedImage, PinnedPackage,
     ReplicaDescriptor, ReplicaIdentity, SecretRef, ServerName, SqlIdentifier,
 };

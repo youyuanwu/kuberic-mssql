@@ -8,10 +8,10 @@ use crate::executor::{QueryRow, SqlSession};
 use crate::query::ReadQuery;
 use crate::runtime_error::RuntimeError;
 use crate::{
-    AvailabilityGroupIdentity, AvailabilityGroupName, DatabaseIdentity, DatabaseLineage,
-    DecimalProgress, Guid, NativeProgress, NativeRole, Observation, ObservationFailureKind,
-    ReplicaIdentity, SUPPORTED_DATABASE_COUNT, SUPPORTED_ENGINE_MAJOR, SUPPORTED_REPLICA_COUNT,
-    SUPPORTED_REQUIRED_SECONDARIES, ServerName, SqlIdentifier,
+    AvailabilityGroupIdentity, AvailabilityGroupName, ConfigurationSequence, DatabaseIdentity,
+    DatabaseLineage, DecimalProgress, Guid, NativeProgress, NativeRole, Observation,
+    ObservationFailureKind, ReplicaIdentity, SUPPORTED_DATABASE_COUNT, SUPPORTED_ENGINE_MAJOR,
+    SUPPORTED_REPLICA_COUNT, SUPPORTED_REQUIRED_SECONDARIES, ServerName, SqlIdentifier,
 };
 
 #[derive(Debug, Clone)]
@@ -51,7 +51,7 @@ pub struct InstanceMetadata {
 pub struct AvailabilityGroupSnapshot {
     pub identity: AvailabilityGroupIdentity,
     /// A nonnegative SQL bigint, serialized as a decimal string.
-    pub configuration_sequence: DecimalProgress,
+    pub configuration_sequence: ConfigurationSequence,
     pub cluster_type: String,
     pub required_synchronized_secondaries_to_commit: u32,
     pub basic_features: bool,
@@ -344,7 +344,7 @@ struct Anchor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GroupAnchor {
     identity: AvailabilityGroupIdentity,
-    configuration_sequence: DecimalProgress,
+    configuration_sequence: ConfigurationSequence,
     cluster_type: u8,
     cluster_type_desc: String,
     required_secondaries: u32,
@@ -568,7 +568,7 @@ fn parse_anchor(rows: &[QueryRow]) -> Result<Anchor, RuntimeError> {
                         .map_err(|_| malformed(row.stage, "invalid availability group name"))?,
                     group_id,
                 },
-                configuration_sequence: row.bigint("sequence_number")?,
+                configuration_sequence: row.configuration_sequence("sequence_number")?,
                 cluster_type: row.unsigned("cluster_type")?,
                 cluster_type_desc: row.text("cluster_type_desc", 60)?,
                 required_secondaries: row
@@ -1284,8 +1284,13 @@ impl<'a> Row<'a> {
         Ok(value)
     }
 
-    fn bigint(&self, column: &str) -> Result<DecimalProgress, RuntimeError> {
-        self.optional_bigint(column)?
+    fn configuration_sequence(&self, column: &str) -> Result<ConfigurationSequence, RuntimeError> {
+        self.optional(column)?
+            .map(|value| {
+                ConfigurationSequence::parse(value)
+                    .map_err(|_| malformed(self.stage, "invalid native nonnegative bigint"))
+            })
+            .transpose()?
             .ok_or_else(|| malformed(self.stage, "required native bigint is NULL"))
     }
 

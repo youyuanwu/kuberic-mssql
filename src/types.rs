@@ -219,6 +219,37 @@ impl Serialize for DecimalProgress {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConfigurationSequence(i64);
+
+impl ConfigurationSequence {
+    pub fn parse(value: &str) -> Result<Self, ContractError> {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ContractError::InvalidProgress);
+        }
+        value
+            .parse::<i64>()
+            .map(Self)
+            .map_err(|_| ContractError::InvalidProgress)
+    }
+
+    pub const fn value(self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ConfigurationSequence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Serialize for ConfigurationSequence {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Endpoint {
     host: String,
