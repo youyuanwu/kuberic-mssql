@@ -1037,7 +1037,7 @@ def cargo_binary():
 
 
 def live_test_command(*, include_ag, include_kuberic):
-    args = [cargo_binary(), "test", "--locked"]
+    args = [cargo_binary(), "test", "--locked", "-p", "kuberic-mssql-tests"]
     if include_kuberic:
         args += ["--all-features", "--tests"]
     else:
@@ -1276,7 +1276,15 @@ def validate_fixture(directory=None):
             if not observer.is_file():
                 command(
                     "build observer binary",
-                    [cargo_binary(), "build", "--locked", "--bin", "sqlserver-observer"],
+                    [
+                        cargo_binary(),
+                        "build",
+                        "--locked",
+                        "-p",
+                        "kuberic-mssql",
+                        "--bin",
+                        "sqlserver-observer",
+                    ],
                     env=env,
                     timeout=600,
                     process_group=True,

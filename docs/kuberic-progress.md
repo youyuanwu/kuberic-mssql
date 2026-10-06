@@ -159,13 +159,13 @@ The required live Kuberic test:
 The standalone observer requires no Kuberic dependency:
 
 ```bash
-cargo build --locked --bin sqlserver-observer
+cargo build --locked -p kuberic-mssql --bin sqlserver-observer
 ```
 
 Build or test the adapter through the feature:
 
 ```bash
-cargo test --locked --features kuberic-testing --test kuberic_contract
+cargo test --locked -p kuberic-mssql-tests --test kuberic_contract
 ```
 
 Run the complete server-free and single-container gate:

@@ -330,7 +330,7 @@ Server-free tests
 cover profile rejection, exact progress, malformed observations, canonical
 operation vectors, duplicate/reused operation IDs, epoch regression,
 destructive approval, and fence binding. They run in the ordinary CI job as
-`cargo test --all-features`.
+`cargo test --workspace --all-features`.
 Runtime tests also cover typed DMV decoding, inconsistent snapshots,
 permissions, transport and sample deadlines, freshness, cancellation, CLI
 output, and credential redaction. A dedicated server-free observer workflow

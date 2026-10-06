@@ -742,6 +742,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "kuberic-mssql"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "clap",
+ "futures",
+ "kuberic-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tiberius",
+ "tokio",
+ "tokio-util",
+ "zeroize",
+]
+
+[[package]]
+name = "kuberic-mssql-tests"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "kuberic-mssql",
+ "kuberic-runtime",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "kuberic-runtime"
 version = "0.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1396,24 +1426,6 @@ dependencies = [
  "js-sys",
  "rsqlite-vfs",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "sqlserver-replicated"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "clap",
- "futures",
- "kuberic-runtime",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tiberius",
- "tokio",
- "tokio-util",
- "zeroize",
 ]
 
 [[package]]

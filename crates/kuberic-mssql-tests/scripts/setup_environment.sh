@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
   echo "The shared validation environment requires Linux x86-64." >&2

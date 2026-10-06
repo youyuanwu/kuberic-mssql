@@ -1,8 +1,8 @@
 use std::io::Write;
 
-use sqlserver_replicated::ObservationFailureKind;
-use sqlserver_replicated::monitor::ObservationReport;
-use sqlserver_replicated::runtime_error::RuntimeError;
+use crate::ObservationFailureKind;
+use crate::monitor::ObservationReport;
+use crate::runtime_error::RuntimeError;
 use tokio::sync::{mpsc, oneshot};
 
 struct PendingWrite {

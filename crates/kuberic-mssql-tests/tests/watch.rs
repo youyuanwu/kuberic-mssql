@@ -1,22 +1,18 @@
-#[path = "../tests/common/mod.rs"]
-mod common;
-
 use std::future::pending;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use kuberic_mssql::executor::{QueryRow, SqlExecutor, SqlSession};
+use kuberic_mssql::instance::SqlServerInstanceManager;
+use kuberic_mssql::observer::run_watch;
+use kuberic_mssql::query::ReadQuery;
+use kuberic_mssql::runtime_config::ObserverConfig;
+use kuberic_mssql::runtime_error::RuntimeError;
+use kuberic_mssql::{AvailabilityGroupName, Observation, ObservationFailureKind};
+use kuberic_mssql_tests::Fixture;
 use serde_json::json;
-use sqlserver_replicated::executor::{QueryRow, SqlExecutor, SqlSession};
-use sqlserver_replicated::instance::SqlServerInstanceManager;
-use sqlserver_replicated::query::ReadQuery;
-use sqlserver_replicated::runtime_config::ObserverConfig;
-use sqlserver_replicated::runtime_error::RuntimeError;
-use sqlserver_replicated::{AvailabilityGroupName, Observation, ObservationFailureKind};
 use tokio::sync::{mpsc, oneshot};
-
-use super::run_watch;
-use common::Fixture;
 
 #[derive(Clone, Copy)]
 enum Sample {

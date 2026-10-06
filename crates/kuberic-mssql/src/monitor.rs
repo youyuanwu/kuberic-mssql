@@ -121,7 +121,8 @@ mod tests {
 
     #[test]
     fn publication_summary_retains_overwritten_failures_and_stale_samples() {
-        let config = ObserverConfig::from_json(include_bytes!("../observer.example.json")).unwrap();
+        let config =
+            ObserverConfig::from_json(include_bytes!("../../../observer.example.json")).unwrap();
         let observed_at = 100_000;
         let now = observed_at + config.max_age_millis() + 1;
         let stale = ObservationReport::new(

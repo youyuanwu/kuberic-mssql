@@ -1,11 +1,19 @@
 use std::path::PathBuf;
 
+use kuberic_mssql::runtime_config::ObserverConfig;
 use serde_json::{Value, json};
-use sqlserver_replicated::runtime_config::ObserverConfig;
+
+pub mod tds;
 
 pub struct Fixture {
     directory: tempfile::TempDir,
     pub document: Value,
+}
+
+impl Default for Fixture {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Fixture {

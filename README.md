@@ -15,6 +15,18 @@ Kubernetes HA integration or an automatic failover implementation. See the
 Role validation never publishes a client service address; the configured
 replication address is returned only by the custom replicator's open callback.
 
+## Workspace layout
+
+The repository is a two-member Cargo workspace:
+
+- `crates/kuberic-mssql` contains the observe-only runtime library and the
+  production `sqlserver-observer` binary.
+- `crates/kuberic-mssql-tests` contains shared test support, integration and
+  ignored licensed live tests, and the SQL Server container fixture scripts.
+
+Dependency versions are declared once in the root `Cargo.toml`; member
+manifests select only the features they need.
+
 ## Run the observer
 
 Provision the instance separately, explicitly accepting the SQL Server EULA
@@ -41,10 +53,10 @@ or connection strings. The observer rereads these files on every connection,
 so a subsequent observation sees rotated credentials.
 
 ```bash
-cargo run --locked --bin sqlserver-observer -- \
+cargo run --locked -p kuberic-mssql --bin sqlserver-observer -- \
   --config /absolute/path/to/observer.json
 
-cargo run --locked --bin sqlserver-observer -- \
+cargo run --locked -p kuberic-mssql --bin sqlserver-observer -- \
   --config /absolute/path/to/observer.json --watch
 ```
 
@@ -238,7 +250,7 @@ CI retains `actions-rust-lang/setup-rust-toolchain@v2`; the bootstrap reuses its
 prepared toolchain.
 
 ```bash
-bash scripts/setup_environment.sh
+bash crates/kuberic-mssql-tests/scripts/setup_environment.sh
 ```
 
 On Ubuntu 24.04, `sudo apt-get install just` is also supported. Recipes put the
@@ -257,9 +269,9 @@ server-free CI helper tests. Builds default to one job; an explicitly supplied
 `CARGO_BUILD_JOBS` is preserved. The underlying Cargo commands remain available:
 
 ```bash
-cargo fmt -- --check
-cargo test --locked --all-features
-cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
+cargo test --locked --workspace --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 ```
 
 The `justfile` is the shared interface for every repository-owned CI step.
@@ -377,7 +389,7 @@ Direct test commands remain available:
 
 ```bash
 cargo nextest list --profile external --run-ignored only
-cargo test --locked --test live_observation -- --ignored
+cargo test --locked -p kuberic-mssql-tests --test live_observation -- --ignored
 ```
 
 An explicitly requested live test fails if any of its prerequisites are

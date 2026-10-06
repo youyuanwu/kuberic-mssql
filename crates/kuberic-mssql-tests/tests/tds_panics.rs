@@ -1,25 +1,20 @@
-mod common;
-#[path = "common/tds.rs"]
-mod tds_peer;
-
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use kuberic_mssql_tests::{Fixture, tds as tds_peer};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use common::Fixture;
-
 fn observer_binary() -> PathBuf {
-    std::env::var_os("NEXTEST_BIN_EXE_sqlserver_observer")
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_sqlserver-observer"))
+    std::env::var_os("NEXTEST_BIN_EXE_sqlserver_observer_test")
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_sqlserver-observer-test"))
         .map(PathBuf::from)
-        .or_else(|| option_env!("CARGO_BIN_EXE_sqlserver-observer").map(PathBuf::from))
-        .expect("sqlserver-observer binary path")
+        .or_else(|| option_env!("CARGO_BIN_EXE_sqlserver-observer-test").map(PathBuf::from))
+        .expect("sqlserver-observer-test binary path")
 }
 
 const UNKNOWN_TOKEN: &[u8] = &[
