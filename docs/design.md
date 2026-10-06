@@ -72,8 +72,11 @@ runtime:
 - native AG, database, replica, and incarnation identities;
 - separate desired replica identities for bootstrap, before SQL Server generates
   native replica GUIDs;
-- exact SQL Server `numeric(25,0)` progress values without narrowing to
-  Kuberic's current `i64` progress type;
+- exact SQL Server `numeric(25,0)` database progress values without narrowing
+  them to Kuberic progress;
+- a dedicated signed `ConfigurationSequence` and optional observe-only Kuberic
+  adapter that publishes validated AG configuration authority as current
+  progress;
 - observations that distinguish present, absent, stale, and failed evidence;
 - versioned operation envelopes with canonical SHA-256 input signatures;
 - explicit destructive approvals and fence references;
@@ -82,9 +85,10 @@ runtime:
 - capability-checked, identity-bracketed native DMV snapshots; and
 - a freshness-aware monitor and observe-only JSON CLI.
 
-The crate connects to already provisioned SQL Server instances. It does not
-create an AG, seed a database, renew a write lease, change a role, or integrate
-with either Kuberic operator.
+The production crate connects to already provisioned SQL Server instances. It
+does not create an AG, seed a database, renew a write lease, change a native
+role, or integrate with either Kuberic operator. The optional Kuberic runtime
+adapter validates role and progress callbacks without mutating SQL Server.
 Mutation configuration is therefore only a contract for later stages, not an
 enabled execution path.
 
@@ -281,8 +285,10 @@ provisioning.
 
 ## Level-Triggered Integration Boundary
 
-The SQL Server library can be developed before youyuanwu/kuberic#79, but it must not be
-wired into the current operator2 prototype until that work provides:
+youyuanwu/kuberic#79 supplied the durable level-triggered runtime and controller
+boundary. This repository now consumes the published runtime for an observe-only
+progress vertical slice. Controller deployment and authority-changing SQL
+operations still require:
 
 - durable replica and incarnation evidence;
 - versioned declarative commands and retained terminal results;
@@ -291,15 +297,16 @@ wired into the current operator2 prototype until that work provides:
 - a pure planner that emits at most one authority-changing command; and
 - separate persistence and dispatch reconciliation cycles.
 
-Until then, the SQL Server code remains an independently testable adapter
-library and laboratory tool. It does not claim automatic Kubernetes failover.
+The current SQL Server code remains an independently testable adapter library
+and laboratory tool. It does not claim automatic Kubernetes failover.
 
 ## Delivery Sequence
 
 1. **Support and safety contract** — implemented: types, validation,
    canonical operation identity, tests, and this design.
-2. **Runtime and observation** — the current slice: a replaceable TDS executor, immutable DMV
-   snapshots, freshness, startup capability checks, and an observe-only CLI.
+2. **Runtime and observation** — implemented: a replaceable TDS executor,
+   immutable DMV snapshots, freshness, startup capability checks, an
+   observe-only CLI, and Kuberic configuration-progress publication.
 3. **Bootstrap, join, and reseed** — pure convergence decisions, one native
    effect at a time, durable SQL-specific result journal, and automatic-seeding
    postconditions.
@@ -307,8 +314,8 @@ library and laboratory tool. It does not claim automatic Kubernetes failover.
    arbitration, verified fence receipts, explicit data-loss recovery, and live
    fault tests. Automatic failover remains disabled until every safety gate
    passes.
-5. **Operator2 integration** — Pod/PVC/Secret/Service convergence and the
-   youyuanwu/kuberic#79 command/evidence boundary.
+5. **Controller integration** — Pod/PVC/Secret/Service convergence through the
+   implemented Kuberic command/evidence boundary.
 6. **Kubernetes E2E and operations** — pinned licensed test environment,
    three-replica failures, process/operator restarts, client reconnection,
    upgrades, and runbooks.
@@ -332,11 +339,14 @@ runs these without provisioning PostgreSQL or Kubernetes.
 Live tests run in the shared validation job alongside server-free checks.
 The job runs on PRs, main-branch pushes and manual dispatches, with automatic
 EULA acceptance for one digest-pinned SQL Server 2025 Enterprise Developer
-container fixture for absence, denied permissions, invalid TLS and
-CLI output validation. Shared `just ci`/`provision`/`validate-live`/`cleanup`
+container fixture for absence, a metadata-only present AG, Kuberic progress,
+denied permissions, invalid TLS and CLI output validation. Shared
+`just ci`/`provision`/`validate-live`/`cleanup`
 commands own image verification, container creation, HADR/TLS/principal setup
 and cleanup outside the observer. Tests and CLI remain host processes. The helper
-refuses unrelated or modified containers and creates no AG. This does not enable
+refuses unrelated or modified containers. The fixture helper creates and owns
+one metadata-only AG with three configured replicas, no database and no
+mirroring endpoint. Production runtime code creates no AG. This does not enable
 runtime mutation or validate HA. The same ensure-ready operation is used locally:
 it preserves an already-running exact fixture, starts/stops a verified stopped
 container, or creates/removes an absent one. A private ownership record lets

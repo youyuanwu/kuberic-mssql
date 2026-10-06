@@ -6,9 +6,11 @@ container, accept an EULA, start or restart `sqlservr`, create an AG, change a
 role, renew a write lease, or execute any mutation command.
 
 The library is compatible with the observation side of the level-triggered
-contract. It remained independent when the classic stack was removed and is
+contract. Its optional Kuberic adapter publishes validated AG configuration
+sequence through the fixed Service Fabric-compatible progress API, but it is
 not wired into the level-triggered controller. This is not a complete
-Kubernetes HA integration or an automatic failover implementation. The
+Kubernetes HA integration or an automatic failover implementation. See the
+[progress integration guide](docs/kuberic-progress.md); the
 [support and safety design](docs/design.md) remains authoritative.
 
 ## Run the observer
@@ -74,8 +76,10 @@ client remain ordinary host processes.
 The fixture accepts the EULA for a non-production Enterprise Developer instance,
 limits the container to 3 GiB and SQL Server to 2 GiB, enables HADR and mounts
 verified TLS configuration. Separate allowed and denied observation principals
-exercise absence, permission and TLS behavior. It creates no AG and performs no
-join, seeding, promotion, lease or failover operation.
+exercise absence, permission and TLS behavior. For the progress happy path it
+creates one metadata-only EXTERNAL AG with three replica definitions, no
+database and no local mirroring endpoint. It performs no join, seeding,
+promotion, lease or failover operation.
 
 Container writable storage is intentionally ephemeral. A container created for a
 validation run is removed afterward, deleting its SQL Server data. Host-side
@@ -294,9 +298,11 @@ container with HADR, verified TLS and separate allowed/denied observation princi
 Credentials are generated per run, kept in private temporary files, and never
 passed in arguments or published as artifacts.
 
-The job exercises absent-AG observation, permission denial, invalid-CA rejection
-and the actual CLI's fresh SQL Server 2025 output. It creates no AG and makes
-no join, seeding, role, lease-renewal or failover changes. An always-run cleanup
+The job exercises absent and present AG observation, permission denial,
+invalid-CA rejection, Kuberic progress publication, and the actual CLI's fresh
+SQL Server 2025 output. The fixture-created AG contains metadata only and makes
+no endpoint, database, join, seeding, role, lease-renewal or failover changes.
+An always-run cleanup
 step removes the owned container and its SQL data; the disposable runner
 is the final containment boundary. This is real-engine observation validation, not
 three-replica AG or HA validation. CI uses its generated runner-temporary fixture
@@ -325,7 +331,9 @@ responsibility. Once the fixture is configured:
 
 ```bash
 just test-live      # absent AG, permission denial, invalid CA
-just test-live-all  # also requires a preconfigured EXTERNAL AG
+just test-live-all  # all direct-observation cases, including the fixture AG
+just test-live-kuberic  # Kuberic progress through the published testing runtime
+just test-live-shared   # direct and Kuberic cases in one Cargo invocation
 just test-live-cli /absolute/path/to/observation.json
 just verify-live-cli /absolute/path/to/fresh-observation.json
 ```
@@ -368,7 +376,7 @@ cargo test --locked --test live_observation -- --ignored
 ```
 
 An explicitly requested live test fails if any of its prerequisites are
-missing; it never silently skips. Tests use observation principals and issue
-no setup/mutation SQL. Fixture provisioning and AG management must be done by
-the test environment owner. Local three-node failover, lease expiry, old-primary
+missing; it never silently skips. Rust tests use observation principals and
+issue no setup/mutation SQL. The fixture helper owns its exact test AG metadata
+and cleanup. Local three-node failover, lease expiry, old-primary
 fencing, and fault injection are stage 4, not claims of this PR.
