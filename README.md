@@ -274,6 +274,11 @@ just cleanup-live-three-replica
 just cleanup
 ```
 
+The one-replica preflight requires at least 5 GiB effective available memory,
+6 GiB on its fixture filesystem and two effective CPUs. Its single container
+uses the same 3 GiB hard memory, two-CPU and 2 GiB SQL Server memory limits as
+each three-replica member.
+
 Override fixture roots with each recipe's optional `root` argument. The
 one-replica environment override is `SQLSERVER_ONE_REPLICA_ROOT`; the
 three-replica override is `KUBERIC_MSSQL_THREE_REPLICA_ROOT`.
