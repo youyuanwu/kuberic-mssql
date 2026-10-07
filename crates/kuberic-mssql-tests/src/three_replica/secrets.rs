@@ -175,8 +175,54 @@ pub struct CredentialFiles {
     pub endpoint_master_key_passwords: [PrivateFile; 3],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SharedCredentialFiles {
+    pub sa_username: PrivateFile,
+    pub sa_password: PrivateFile,
+    pub admin_username: PrivateFile,
+    pub admin_password: PrivateFile,
+    pub observer_username: PrivateFile,
+    pub observer_password: PrivateFile,
+    pub endpoint_master_key_passwords: Vec<PrivateFile>,
+}
+
 impl CredentialFiles {
     pub fn generate(root: &Path, run_id: &str) -> Result<Self, SecretError> {
+        let shared = SharedCredentialFiles::generate(root, run_id, 3)?;
+        Ok(Self {
+            sa_username: shared.sa_username,
+            sa_password: shared.sa_password,
+            admin_username: shared.admin_username,
+            admin_password: shared.admin_password,
+            observer_username: shared.observer_username,
+            observer_password: shared.observer_password,
+            endpoint_master_key_passwords: shared
+                .endpoint_master_key_passwords
+                .try_into()
+                .map_err(|_| SecretError::Io)?,
+        })
+    }
+
+    pub fn all(&self) -> impl Iterator<Item = &PrivateFile> {
+        [
+            &self.sa_username,
+            &self.sa_password,
+            &self.admin_username,
+            &self.admin_password,
+            &self.observer_username,
+            &self.observer_password,
+        ]
+        .into_iter()
+        .chain(self.endpoint_master_key_passwords.iter())
+    }
+}
+
+impl SharedCredentialFiles {
+    pub(crate) fn generate(
+        root: &Path,
+        run_id: &str,
+        endpoint_password_count: usize,
+    ) -> Result<Self, SecretError> {
         let directory = root.join("credentials");
         create_private_directory(&directory)?;
         let suffix = validated_suffix(run_id)?;
@@ -185,16 +231,14 @@ impl CredentialFiles {
         let observer_password = SecretValue::generate_password()?;
         let admin_username = format!("km_admin_{suffix}");
         let observer_username = format!("km_observer_{suffix}");
-        let endpoint_master_key_passwords = (0..3)
+        let endpoint_master_key_passwords = (0..endpoint_password_count)
             .map(|index| {
                 PrivateFile::create(
                     directory.join(format!("endpoint-master-key-{}", index + 1)),
                     &SecretValue::generate_password()?,
                 )
             })
-            .collect::<Result<Vec<_>, SecretError>>()?
-            .try_into()
-            .map_err(|_| SecretError::Io)?;
+            .collect::<Result<Vec<_>, SecretError>>()?;
         Ok(Self {
             sa_username: PrivateFile::create_text(directory.join("sa-username"), "sa")?,
             sa_password: PrivateFile::create(directory.join("sa-password"), &sa_password)?,
@@ -213,21 +257,6 @@ impl CredentialFiles {
             )?,
             endpoint_master_key_passwords,
         })
-    }
-
-    pub fn all(&self) -> impl Iterator<Item = &PrivateFile> {
-        [
-            &self.sa_username,
-            &self.sa_password,
-            &self.admin_username,
-            &self.admin_password,
-            &self.observer_username,
-            &self.observer_password,
-            &self.endpoint_master_key_passwords[0],
-            &self.endpoint_master_key_passwords[1],
-            &self.endpoint_master_key_passwords[2],
-        ]
-        .into_iter()
     }
 }
 

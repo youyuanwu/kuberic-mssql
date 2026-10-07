@@ -1,19 +1,19 @@
-mod admin;
+pub(crate) mod admin;
 mod availability_group;
-mod cleanup;
-mod config;
+pub(crate) mod cleanup;
+pub(crate) mod config;
 mod data;
-mod deadline;
-mod docker;
+pub(crate) mod deadline;
+pub(crate) mod docker;
 mod evidence;
 mod kuberic_group;
 mod member;
 mod model;
-mod ownership;
-mod preflight;
-mod process;
-mod secrets;
-mod tls;
+pub(crate) mod ownership;
+pub(crate) mod preflight;
+pub(crate) mod process;
+pub(crate) mod secrets;
+pub(crate) mod tls;
 
 pub use admin::{
     AdminDeadlines, AdminEndpoint, AdminError, AdminSession, EXPECTED_SQL_SERVER_VERSION,

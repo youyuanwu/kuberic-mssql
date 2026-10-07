@@ -6,16 +6,17 @@ use std::time::{Duration, Instant as StdInstant};
 use tiberius::ToSql;
 use tokio::time::{Instant, sleep};
 
-use super::admin::{
+use crate::fixture::admin::{
     AdminDeadlines, AdminEndpoint, AdminError, AdminSession, LoginFiles, required_text, single_row,
 };
-use super::config::StageDeadlines;
-use super::deadline::{BoundedOperationError, complete_before, earlier};
+use crate::fixture::config::StageDeadlines;
+use crate::fixture::deadline::{BoundedOperationError, complete_before, earlier};
+use crate::fixture::secrets::{CredentialFiles, SecretError};
+use crate::fixture::tls::TlsAssets;
+
 use super::evidence::ValidatedNativeEvidence;
 use super::member::ReadyMember;
 use super::model::TopologyRun;
-use super::secrets::{CredentialFiles, SecretError};
-use super::tls::TlsAssets;
 
 const MARKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 

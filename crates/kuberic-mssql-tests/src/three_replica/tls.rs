@@ -26,6 +26,21 @@ pub struct TlsAssets {
     pub members: [MemberTlsAssets; 3],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SharedTlsAssets {
+    pub ca_certificate: PrivateFile,
+    pub ca_private_key: PrivateFile,
+    pub members: Vec<MemberTlsAssets>,
+}
+
+pub(crate) struct TlsGenerationRequest<'a> {
+    pub root: &'a Path,
+    pub hostnames: &'a [&'a str],
+    pub member_data_directories: &'a [&'a Path],
+    pub ca_common_name: &'a str,
+    pub timeout: Duration,
+}
+
 pub trait TlsAssetRecorder {
     fn create_directory(&mut self, logical_name: &str, path: &Path) -> Result<(), TlsError>;
     fn create_text_file(
@@ -123,13 +138,59 @@ impl TlsAssets {
         recorder: &mut impl TlsAssetRecorder,
         clock: &C,
     ) -> Result<Self, TlsError> {
-        let budget = OperationBudget::new(clock, timeout);
-        for hostname in hostnames {
+        let shared = SharedTlsAssets::generate_recorded_with_clock(
+            TlsGenerationRequest {
+                root,
+                hostnames: &hostnames,
+                member_data_directories: &member_data_directories,
+                ca_common_name: "Kuberic three replica test CA",
+                timeout,
+            },
+            runner,
+            recorder,
+            clock,
+        )?;
+        Ok(Self {
+            ca_certificate: shared.ca_certificate,
+            ca_private_key: shared.ca_private_key,
+            members: shared.members.try_into().map_err(|_| TlsError::Helper)?,
+        })
+    }
+
+    pub fn private_files(&self) -> impl Iterator<Item = &PrivateFile> {
+        [
+            &self.ca_certificate,
+            &self.ca_private_key,
+            &self.members[0].server_certificate,
+            &self.members[0].server_private_key,
+            &self.members[1].server_certificate,
+            &self.members[1].server_private_key,
+            &self.members[2].server_certificate,
+            &self.members[2].server_private_key,
+        ]
+        .into_iter()
+    }
+}
+
+impl SharedTlsAssets {
+    pub(crate) fn generate_recorded_with_clock<C: CleanupClock>(
+        request: TlsGenerationRequest<'_>,
+        runner: &impl ProcessRunner,
+        recorder: &mut impl TlsAssetRecorder,
+        clock: &C,
+    ) -> Result<Self, TlsError> {
+        if request.hostnames.is_empty()
+            || request.hostnames.len() != request.member_data_directories.len()
+        {
+            return Err(TlsError::Helper);
+        }
+        let budget = OperationBudget::new(clock, request.timeout);
+        for hostname in request.hostnames {
             validate_hostname(hostname)?;
         }
-        let tls_root = root.join("tls");
+        let tls_root = request.root.join("tls");
         recorder.create_directory("tls-directory", &tls_root)?;
-        let exchange_root = root.join("endpoint-exchange");
+        let exchange_root = request.root.join("endpoint-exchange");
         recorder.create_directory("endpoint-exchange-directory", &exchange_root)?;
 
         let ca_key = tls_root.join("ca.key");
@@ -167,7 +228,7 @@ impl TlsAssets {
                 "-key",
                 path_text(&ca_key)?,
                 "-subj",
-                "/CN=Kuberic three replica test CA",
+                &format!("/CN={}", request.ca_common_name),
                 "-addext",
                 "basicConstraints=critical,CA:TRUE",
                 "-addext",
@@ -182,9 +243,9 @@ impl TlsAssets {
 
         let serial = tls_root.join("ca.srl");
         let serial_record = recorder.dispatch_file("tls-ca-serial", &serial)?;
-        let mut members = Vec::with_capacity(3);
-        for index in 0..3 {
-            let secrets = member_data_directories[index].join("secrets");
+        let mut members = Vec::with_capacity(request.hostnames.len());
+        for index in 0..request.hostnames.len() {
+            let secrets = request.member_data_directories[index].join("secrets");
             recorder
                 .create_directory(&format!("member-{}-secrets-directory", index + 1), &secrets)?;
             configure_sql_directory(&secrets, &budget, runner)?;
@@ -192,7 +253,7 @@ impl TlsAssets {
             recorder.create_directory(&format!("member-{}-tls-directory", index + 1), &kuberic)?;
             configure_sql_directory(&kuberic, &budget, runner)?;
             let key = kuberic.join("server.key");
-            let request = tls_root.join(format!("server-{}.csr", index + 1));
+            let certificate_request = tls_root.join(format!("server-{}.csr", index + 1));
             let extensions = tls_root.join(format!("server-{}.ext", index + 1));
             let certificate = kuberic.join("server.crt");
             let extension_file = recorder.create_text_file(
@@ -203,7 +264,7 @@ impl TlsAssets {
                      extendedKeyUsage=serverAuth\n\
                      keyUsage=critical,digitalSignature,keyEncipherment\n\
                      basicConstraints=critical,CA:FALSE\n",
-                    hostnames[index]
+                    request.hostnames[index]
                 ),
             )?;
             let key_record =
@@ -225,8 +286,10 @@ impl TlsAssets {
             make_private(&key)?;
             share_file_with_sql(&key, &budget, runner)?;
             let key_file = recorder.bind_file(key_record, &key, true)?;
-            let request_record =
-                recorder.dispatch_file(&format!("tls-server-{}-request", index + 1), &request)?;
+            let request_record = recorder.dispatch_file(
+                &format!("tls-server-{}-request", index + 1),
+                &certificate_request,
+            )?;
             run_openssl(
                 runner,
                 &budget,
@@ -238,13 +301,13 @@ impl TlsAssets {
                     "-key",
                     path_text(&key)?,
                     "-subj",
-                    &format!("/CN={}", hostnames[index]),
+                    &format!("/CN={}", request.hostnames[index]),
                     "-out",
-                    path_text(&request)?,
+                    path_text(&certificate_request)?,
                 ],
             )?;
-            make_private(&request)?;
-            let _request_file = recorder.bind_file(request_record, &request, false)?;
+            make_private(&certificate_request)?;
+            let _request_file = recorder.bind_file(request_record, &certificate_request, false)?;
             let certificate_record = recorder.dispatch_file(
                 &format!("tls-server-{}-certificate", index + 1),
                 &certificate,
@@ -256,7 +319,7 @@ impl TlsAssets {
                 "-days".to_owned(),
                 "2".to_owned(),
                 "-in".to_owned(),
-                path_text(&request)?.to_owned(),
+                path_text(&certificate_request)?.to_owned(),
                 "-CA".to_owned(),
                 path_text(&ca_certificate)?.to_owned(),
                 "-CAkey".to_owned(),
@@ -296,26 +359,11 @@ impl TlsAssets {
         }
         make_private(&serial)?;
         let _serial_file = recorder.bind_file(serial_record, &serial, false)?;
-        let members = members.try_into().map_err(|_| TlsError::Helper)?;
         Ok(Self {
             ca_certificate: ca_certificate_file,
             ca_private_key,
             members,
         })
-    }
-
-    pub fn private_files(&self) -> impl Iterator<Item = &PrivateFile> {
-        [
-            &self.ca_certificate,
-            &self.ca_private_key,
-            &self.members[0].server_certificate,
-            &self.members[0].server_private_key,
-            &self.members[1].server_certificate,
-            &self.members[1].server_private_key,
-            &self.members[2].server_certificate,
-            &self.members[2].server_private_key,
-        ]
-        .into_iter()
     }
 }
 

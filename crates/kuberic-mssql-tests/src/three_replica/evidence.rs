@@ -11,7 +11,8 @@ use kuberic_mssql::runtime_config::ObserverConfig;
 use kuberic_mssql::tds::TdsExecutor;
 use kuberic_mssql::{NativeRole, Observation};
 
-use super::deadline::{BoundedOperationError, complete_before};
+use crate::fixture::deadline::{BoundedOperationError, complete_before};
+
 use super::member::ReadyMember;
 use super::model::TopologyRun;
 

@@ -11,38 +11,39 @@ use tokio::time::sleep;
 
 use kuberic_mssql::runtime_config::ObserverConfig;
 
-use super::admin::{
-    AdminDeadlines, AdminEndpoint, AdminError, AdminSession, LoginFiles, MemberReadinessEvidence,
-};
 use super::availability_group::{
     AvailabilityGroupError, FrozenMemberVerifier, ProvisionContext, ProvisionedAvailabilityGroup,
     provision,
 };
-use super::cleanup::{
+use super::data::{DataContext, DataError, MarkerEvidence, prove_replicated_marker};
+use crate::fixture::admin::{
+    AdminDeadlines, AdminEndpoint, AdminError, AdminSession, LoginFiles, MemberReadinessEvidence,
+};
+use crate::fixture::cleanup::{
     CLEANUP_BUDGET, CleanupBackend, CleanupClock, CleanupCoordinator, CleanupError, CleanupReport,
     OperationBudget, SystemCleanupClock, combine_with_cleanup,
 };
-use super::config::{FixtureConfig, PINNED_SQL_SERVER_IMAGE};
-use super::data::{DataContext, DataError, MarkerEvidence, prove_replicated_marker};
-use super::docker::{
+use crate::fixture::config::{FixtureConfig, PINNED_SQL_SERVER_IMAGE};
+use crate::fixture::docker::{
     ContainerInspection, ContainerRequest, DockerApi, DockerCli, DockerError, NetworkRequest,
     OwnedLabels, SQL_SERVER_UID, SqlServerContainerSpec,
 };
-use super::model::{
-    CombinedFixtureError, FailureCategory, FailureStage, KubericMember, OwnershipJournal,
-    ResourceBinding, ResourceKind, ResourceRecord, ResourceState, RunState, SanitizedFailure,
-    SqlMember, SqlMemberIncarnation, TopologyRun,
-};
-use super::ownership::{
+use crate::fixture::ownership::{
     CommandAclController, DirectoryBinding, JournalStore, OwnershipInspector,
     PrivateDirectoryBinding, ReconcileError, ResourceObservation, RootLock, acquire_root_lock,
     create_private_owned_directory, inspect_member_directory, inspect_owned_directory,
     prepare_member_directory, process_incarnation_is_alive,
 };
-use super::preflight::{CommandAclProbe, LocalHostProbe, run_preflight_with_deadline};
-use super::process::{BoundedProcessRunner, CommandSpec, ProcessRunner};
-use super::secrets::{CredentialFiles, PrivateFile, SecretError, SecretValue};
-use super::tls::{TlsAssetRecorder, TlsAssets, TlsError};
+use crate::fixture::preflight::{CommandAclProbe, LocalHostProbe, run_preflight_with_deadline};
+use crate::fixture::process::{BoundedProcessRunner, CommandSpec, ProcessRunner};
+use crate::fixture::secrets::{CredentialFiles, PrivateFile, SecretError, SecretValue};
+use crate::fixture::tls::{TlsAssetRecorder, TlsAssets, TlsError};
+
+use super::model::{
+    CombinedFixtureError, FailureCategory, FailureStage, KubericMember, OwnershipJournal,
+    ResourceBinding, ResourceKind, ResourceRecord, ResourceState, RunState, SanitizedFailure,
+    SqlMember, SqlMemberIncarnation, TopologyRun,
+};
 
 const READINESS_RETRY: Duration = Duration::from_secs(2);
 
