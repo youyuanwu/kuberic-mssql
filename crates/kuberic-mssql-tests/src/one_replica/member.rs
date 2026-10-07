@@ -1,9 +1,12 @@
 use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures::FutureExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tiberius::ToSql;
@@ -16,7 +19,8 @@ use crate::fixture::admin::{
     validated_identifier,
 };
 use crate::fixture::cleanup::{
-    CleanupCoordinator, CleanupReport, SystemCleanupClock, combine_with_cleanup,
+    CancellationSignals, CleanupCompletion, CleanupCoordinator, CleanupReport, SystemCleanupClock,
+    combine_with_cleanup,
 };
 use crate::fixture::docker::{
     ContainerInspection, ContainerRequest, DockerApi, DockerCli, NetworkRequest, OwnedLabels,
@@ -96,6 +100,69 @@ impl LaunchedOneReplica {
             .store
             .block_for_current_process(&mut self.context.journal)
             .map_err(|_| OneReplicaCleanupError::Journal)
+    }
+
+    pub async fn run_with_cleanup<T, F, Fut>(
+        mut self,
+        timeout: Duration,
+        operation: F,
+    ) -> Result<T, CombinedFixtureError>
+    where
+        F: FnOnce(ReadyOneReplica) -> Fut,
+        Fut: Future<Output = Result<T, SanitizedFailure>>,
+    {
+        if self
+            .context
+            .store
+            .block_for_current_process(&mut self.context.journal)
+            .is_err()
+        {
+            let failure = failure(FailureCategory::Journal);
+            let report = self.context.cleanup_report();
+            return Err(combine_with_cleanup::<()>(Err(failure), &report).unwrap_err());
+        }
+        let member = self.member.clone();
+        let completion = match CancellationSignals::register() {
+            Ok(mut signals) => {
+                let operation = AssertUnwindSafe(operation(member)).catch_unwind();
+                tokio::select! {
+                    signal = signals.recv() => CleanupCompletion::HandledSignal {
+                        signal,
+                        failure: SanitizedFailure::new(
+                            FailureStage::Test,
+                            FailureCategory::DeadlineExceeded,
+                        ),
+                    },
+                    result = tokio::time::timeout(timeout, operation) => match result {
+                        Ok(Ok(result)) => CleanupCompletion::Result(result),
+                        Ok(Err(_)) => CleanupCompletion::CaughtPanic(SanitizedFailure::new(
+                            FailureStage::Test,
+                            FailureCategory::OwnershipMismatch,
+                        )),
+                        Err(_) => CleanupCompletion::Result(Err(SanitizedFailure::new(
+                            FailureStage::Test,
+                            FailureCategory::DeadlineExceeded,
+                        ))),
+                    }
+                }
+            }
+            Err(_) => CleanupCompletion::Result(Err(SanitizedFailure::new(
+                FailureStage::Test,
+                FailureCategory::OwnershipMismatch,
+            ))),
+        };
+        let completion = if fault_matches(
+            std::env::var(ONE_REPLICA_FAULT_ENV).ok().as_deref(),
+            "before-cleanup",
+        ) {
+            CleanupCompletion::Result(Err(SanitizedFailure::new(
+                FailureStage::Cleanup,
+                FailureCategory::DeadlineExceeded,
+            )))
+        } else {
+            completion
+        };
+        self.context.coordinate_completion(completion)
     }
 }
 
@@ -1013,6 +1080,28 @@ impl LaunchContext {
             self.config.fixture().deadlines().cleanup,
         )
         .cleanup_shared(&self.store, &mut self.journal, &backend)
+    }
+
+    fn coordinate_completion<T>(
+        &mut self,
+        completion: CleanupCompletion<T>,
+    ) -> Result<T, CombinedFixtureError> {
+        let artifacts = CleanupArtifacts::from_journal(&self.config, &self.journal);
+        let image_id = self.journal.run.image_id.clone();
+        let backend = OneReplicaCleanupBackend {
+            root: self.store.root(),
+            docker: &self.docker,
+            runner: self.runner,
+            image_id: &image_id,
+            network: artifacts.network.as_ref(),
+            container_name: artifacts.container_name.as_deref(),
+            container: artifacts.container.as_ref(),
+        };
+        CleanupCoordinator::new(
+            SystemCleanupClock::default(),
+            self.config.fixture().deadlines().cleanup,
+        )
+        .coordinate_shared(completion, &self.store, &mut self.journal, &backend)
     }
 }
 

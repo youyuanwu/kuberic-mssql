@@ -56,41 +56,31 @@ pub async fn run_unique_scenarios(
     member: &ReadyOneReplica,
     observer_binary: &Path,
 ) -> Result<OneReplicaScenarioEvidence, OneReplicaScenarioError> {
+    validate_scenario_file_separation(&member.files)?;
     check_fault("before-scenarios")?;
     let absent_config = ObserverConfig::read(&member.files.absent_config)
         .await
         .map_err(|_| OneReplicaScenarioError::Config)?;
-    let absent = observe(absent_config.clone()).await?;
-    let absent_observed_at_unix_millis = match absent {
-        Observation::Present {
-            value,
-            observed_at_unix_millis,
-        } if matches!(value.availability_group, Observation::Absent { .. }) => {
-            observed_at_unix_millis
-        }
-        _ => return Err(OneReplicaScenarioError::ExpectedAbsent),
-    };
+    let absent_observed_at_unix_millis =
+        absent_observed_at(&observe(absent_config.clone()).await?)?;
 
     let denied_config = ObserverConfig::read(&member.files.denied_config)
         .await
         .map_err(|_| OneReplicaScenarioError::Config)?;
-    if !matches!(
-        observe(denied_config).await?,
-        Observation::Failed(failure)
-            if failure.kind == ObservationFailureKind::PermissionDenied
-    ) {
-        return Err(OneReplicaScenarioError::ExpectedPermissionDenied);
-    }
+    expect_failure_kind(
+        &observe(denied_config).await?,
+        ObservationFailureKind::PermissionDenied,
+        OneReplicaScenarioError::ExpectedPermissionDenied,
+    )?;
 
     let bad_tls_config = ObserverConfig::read(&member.files.bad_tls_config)
         .await
         .map_err(|_| OneReplicaScenarioError::Config)?;
-    if !matches!(
-        observe(bad_tls_config).await?,
-        Observation::Failed(failure) if failure.kind == ObservationFailureKind::Tls
-    ) {
-        return Err(OneReplicaScenarioError::ExpectedTls);
-    }
+    expect_failure_kind(
+        &observe(bad_tls_config).await?,
+        ObservationFailureKind::Tls,
+        OneReplicaScenarioError::ExpectedTls,
+    )?;
 
     let result = BoundedProcessRunner
         .run(
@@ -117,6 +107,60 @@ pub async fn run_unique_scenarios(
         absent_observed_at_unix_millis,
         cli_observed_at_unix_millis,
     })
+}
+
+pub fn validate_scenario_file_separation(
+    files: &super::member::OneReplicaFixtureFiles,
+) -> Result<(), OneReplicaScenarioError> {
+    let paths = [
+        &files.ca_certificate,
+        &files.bad_ca_certificate,
+        &files.admin_username,
+        &files.admin_password,
+        &files.observer_username,
+        &files.observer_password,
+        &files.denied_username,
+        &files.denied_password,
+        &files.absent_config,
+        &files.denied_config,
+        &files.bad_tls_config,
+    ];
+    if paths.iter().any(|path| !path.is_absolute())
+        || files.ca_certificate == files.bad_ca_certificate
+        || files.observer_username == files.denied_username
+        || files.observer_password == files.denied_password
+        || files.absent_config == files.denied_config
+        || files.absent_config == files.bad_tls_config
+        || files.denied_config == files.bad_tls_config
+    {
+        return Err(OneReplicaScenarioError::Config);
+    }
+    Ok(())
+}
+
+fn absent_observed_at(
+    observation: &Observation<InstanceSnapshot>,
+) -> Result<u64, OneReplicaScenarioError> {
+    match observation {
+        Observation::Present {
+            value,
+            observed_at_unix_millis,
+        } if matches!(value.availability_group, Observation::Absent { .. }) => {
+            Ok(*observed_at_unix_millis)
+        }
+        _ => Err(OneReplicaScenarioError::ExpectedAbsent),
+    }
+}
+
+fn expect_failure_kind(
+    observation: &Observation<InstanceSnapshot>,
+    expected: ObservationFailureKind,
+    error: OneReplicaScenarioError,
+) -> Result<(), OneReplicaScenarioError> {
+    match observation {
+        Observation::Failed(failure) if failure.kind == expected => Ok(()),
+        _ => Err(error),
+    }
 }
 
 fn check_fault(point: &str) -> Result<(), OneReplicaScenarioError> {
@@ -196,5 +240,64 @@ pub fn validate_cli_report(
         Ok(observed_at)
     } else {
         Err(OneReplicaScenarioError::CliReport)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kuberic_mssql::observation::InstanceMetadata;
+    use kuberic_mssql::{ObservationFailure, ServerName};
+
+    use super::*;
+
+    fn absent_observation() -> Observation<InstanceSnapshot> {
+        Observation::Present {
+            value: InstanceSnapshot {
+                observed_at_unix_millis: 10,
+                instance: InstanceMetadata {
+                    server_name: ServerName::new("sql-one").unwrap(),
+                    property_server_name: ServerName::new("sql-one").unwrap(),
+                    product_version: EXPECTED_SQL_SERVER_VERSION.to_owned(),
+                    product_major_version: 17,
+                    edition: "Enterprise Developer Edition (64-bit)".to_owned(),
+                    engine_edition: 3,
+                    hadr_enabled: true,
+                    host_platform: "Linux".to_owned(),
+                    host_distribution: Some("Ubuntu".to_owned()),
+                    architecture: "x86_64".to_owned(),
+                    sqlserver_start_time: "2026-01-01T00:00:00".to_owned(),
+                },
+                availability_group: Observation::Absent {
+                    observed_at_unix_millis: 10,
+                },
+            },
+            observed_at_unix_millis: 10,
+        }
+    }
+
+    #[test]
+    fn fake_observations_require_exact_absent_and_failure_categories() {
+        assert_eq!(absent_observed_at(&absent_observation()).unwrap(), 10);
+        let permission = Observation::Failed(ObservationFailure {
+            kind: ObservationFailureKind::PermissionDenied,
+            message: "denied".to_owned(),
+            observed_at_unix_millis: 11,
+        });
+        assert!(
+            expect_failure_kind(
+                &permission,
+                ObservationFailureKind::PermissionDenied,
+                OneReplicaScenarioError::ExpectedPermissionDenied,
+            )
+            .is_ok()
+        );
+        assert!(
+            expect_failure_kind(
+                &permission,
+                ObservationFailureKind::Tls,
+                OneReplicaScenarioError::ExpectedTls,
+            )
+            .is_err()
+        );
     }
 }

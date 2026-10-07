@@ -23,4 +23,5 @@ pub use model::{
 };
 pub use scenarios::{
     OneReplicaScenarioError, OneReplicaScenarioEvidence, run_unique_scenarios, validate_cli_report,
+    validate_scenario_file_separation,
 };

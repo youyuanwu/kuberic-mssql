@@ -1,5 +1,7 @@
 use kuberic_mssql::runtime_config::ObserverConfig;
-use kuberic_mssql_tests::one_replica::validate_cli_report;
+use kuberic_mssql_tests::one_replica::{
+    OneReplicaFixtureFiles, validate_cli_report, validate_scenario_file_separation,
+};
 use serde_json::{Value, json};
 
 fn config() -> ObserverConfig {
@@ -111,4 +113,38 @@ fn wrong_engine_or_present_group_reports_are_rejected() {
     let mut present = report(&config, 1_000_000);
     present["observation"]["value"]["availability_group"]["status"] = json!("present");
     assert!(validate_cli_report(&present, &config, 1_000_001).is_err());
+}
+
+fn scenario_files() -> OneReplicaFixtureFiles {
+    OneReplicaFixtureFiles {
+        ca_certificate: "/fixture/trusted-ca.crt".into(),
+        bad_ca_certificate: "/fixture/bad-ca.crt".into(),
+        admin_username: "/fixture/admin-username".into(),
+        admin_password: "/fixture/admin-password".into(),
+        observer_username: "/fixture/observer-username".into(),
+        observer_password: "/fixture/observer-password".into(),
+        denied_username: "/fixture/denied-username".into(),
+        denied_password: "/fixture/denied-password".into(),
+        absent_config: "/fixture/absent.json".into(),
+        denied_config: "/fixture/denied.json".into(),
+        bad_tls_config: "/fixture/bad-tls.json".into(),
+    }
+}
+
+#[test]
+fn scenario_credentials_ca_and_configs_are_isolated() {
+    let files = scenario_files();
+    assert!(validate_scenario_file_separation(&files).is_ok());
+
+    let mut shared_login = files.clone();
+    shared_login.denied_username = shared_login.observer_username.clone();
+    assert!(validate_scenario_file_separation(&shared_login).is_err());
+
+    let mut shared_ca = files.clone();
+    shared_ca.bad_ca_certificate = shared_ca.ca_certificate.clone();
+    assert!(validate_scenario_file_separation(&shared_ca).is_err());
+
+    let mut shared_config = files;
+    shared_config.denied_config = shared_config.absent_config.clone();
+    assert!(validate_scenario_file_separation(&shared_config).is_err());
 }
