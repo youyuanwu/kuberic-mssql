@@ -50,6 +50,22 @@ const AGENT_TOKEN: &str = "mssql-three-replica-agent";
 type Source = Arc<dyn SqlServerObservationSource>;
 type Clock = Arc<dyn ObservationClock>;
 
+struct AddressReservation {
+    listener: TcpListener,
+}
+
+impl AddressReservation {
+    fn bind() -> Result<Self, MssqlGroupError> {
+        Ok(Self {
+            listener: TcpListener::bind("127.0.0.1:0").map_err(display_error)?,
+        })
+    }
+
+    fn address(&self) -> Result<SocketAddr, MssqlGroupError> {
+        self.listener.local_addr().map_err(display_error)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MssqlGroupError(String);
 
@@ -145,6 +161,8 @@ pub struct MssqlPod {
     pub application_root: PathBuf,
     pub control_address: SocketAddr,
     pub replication_address: SocketAddr,
+    control_reservation: Option<AddressReservation>,
+    replication_reservation: Option<AddressReservation>,
     source: Source,
     agent: AgentService<SqliteStore, PodRuntime>,
     shutdown: Option<tokio::sync::watch::Sender<bool>>,
@@ -186,12 +204,21 @@ impl MssqlPod {
         let (ready, mut ready_rx) = tokio::sync::watch::channel(false);
         let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
         let agent = self.agent.clone();
-        let control = self.control_address;
-        let replication = self.replication_address;
-        let server =
-            tokio::spawn(
-                async move { agent.serve(control, replication, ready, shutdown_rx).await },
-            );
+        let control_reservation = self
+            .control_reservation
+            .take()
+            .ok_or_else(|| MssqlGroupError::new("control address reservation is missing"))?;
+        let replication_reservation = self
+            .replication_reservation
+            .take()
+            .ok_or_else(|| MssqlGroupError::new("replication address reservation is missing"))?;
+        let control = control_reservation.address()?;
+        let replication = replication_reservation.address()?;
+        let server = tokio::spawn(async move {
+            drop(control_reservation);
+            drop(replication_reservation);
+            agent.serve(control, replication, ready, shutdown_rx).await
+        });
         self.shutdown = Some(shutdown);
         self.server = Some(server);
         budget
@@ -375,11 +402,15 @@ impl MssqlGroup {
                 .collect(),
             2,
         );
-        let control_addresses = reserve_addresses()?;
-        let replication_addresses = reserve_addresses()?;
+        let mut address_reservations = reserve_agent_addresses()?.into_iter();
 
         let mut pods = Vec::with_capacity(3);
         for index in 0..3 {
+            let (control_reservation, replication_reservation) = address_reservations
+                .next()
+                .ok_or_else(|| MssqlGroupError::new("agent address reservations are missing"))?;
+            let control_address = control_reservation.address()?;
+            let replication_address = replication_reservation.address()?;
             if !run.members[index].data_directory.starts_with(root) {
                 return Err(MssqlGroupError::new(
                     "Kuberic member roots must remain inside the fixture root",
@@ -416,11 +447,8 @@ impl MssqlGroup {
                 .map_err(display_error)?,
             );
             let application = Arc::new(SqlServerService::with_observation_source(
-                SqlServerServiceConfig::new(
-                    resource_uid.clone(),
-                    replication_addresses[index].to_string(),
-                )
-                .map_err(display_error)?,
+                SqlServerServiceConfig::new(resource_uid.clone(), replication_address.to_string())
+                    .map_err(display_error)?,
                 sources[index].clone(),
                 clocks[index].clone(),
             ));
@@ -448,8 +476,10 @@ impl MssqlGroup {
                 application,
                 store_root,
                 application_root,
-                control_address: control_addresses[index],
-                replication_address: replication_addresses[index],
+                control_address,
+                replication_address,
+                control_reservation: Some(control_reservation),
+                replication_reservation: Some(replication_reservation),
                 source: sources[index].clone(),
                 agent,
                 shutdown: None,
@@ -1100,15 +1130,15 @@ fn database_lineage(
     })
 }
 
-fn reserve_addresses() -> Result<[SocketAddr; 3], MssqlGroupError> {
-    let mut addresses = Vec::with_capacity(3);
+fn reserve_agent_addresses()
+-> Result<[(AddressReservation, AddressReservation); 3], MssqlGroupError> {
+    let mut reservations = Vec::with_capacity(3);
     for _ in 0..3 {
-        let listener = TcpListener::bind("127.0.0.1:0").map_err(display_error)?;
-        addresses.push(listener.local_addr().map_err(display_error)?);
+        reservations.push((AddressReservation::bind()?, AddressReservation::bind()?));
     }
-    addresses
+    reservations
         .try_into()
-        .map_err(|_| MssqlGroupError::new("exactly three loopback addresses required"))
+        .map_err(|_| MssqlGroupError::new("exactly three agent address reservations required"))
 }
 
 fn create_private_directory(path: &Path) -> Result<(), MssqlGroupError> {
@@ -1179,6 +1209,7 @@ fn display_error(error: impl fmt::Display) -> MssqlGroupError {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     use kuberic_mssql::observation::{
@@ -1208,6 +1239,59 @@ mod tests {
         "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
         "ffffffff-ffff-4fff-8fff-ffffffffffff",
     ];
+
+    #[test]
+    fn concurrent_address_reservations_are_unique_and_reusable_only_after_release() {
+        const THREADS: usize = 8;
+        let start = Arc::new(Barrier::new(THREADS + 1));
+        let release = Arc::new(Barrier::new(THREADS + 1));
+        let (send, receive) = std::sync::mpsc::channel();
+        let mut workers = Vec::with_capacity(THREADS);
+
+        for _ in 0..THREADS {
+            let start = start.clone();
+            let release = release.clone();
+            let send = send.clone();
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                let reservations = reserve_agent_addresses().unwrap();
+                let addresses = reservations
+                    .iter()
+                    .flat_map(|(control, replication)| {
+                        [control.address().unwrap(), replication.address().unwrap()]
+                    })
+                    .collect::<Vec<_>>();
+                send.send(addresses).unwrap();
+                release.wait();
+                drop(reservations);
+            }));
+        }
+        drop(send);
+
+        start.wait();
+        let addresses = (0..THREADS)
+            .flat_map(|_| receive.recv().unwrap())
+            .collect::<Vec<_>>();
+        let unique = addresses
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(addresses.len(), THREADS * 6);
+        assert_eq!(unique.len(), addresses.len());
+        for address in &addresses {
+            assert_eq!(
+                TcpListener::bind(address).unwrap_err().kind(),
+                std::io::ErrorKind::AddrInUse
+            );
+        }
+
+        let reusable = addresses[0];
+        release.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        TcpListener::bind(reusable).unwrap();
+    }
 
     struct StaticSource {
         config: ObserverConfig,

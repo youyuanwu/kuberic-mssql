@@ -242,7 +242,9 @@ pub fn cleanup_three_replica_fixture(root: &Path) -> Result<CleanupEvidence, Com
 
     let runner = BoundedProcessRunner;
     let docker = DockerCli::new(runner);
-    let image_id = recover_image_id(&docker, &journal)?;
+    let clock = SystemCleanupClock::default();
+    let coordinator = CleanupCoordinator::new(clock.clone(), CLEANUP_BUDGET);
+    let image_id = recover_image_id(&docker, &journal, &coordinator)?;
     let network_request = NetworkRequest {
         name: format!("km-three-{}", journal.run.run_id),
         labels: OwnedLabels::network(&journal.run.run_id),
@@ -303,7 +305,6 @@ pub fn cleanup_three_replica_fixture(root: &Path) -> Result<CleanupEvidence, Com
         .iter()
         .filter_map(|container| container.id.clone())
         .collect();
-    let clock = SystemCleanupClock::default();
     let backend = NativeCleanupBackend {
         root: store.root(),
         docker: &docker,
@@ -313,8 +314,7 @@ pub fn cleanup_three_replica_fixture(root: &Path) -> Result<CleanupEvidence, Com
         network: Some(&network),
         containers: &containers,
     };
-    let report =
-        CleanupCoordinator::new(clock, CLEANUP_BUDGET).cleanup(&store, &mut journal, &backend);
+    let report = coordinator.cleanup(&store, &mut journal, &backend);
     combine_with_cleanup(
         Ok(CleanupEvidence {
             removed_container_ids,
@@ -325,13 +325,21 @@ pub fn cleanup_three_replica_fixture(root: &Path) -> Result<CleanupEvidence, Com
     )
 }
 
-fn recover_image_id(
-    docker: &DockerCli<BoundedProcessRunner>,
+fn recover_image_id<D, C>(
+    docker: &D,
     journal: &OwnershipJournal,
-) -> Result<String, CombinedFixtureError> {
+    coordinator: &CleanupCoordinator<C>,
+) -> Result<String, CombinedFixtureError>
+where
+    D: DockerApi,
+    C: CleanupClock,
+{
     if let Some(image) = docker
-        .inspect_image(PINNED_SQL_SERVER_IMAGE, Duration::from_secs(30))
-        .map_err(|_| cleanup_setup_error(FailureCategory::ContainerRemoval))?
+        .inspect_image(
+            PINNED_SQL_SERVER_IMAGE,
+            cleanup_recovery_timeout(coordinator)?,
+        )
+        .map_err(|_| cleanup_recovery_error(coordinator))?
     {
         image
             .verify_pinned_sql_server()
@@ -340,14 +348,17 @@ fn recover_image_id(
     }
     for member in &journal.run.members {
         let Some(container) = docker
-            .inspect_container(&member.container_name, Duration::from_secs(30))
-            .map_err(|_| cleanup_setup_error(FailureCategory::ContainerRemoval))?
+            .inspect_container(
+                &member.container_name,
+                cleanup_recovery_timeout(coordinator)?,
+            )
+            .map_err(|_| cleanup_recovery_error(coordinator))?
         else {
             continue;
         };
         let image = docker
-            .inspect_image(&container.image_id, Duration::from_secs(30))
-            .map_err(|_| cleanup_setup_error(FailureCategory::ContainerRemoval))?
+            .inspect_image(&container.image_id, cleanup_recovery_timeout(coordinator)?)
+            .map_err(|_| cleanup_recovery_error(coordinator))?
             .ok_or_else(|| cleanup_setup_error(FailureCategory::OwnershipMismatch))?;
         image
             .verify_pinned_sql_server()
@@ -355,6 +366,28 @@ fn recover_image_id(
         return Ok(container.image_id);
     }
     Ok(String::new())
+}
+
+fn cleanup_recovery_timeout(
+    coordinator: &CleanupCoordinator<impl CleanupClock>,
+) -> Result<Duration, CombinedFixtureError> {
+    let remaining = coordinator.remaining();
+    if remaining.is_zero() {
+        Err(cleanup_setup_error(FailureCategory::DeadlineExceeded))
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn cleanup_recovery_error(
+    coordinator: &CleanupCoordinator<impl CleanupClock>,
+) -> CombinedFixtureError {
+    let category = if coordinator.remaining().is_zero() {
+        FailureCategory::DeadlineExceeded
+    } else {
+        FailureCategory::ContainerRemoval
+    };
+    cleanup_setup_error(category)
 }
 
 fn cleanup_setup_error(category: FailureCategory) -> CombinedFixtureError {
@@ -2097,6 +2130,95 @@ mod tests {
         }
     }
 
+    struct SlowRecoveryDocker {
+        clock: FakeClock,
+        elapsed_per_call: Duration,
+        calls: RefCell<Vec<(String, Duration)>>,
+    }
+
+    impl SlowRecoveryDocker {
+        fn record(&self, operation: &str, timeout: Duration) -> Result<(), DockerError> {
+            self.calls
+                .borrow_mut()
+                .push((operation.to_owned(), timeout));
+            let elapsed = self.elapsed_per_call.min(timeout);
+            self.clock.now.set(self.clock.now.get() + elapsed);
+            if elapsed == timeout {
+                Err(DockerError::Command)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl DockerApi for SlowRecoveryDocker {
+        fn capabilities(&self, _: Duration) -> Result<DockerCapabilities, DockerError> {
+            Err(DockerError::Command)
+        }
+
+        fn docker_root(&self, _: Duration) -> Result<PathBuf, DockerError> {
+            Err(DockerError::Command)
+        }
+
+        fn inspect_image(
+            &self,
+            _: &str,
+            timeout: Duration,
+        ) -> Result<Option<ImageInspection>, DockerError> {
+            self.record("inspect-image", timeout)?;
+            Ok(None)
+        }
+
+        fn pull_image(&self, _: &str, _: Duration) -> Result<(), DockerError> {
+            Err(DockerError::Command)
+        }
+
+        fn inspect_network(
+            &self,
+            _: &str,
+            _: Duration,
+        ) -> Result<Option<NetworkInspection>, DockerError> {
+            Err(DockerError::Command)
+        }
+
+        fn create_network(&self, _: &NetworkRequest, _: Duration) -> Result<String, DockerError> {
+            Err(DockerError::Command)
+        }
+
+        fn remove_network(&self, _: &str, _: Duration) -> Result<(), DockerError> {
+            Err(DockerError::Command)
+        }
+
+        fn inspect_container(
+            &self,
+            _: &str,
+            timeout: Duration,
+        ) -> Result<Option<ContainerInspection>, DockerError> {
+            self.record("inspect-container", timeout)?;
+            Ok(None)
+        }
+
+        fn create_container(
+            &self,
+            _: &ContainerRequest,
+            _: Duration,
+        ) -> Result<String, DockerError> {
+            Err(DockerError::Command)
+        }
+
+        fn start_container(&self, _: &str, _: Duration) -> Result<(), DockerError> {
+            Err(DockerError::Command)
+        }
+
+        fn stop_container(&self, _: &str, _: Duration) -> Result<(), DockerError> {
+            Err(DockerError::Command)
+        }
+
+        fn remove_container(&self, _: &str, _: Duration) -> Result<(), DockerError> {
+            Err(DockerError::Command)
+        }
+    }
+
     fn cleanup_container(
         root: &Path,
         running: bool,
@@ -2410,6 +2532,38 @@ mod tests {
                 Duration::from_secs(30),
                 Duration::from_secs(23),
                 Duration::from_secs(16),
+            ]
+        );
+    }
+
+    #[test]
+    fn slow_image_recovery_consumes_the_independent_cleanup_ceiling() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("fixture");
+        let store = JournalStore::initialize(&root).unwrap();
+        let journal = store.create(run(&root)).unwrap();
+        let clock = FakeClock::new();
+        let docker = SlowRecoveryDocker {
+            clock: clock.clone(),
+            elapsed_per_call: Duration::from_secs(70),
+            calls: RefCell::new(Vec::new()),
+        };
+        let coordinator = CleanupCoordinator::new(clock.clone(), CLEANUP_BUDGET);
+
+        let error = recover_image_id(&docker, &journal, &coordinator).unwrap_err();
+
+        assert_eq!(
+            error.primary(),
+            SanitizedFailure::new(FailureStage::Cleanup, FailureCategory::DeadlineExceeded)
+        );
+        assert_eq!(clock.now(), CLEANUP_BUDGET);
+        assert_eq!(coordinator.remaining(), Duration::ZERO);
+        assert_eq!(
+            docker.calls.borrow().as_slice(),
+            [
+                ("inspect-image".to_owned(), Duration::from_secs(180)),
+                ("inspect-container".to_owned(), Duration::from_secs(110)),
+                ("inspect-container".to_owned(), Duration::from_secs(40)),
             ]
         );
     }
