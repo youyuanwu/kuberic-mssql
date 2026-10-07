@@ -51,9 +51,25 @@ fn primary_and_shutdown_errors_are_preserved() {
 #[test]
 #[ignore = "requires explicit SQL Server EULA acknowledgement and a qualified local Docker host"]
 fn three_replica_sigterm_during_owned_launch_is_recoverable() {
+    exercise_signal_recovery(libc::SIGTERM, "SIGTERM");
+}
+
+#[test]
+#[ignore = "requires explicit SQL Server EULA acknowledgement and a qualified local Docker host"]
+fn three_replica_sigint_during_owned_launch_is_recoverable() {
+    exercise_signal_recovery(libc::SIGINT, "SIGINT");
+}
+
+#[test]
+#[ignore = "requires explicit SQL Server EULA acknowledgement and a qualified local Docker host"]
+fn three_replica_sigkill_is_recovered_by_a_separate_process() {
+    exercise_signal_recovery(libc::SIGKILL, "SIGKILL");
+}
+
+fn exercise_signal_recovery(signal: i32, signal_name: &str) {
     let root = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
     let acknowledgement = required_path("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT");
-    cleanup_three_replica_fixture(&root).expect("clean baseline before SIGTERM regression");
+    cleanup_three_replica_fixture(&root).expect("clean baseline before signal regression");
 
     let ready = root
         .parent()
@@ -78,28 +94,88 @@ fn three_replica_sigterm_during_owned_launch_is_recoverable() {
     })
     .expect("subprocess never entered a journaled owned-resource phase");
 
-    let signal_result = unsafe { libc::kill(interrupted.id() as i32, libc::SIGTERM) };
-    assert_eq!(signal_result, 0, "send SIGTERM to live subprocess");
-    let status = wait_for_child(&mut interrupted, Duration::from_secs(240));
+    let signal_result = unsafe { libc::kill(interrupted.id() as i32, signal) };
+    assert_eq!(signal_result, 0, "send {signal_name} to live subprocess");
+    let status = wait_for_child_with_cleanup(
+        &mut interrupted,
+        Duration::from_secs(240),
+        &root,
+        &acknowledgement,
+    );
     assert!(
         !status.success(),
-        "handled SIGTERM must make the interrupted validation fail explicitly"
+        "{signal_name} must make the interrupted validation fail explicitly"
     );
 
     let journal = load_journal_if_present(&root).expect("recoverable ownership journal");
     assert!(
         journal.state == RunState::Removed || !journal.resources.is_empty(),
-        "SIGTERM must leave explicit cleanup or recoverable ownership evidence"
+        "{signal_name} must leave explicit cleanup or recoverable ownership evidence"
     );
-    cleanup_three_replica_fixture(&root).expect("recover exact state after SIGTERM");
+    let mut cleanup = spawn_cleanup_child(&root, &acknowledgement);
+    assert!(
+        wait_for_child(&mut cleanup, Duration::from_secs(240)).success(),
+        "separate cleanup process after {signal_name}"
+    );
     assert_removed(&root);
 
     let mut retry = spawn_live_child(&root, &acknowledgement, None);
-    let retry_status = wait_for_child(&mut retry, Duration::from_secs(1200));
-    assert!(retry_status.success(), "retry after SIGTERM must succeed");
+    let retry_status = wait_for_child_with_cleanup(
+        &mut retry,
+        Duration::from_secs(1200),
+        &root,
+        &acknowledgement,
+    );
+    assert!(
+        retry_status.success(),
+        "retry after {signal_name} must succeed"
+    );
     cleanup_three_replica_fixture(&root).expect("idempotent cleanup after retry");
     assert_removed(&root);
     fs::remove_file(&ready).expect("remove signal-ready evidence");
+}
+
+#[test]
+#[ignore = "requires explicit SQL Server EULA acknowledgement and a qualified local Docker host"]
+fn three_replica_post_ag_and_report_fault_checkpoints_recover() {
+    for checkpoint in [
+        "fail-after-ag",
+        "panic-after-agent-start",
+        "fail-during-report",
+    ] {
+        let root = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
+        let acknowledgement = required_path("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT");
+        cleanup_three_replica_fixture(&root).expect("clean fault-checkpoint baseline");
+        let mut child = spawn_live_child_with_fault(&root, &acknowledgement, checkpoint);
+        let status = wait_for_child_with_cleanup(
+            &mut child,
+            Duration::from_secs(1200),
+            &root,
+            &acknowledgement,
+        );
+        assert!(!status.success(), "{checkpoint} must fail explicitly");
+        let mut cleanup = spawn_cleanup_child(&root, &acknowledgement);
+        assert!(
+            wait_for_child(&mut cleanup, Duration::from_secs(240)).success(),
+            "cleanup process after {checkpoint}"
+        );
+        assert_removed(&root);
+    }
+    let root = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
+    let acknowledgement = required_path("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT");
+    let mut retry = spawn_live_child(&root, &acknowledgement, None);
+    assert!(
+        wait_for_child_with_cleanup(
+            &mut retry,
+            Duration::from_secs(1200),
+            &root,
+            &acknowledgement,
+        )
+        .success(),
+        "retry after fault checkpoints"
+    );
+    cleanup_three_replica_fixture(&root).expect("cleanup after fault-checkpoint retry");
+    assert_removed(&root);
 }
 
 async fn run_three_replica_mssql_happy_path() {
@@ -129,12 +205,9 @@ async fn run_three_replica_mssql_happy_path() {
             panic!("three-replica lifecycle failed: {error}")
         }
         ExecutionOutcome::Completed(Err(panic)) => {
-            cleanup_three_replica_fixture(&root).expect("exact cleanup after live lifecycle panic");
             std::panic::resume_unwind(panic);
         }
         ExecutionOutcome::Interrupted(signal) => {
-            cleanup_three_replica_fixture(&root)
-                .expect("exact cleanup after handled live lifecycle interruption");
             panic!("three-replica lifecycle interrupted by {signal:?}");
         }
     }
@@ -152,6 +225,9 @@ async fn execute_live_lifecycle(root: &Path, config: FixtureConfig) -> Result<()
 
     let lifecycle = AssertUnwindSafe(async {
         let topology = launched.provision_availability_group().await?;
+        if fault_checkpoint("fail-after-ag") {
+            return Err::<(), TestError>("injected failure after AG provisioning".into());
+        }
         let native_binding = launched
             .journal()
             .native_binding
@@ -170,7 +246,13 @@ async fn execute_live_lifecycle(root: &Path, config: FixtureConfig) -> Result<()
             launched.complete_deadline(),
         )
         .await?;
+        if fault_checkpoint("panic-after-agent-start") {
+            panic!("injected panic after agent startup");
+        }
         let runtime_result = AssertUnwindSafe(async {
+            if fault_checkpoint("fail-during-report") {
+                return Err::<(), TestError>("injected failure during bracketed reporting".into());
+            }
             let reports = group.reports_bracketed().await?;
             assert_exact_reports(&group, &reports, native_binding.configuration_sequence)?;
 
@@ -210,7 +292,10 @@ async fn execute_live_lifecycle(root: &Path, config: FixtureConfig) -> Result<()
         }
         (Err(panic), cleanup) => {
             if let Err(cleanup) = cleanup {
-                panic!("three-replica lifecycle panicked; cleanup also failed: {cleanup}");
+                let primary = panic_message(&panic);
+                panic!(
+                    "three-replica lifecycle panicked: {primary}; cleanup also failed: {cleanup}"
+                );
             }
             std::panic::resume_unwind(panic);
         }
@@ -299,6 +384,45 @@ fn spawn_live_child(root: &Path, acknowledgement: &Path, ready: Option<&Path>) -
     command.spawn().expect("spawn exact live child")
 }
 
+fn spawn_live_child_with_fault(root: &Path, acknowledgement: &Path, checkpoint: &str) -> Child {
+    let mut child = Command::new(std::env::current_exe().expect("current live test executable"));
+    child
+        .arg("three_replica_mssql_happy_path")
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .env("KUBERIC_MSSQL_THREE_REPLICA_ROOT", root)
+        .env("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT", acknowledgement)
+        .env("KUBERIC_MSSQL_FAULT_CHECKPOINT", checkpoint)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    child.spawn().expect("spawn fault-injected live child")
+}
+
+fn spawn_cleanup_child(root: &Path, acknowledgement: &Path) -> Child {
+    let binary = std::env::current_exe()
+        .expect("current live test executable")
+        .parent()
+        .and_then(Path::parent)
+        .expect("test executable target directory")
+        .join("mssql-three-replica-fixture");
+    Command::new(binary)
+        .arg("cleanup")
+        .arg("--root")
+        .arg(root)
+        .env("KUBERIC_MSSQL_THREE_REPLICA_ROOT", root)
+        .env("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT", acknowledgement)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn exact cleanup process")
+}
+
+fn fault_checkpoint(expected: &str) -> bool {
+    std::env::var("KUBERIC_MSSQL_FAULT_CHECKPOINT").as_deref() == Ok(expected)
+}
+
 fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> Result<(), ()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -316,10 +440,36 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> ExitStatus {
         if let Some(status) = child.try_wait().expect("poll live child") {
             return status;
         }
+
         if Instant::now() >= deadline {
             child.kill().expect("kill timed-out live child");
             let _ = child.wait();
             panic!("live child exceeded {timeout:?}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_child_with_cleanup(
+    child: &mut Child,
+    timeout: Duration,
+    root: &Path,
+    acknowledgement: &Path,
+) -> ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll live child") {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill timed-out live child");
+            let status = child.wait().expect("reap timed-out live child");
+            let mut cleanup = spawn_cleanup_child(root, acknowledgement);
+            assert!(
+                wait_for_child(&mut cleanup, Duration::from_secs(240)).success(),
+                "exact cleanup after timed-out live child"
+            );
+            return status;
         }
         thread::sleep(Duration::from_millis(100));
     }

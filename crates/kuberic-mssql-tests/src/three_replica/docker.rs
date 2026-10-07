@@ -10,6 +10,9 @@ use sha2::{Digest, Sha256};
 
 use super::config::{PINNED_SQL_SERVER_IMAGE, ResourcePolicy};
 use super::model::ResourceBinding;
+use super::ownership::{
+    AclController, DirectoryBinding, MemberDirectoryError, verify_member_directory,
+};
 use super::process::{CommandSpec, ProcessErrorKind, ProcessRunner};
 use super::secrets::SecretValue;
 
@@ -349,6 +352,20 @@ impl ContainerRequest {
         self.environment.iter().map(EnvironmentVariable::key)
     }
 
+    pub fn verify_data_directory_binding(
+        &self,
+        root: &std::path::Path,
+        expected: &DirectoryBinding,
+        host_uid: u32,
+        timeout: Duration,
+        acl: &impl AclController,
+    ) -> Result<(), MemberDirectoryError> {
+        if self.data_directory != expected.canonical_path {
+            return Err(MemberDirectoryError::Replaced);
+        }
+        verify_member_directory(root, expected, host_uid, SQL_SERVER_UID, timeout, acl)
+    }
+
     pub fn environment_file_contents(&self) -> String {
         let mut value = self
             .environment
@@ -380,10 +397,7 @@ impl ContainerRequest {
             return Err(DockerError::OwnershipMismatch);
         }
         let expected_mount = ContainerMount {
-            source: self
-                .data_directory
-                .canonicalize()
-                .map_err(|_| DockerError::OwnershipMismatch)?,
+            source: self.data_directory.clone(),
             destination: PathBuf::from(SQL_DATA_DESTINATION),
             read_only: false,
         };
@@ -688,10 +702,6 @@ impl<R: ProcessRunner> DockerApi for DockerCli<R> {
         request: &ContainerRequest,
         timeout: Duration,
     ) -> Result<String, DockerError> {
-        let canonical_data = request
-            .data_directory
-            .canonicalize()
-            .map_err(|_| DockerError::OwnershipMismatch)?;
         let mut command = self
             .command("create owned SQL Server container", timeout)
             .args([
@@ -720,7 +730,7 @@ impl<R: ProcessRunner> DockerApi for DockerCli<R> {
                 "--mount",
                 &format!(
                     "type=bind,src={},dst={SQL_DATA_DESTINATION}",
-                    canonical_data.display()
+                    request.data_directory.display()
                 ),
             ]);
         for (key, value) in request.labels.as_map() {

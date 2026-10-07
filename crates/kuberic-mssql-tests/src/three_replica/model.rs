@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const JOURNAL_SCHEMA_VERSION: u32 = 4;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,6 +40,7 @@ pub struct NativeMemberBinding {
     pub ordinal: u8,
     pub server_name: String,
     pub container_id: String,
+    pub sql_start_time: String,
     pub sql_start_unix_millis: i64,
     pub native_replica_id: String,
     pub local_database_id: u32,
@@ -58,6 +59,7 @@ pub struct SqlMemberIncarnation {
     pub ordinal: u8,
     pub server_name: String,
     pub container_id: String,
+    pub sql_start_time: String,
     pub sql_start_unix_millis: i64,
 }
 
@@ -65,12 +67,15 @@ impl SqlMemberIncarnation {
     pub fn verify(
         &self,
         container_id: &str,
+        sql_start_time: &str,
         sql_start_unix_millis: i64,
     ) -> Result<(), IncarnationError> {
         if self.container_id != container_id {
             return Err(IncarnationError::ContainerReplaced);
         }
-        if self.sql_start_unix_millis != sql_start_unix_millis {
+        if self.sql_start_time != sql_start_time
+            || self.sql_start_unix_millis != sql_start_unix_millis
+        {
             return Err(IncarnationError::SqlRestarted);
         }
         Ok(())
@@ -115,6 +120,7 @@ pub struct NativeMemberIntent {
     pub ordinal: u8,
     pub server_name: String,
     pub container_id: String,
+    pub sql_start_time: String,
     pub sql_start_unix_millis: i64,
     pub endpoint_certificate_name: String,
     pub peer_login_names: [String; 2],
@@ -210,6 +216,10 @@ impl fmt::Display for FailureStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureCategory {
     Preflight,
+    Acknowledgement,
+    DataDirectory,
+    Tls,
+    Secret,
     ContainerCreation,
     ContainerRemoval,
     NetworkRemoval,
@@ -224,6 +234,10 @@ impl fmt::Display for FailureCategory {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Preflight => "preflight failed",
+            Self::Acknowledgement => "EULA acknowledgement validation failed",
+            Self::DataDirectory => "member data directory validation failed",
+            Self::Tls => "TLS asset operation failed",
+            Self::Secret => "private credential operation failed",
             Self::ContainerCreation => "container creation failed",
             Self::ContainerRemoval => "container removal failed",
             Self::NetworkRemoval => "network removal failed",
@@ -236,21 +250,42 @@ impl fmt::Display for FailureCategory {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SanitizedFailure {
     stage: FailureStage,
     category: FailureCategory,
+    detail: Option<String>,
 }
 
 impl SanitizedFailure {
     pub const fn new(stage: FailureStage, category: FailureCategory) -> Self {
-        Self { stage, category }
+        Self {
+            stage,
+            category,
+            detail: None,
+        }
+    }
+
+    pub fn with_detail(
+        stage: FailureStage,
+        category: FailureCategory,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            stage,
+            category,
+            detail: Some(detail.into()),
+        }
     }
 }
 
 impl fmt::Display for SanitizedFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}: {}", self.stage, self.category)
+        write!(formatter, "{}: {}", self.stage, self.category)?;
+        if let Some(detail) = &self.detail {
+            write!(formatter, " ({detail})")?;
+        }
+        Ok(())
     }
 }
 
@@ -266,7 +301,7 @@ impl CombinedFixtureError {
     }
 
     pub fn primary(&self) -> SanitizedFailure {
-        self.primary
+        self.primary.clone()
     }
 
     pub fn cleanup(&self) -> &[SanitizedFailure] {

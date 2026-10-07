@@ -250,6 +250,7 @@ fn readiness_rejects_wrong_identity_version_edition_hadr_and_start() {
         edition: "Enterprise Developer Edition (64-bit)".to_owned(),
         engine_edition: 3,
         hadr_enabled: true,
+        sql_start_time: "2027-01-15T08:00:00".to_owned(),
         sql_start_unix_millis: 1_800_000_000_000,
     };
     valid.verify("km0123456789n1").unwrap();
@@ -301,19 +302,32 @@ fn logical_incarnation_is_bound_to_container_id_and_sql_start() {
         ordinal: 1,
         server_name: "km0123456789n1".to_owned(),
         container_id: "sha256:container-1".to_owned(),
+        sql_start_time: "2027-01-15T08:00:00".to_owned(),
         sql_start_unix_millis: 1_800_000_000_000,
     };
     binding
-        .verify("sha256:container-1", 1_800_000_000_000)
+        .verify(
+            "sha256:container-1",
+            "2027-01-15T08:00:00",
+            1_800_000_000_000,
+        )
         .unwrap();
     assert!(
         binding
-            .verify("sha256:replacement", 1_800_000_000_000)
+            .verify(
+                "sha256:replacement",
+                "2027-01-15T08:00:00",
+                1_800_000_000_000,
+            )
             .is_err()
     );
     assert!(
         binding
-            .verify("sha256:container-1", 1_800_000_000_001)
+            .verify(
+                "sha256:container-1",
+                "2027-01-15T08:00:01",
+                1_800_000_000_001,
+            )
             .is_err()
     );
 }
@@ -325,6 +339,7 @@ fn native_binding_rejects_sql_restart_after_member_readiness() {
         server_name: format!("km0123456789n{}", index + 1),
         container_id: format!("sha256:container-{}", index + 1),
         host_port: 49_171 + index as u16,
+        sql_start_time: format!("2027-01-15T08:00:0{index}"),
         sql_start_unix_millis: 1_800_000_000_000 + index as i64,
         observer_config: PathBuf::from(format!("/fixture/member-{}/observer.json", index + 1)),
     });
@@ -332,6 +347,7 @@ fn native_binding_rejects_sql_restart_after_member_readiness() {
         ordinal: launched[index].ordinal,
         server_name: launched[index].server_name.clone(),
         container_id: launched[index].container_id.clone(),
+        sql_start_time: launched[index].sql_start_time.clone(),
         sql_start_unix_millis: launched[index].sql_start_unix_millis,
     });
     let mut fresh: [MemberReadinessEvidence; 3] =
@@ -341,6 +357,7 @@ fn native_binding_rejects_sql_restart_after_member_readiness() {
             edition: "Enterprise Developer Edition (64-bit)".to_owned(),
             engine_edition: 3,
             hadr_enabled: true,
+            sql_start_time: launched[index].sql_start_time.clone(),
             sql_start_unix_millis: launched[index].sql_start_unix_millis,
         });
     let rebound = validate_binding_incarnations(&launched, &frozen, &fresh).unwrap();

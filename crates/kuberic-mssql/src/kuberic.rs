@@ -619,11 +619,6 @@ impl HealthyTopologyBinding {
         };
         validate_eligible_snapshot(config, &snapshot.instance, group, require_progress_role)?;
         validate_bound_evidence(self, config, &snapshot.instance, group, requested_role)?;
-        if group.configuration_sequence.value() != self.configuration.epoch.configuration_number {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "configuration sequence differs from the frozen configuration",
-            ));
-        }
         Ok(())
     }
 
@@ -1477,6 +1472,11 @@ fn validate_bound_evidence(
 ) -> Result<(), KubericAdapterError> {
     let local = binding.local_member();
     let target = config.target();
+    if group.configuration_sequence.value() != binding.configuration.epoch.configuration_number {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "configuration sequence differs from the frozen configuration",
+        ));
+    }
     if target.replica.logical_id() != local.sql_replica_identity.logical_id()
         || target.replica.incarnation() != local.sql_replica_identity.incarnation()
         || instance.server_name != *local.server_name()

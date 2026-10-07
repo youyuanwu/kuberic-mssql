@@ -306,6 +306,12 @@ fn cleanup_with_coordinator(
                     record.state,
                     ResourceState::Dispatched | ResourceState::Blocked
                 ) && record.binding.is_none()
+                    && !matches!(
+                        record.kind,
+                        ResourceKind::DataDirectory
+                            | ResourceKind::Directory
+                            | ResourceKind::SecretFile
+                    )
                 {
                     block(journal, index, &record, &mut report);
                 } else {
@@ -403,12 +409,12 @@ pub fn combine_with_cleanup<T>(
     let cleanup_failures = cleanup
         .errors
         .iter()
-        .map(|error| error.failure)
+        .map(|error| error.failure.clone())
         .collect::<Vec<_>>();
     match primary {
         Ok(value) if cleanup.succeeded() => Ok(value),
         Ok(_) => {
-            let primary = cleanup_failures.first().copied().unwrap_or_else(|| {
+            let primary = cleanup_failures.first().cloned().unwrap_or_else(|| {
                 SanitizedFailure::new(FailureStage::Cleanup, FailureCategory::OwnershipMismatch)
             });
             Err(CombinedFixtureError::new(

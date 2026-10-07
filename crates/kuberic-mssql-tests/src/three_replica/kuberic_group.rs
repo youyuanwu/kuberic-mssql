@@ -147,8 +147,11 @@ impl ConvergenceBudget {
             })
     }
 
-    fn shutdown_budget(self) -> Result<Self, MssqlGroupError> {
-        Self::new(self.operation_timeout, self.complete_deadline)
+    fn cleanup_budget() -> Result<Self, MssqlGroupError> {
+        Self::new(
+            Duration::from_secs(180),
+            StdInstant::now() + Duration::from_secs(180),
+        )
     }
 }
 
@@ -180,6 +183,15 @@ impl MssqlPod {
         action: RuntimeEffectAction,
         budget: ConvergenceBudget,
     ) -> Result<(), MssqlGroupError> {
+        let operation = match &action {
+            RuntimeEffectAction::Open(_) => "open runtime",
+            RuntimeEffectAction::RegisterPeerSession { .. } => "register peer session",
+            RuntimeEffectAction::AdmitAuthority(_) => "admit current authority",
+            RuntimeEffectAction::ChangeRole(_) => "publish stable role",
+            RuntimeEffectAction::SetAccessStatus { .. } => "fence client access",
+            RuntimeEffectAction::RefreshApplicationProgress => "refresh SQL progress",
+            _ => "apply runtime effect",
+        };
         budget
             .run("RuntimeAdapter effect", budget.operation_timeout, async {
                 let sequence = self
@@ -198,7 +210,9 @@ impl MssqlPod {
                         action,
                     })
                     .await
-                    .map_err(display_error)?;
+                    .map_err(|error| {
+                        MssqlGroupError::new(format!("{operation} failed: {error}"))
+                    })?;
                 Ok(())
             })
             .await
@@ -277,19 +291,34 @@ impl MssqlPod {
         if let Some(shutdown) = self.shutdown.take() {
             shutdown.send_replace(true);
         }
-        if let Some(server) = self.server.take() {
-            match budget
-                .run("agent shutdown", budget.operation_timeout, server)
-                .await
-            {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(error))) => return Err(display_error(error)),
-                Ok(Err(error)) if error.is_cancelled() => {}
-                Ok(Err(error)) => return Err(display_error(error)),
-                Err(error) => return Err(error),
-            }
+        if let Some(mut server) = self.server.take() {
+            terminate_agent_server(&mut server, budget).await?;
         }
         Ok(())
+    }
+}
+
+async fn terminate_agent_server(
+    server: &mut tokio::task::JoinHandle<kuberic_runtime::host::Result<()>>,
+    budget: ConvergenceBudget,
+) -> Result<(), MssqlGroupError> {
+    match budget
+        .run("agent shutdown", budget.operation_timeout, &mut *server)
+        .await
+    {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(display_error(error)),
+        Ok(Err(error)) if error.is_cancelled() => Ok(()),
+        Ok(Err(error)) => Err(display_error(error)),
+        Err(timeout) => {
+            server.abort();
+            match (&mut *server).await {
+                Err(error) if error.is_cancelled() => Err(timeout),
+                Ok(Ok(())) => Err(timeout),
+                Ok(Err(error)) => Err(display_error(error)),
+                Err(error) => Err(display_error(error)),
+            }
+        }
     }
 }
 
@@ -570,6 +599,16 @@ impl MssqlGroup {
             }
         }
         for pod in &pods {
+            budget
+                .run(
+                    "settle peer configuration work",
+                    budget.operation_timeout,
+                    pod.runtime.cancel_configuration_work(),
+                )
+                .await?
+                .map_err(display_error)?;
+        }
+        for pod in &pods {
             pod.effect(
                 RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
                     local_identity: pod.identity.clone(),
@@ -723,7 +762,7 @@ impl MssqlGroup {
 
     pub async fn shutdown(mut self) -> Result<(), MssqlGroupError> {
         let mut errors = Vec::new();
-        let budget = self.convergence_budget.shutdown_budget()?;
+        let budget = ConvergenceBudget::cleanup_budget()?;
         for pod in &mut self.pods {
             if let Err(error) = pod.shutdown(budget).await {
                 errors.push(error.to_string());
@@ -944,7 +983,7 @@ fn build_member_bindings(
                 )
                 .map_err(display_error)?,
                 SqlServerStartIncarnation::new(
-                    snapshots[index].instance.sqlserver_start_time.clone(),
+                    native_binding.members[index].sql_start_time.clone(),
                 )
                 .map_err(display_error)?,
                 roles[index],
@@ -1034,6 +1073,7 @@ fn validate_native_observation(
         || group.configuration_sequence.value() != native_binding.configuration_sequence
         || observed_native.to_string() != member.native_replica_id
         || group.local_replica.role != Some(expected_role)
+        || snapshot.instance.sqlserver_start_time != member.sql_start_time
         || group.local_replica.identity.incarnation() != configured_incarnation
         || profile.server_name.as_str() != member.server_name
         || profile.endpoint_url.as_deref() != Some(member.endpoint_url.as_str())
@@ -1591,10 +1631,7 @@ mod tests {
                 sources[0].observer_config(),
             )
             .unwrap_err();
-            assert!(
-                error.to_string().contains("incarnation evidence"),
-                "{error}"
-            );
+            assert!(error.to_string().contains("native binding"), "{error}");
 
             let mut health_drift = sources[0].snapshot.clone();
             let local = present_group(&health_drift)
@@ -1627,6 +1664,88 @@ mod tests {
 
             group.shutdown().await.unwrap();
             fs::remove_dir_all(&root).unwrap();
+        });
+    }
+
+    #[test]
+    fn assembly_rejects_sql_restart_after_native_binding_was_frozen() {
+        run_group_test(async {
+            let root = test_root("assembly-start-drift");
+            let run = run(&root);
+            let native = native_binding(&run);
+            let now = unix_millis().unwrap();
+            let mut sources = std::array::from_fn(|index| source(&run, index, now));
+            sources[1].snapshot.instance.sqlserver_start_time = "2099-01-01T00:00:00".to_owned();
+            let error = match MssqlGroup::assemble(
+                &root,
+                &run,
+                &native,
+                sources.map(|source| Arc::new(source) as Source),
+                std::array::from_fn(|_| Arc::new(FixedClock(AtomicU64::new(now))) as Clock),
+                Duration::from_secs(60),
+                StdInstant::now() + Duration::from_secs(120),
+            )
+            .await
+            {
+                Ok(group) => {
+                    group.shutdown().await.unwrap();
+                    panic!("restarted SQL member unexpectedly assembled")
+                }
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("native binding"), "{error}");
+            fs::remove_dir_all(&root).unwrap();
+        });
+    }
+
+    #[test]
+    fn stalled_agent_shutdown_is_aborted_and_joined() {
+        run_group_test(async {
+            let mut server = tokio::spawn(async {
+                std::future::pending::<kuberic_runtime::host::Result<()>>().await
+            });
+            let budget = ConvergenceBudget::new(
+                Duration::from_millis(10),
+                StdInstant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+            let error = terminate_agent_server(&mut server, budget)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("deadline") || error.to_string().contains("timed out"),
+                "{error}"
+            );
+            assert!(server.is_finished(), "aborted agent task must be joined");
+        });
+    }
+
+    #[test]
+    fn assembly_tolerates_slow_native_authority_validation() {
+        run_group_test(async {
+            let root = test_root("slow-authority-validation");
+            let run = run(&root);
+            let native = native_binding(&run);
+            let now = unix_millis().unwrap();
+            let sources: [Source; 3] = std::array::from_fn(|index| {
+                Arc::new(DelayedSource {
+                    inner: source(&run, index, now),
+                    delay: Duration::from_millis(200),
+                }) as Source
+            });
+            let group = MssqlGroup::assemble(
+                &root,
+                &run,
+                &native,
+                sources,
+                std::array::from_fn(|_| Arc::new(FixedClock(AtomicU64::new(now))) as Clock),
+                Duration::from_secs(10),
+                StdInstant::now() + Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+            group.shutdown().await.unwrap();
+            fs::remove_dir_all(root).unwrap();
         });
     }
 
@@ -1701,6 +1820,7 @@ mod tests {
                 ordinal: (index + 1) as u8,
                 server_name: run.members[index].server_name.clone(),
                 container_id: format!("container-id-{}", index + 1),
+                sql_start_time: format!("2026-10-07T00:00:0{index}"),
                 sql_start_unix_millis: 1000 + index as i64,
                 native_replica_id: NATIVE_IDS[index].to_owned(),
                 local_database_id: 5,

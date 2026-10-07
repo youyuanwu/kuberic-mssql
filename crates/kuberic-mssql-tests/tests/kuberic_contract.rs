@@ -412,7 +412,7 @@ fn sql_identity(index: usize) -> ReplicaIdentity {
 
 fn configuration() -> ConfigurationDescriptor {
     ConfigurationDescriptor::new(
-        Epoch::new(7, 11),
+        Epoch::new(7, 42),
         ReplicaId::new(1),
         vec![
             ConfigurationMember {
@@ -1677,21 +1677,14 @@ fn pod_runtime_wrong_policy_cannot_admit_or_report_capability() {
         assert!(durable.admitted_policy.is_none());
         assert!(durable.pending_effect.is_some());
         assert!(
-            application_error(
-                service
-                    .replicator()
-                    .unwrap()
-                    .catch_up_capability()
-                    .await
-                    .unwrap_err()
-            )
-            .contains("not been admitted")
+            service.replicator().is_none(),
+            "stateful custom-authority failure must close the application"
         );
     });
 }
 
 #[test]
-fn runtime_adapter_retries_missing_peer_addresses_and_admits_only_the_exact_topology() {
+fn runtime_adapter_contains_missing_peer_authority_failure_before_persistence() {
     run_runtime_effect_test(async {
         let binding = topology_binding();
         let source = Arc::new(CountingSource {
@@ -1729,27 +1722,21 @@ fn runtime_adapter_retries_missing_peer_addresses_and_admits_only_the_exact_topo
         assert!(failed.current_configuration.is_none());
         assert!(failed.admitted_policy.is_none());
 
-        describe_bound_peers(&runtime, &binding).await;
-        let result = adapter.resume_pending().await.unwrap().unwrap();
-        assert_eq!(
-            result.postcondition.authority,
-            Some(admitted_authority(&binding))
+        assert!(
+            describe_peer(
+                &runtime,
+                ReplicaInformation::new(
+                    OperationId::new("post-failure-peer-description"),
+                    binding.members()[1].kuberic_identity().clone(),
+                    binding.members()[1].replication_address().to_owned(),
+                ),
+            )
+            .await
+            .is_err(),
+            "contained authority failure must close the runtime before later peer mutation"
         );
-        assert_eq!(
-            runtime.snapshot().await.authority,
-            Some(admitted_authority(&binding))
-        );
-        let admitted = store.load_state().await.unwrap();
-        assert_eq!(
-            admitted.current_configuration,
-            Some(binding.configuration().clone())
-        );
-        assert_eq!(
-            admitted.admitted_policy,
-            Some(binding.effective_policy().clone())
-        );
-        assert!(admitted.pending_effect.is_none());
-        assert_eq!(source.observations.load(Ordering::SeqCst), 4);
+        assert!(failed.pending_effect.is_some());
+        assert_eq!(source.observations.load(Ordering::SeqCst), 2);
     });
 }
 
@@ -2098,6 +2085,62 @@ async fn bound_evidence_rejects_identity_incarnation_lineage_role_and_health_dri
             "{name}: {message}"
         );
     }
+}
+
+#[tokio::test]
+async fn every_bound_callback_rejects_frozen_configuration_sequence_drift() {
+    let binding = topology_binding();
+    let mut drifted = bound_snapshot();
+    if let Observation::Present { value: group, .. } = &mut drifted.availability_group {
+        group.configuration_sequence = ConfigurationSequence::parse("43").unwrap();
+    }
+
+    for operation in ["admission", "progress", "role", "epoch"] {
+        let replicator =
+            opened_bound_replicator(vec![Ok(present(drifted.clone()))], vec![OBSERVED_AT]).await;
+        let error = match operation {
+            "admission" => replicator
+                .update_current_replica_set_configuration(bound_replica_set(&binding))
+                .await
+                .unwrap_err(),
+            "progress" => replicator.current_progress().await.unwrap_err(),
+            "role" => replicator
+                .change_role(binding.configuration().epoch, ReplicaRole::Primary)
+                .await
+                .unwrap_err(),
+            "epoch" => replicator
+                .update_epoch(binding.configuration().epoch)
+                .await
+                .unwrap_err(),
+            _ => unreachable!(),
+        };
+        assert!(
+            application_error(error).contains("configuration sequence"),
+            "{operation}"
+        );
+    }
+
+    let replicator = opened_bound_replicator(
+        vec![
+            Ok(present(bound_snapshot())),
+            Ok(present(bound_snapshot())),
+            Ok(present(drifted)),
+        ],
+        vec![OBSERVED_AT; 3],
+    )
+    .await;
+    replicator
+        .update_current_replica_set_configuration(bound_replica_set(&binding))
+        .await
+        .unwrap();
+    replicator
+        .change_role(binding.configuration().epoch, ReplicaRole::Primary)
+        .await
+        .unwrap();
+    assert!(
+        application_error(replicator.catch_up_capability().await.unwrap_err())
+            .contains("configuration sequence")
+    );
 }
 
 #[tokio::test]

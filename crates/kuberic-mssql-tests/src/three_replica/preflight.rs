@@ -4,7 +4,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::config::FixtureConfig;
 use super::docker::{DockerApi, DockerCapabilities, ImageInspection, SQL_SERVER_UID};
@@ -58,6 +58,8 @@ pub enum PreflightError {
     InsufficientDockerSpace { available: u64, required: u64 },
     AclTools,
     AclFilesystem,
+    Privilege,
+    Deadline,
     Unverifiable,
 }
 
@@ -114,6 +116,10 @@ impl fmt::Display for PreflightError {
             Self::AclFilesystem => formatter.write_str(
                 "fixture filesystem does not support the required ACL inheritance and deletion",
             ),
+            Self::Privilege => formatter.write_str(
+                "noninteractive sudo access for the SQL UID probe and ACL recovery is required",
+            ),
+            Self::Deadline => formatter.write_str("complete-run deadline expired during preflight"),
             Self::Unverifiable => formatter.write_str("host capability could not be verified"),
         }
     }
@@ -137,6 +143,32 @@ pub fn run_preflight(
     acl: &impl AclProbe,
     docker: &impl DockerApi,
 ) -> Result<PreflightReport, PreflightError> {
+    run_preflight_with_deadline(
+        config,
+        host,
+        acl,
+        docker,
+        Instant::now() + config.deadlines().complete_run,
+    )
+}
+
+pub fn run_preflight_with_deadline(
+    config: &FixtureConfig,
+    host: &impl HostProbe,
+    acl: &impl AclProbe,
+    docker: &impl DockerApi,
+    deadline: Instant,
+) -> Result<PreflightReport, PreflightError> {
+    let limit = |local: Duration| {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(PreflightError::Deadline)?;
+        if remaining.is_zero() {
+            Err(PreflightError::Deadline)
+        } else {
+            Ok(local.min(remaining))
+        }
+    };
     config
         .authorization()
         .revalidate()
@@ -169,7 +201,7 @@ pub fn run_preflight(
         });
     }
     let capabilities = docker
-        .capabilities(config.deadlines().docker_command)
+        .capabilities(limit(config.deadlines().docker_command)?)
         .map_err(|_| PreflightError::DockerUnavailable)?;
     validate_docker_capabilities(capabilities)?;
 
@@ -178,14 +210,14 @@ pub fn run_preflight(
         config.root(),
         host_uid,
         SQL_SERVER_UID,
-        config.deadlines().tls_helper,
+        limit(config.deadlines().tls_helper)?,
     )?;
 
     let docker_root = docker
-        .docker_root(config.deadlines().docker_command)
+        .docker_root(limit(config.deadlines().docker_command)?)
         .map_err(|_| PreflightError::DockerUnavailable)?;
     let cached = docker
-        .inspect_image(config.image(), config.deadlines().docker_command)
+        .inspect_image(config.image(), limit(config.deadlines().docker_command)?)
         .map_err(|_| PreflightError::DockerUnavailable)?;
     let image_was_cached = cached.is_some();
     let image = if let Some(image) = cached {
@@ -199,10 +231,10 @@ pub fn run_preflight(
             });
         }
         docker
-            .pull_image(config.image(), config.deadlines().image_pull)
+            .pull_image(config.image(), limit(config.deadlines().image_pull)?)
             .map_err(|_| PreflightError::ImageUnavailable)?;
         docker
-            .inspect_image(config.image(), config.deadlines().docker_command)
+            .inspect_image(config.image(), limit(config.deadlines().docker_command)?)
             .map_err(|_| PreflightError::ImageUnavailable)?
             .ok_or(PreflightError::ImageUnavailable)?
     };
@@ -362,6 +394,37 @@ impl<R: ProcessRunner> AclProbe for CommandAclProbe<R> {
             if !acl_output_has_users(&output.stdout, host_uid, sql_uid) {
                 return Err(PreflightError::AclFilesystem);
             }
+            const UID_PROBE: &str = r#"
+import os
+import sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+os.setgroups([])
+os.setgid(0)
+os.setuid(10001)
+os.mkdir("uid-probe", dir_fd=fd)
+os.close(fd)
+"#;
+            self.runner
+                .run(
+                    &CommandSpec::new("sudo", "verify SQL UID privilege", timeout)
+                        .args(["-n", "python3", "-c", UID_PROBE])
+                        .arg(&probe),
+                )
+                .map_err(|_| PreflightError::Privilege)?;
+            self.runner
+                .run(
+                    &CommandSpec::new("sudo", "verify cleanup ACL privilege", timeout)
+                        .args([
+                            "-n",
+                            "setfacl",
+                            "--recursive",
+                            "--physical",
+                            "--modify",
+                            &format!("u:{host_uid}:rwx,m:rwx"),
+                        ])
+                        .arg(&probe),
+                )
+                .map_err(|_| PreflightError::Privilege)?;
             fs::remove_dir_all(&probe).map_err(|_| PreflightError::AclFilesystem)?;
             if probe.exists() {
                 return Err(PreflightError::AclFilesystem);

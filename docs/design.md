@@ -339,7 +339,7 @@ write uses its private administrator connection to the directly observed native
 primary and is not a Kuberic client-access decision.
 
 The current implementation temporarily pins Kuberic Git commit
-`2eed72e2e2e906c286e9d12b5dd7950e9dc2ddc9` for the authority-validation
+`71599f8395953d121081634736e50299610f0d26` for the authority-validation
 ordering tracked by
 [youyuanwu/kuberic#124](https://github.com/youyuanwu/kuberic/pull/124). This pin
 remains an upstream dependency until an appropriate merge or release is

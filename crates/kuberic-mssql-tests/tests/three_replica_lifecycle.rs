@@ -24,7 +24,7 @@ use kuberic_mssql_tests::three_replica::{
     cgroup_v2_available_memory, cgroup_v2_effective_cpu_quota, cgroup_v2_effective_cpuset,
     cgroup_v2_path_from, cleanup, combine_with_cleanup, effective_cpu_count,
     inspect_member_directory, parse_acl_evidence, parse_cpu_list, prepare_member_directory,
-    reconcile, run_preflight, verify_member_directory,
+    reconcile, run_preflight, run_preflight_with_deadline, verify_member_directory,
 };
 
 fn effective_uid() -> u32 {
@@ -408,6 +408,23 @@ fn preflight_enforces_exact_numeric_policy_and_deadlines() {
 }
 
 #[test]
+fn preflight_is_inside_the_complete_run_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = fixture_config(directory.path());
+    assert_eq!(
+        run_preflight_with_deadline(
+            &config,
+            &FakeHost::sufficient(),
+            &FakeAclProbe::supported(),
+            &FakeDocker::cached(),
+            Instant::now(),
+        )
+        .unwrap_err(),
+        PreflightError::Deadline
+    );
+}
+
+#[test]
 fn every_preflight_failure_precedes_network_and_container_creation() {
     let directory = tempfile::tempdir().unwrap();
     let config = fixture_config(directory.path());
@@ -479,7 +496,11 @@ fn changed_acknowledgement_and_acl_failures_create_nothing() {
 
     write_acknowledgement(&acknowledgement);
     let config = FixtureConfig::new(directory.path().join("fixture"), &acknowledgement).unwrap();
-    for error in [PreflightError::AclTools, PreflightError::AclFilesystem] {
+    for error in [
+        PreflightError::AclTools,
+        PreflightError::AclFilesystem,
+        PreflightError::Privilege,
+    ] {
         let acl = FakeAclProbe {
             result: Err(error.clone()),
             calls: Cell::new(0),
@@ -1278,6 +1299,23 @@ fn wrong_sql_uid_acl_symlinks_and_replaced_paths_fail_closed() {
         &acl,
     )
     .unwrap();
+    let request = ContainerRequest::sql_server(
+        SqlServerContainerSpec {
+            name: "container-name".to_owned(),
+            hostname: "km0123456789n1".to_owned(),
+            network_name: "network-name".to_owned(),
+            data_directory: path.clone(),
+            environment_file: root.join("container.env"),
+            sa_password: SecretValue::from_test("Password-Aa1!"),
+        },
+        OwnedLabels::container("0123456789ab", 1),
+        ResourcePolicy::default(),
+        [("ACCEPT_EULA", "Y")],
+    )
+    .unwrap();
+    request
+        .verify_data_directory_binding(&root, &expected, host_uid, Duration::from_secs(30), &acl)
+        .unwrap();
     fs::remove_dir_all(&path).unwrap();
     fs::create_dir(&path).unwrap();
     assert!(
@@ -1291,9 +1329,33 @@ fn wrong_sql_uid_acl_symlinks_and_replaced_paths_fail_closed() {
         )
         .is_err()
     );
+    assert!(
+        request
+            .verify_data_directory_binding(
+                &root,
+                &expected,
+                host_uid,
+                Duration::from_secs(30),
+                &acl,
+            )
+            .is_err()
+    );
 
     let target = root.join("target");
     fs::create_dir(&target).unwrap();
+    fs::remove_dir(&path).unwrap();
+    symlink(&target, &path).unwrap();
+    assert!(
+        request
+            .verify_data_directory_binding(
+                &root,
+                &expected,
+                host_uid,
+                Duration::from_secs(30),
+                &acl,
+            )
+            .is_err()
+    );
     let link = root.join("member-link");
     symlink(&target, &link).unwrap();
     assert!(

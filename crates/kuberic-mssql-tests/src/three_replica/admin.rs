@@ -39,6 +39,7 @@ pub struct MemberReadinessEvidence {
     pub edition: String,
     pub engine_edition: i32,
     pub hadr_enabled: bool,
+    pub sql_start_time: String,
     pub sql_start_unix_millis: i64,
 }
 
@@ -141,6 +142,7 @@ SELECT
     CONVERT(nvarchar(128), SERVERPROPERTY(N'Edition')),
     CONVERT(int, SERVERPROPERTY(N'EngineEdition')),
     CONVERT(bit, SERVERPROPERTY(N'IsHadrEnabled')),
+    CONVERT(nvarchar(33), info.sqlserver_start_time, 126),
     CONVERT(bigint, DATEDIFF_BIG(millisecond, CONVERT(datetime2, '1970-01-01T00:00:00'), info.sqlserver_start_time))
 FROM sys.dm_os_sys_info AS info;"#;
         let rows = self.query_rows(QUERY, &[]).await?;
@@ -151,7 +153,8 @@ FROM sys.dm_os_sys_info AS info;"#;
             edition: required_text(&row, 2)?,
             engine_edition: row.get::<i32, _>(3).ok_or(AdminError::MalformedResult)?,
             hadr_enabled: row.get::<bool, _>(4).ok_or(AdminError::MalformedResult)?,
-            sql_start_unix_millis: row.get::<i64, _>(5).ok_or(AdminError::MalformedResult)?,
+            sql_start_time: required_text(&row, 5)?,
+            sql_start_unix_millis: row.get::<i64, _>(6).ok_or(AdminError::MalformedResult)?,
         })
     }
 

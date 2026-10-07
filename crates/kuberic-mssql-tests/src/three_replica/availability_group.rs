@@ -269,6 +269,7 @@ fn native_intent(
                 ordinal: run.members[index].ordinal,
                 server_name: run.members[index].server_name.clone(),
                 container_id: members[index].container_id.clone(),
+                sql_start_time: members[index].sql_start_time.clone(),
                 sql_start_unix_millis: members[index].sql_start_unix_millis,
                 endpoint_certificate_name: endpoint_certificate_name(run, index)?,
                 peer_login_names: [
@@ -606,6 +607,7 @@ fn build_binding(
                 ordinal: member.ordinal,
                 server_name: member.server_name.clone(),
                 container_id: incarnation.container_id.clone(),
+                sql_start_time: incarnation.sql_start_time.clone(),
                 sql_start_unix_millis: incarnation.sql_start_unix_millis,
                 native_replica_id: member.local_replica_id.clone(),
                 local_database_id: member.database.local_database_id,
@@ -655,15 +657,24 @@ pub fn validate_binding_incarnations(
                 return Err(AvailabilityGroupError::Intent);
             }
             frozen
-                .verify(&launched.container_id, launched.sql_start_unix_millis)
+                .verify(
+                    &launched.container_id,
+                    &launched.sql_start_time,
+                    launched.sql_start_unix_millis,
+                )
                 .map_err(AvailabilityGroupError::Incarnation)?;
             frozen
-                .verify(&launched.container_id, fresh.sql_start_unix_millis)
+                .verify(
+                    &launched.container_id,
+                    &fresh.sql_start_time,
+                    fresh.sql_start_unix_millis,
+                )
                 .map_err(AvailabilityGroupError::Incarnation)?;
             Ok(SqlMemberIncarnation {
                 ordinal: launched.ordinal,
                 server_name: fresh.server_name.clone(),
                 container_id: launched.container_id.clone(),
+                sql_start_time: fresh.sql_start_time.clone(),
                 sql_start_unix_millis: fresh.sql_start_unix_millis,
             })
         })

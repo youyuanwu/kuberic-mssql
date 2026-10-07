@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -33,12 +34,12 @@ use super::model::{
     SqlMember, SqlMemberIncarnation, TopologyRun,
 };
 use super::ownership::{
-    CommandAclController, JournalStore, OwnershipInspector, PrivateDirectoryBinding,
-    ReconcileError, ResourceObservation, RootLock, acquire_root_lock,
+    CommandAclController, DirectoryBinding, JournalStore, OwnershipInspector,
+    PrivateDirectoryBinding, ReconcileError, ResourceObservation, RootLock, acquire_root_lock,
     create_private_owned_directory, inspect_member_directory, inspect_owned_directory,
     prepare_member_directory,
 };
-use super::preflight::{CommandAclProbe, LocalHostProbe, run_preflight};
+use super::preflight::{CommandAclProbe, LocalHostProbe, run_preflight_with_deadline};
 use super::process::{BoundedProcessRunner, CommandSpec, ProcessRunner};
 use super::secrets::{CredentialFiles, PrivateFile, SecretError, SecretValue};
 use super::tls::{TlsAssetRecorder, TlsAssets, TlsError};
@@ -51,6 +52,7 @@ pub struct ReadyMember {
     pub server_name: String,
     pub container_id: String,
     pub host_port: u16,
+    pub sql_start_time: String,
     pub sql_start_unix_millis: i64,
     pub observer_config: PathBuf,
 }
@@ -170,11 +172,15 @@ pub enum NativePhaseError {
 
 impl fmt::Display for NativePhaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Unavailable => "native phase requires the live member launch context",
-            Self::AvailabilityGroup(_) => "native availability-group phase failed",
-            Self::Data(_) => "native replicated-data phase failed",
-        })
+        match self {
+            Self::Unavailable => {
+                formatter.write_str("native phase requires the live member launch context")
+            }
+            Self::AvailabilityGroup(error) => {
+                write!(formatter, "native availability-group phase failed: {error}")
+            }
+            Self::Data(error) => write!(formatter, "native replicated-data phase failed: {error}"),
+        }
     }
 }
 
@@ -294,8 +300,18 @@ pub fn cleanup_three_replica_fixture(root: &Path) -> Result<CleanupEvidence, Com
                 })
                 .and_then(|record| record.binding.as_ref())
                 .map(|binding| binding.immutable_id.clone());
+            let data_directory = inspect_member_directory(
+                store.root(),
+                &member.data_directory,
+                unsafe { libc::geteuid() },
+                SQL_SERVER_UID,
+                cleanup_recovery_timeout(&coordinator)?,
+                &CommandAclController::new(runner),
+            )
+            .ok();
             Ok(OwnedContainer {
                 request,
+                data_directory,
                 id,
                 frozen_running_inspection: None,
             })
@@ -375,7 +391,7 @@ fn cleanup_recovery_timeout(
     if remaining.is_zero() {
         Err(cleanup_setup_error(FailureCategory::DeadlineExceeded))
     } else {
-        Ok(remaining)
+        Ok(remaining.min(Duration::from_secs(30)))
     }
 }
 
@@ -404,6 +420,7 @@ struct OwnedNetwork {
 
 struct OwnedContainer {
     request: ContainerRequest,
+    data_directory: Option<DirectoryBinding>,
     id: Option<String>,
     frozen_running_inspection: Option<ContainerInspection>,
 }
@@ -470,6 +487,7 @@ struct LaunchContext {
     tls: Option<TlsAssets>,
     network: Option<OwnedNetwork>,
     containers: Vec<OwnedContainer>,
+    member_directories: Vec<DirectoryBinding>,
 }
 
 impl LaunchContext {
@@ -497,17 +515,19 @@ impl LaunchContext {
         }
         let runner = BoundedProcessRunner;
         let docker = DockerCli::new(runner);
-        let preflight = run_preflight(
+        let deadline = Instant::now() + config.deadlines().complete_run;
+        let preflight = run_preflight_with_deadline(
             &config,
             &LocalHostProbe,
             &CommandAclProbe::new(runner),
             &docker,
+            deadline,
         )
-        .map_err(|_| NativeLaunchError::Preflight)?;
+        .map_err(NativeLaunchError::Preflight)?;
         let run = topology_run(store.root())?;
         let journal = store.create(run).map_err(|_| NativeLaunchError::Journal)?;
         Ok(Self {
-            deadline: Instant::now() + config.deadlines().complete_run,
+            deadline,
             config,
             _lock: lock,
             store,
@@ -520,6 +540,7 @@ impl LaunchContext {
             tls: None,
             network: None,
             containers: Vec::new(),
+            member_directories: Vec::new(),
         })
     }
 
@@ -629,9 +650,11 @@ impl LaunchContext {
             )?;
             self.containers.push(OwnedContainer {
                 request,
+                data_directory: Some(self.member_directories[index].clone()),
                 id: None,
                 frozen_running_inspection: None,
             });
+            self.verify_container_directory(index)?;
             self.store
                 .mark_dispatched(&mut self.journal, record_index)
                 .map_err(|_| NativeLaunchError::Journal)?;
@@ -657,6 +680,7 @@ impl LaunchContext {
         }
         self.verify_network_attachments(false)?;
         for index in 0..self.containers.len() {
+            self.verify_container_directory(index)?;
             let id = self.containers[index]
                 .id
                 .clone()
@@ -707,6 +731,7 @@ impl LaunchContext {
                 ordinal: run.members[index].ordinal,
                 server_name: run.members[index].server_name.clone(),
                 container_id: inspection.id.clone(),
+                sql_start_time: evidence.sql_start_time.clone(),
                 sql_start_unix_millis: evidence.sql_start_unix_millis,
             };
             let observer_config =
@@ -716,6 +741,7 @@ impl LaunchContext {
                 server_name: run.members[index].server_name.clone(),
                 container_id: inspection.id,
                 host_port: port,
+                sql_start_time: evidence.sql_start_time,
                 sql_start_unix_millis: evidence.sql_start_unix_millis,
                 observer_config,
             });
@@ -761,16 +787,38 @@ impl LaunchContext {
                 &acl,
             )
             .map_err(|_| NativeLaunchError::DataDirectory)?;
+            self.store
+                .bind(&mut self.journal, index, binding.binding.clone())
+                .map_err(|_| NativeLaunchError::Journal)?;
+            self.member_directories.push(binding);
             probe_sql_uid_access(
                 &member.data_directory,
                 self.limit(self.config.deadlines().tls_helper)?,
                 &self.runner,
             )?;
-            self.store
-                .bind(&mut self.journal, index, binding.binding.clone())
-                .map_err(|_| NativeLaunchError::Journal)?;
         }
         Ok(())
+    }
+
+    fn verify_container_directory(&self, index: usize) -> Result<(), NativeLaunchError> {
+        let container = self
+            .containers
+            .get(index)
+            .ok_or(NativeLaunchError::Ownership)?;
+        let binding = container
+            .data_directory
+            .as_ref()
+            .ok_or(NativeLaunchError::Ownership)?;
+        container
+            .request
+            .verify_data_directory_binding(
+                self.store.root(),
+                binding,
+                unsafe { libc::geteuid() },
+                self.limit(self.config.deadlines().tls_helper)?,
+                &CommandAclController::new(self.runner),
+            )
+            .map_err(|_| NativeLaunchError::DataDirectory)
     }
 
     fn generate_credentials(
@@ -1451,7 +1499,7 @@ where
             }
             Err(_) => return Err(ReconcileError::Io),
         }
-        if resource.binding.is_none() {
+        if resource.binding.is_none() && resource.kind != ResourceKind::DataDirectory {
             return Ok(ResourceObservation::Foreign);
         }
         let canonical = path
@@ -1466,16 +1514,25 @@ where
                 if timeout.is_zero() {
                     return Err(ReconcileError::Io);
                 }
-                inspect_member_directory(
+                match inspect_member_directory(
                     self.root,
                     path,
                     unsafe { libc::geteuid() },
                     SQL_SERVER_UID,
                     timeout,
                     &CommandAclController::new(*self.runner),
-                )
-                .map_err(|_| ReconcileError::OwnershipMismatch)?
-                .binding
+                ) {
+                    Ok(binding) => binding.binding,
+                    Err(_)
+                        if resource.binding.is_none()
+                            || resource.binding.as_ref().is_some_and(|binding| {
+                                binding.immutable_id.starts_with("empty-device:")
+                            }) =>
+                    {
+                        inspect_empty_dispatched_directory(self.root, path)?
+                    }
+                    Err(_) => return Err(ReconcileError::OwnershipMismatch),
+                }
             }
             ResourceKind::Directory => {
                 inspect_owned_directory(self.root, path)
@@ -1729,8 +1786,20 @@ where
             .ok_or_else(|| cleanup_ownership_error(resource))?;
         match resource.kind {
             ResourceKind::SecretFile => fs::remove_file(path),
-            ResourceKind::Directory => fs::remove_dir_all(path),
+            ResourceKind::Directory => {
+                remove_tree_before(path, Instant::now() + self.timeout(resource, &budget)?)
+            }
             ResourceKind::DataDirectory => {
+                if expected.immutable_id.starts_with("empty-device:") {
+                    let current = inspect_empty_dispatched_directory(self.root, path)
+                        .map_err(|_| cleanup_ownership_error(resource))?;
+                    if &current != expected {
+                        return Err(cleanup_ownership_error(resource));
+                    }
+                    return fs::remove_dir(path).map_err(|_| {
+                        cleanup_operation_error(resource, FailureCategory::PathRemoval)
+                    });
+                }
                 restore_host_cleanup_acl(
                     path,
                     unsafe { libc::geteuid() },
@@ -1743,12 +1812,71 @@ where
                 if current.binding.immutable_id != expected.immutable_id {
                     return Err(cleanup_ownership_error(resource));
                 }
-                fs::remove_dir_all(path)
+                remove_tree_before(path, Instant::now() + self.timeout(resource, &budget)?)
             }
             _ => return Err(cleanup_ownership_error(resource)),
         }
         .map_err(|_| cleanup_operation_error(resource, FailureCategory::PathRemoval))
     }
+}
+
+fn remove_tree_before(path: &Path, deadline: Instant) -> std::io::Result<()> {
+    fn remove(path: &Path, deadline: Instant) -> std::io::Result<()> {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "cleanup deadline exceeded",
+            ));
+        }
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return fs::remove_file(path);
+        }
+        for entry in fs::read_dir(path)? {
+            remove(&entry?.path(), deadline)?;
+        }
+        fs::remove_dir(path)
+    }
+
+    match remove(path, deadline) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+fn inspect_empty_dispatched_directory(
+    root: &Path,
+    path: &Path,
+) -> Result<ResourceBinding, ReconcileError> {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| ReconcileError::OwnershipMismatch)?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| ReconcileError::OwnershipMismatch)?;
+    if canonical != path || canonical.parent() != Some(canonical_root.as_path()) {
+        return Err(ReconcileError::OwnershipMismatch);
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| ReconcileError::OwnershipMismatch)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || fs::read_dir(path)
+            .map_err(|_| ReconcileError::OwnershipMismatch)?
+            .next()
+            .is_some()
+    {
+        return Err(ReconcileError::OwnershipMismatch);
+    }
+    let immutable_id = format!("empty-device:{}/inode:{}", metadata.dev(), metadata.ino());
+    let attributes_sha256 = Sha256::digest(immutable_id.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(ResourceBinding {
+        attributes_sha256,
+        immutable_id,
+    })
 }
 
 fn cleanup_ownership_error(resource: &ResourceRecord) -> CleanupError {
@@ -1758,7 +1886,11 @@ fn cleanup_ownership_error(resource: &ResourceRecord) -> CleanupError {
 fn cleanup_operation_error(resource: &ResourceRecord, category: FailureCategory) -> CleanupError {
     CleanupError {
         resource: resource.logical_name.clone(),
-        failure: SanitizedFailure::new(FailureStage::Cleanup, category),
+        failure: SanitizedFailure::with_detail(
+            FailureStage::Cleanup,
+            category,
+            format!("resource {}", resource.logical_name),
+        ),
     }
 }
 
@@ -1767,6 +1899,7 @@ fn reconcile_network_create(
     network: &OwnedNetwork,
     timeout: Duration,
 ) -> Result<super::docker::NetworkInspection, NativeLaunchError> {
+    let deadline = Instant::now() + timeout;
     let create = docker.create_network(&network.request, timeout);
     let returned_id = create.as_ref().ok().filter(|id| !id.is_empty());
     let identities = returned_id
@@ -1774,7 +1907,11 @@ fn reconcile_network_create(
         .map(String::as_str)
         .chain(std::iter::once(network.request.name.as_str()));
     for identity in identities {
-        if let Ok(Some(inspection)) = docker.inspect_network(identity, timeout)
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(NativeLaunchError::Deadline);
+        }
+        if let Ok(Some(inspection)) = docker.inspect_network(identity, remaining)
             && network.request.verify_inspection(&inspection).is_ok()
         {
             return Ok(inspection);
@@ -1792,6 +1929,7 @@ fn reconcile_container_create(
     image_id: &str,
     timeout: Duration,
 ) -> Result<ContainerInspection, NativeLaunchError> {
+    let deadline = Instant::now() + timeout;
     let create = docker.create_container(&container.request, timeout);
     let returned_id = create.as_ref().ok().filter(|id| !id.is_empty());
     let identities = returned_id
@@ -1799,7 +1937,11 @@ fn reconcile_container_create(
         .map(String::as_str)
         .chain(std::iter::once(container.request.name.as_str()));
     for identity in identities {
-        if let Ok(Some(inspection)) = docker.inspect_container(identity, timeout)
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(NativeLaunchError::Deadline);
+        }
+        if let Ok(Some(inspection)) = docker.inspect_container(identity, remaining)
             && container
                 .request
                 .verify_inspection(&inspection, image_id, false)
@@ -1819,7 +1961,7 @@ pub enum NativeLaunchError {
     RootLock,
     PriorRunUnresolved,
     AuthorizationChanged,
-    Preflight,
+    Preflight(super::preflight::PreflightError),
     Journal,
     DataDirectory,
     Secret(SecretError),
@@ -1834,11 +1976,13 @@ pub enum NativeLaunchError {
 
 impl fmt::Display for NativeLaunchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
+        let message = match self {
             Self::RootLock => "three-replica fixture root lock failed",
             Self::PriorRunUnresolved => "a prior three-replica run remains unresolved",
             Self::AuthorizationChanged => "SQL Server EULA acknowledgement changed before create",
-            Self::Preflight => "three-replica host preflight failed",
+            Self::Preflight(error) => {
+                return write!(formatter, "three-replica host preflight failed: {error}");
+            }
             Self::Journal => "three-replica ownership journal failed",
             Self::DataDirectory => "three-replica member data directory failed",
             Self::Secret(_) => "three-replica private credential operation failed",
@@ -1849,7 +1993,8 @@ impl fmt::Display for NativeLaunchError {
             Self::Readiness => "three-replica SQL readiness failed",
             Self::Deadline => "three-replica setup deadline exceeded",
             Self::Cleanup => "three-replica exact cleanup failed",
-        })
+        };
+        formatter.write_str(message)
     }
 }
 
@@ -1858,7 +2003,7 @@ impl std::error::Error for NativeLaunchError {}
 impl NativeLaunchError {
     fn sanitized(&self) -> SanitizedFailure {
         let category = match self {
-            Self::Preflight => FailureCategory::Preflight,
+            Self::Preflight(_) => FailureCategory::Preflight,
             Self::Docker(_) => FailureCategory::ContainerCreation,
             Self::Admin(_) | Self::Readiness => FailureCategory::SqlUnavailable,
             Self::Deadline => FailureCategory::DeadlineExceeded,
@@ -1866,13 +2011,13 @@ impl NativeLaunchError {
             Self::Ownership | Self::PriorRunUnresolved | Self::RootLock => {
                 FailureCategory::OwnershipMismatch
             }
-            Self::AuthorizationChanged
-            | Self::DataDirectory
-            | Self::Secret(_)
-            | Self::Tls(_)
-            | Self::Cleanup => FailureCategory::PathRemoval,
+            Self::AuthorizationChanged => FailureCategory::Acknowledgement,
+            Self::DataDirectory => FailureCategory::DataDirectory,
+            Self::Secret(_) => FailureCategory::Secret,
+            Self::Tls(_) => FailureCategory::Tls,
+            Self::Cleanup => FailureCategory::PathRemoval,
         };
-        SanitizedFailure::new(FailureStage::Setup, category)
+        SanitizedFailure::with_detail(FailureStage::Setup, category, self.to_string())
     }
 }
 
@@ -2271,6 +2416,7 @@ mod tests {
         };
         let owned = OwnedContainer {
             request: request.clone(),
+            data_directory: None,
             id: None,
             frozen_running_inspection: None,
         };
@@ -2537,7 +2683,7 @@ mod tests {
     }
 
     #[test]
-    fn slow_image_recovery_consumes_the_independent_cleanup_ceiling() {
+    fn recovery_inspections_are_capped_and_leave_cleanup_budget() {
         let temporary = tempdir().unwrap();
         let root = temporary.path().join("fixture");
         let store = JournalStore::initialize(&root).unwrap();
@@ -2545,25 +2691,24 @@ mod tests {
         let clock = FakeClock::new();
         let docker = SlowRecoveryDocker {
             clock: clock.clone(),
-            elapsed_per_call: Duration::from_secs(70),
+            elapsed_per_call: Duration::from_secs(10),
             calls: RefCell::new(Vec::new()),
         };
         let coordinator = CleanupCoordinator::new(clock.clone(), CLEANUP_BUDGET);
 
-        let error = recover_image_id(&docker, &journal, &coordinator).unwrap_err();
-
         assert_eq!(
-            error.primary(),
-            SanitizedFailure::new(FailureStage::Cleanup, FailureCategory::DeadlineExceeded)
+            recover_image_id(&docker, &journal, &coordinator).unwrap(),
+            ""
         );
-        assert_eq!(clock.now(), CLEANUP_BUDGET);
-        assert_eq!(coordinator.remaining(), Duration::ZERO);
+        assert_eq!(clock.now(), Duration::from_secs(40));
+        assert_eq!(coordinator.remaining(), Duration::from_secs(140));
         assert_eq!(
             docker.calls.borrow().as_slice(),
             [
-                ("inspect-image".to_owned(), Duration::from_secs(180)),
-                ("inspect-container".to_owned(), Duration::from_secs(110)),
-                ("inspect-container".to_owned(), Duration::from_secs(40)),
+                ("inspect-image".to_owned(), Duration::from_secs(30)),
+                ("inspect-container".to_owned(), Duration::from_secs(30)),
+                ("inspect-container".to_owned(), Duration::from_secs(30)),
+                ("inspect-container".to_owned(), Duration::from_secs(30)),
             ]
         );
     }
@@ -2729,6 +2874,7 @@ mod tests {
             tls: None,
             network: None,
             containers: Vec::new(),
+            member_directories: Vec::new(),
         };
 
         let report = context.cleanup_report();
@@ -2775,6 +2921,7 @@ mod tests {
             tls: None,
             network: None,
             containers: Vec::new(),
+            member_directories: Vec::new(),
         });
 
         let store = JournalStore::initialize(&root).unwrap();
@@ -2821,6 +2968,7 @@ mod tests {
             tls: None,
             network: None,
             containers: Vec::new(),
+            member_directories: Vec::new(),
         };
         let topology = context.journal.run.clone();
         assert!(context.generate_credentials(&topology).is_err());
@@ -2873,6 +3021,22 @@ mod tests {
             fs::read_to_string(directory.join("replacement")).unwrap(),
             "keep"
         );
+    }
+
+    #[test]
+    fn empty_dispatched_member_directory_can_be_rebound_but_nonempty_foreign_path_cannot() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("fixture");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("member-1");
+        fs::create_dir(&path).unwrap();
+
+        let binding = inspect_empty_dispatched_directory(&root, &path).unwrap();
+        assert!(binding.immutable_id.starts_with("empty-device:"));
+
+        fs::write(path.join("foreign"), b"not-owned").unwrap();
+        assert!(inspect_empty_dispatched_directory(&root, &path).is_err());
     }
 
     #[test]

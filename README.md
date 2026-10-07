@@ -402,6 +402,11 @@ least 10 GiB effective available memory, two effective CPUs, 15 GiB free on the
 fixture filesystem, and Docker-root capacity of 8 GiB before an absent-image
 pull and 2 GiB after the image is present. Each container is capped at 3 GiB,
 two CPUs, and 2 GiB SQL Server memory; compilation uses one Cargo build job.
+Before creating run resources, preflight also requires noninteractive `sudo`
+for exactly `python3` running the UID-10001 access probe and recursive physical
+`setfacl --modify` used to restore host cleanup access. Missing, denied, or
+expired authorization fails closed; the member-directory binding is journaled
+before the fallible UID probe so exact cleanup remains possible.
 
 The fixture pins:
 
@@ -410,7 +415,7 @@ mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59
 ```
 
 It currently also pins Kuberic Git commit
-`2eed72e2e2e906c286e9d12b5dd7950e9dc2ddc9`, associated with the open
+`71599f8395953d121081634736e50299610f0d26`, associated with the open
 [Kuberic PR #124](https://github.com/youyuanwu/kuberic/pull/124). This is a
 temporary dependency until a suitable upstream merge or release is available;
 it does not promise that the PR will merge.
@@ -468,12 +473,19 @@ just cleanup-live-three-replica target/my-mssql-three-replica
 just test-live-three-replica-signal .local-eula-acknowledgement.json
 just test-live-three-replica-signal \
   .local-eula-acknowledgement.json target/my-mssql-three-replica-signal
+just test-live-three-replica-recovery \
+  .local-eula-acknowledgement.json target/my-mssql-three-replica-recovery
+just test-live-three-replica-faults \
+  .local-eula-acknowledgement.json target/my-mssql-three-replica-faults
 ```
 
 Cleanup removes only exactly journaled resources. Foreign, replaced, or
 otherwise unverifiable resources remain untouched and block reuse. The signal
-recipe interrupts an owned launch with SIGTERM, recovers it, reruns the complete
-happy path, and verifies idempotent cleanup.
+signal recipe interrupts an owned launch with SIGTERM, recovers it, reruns the
+complete happy path, and verifies idempotent cleanup. The recovery recipe also
+executes real SIGINT and SIGKILL subprocess cases. The fault recipe injects a
+post-AG failure, an actual panic after agent startup, and a report-stage failure;
+each is followed by a separate exact cleanup process and a final retry.
 
 Direct test commands remain available:
 
