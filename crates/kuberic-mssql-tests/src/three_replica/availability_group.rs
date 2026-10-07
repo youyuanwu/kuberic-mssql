@@ -16,8 +16,7 @@ use crate::fixture::config::StageDeadlines;
 use crate::fixture::deadline::{BoundedOperationError, complete_before, earlier};
 use crate::fixture::ownership::JournalStore;
 use crate::fixture::process::{CommandSpec, ProcessError, ProcessRunner};
-use crate::fixture::secrets::{CredentialFiles, SecretError, SecretValue};
-use crate::fixture::tls::TlsAssets;
+use crate::fixture::secrets::{SecretError, SecretValue};
 
 use super::data::{DataContext, verify_direct_read_connectivity};
 use super::evidence::{
@@ -29,6 +28,8 @@ use super::model::{
     IncarnationError, NativeMemberBinding, NativeMemberIntent, NativeTopologyBinding,
     NativeTopologyIntent, OwnershipJournal, SqlMemberIncarnation, TopologyRun,
 };
+use super::secrets::CredentialFiles;
+use super::tls::TlsAssets;
 
 pub const HADR_ENDPOINT_NAME: &str = "kuberic_hadr";
 pub const HADR_ENDPOINT_PORT: u16 = 5022;

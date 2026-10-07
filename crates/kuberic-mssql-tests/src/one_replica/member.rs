@@ -203,6 +203,18 @@ impl LaunchContext {
     fn prepare(config: OneReplicaConfig) -> Result<Self, SanitizedFailure> {
         let runner = BoundedProcessRunner;
         let docker = DockerCli::new(runner);
+        detect_legacy_state(
+            config.root(),
+            &docker,
+            config.fixture().deadlines().docker_command,
+        )
+        .map_err(|error| {
+            SanitizedFailure::with_detail(
+                FailureStage::Setup,
+                FailureCategory::OwnershipMismatch,
+                error.to_string(),
+            )
+        })?;
         let lock = acquire_one_replica_root_lock(config.root())
             .map_err(|_| failure(FailureCategory::OwnershipMismatch))?;
         detect_legacy_state(
@@ -247,7 +259,7 @@ impl LaunchContext {
                 SystemCleanupClock::default(),
                 config.fixture().deadlines().cleanup,
             )
-            .cleanup_shared(&store, &mut previous, &backend);
+            .cleanup(&store, &mut previous, &backend);
             if !report.succeeded() {
                 return Err(failure(FailureCategory::OwnershipMismatch));
             }
@@ -1079,7 +1091,7 @@ impl LaunchContext {
             SystemCleanupClock::default(),
             self.config.fixture().deadlines().cleanup,
         )
-        .cleanup_shared(&self.store, &mut self.journal, &backend)
+        .cleanup(&self.store, &mut self.journal, &backend)
     }
 
     fn coordinate_completion<T>(
@@ -1101,7 +1113,7 @@ impl LaunchContext {
             SystemCleanupClock::default(),
             self.config.fixture().deadlines().cleanup,
         )
-        .coordinate_shared(completion, &self.store, &mut self.journal, &backend)
+        .coordinate(completion, &self.store, &mut self.journal, &backend)
     }
 }
 

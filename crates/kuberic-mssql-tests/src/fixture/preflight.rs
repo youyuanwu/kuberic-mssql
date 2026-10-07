@@ -71,7 +71,7 @@ impl fmt::Display for PreflightError {
                 formatter.write_str("SQL Server EULA acknowledgement failed revalidation")
             }
             Self::UnsupportedHost => {
-                formatter.write_str("three-replica fixture requires local Linux x86-64")
+                formatter.write_str("SQL Server fixture requires local Linux x86-64")
             }
             Self::DockerUnavailable => formatter.write_str("Docker is unavailable"),
             Self::DockerNotLocal => formatter.write_str("Docker engine must be local"),

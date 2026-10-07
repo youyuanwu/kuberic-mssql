@@ -11,12 +11,13 @@ use crate::fixture::admin::{
 };
 use crate::fixture::config::StageDeadlines;
 use crate::fixture::deadline::{BoundedOperationError, complete_before, earlier};
-use crate::fixture::secrets::{CredentialFiles, SecretError};
-use crate::fixture::tls::TlsAssets;
+use crate::fixture::secrets::SecretError;
 
 use super::evidence::ValidatedNativeEvidence;
 use super::member::ReadyMember;
 use super::model::TopologyRun;
+use super::secrets::CredentialFiles;
+use super::tls::TlsAssets;
 
 const MARKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 

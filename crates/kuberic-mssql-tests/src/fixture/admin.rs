@@ -113,7 +113,7 @@ impl AdminSession {
             config.port(endpoint.port);
             config.database(database);
             config.readonly(read_only);
-            config.application_name("kuberic-mssql-three-replica-test-admin");
+            config.application_name("kuberic-mssql-test-admin");
             config.encryption(EncryptionLevel::Required);
             config.trust_cert_ca(endpoint.ca_certificate.to_string_lossy());
             config.authentication(AuthMethod::sql_server(username.expose(), password.expose()));

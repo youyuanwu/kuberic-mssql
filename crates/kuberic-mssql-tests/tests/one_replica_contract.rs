@@ -8,7 +8,10 @@ use kuberic_mssql_tests::one_replica::{
     OneReplicaConfig, OneReplicaJournal, OneReplicaMember, OneReplicaRun,
     cleanup_one_replica_fixture_with, format_cleanup_summary, legacy_container_name,
 };
-use kuberic_mssql_tests::three_replica::{BoundedProcessRunner, RunState};
+use kuberic_mssql_tests::three_replica::{
+    BoundedProcessRunner, CleanupError, CleanupReport, FailureCategory, FailureStage, RunState,
+    SanitizedFailure,
+};
 
 mod support;
 use support::FakeDocker;
@@ -89,6 +92,10 @@ fn legacy_owner_marker_is_refused_before_docker_access() {
         b"kuberic-sqlserver-observer-container-v1\n",
     )
     .unwrap();
+    let before = fs::read_dir(parent.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
 
     let error =
         cleanup_one_replica_fixture_with(&root, &FakeDocker::default(), BoundedProcessRunner)
@@ -97,6 +104,12 @@ fn legacy_owner_marker_is_refused_before_docker_access() {
     assert!(error.contains(&root.display().to_string()));
     assert!(error.contains("not adopted or deleted"));
     assert!(error.contains(LEGACY_CLEANUP_SECTION));
+    let after = fs::read_dir(parent.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(after, before);
+    assert!(!parent.path().join("ownership.json").exists());
 }
 
 #[test]
@@ -161,6 +174,26 @@ fn successful_cleanup_summary_is_stable_and_secret_free() {
 }
 
 #[test]
+fn cleanup_refusal_diagnostic_names_resources_and_categories() {
+    let error = kuberic_mssql_tests::one_replica::OneReplicaCleanupError::Cleanup(CleanupReport {
+        removed: Vec::new(),
+        unresolved: vec!["container-1".to_owned()],
+        errors: vec![CleanupError {
+            resource: "container-1".to_owned(),
+            failure: SanitizedFailure::new(
+                FailureStage::Cleanup,
+                FailureCategory::OwnershipMismatch,
+            ),
+        }],
+    })
+    .to_string();
+    assert!(error.contains("unresolved resource container-1"));
+    assert!(error.contains("container-1"));
+    assert!(error.contains("ownership validation failed"));
+    assert!(!error.contains("password"));
+}
+
+#[test]
 fn repository_routes_one_replica_validation_without_python_fixture_helpers() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -168,6 +201,10 @@ fn repository_routes_one_replica_validation_without_python_fixture_helpers() {
         .unwrap();
     let justfile = fs::read_to_string(root.join("justfile")).unwrap();
     assert!(justfile.contains("test-live-one-replica root=\"target/mssql-one-replica\":"));
+    assert!(
+        justfile
+            .contains("test-live-one-replica-recovery root=\"target/mssql-one-replica-recovery\":")
+    );
     assert!(
         justfile.contains("cargo test --locked -p kuberic-mssql-tests --test live_one_replica")
     );

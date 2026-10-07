@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::fixture::cleanup::{CleanupJournal, CleanupJournalStore};
 use crate::fixture::model::{
-    JournalError, ProcessIncarnation, ResourceBinding, ResourceRecord, ResourceState, RunState,
+    JournalError, ProcessIncarnation, ResourceBinding, ResourceRecord, RunState,
 };
-use crate::fixture::ownership::{JournalStore, ReconcileError, current_process_incarnation};
+use crate::fixture::ownership::{
+    JournalDocument, JournalStore, NewJournal, ProcessOwnedJournal, ReconcileError,
+};
 
 pub const ONE_REPLICA_JOURNAL_SCHEMA_VERSION: u32 = 1;
 
@@ -87,6 +89,30 @@ impl CleanupJournal for OneReplicaJournal {
     }
 }
 
+impl JournalDocument for OneReplicaJournal {
+    fn from_json(bytes: &[u8]) -> Result<Self, JournalError> {
+        Self::from_json(bytes)
+    }
+
+    fn to_json(&self) -> Result<Vec<u8>, JournalError> {
+        self.to_json()
+    }
+}
+
+impl NewJournal<OneReplicaRun> for OneReplicaJournal {
+    fn new_journal(run: OneReplicaRun) -> Self {
+        Self::new(run)
+    }
+}
+
+impl ProcessOwnedJournal for OneReplicaJournal {
+    fn block_for_owner(&mut self, owner: ProcessIncarnation) {
+        self.blocked_owner = Some(owner);
+        self.blocked_owner_unknown = false;
+        self.state = RunState::Blocked;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OneReplicaJournalStore {
     inner: JournalStore,
@@ -106,21 +132,15 @@ impl OneReplicaJournalStore {
     }
 
     pub fn load(&self) -> Result<Option<OneReplicaJournal>, ReconcileError> {
-        self.inner
-            .load_bytes()?
-            .map(|bytes| OneReplicaJournal::from_json(&bytes).map_err(ReconcileError::Journal))
-            .transpose()
+        self.inner.load()
     }
 
     pub fn create(&self, run: OneReplicaRun) -> Result<OneReplicaJournal, ReconcileError> {
-        let journal = OneReplicaJournal::new(run);
-        self.save(&journal)?;
-        Ok(journal)
+        self.inner.create(run)
     }
 
     pub fn save(&self, journal: &OneReplicaJournal) -> Result<(), ReconcileError> {
-        self.inner
-            .save_bytes(&journal.to_json().map_err(ReconcileError::Journal)?)
+        self.inner.save(journal)
     }
 
     pub fn record_intent(
@@ -128,12 +148,7 @@ impl OneReplicaJournalStore {
         journal: &mut OneReplicaJournal,
         record: ResourceRecord,
     ) -> Result<usize, ReconcileError> {
-        if record.state != ResourceState::Intended || record.binding.is_some() {
-            return Err(ReconcileError::InvalidTransition);
-        }
-        journal.resources.push(record);
-        self.save(journal)?;
-        Ok(journal.resources.len() - 1)
+        self.inner.record_intent(journal, record)
     }
 
     pub fn mark_dispatched(
@@ -141,15 +156,7 @@ impl OneReplicaJournalStore {
         journal: &mut OneReplicaJournal,
         index: usize,
     ) -> Result<(), ReconcileError> {
-        let record = journal
-            .resources
-            .get_mut(index)
-            .ok_or(ReconcileError::InvalidTransition)?;
-        if record.state != ResourceState::Intended {
-            return Err(ReconcileError::InvalidTransition);
-        }
-        record.state = ResourceState::Dispatched;
-        self.save(journal)
+        self.inner.mark_dispatched(journal, index)
     }
 
     pub fn bind(
@@ -158,31 +165,14 @@ impl OneReplicaJournalStore {
         index: usize,
         binding: ResourceBinding,
     ) -> Result<(), ReconcileError> {
-        let record = journal
-            .resources
-            .get_mut(index)
-            .ok_or(ReconcileError::InvalidTransition)?;
-        if !matches!(
-            record.state,
-            ResourceState::Dispatched | ResourceState::Blocked
-        ) || record.binding.is_some()
-        {
-            return Err(ReconcileError::InvalidTransition);
-        }
-        record.binding = Some(binding);
-        record.state = ResourceState::Bound;
-        self.save(journal)
+        self.inner.bind(journal, index, binding)
     }
 
     pub fn block_for_current_process(
         &self,
         journal: &mut OneReplicaJournal,
     ) -> Result<(), ReconcileError> {
-        journal.blocked_owner =
-            Some(current_process_incarnation().map_err(|_| ReconcileError::Io)?);
-        journal.blocked_owner_unknown = false;
-        journal.state = RunState::Blocked;
-        self.save(journal)
+        self.inner.block_for_current_process(journal)
     }
 }
 

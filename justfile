@@ -46,6 +46,14 @@ cleanup-live-one-replica root="target/mssql-one-replica":
     env -u SQLSERVER_TEST_EULA_ACCEPTED CARGO_BUILD_JOBS=1 \
         cargo run --locked -p kuberic-mssql-tests --bin mssql-one-replica-fixture -- cleanup --root "$(realpath -m {{quote(root)}})"
 
+# Exercise launch/scenario faults, panic, timeout, explicit error, SIGINT and SIGTERM recovery.
+test-live-one-replica-recovery root="target/mssql-one-replica-recovery":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        SQLSERVER_ONE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_one_replica \
+        one_replica_recovery_ -- --ignored --test-threads=1 --nocapture
+
 # Launch, validate, and clean up the dedicated real three-member topology.
 test-live-three-replica root="target/mssql-three-replica":
     env -u SQLSERVER_TEST_EULA_ACCEPTED \

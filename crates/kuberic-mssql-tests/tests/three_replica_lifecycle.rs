@@ -1049,7 +1049,9 @@ fn private_root_and_journal_updates_are_durable_and_same_directory() {
         fs::metadata(&root).unwrap().permissions().mode() & 0o777,
         0o700
     );
-    let mut journal = store.create(sample_run(&root)).unwrap();
+    let mut journal = store
+        .create::<OwnershipJournal, _>(sample_run(&root))
+        .unwrap();
     let index = store
         .record_intent(
             &mut journal,
@@ -1062,19 +1064,19 @@ fn private_root_and_journal_updates_are_durable_and_same_directory() {
         )
         .unwrap();
     assert_eq!(
-        store.load().unwrap().unwrap().resources[index].state,
+        store.load::<OwnershipJournal>().unwrap().unwrap().resources[index].state,
         ResourceState::Intended
     );
     store.mark_dispatched(&mut journal, index).unwrap();
     assert_eq!(
-        store.load().unwrap().unwrap().resources[index].state,
+        store.load::<OwnershipJournal>().unwrap().unwrap().resources[index].state,
         ResourceState::Dispatched
     );
     store
         .bind(&mut journal, index, binding("network-id"))
         .unwrap();
     assert_eq!(
-        store.load().unwrap().unwrap().resources[index].state,
+        store.load::<OwnershipJournal>().unwrap().unwrap().resources[index].state,
         ResourceState::Bound
     );
     assert!(fs::read_dir(&root).unwrap().all(|entry| {
@@ -1093,7 +1095,9 @@ fn journal_store_rejects_renamed_root_and_symlink_replacement() {
     let moved = directory.path().join("moved-fixture");
     let attacker = directory.path().join("attacker");
     let store = JournalStore::initialize(&root).unwrap();
-    let journal = store.create(sample_run(&root)).unwrap();
+    let journal = store
+        .create::<OwnershipJournal, _>(sample_run(&root))
+        .unwrap();
 
     fs::rename(&root, &moved).unwrap();
     fs::create_dir(&attacker).unwrap();
@@ -1101,7 +1105,7 @@ fn journal_store_rejects_renamed_root_and_symlink_replacement() {
     symlink(&attacker, &root).unwrap();
 
     assert!(matches!(
-        store.load(),
+        store.load::<OwnershipJournal>(),
         Err(ReconcileError::OwnershipMismatch | ReconcileError::Io)
     ));
     assert!(matches!(
@@ -1117,7 +1121,9 @@ fn every_host_resource_create_boundary_persists_intent_then_dispatch() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("fixture");
     let store = JournalStore::initialize(&root).unwrap();
-    let mut journal = store.create(sample_run(&root)).unwrap();
+    let mut journal = store
+        .create::<OwnershipJournal, _>(sample_run(&root))
+        .unwrap();
     for (index, kind) in [
         ResourceKind::Network,
         ResourceKind::DataDirectory,
@@ -1135,12 +1141,12 @@ fn every_host_resource_create_boundary_persists_intent_then_dispatch() {
             )
             .unwrap();
         assert_eq!(
-            store.load().unwrap().unwrap().resources[record_index].state,
+            store.load::<OwnershipJournal>().unwrap().unwrap().resources[record_index].state,
             ResourceState::Intended
         );
         store.mark_dispatched(&mut journal, record_index).unwrap();
         assert_eq!(
-            store.load().unwrap().unwrap().resources[record_index].state,
+            store.load::<OwnershipJournal>().unwrap().unwrap().resources[record_index].state,
             ResourceState::Dispatched
         );
     }
@@ -1151,16 +1157,18 @@ fn stale_or_unknown_journal_schema_blocks_recovery() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("fixture");
     let store = JournalStore::initialize(&root).unwrap();
-    let journal = store.create(sample_run(&root)).unwrap();
+    let journal = store
+        .create::<OwnershipJournal, _>(sample_run(&root))
+        .unwrap();
     let mut value: serde_json::Value = serde_json::from_slice(&journal.to_json().unwrap()).unwrap();
     value["schema_version"] = serde_json::json!(999);
     fs::write(store.path(), serde_json::to_vec(&value).unwrap()).unwrap();
-    assert!(store.load().is_err());
+    assert!(store.load::<OwnershipJournal>().is_err());
 
     value["schema_version"] = serde_json::json!(1);
     value["unknown"] = serde_json::json!(true);
     fs::write(store.path(), serde_json::to_vec(&value).unwrap()).unwrap();
-    assert!(store.load().is_err());
+    assert!(store.load::<OwnershipJournal>().is_err());
 }
 
 struct FakeAclController {
@@ -1718,7 +1726,9 @@ impl CleanupBackend for BudgetLifecycle {
 fn lost_create_output_is_bound_from_exact_post_create_evidence() {
     let directory = tempfile::tempdir().unwrap();
     let store = JournalStore::initialize(&directory.path().join("fixture")).unwrap();
-    let mut journal = store.create(sample_run(store.root())).unwrap();
+    let mut journal = store
+        .create::<OwnershipJournal, _>(sample_run(store.root()))
+        .unwrap();
     journal.resources.push(record(
         ResourceKind::Container,
         "sql-1",
@@ -1747,7 +1757,9 @@ fn lost_create_output_is_bound_from_exact_post_create_evidence() {
 fn dispatched_create_initial_absence_remains_blocked_for_late_daemon_completion() {
     let directory = tempfile::tempdir().unwrap();
     let store = JournalStore::initialize(&directory.path().join("fixture")).unwrap();
-    let mut journal = store.create(sample_run(store.root())).unwrap();
+    let mut journal = store
+        .create::<OwnershipJournal, _>(sample_run(store.root()))
+        .unwrap();
     journal.resources.push(record(
         ResourceKind::Container,
         "sql-late",
@@ -1782,7 +1794,9 @@ fn dispatched_create_initial_absence_remains_blocked_for_late_daemon_completion(
 fn cleanup_is_reverse_order_and_distinguishes_container_path_and_network() {
     let directory = tempfile::tempdir().unwrap();
     let store = JournalStore::initialize(&directory.path().join("fixture")).unwrap();
-    let mut journal = store.create(sample_run(store.root())).unwrap();
+    let mut journal = store
+        .create::<OwnershipJournal, _>(sample_run(store.root()))
+        .unwrap();
     journal.resources = vec![
         record(
             ResourceKind::Network,
@@ -1830,7 +1844,9 @@ fn cleanup_is_reverse_order_and_distinguishes_container_path_and_network() {
 fn cleanup_budget_is_parent_scoped_and_propagates_only_remaining_time() {
     let directory = tempfile::tempdir().unwrap();
     let store = JournalStore::initialize(&directory.path().join("fixture")).unwrap();
-    let mut journal = store.create(sample_run(store.root())).unwrap();
+    let mut journal = store
+        .create::<OwnershipJournal, _>(sample_run(store.root()))
+        .unwrap();
     journal.resources = vec![
         record(
             ResourceKind::Container,
@@ -1907,7 +1923,9 @@ fn coordinator_routes_results_errors_panics_and_cancellation_through_cleanup() {
     ] {
         let directory = tempfile::tempdir().unwrap();
         let store = JournalStore::initialize(&directory.path().join("fixture")).unwrap();
-        let mut journal = store.create(sample_run(store.root())).unwrap();
+        let mut journal = store
+            .create::<OwnershipJournal, _>(sample_run(store.root()))
+            .unwrap();
         journal.resources.push(record(
             ResourceKind::SecretFile,
             "never-dispatched",
@@ -1929,7 +1947,9 @@ fn failed_or_unresolved_containers_block_data_directory_and_network_deletion() {
     for late_create in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let store = JournalStore::initialize(&directory.path().join("fixture")).unwrap();
-        let mut journal = store.create(sample_run(store.root())).unwrap();
+        let mut journal = store
+            .create::<OwnershipJournal, _>(sample_run(store.root()))
+            .unwrap();
         journal.resources = vec![
             record(
                 ResourceKind::Network,
@@ -1990,7 +2010,9 @@ fn failed_or_unresolved_containers_block_data_directory_and_network_deletion() {
 fn cleanup_of_owned_containers_does_not_require_sql_availability_or_native_binding() {
     let directory = tempfile::tempdir().unwrap();
     let store = JournalStore::initialize(&directory.path().join("fixture")).unwrap();
-    let mut journal = store.create(sample_run(store.root())).unwrap();
+    let mut journal = store
+        .create::<OwnershipJournal, _>(sample_run(store.root()))
+        .unwrap();
     assert!(journal.native_binding.is_none());
     journal.resources.push(record(
         ResourceKind::Container,
@@ -2046,7 +2068,9 @@ fn ownership_mismatch_foreign_lookalikes_and_attachments_are_preserved() {
 fn partial_deletion_and_cleanup_failures_remain_durable_and_combined() {
     let directory = tempfile::tempdir().unwrap();
     let store = JournalStore::initialize(&directory.path().join("fixture")).unwrap();
-    let mut journal = store.create(sample_run(store.root())).unwrap();
+    let mut journal = store
+        .create::<OwnershipJournal, _>(sample_run(store.root()))
+        .unwrap();
     journal.resources.push(record(
         ResourceKind::Container,
         "sql-1",
@@ -2065,7 +2089,10 @@ fn partial_deletion_and_cleanup_failures_remain_durable_and_combined() {
     backend.fail_removal.borrow_mut().insert("sql-1".to_owned());
     let report = cleanup(&store, &mut journal, &backend);
     assert!(!report.succeeded());
-    assert_eq!(store.load().unwrap().unwrap().state, RunState::Blocked);
+    assert_eq!(
+        store.load::<OwnershipJournal>().unwrap().unwrap().state,
+        RunState::Blocked
+    );
     let combined = combine_with_cleanup::<()>(
         Err(SanitizedFailure::new(
             FailureStage::Setup,

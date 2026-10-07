@@ -4,10 +4,10 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use super::model::{
-    CombinedFixtureError, FailureCategory, FailureStage, OwnershipJournal, ResourceKind,
-    ResourceRecord, ResourceState, RunState, SanitizedFailure,
+    CombinedFixtureError, FailureCategory, FailureStage, ResourceKind, ResourceRecord,
+    ResourceState, RunState, SanitizedFailure,
 };
-use super::ownership::{JournalStore, OwnershipInspector, ReconcileError, ResourceObservation};
+use super::ownership::{OwnershipInspector, ReconcileError, ResourceObservation};
 
 pub trait CleanupBackend: OwnershipInspector {
     fn inspect_cleanup(
@@ -35,40 +35,15 @@ pub trait CleanupBackend: OwnershipInspector {
     ) -> Result<(), CleanupError>;
 }
 
-pub(crate) trait CleanupJournal {
+pub trait CleanupJournal {
     fn state_mut(&mut self) -> &mut RunState;
     fn resources(&self) -> &[ResourceRecord];
     fn resources_mut(&mut self) -> &mut Vec<ResourceRecord>;
     fn clear_blocked_owner(&mut self);
 }
 
-impl CleanupJournal for OwnershipJournal {
-    fn state_mut(&mut self) -> &mut RunState {
-        &mut self.state
-    }
-
-    fn resources(&self) -> &[ResourceRecord] {
-        &self.resources
-    }
-
-    fn resources_mut(&mut self) -> &mut Vec<ResourceRecord> {
-        &mut self.resources
-    }
-
-    fn clear_blocked_owner(&mut self) {
-        self.blocked_owner = None;
-        self.blocked_owner_unknown = false;
-    }
-}
-
-pub(crate) trait CleanupJournalStore<J> {
+pub trait CleanupJournalStore<J> {
     fn save_cleanup_journal(&self, journal: &J) -> Result<(), ReconcileError>;
-}
-
-impl CleanupJournalStore<OwnershipJournal> for JournalStore {
-    fn save_cleanup_journal(&self, journal: &OwnershipJournal) -> Result<(), ReconcileError> {
-        self.save(journal)
-    }
 }
 
 pub const CLEANUP_BUDGET: Duration = Duration::from_secs(180);
@@ -187,16 +162,7 @@ impl<C: CleanupClock> CleanupCoordinator<C> {
         &self.clock
     }
 
-    pub fn cleanup(
-        &self,
-        store: &JournalStore,
-        journal: &mut OwnershipJournal,
-        backend: &impl CleanupBackend,
-    ) -> CleanupReport {
-        self.cleanup_shared(store, journal, backend)
-    }
-
-    pub(crate) fn cleanup_shared<J, S>(
+    pub fn cleanup<J, S>(
         &self,
         store: &S,
         journal: &mut J,
@@ -209,17 +175,7 @@ impl<C: CleanupClock> CleanupCoordinator<C> {
         cleanup_with_coordinator(store, journal, backend, self)
     }
 
-    pub fn coordinate<T>(
-        &self,
-        completion: CleanupCompletion<T>,
-        store: &JournalStore,
-        journal: &mut OwnershipJournal,
-        backend: &impl CleanupBackend,
-    ) -> Result<T, CombinedFixtureError> {
-        self.coordinate_shared(completion, store, journal, backend)
-    }
-
-    pub(crate) fn coordinate_shared<T, J, S>(
+    pub fn coordinate<T, J, S>(
         &self,
         completion: CleanupCompletion<T>,
         store: &S,
@@ -235,7 +191,7 @@ impl<C: CleanupClock> CleanupCoordinator<C> {
             CleanupCompletion::CaughtPanic(failure)
             | CleanupCompletion::HandledSignal { failure, .. } => Err(failure),
         };
-        combine_with_cleanup(primary, &self.cleanup_shared(store, journal, backend))
+        combine_with_cleanup(primary, &self.cleanup(store, journal, backend))
     }
 }
 
@@ -285,11 +241,11 @@ impl CleanupReport {
     }
 }
 
-pub fn cleanup(
-    store: &JournalStore,
-    journal: &mut OwnershipJournal,
-    backend: &impl CleanupBackend,
-) -> CleanupReport {
+pub fn cleanup<J, S>(store: &S, journal: &mut J, backend: &impl CleanupBackend) -> CleanupReport
+where
+    J: CleanupJournal,
+    S: CleanupJournalStore<J>,
+{
     CleanupCoordinator::default().cleanup(store, journal, backend)
 }
 

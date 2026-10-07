@@ -58,7 +58,7 @@ impl fmt::Display for FixtureConfigError {
                 formatter.write_str("SQL Server EULA acknowledgement changed during launch")
             }
             Self::InvalidFixtureRoot => {
-                formatter.write_str("three-replica fixture root must be an absolute path")
+                formatter.write_str("SQL Server fixture root must be an absolute path")
             }
         }
     }

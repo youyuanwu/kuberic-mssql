@@ -272,6 +272,10 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         .unwrap();
     let justfile = fs::read_to_string(root.join("justfile")).unwrap();
     assert!(justfile.contains("test-live-one-replica root=\"target/mssql-one-replica\":"));
+    assert!(
+        justfile
+            .contains("test-live-one-replica-recovery root=\"target/mssql-one-replica-recovery\":")
+    );
     assert!(justfile.contains("cleanup-live-one-replica root=\"target/mssql-one-replica\":"));
     assert!(justfile.contains("test-live-three-replica root=\"target/mssql-three-replica\":"));
     assert!(justfile.contains("cleanup-live-three-replica root=\"target/mssql-three-replica\":"));
@@ -291,7 +295,7 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
             .lines()
             .filter(|line| line.contains("env -u SQLSERVER_TEST_EULA_ACCEPTED"))
             .count(),
-        7
+        8
     );
     assert!(!justfile.contains("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT"));
     assert!(!justfile.contains("acknowledgement root="));

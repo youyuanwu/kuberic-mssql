@@ -90,6 +90,31 @@ fn stale_or_future_cli_reports_are_rejected() {
 }
 
 #[test]
+fn evaluation_time_must_match_the_serialized_freshness_claim() {
+    let config = config();
+
+    let mut missing = report(&config, 1_000_000);
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("evaluated_at_unix_millis");
+    assert!(validate_cli_report(&missing, &config, 1_000_001).is_err());
+
+    let mut before_observation = report(&config, 1_000_000);
+    before_observation["evaluated_at_unix_millis"] = json!(999_999);
+    assert!(validate_cli_report(&before_observation, &config, 1_000_001).is_err());
+
+    let mut stale_at_evaluation = report(&config, 1_000_000);
+    stale_at_evaluation["evaluated_at_unix_millis"] = json!(1_060_001);
+    stale_at_evaluation["fresh"] = json!(true);
+    assert!(validate_cli_report(&stale_at_evaluation, &config, 1_060_001).is_err());
+
+    let mut future_evaluation = report(&config, 1_000_000);
+    future_evaluation["evaluated_at_unix_millis"] = json!(1_000_002);
+    assert!(validate_cli_report(&future_evaluation, &config, 1_000_001).is_err());
+}
+
+#[test]
 fn malformed_failed_or_wrong_provenance_reports_are_rejected() {
     let config = config();
     assert!(validate_cli_report(&json!({}), &config, 1_000_001).is_err());

@@ -68,7 +68,16 @@ impl fmt::Display for OneReplicaCleanupError {
             Self::UnknownOwner => {
                 formatter.write_str("one-replica fixture owner identity is unavailable")
             }
-            Self::Cleanup(_) => formatter.write_str("one-replica exact cleanup failed"),
+            Self::Cleanup(report) => {
+                formatter.write_str("one-replica exact cleanup failed")?;
+                for resource in &report.unresolved {
+                    write!(formatter, "; unresolved resource {resource}")?;
+                }
+                for error in &report.errors {
+                    write!(formatter, "; {error}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -95,6 +104,12 @@ where
 {
     let config = OneReplicaConfig::for_test_fixture(root.as_ref())
         .map_err(|_| OneReplicaCleanupError::Config)?;
+    detect_legacy_state(
+        config.root(),
+        docker,
+        config.fixture().deadlines().docker_command,
+    )
+    .map_err(|error| OneReplicaCleanupError::Legacy(error.to_string()))?;
     let _lock =
         acquire_one_replica_root_lock(config.root()).map_err(|_| OneReplicaCleanupError::Lock)?;
     detect_legacy_state(
@@ -148,7 +163,7 @@ where
         SystemCleanupClock::default(),
         config.fixture().deadlines().cleanup,
     );
-    let report = coordinator.cleanup_shared(&store, &mut journal, &backend);
+    let report = coordinator.cleanup(&store, &mut journal, &backend);
     let evidence = OneReplicaCleanupEvidence {
         journal_path: Some(store.path().to_path_buf()),
         report: report.clone(),
@@ -708,7 +723,7 @@ mod tests {
             attachments: false,
             removed: Cell::new(false),
         };
-        let report = CleanupCoordinator::default().cleanup_shared(&store, &mut journal, &backend);
+        let report = CleanupCoordinator::default().cleanup(&store, &mut journal, &backend);
         assert!(report.succeeded());
         assert_eq!(journal.state, RunState::Removed);
         assert_eq!(journal.resources[0].state, ResourceState::Removed);
@@ -723,7 +738,7 @@ mod tests {
             attachments: false,
             removed: Cell::new(false),
         };
-        let report = CleanupCoordinator::default().cleanup_shared(&store, &mut journal, &backend);
+        let report = CleanupCoordinator::default().cleanup(&store, &mut journal, &backend);
         assert!(!report.succeeded());
         assert!(!backend.removed.get());
         assert_eq!(journal.state, RunState::Blocked);
@@ -741,7 +756,7 @@ mod tests {
         };
         let coordinator =
             CleanupCoordinator::new(AdvancingClock { now: Cell::new(0) }, Duration::from_secs(1));
-        let report = coordinator.cleanup_shared(&store, &mut journal, &backend);
+        let report = coordinator.cleanup(&store, &mut journal, &backend);
         assert!(!report.succeeded());
         assert!(!backend.removed.get());
         assert_eq!(journal.resources[0].state, ResourceState::Blocked);
@@ -756,16 +771,15 @@ mod tests {
             attachments: false,
             removed: Cell::new(false),
         };
-        let result: Result<(), CombinedFixtureError> = CleanupCoordinator::default()
-            .coordinate_shared(
-                CleanupCompletion::CaughtPanic(SanitizedFailure::new(
-                    FailureStage::Test,
-                    FailureCategory::OwnershipMismatch,
-                )),
-                &store,
-                &mut journal,
-                &backend,
-            );
+        let result: Result<(), CombinedFixtureError> = CleanupCoordinator::default().coordinate(
+            CleanupCompletion::CaughtPanic(SanitizedFailure::new(
+                FailureStage::Test,
+                FailureCategory::OwnershipMismatch,
+            )),
+            &store,
+            &mut journal,
+            &backend,
+        );
         assert!(result.is_err());
         assert!(backend.removed.get());
         assert_eq!(journal.state, RunState::Removed);
@@ -780,7 +794,7 @@ mod tests {
             attachments: true,
             removed: Cell::new(false),
         };
-        let report = CleanupCoordinator::default().cleanup_shared(&store, &mut journal, &backend);
+        let report = CleanupCoordinator::default().cleanup(&store, &mut journal, &backend);
         assert!(!report.succeeded());
         assert!(!backend.removed.get());
         assert_eq!(journal.resources[0].state, ResourceState::Blocked);
@@ -798,7 +812,7 @@ mod tests {
             attachments: false,
             removed: Cell::new(false),
         };
-        let report = CleanupCoordinator::default().cleanup_shared(&store, &mut journal, &backend);
+        let report = CleanupCoordinator::default().cleanup(&store, &mut journal, &backend);
         assert!(report.succeeded());
         assert!(backend.removed.get());
         assert_eq!(journal.resources[0].state, ResourceState::Removed);
@@ -827,7 +841,7 @@ mod tests {
                 removed: Cell::new(false),
             };
             let result: Result<(), CombinedFixtureError> = CleanupCoordinator::default()
-                .coordinate_shared(completion.clone(), &store, &mut journal, &backend);
+                .coordinate(completion.clone(), &store, &mut journal, &backend);
             assert!(result.is_err());
             assert!(backend.removed.get());
             assert_eq!(journal.state, RunState::Removed);

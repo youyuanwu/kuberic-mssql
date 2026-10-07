@@ -15,10 +15,9 @@ use std::time::SystemTime;
 use rustix::fs::{FlockOperation, flock};
 use sha2::{Digest, Sha256};
 
-use super::cleanup::{CleanupClock, OperationBudget, SystemCleanupClock};
+use super::cleanup::{CleanupClock, CleanupJournal, OperationBudget, SystemCleanupClock};
 use super::model::{
-    JournalError, OwnershipJournal, ProcessIncarnation, ResourceBinding, ResourceRecord,
-    ResourceState, RunState, TopologyRun,
+    JournalError, ProcessIncarnation, ResourceBinding, ResourceRecord, ResourceState, RunState,
 };
 use super::process::{CommandSpec, ProcessRunner};
 
@@ -26,6 +25,19 @@ const JOURNAL_FILE: &str = "ownership.json";
 const DIRECTORY_MARKER: &str = ".kuberic-mssql-owner";
 static DIRECTORY_MARKER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static JOURNAL_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+pub trait JournalDocument: Sized {
+    fn from_json(bytes: &[u8]) -> Result<Self, JournalError>;
+    fn to_json(&self) -> Result<Vec<u8>, JournalError>;
+}
+
+pub trait NewJournal<R>: JournalDocument {
+    fn new_journal(run: R) -> Self;
+}
+
+pub trait ProcessOwnedJournal: JournalDocument {
+    fn block_for_owner(&mut self, owner: ProcessIncarnation);
+}
 
 #[derive(Debug)]
 pub struct RootLock {
@@ -138,9 +150,9 @@ impl JournalStore {
         &self.path
     }
 
-    pub fn load(&self) -> Result<Option<OwnershipJournal>, ReconcileError> {
+    pub fn load<J: JournalDocument>(&self) -> Result<Option<J>, ReconcileError> {
         self.load_bytes()?
-            .map(|bytes| OwnershipJournal::from_json(&bytes).map_err(ReconcileError::Journal))
+            .map(|bytes| J::from_json(&bytes).map_err(ReconcileError::Journal))
             .transpose()
     }
 
@@ -162,13 +174,16 @@ impl JournalStore {
         }
     }
 
-    pub fn create(&self, run: TopologyRun) -> Result<OwnershipJournal, ReconcileError> {
-        let journal = OwnershipJournal::new(run);
+    pub fn create<J, R>(&self, run: R) -> Result<J, ReconcileError>
+    where
+        J: NewJournal<R>,
+    {
+        let journal = J::new_journal(run);
         self.save(&journal)?;
         Ok(journal)
     }
 
-    pub fn save(&self, journal: &OwnershipJournal) -> Result<(), ReconcileError> {
+    pub fn save<J: JournalDocument>(&self, journal: &J) -> Result<(), ReconcileError> {
         let bytes = journal.to_json().map_err(ReconcileError::Journal)?;
         self.save_bytes(&bytes)
     }
@@ -202,14 +217,11 @@ impl JournalStore {
         result
     }
 
-    pub fn block_for_current_process(
+    pub fn block_for_current_process<J: ProcessOwnedJournal>(
         &self,
-        journal: &mut OwnershipJournal,
+        journal: &mut J,
     ) -> Result<(), ReconcileError> {
-        journal.blocked_owner =
-            Some(current_process_incarnation().map_err(|_| ReconcileError::Io)?);
-        journal.blocked_owner_unknown = false;
-        journal.state = RunState::Blocked;
+        journal.block_for_owner(current_process_incarnation().map_err(|_| ReconcileError::Io)?);
         self.save(journal)
     }
 
@@ -274,24 +286,26 @@ impl JournalStore {
         }
     }
 
-    pub fn record_intent(
+    pub fn record_intent<J>(
         &self,
-        journal: &mut OwnershipJournal,
+        journal: &mut J,
         record: ResourceRecord,
-    ) -> Result<usize, ReconcileError> {
+    ) -> Result<usize, ReconcileError>
+    where
+        J: CleanupJournal + JournalDocument,
+    {
         if record.state != ResourceState::Intended || record.binding.is_some() {
             return Err(ReconcileError::InvalidTransition);
         }
-        journal.resources.push(record);
+        journal.resources_mut().push(record);
         self.save(journal)?;
-        Ok(journal.resources.len() - 1)
+        Ok(journal.resources().len() - 1)
     }
 
-    pub fn mark_dispatched(
-        &self,
-        journal: &mut OwnershipJournal,
-        index: usize,
-    ) -> Result<(), ReconcileError> {
+    pub fn mark_dispatched<J>(&self, journal: &mut J, index: usize) -> Result<(), ReconcileError>
+    where
+        J: CleanupJournal + JournalDocument,
+    {
         transition(
             journal,
             index,
@@ -301,14 +315,17 @@ impl JournalStore {
         self.save(journal)
     }
 
-    pub fn bind(
+    pub fn bind<J>(
         &self,
-        journal: &mut OwnershipJournal,
+        journal: &mut J,
         index: usize,
         binding: ResourceBinding,
-    ) -> Result<(), ReconcileError> {
+    ) -> Result<(), ReconcileError>
+    where
+        J: CleanupJournal + JournalDocument,
+    {
         let record = journal
-            .resources
+            .resources_mut()
             .get_mut(index)
             .ok_or(ReconcileError::InvalidTransition)?;
         if !matches!(
@@ -460,17 +477,20 @@ impl fmt::Display for ReconcileError {
 
 impl Error for ReconcileError {}
 
-pub fn reconcile(
+pub fn reconcile<J>(
     store: &JournalStore,
-    journal: &mut OwnershipJournal,
+    journal: &mut J,
     inspector: &impl OwnershipInspector,
-) -> Result<ReconcileReport, ReconcileError> {
+) -> Result<ReconcileReport, ReconcileError>
+where
+    J: CleanupJournal + JournalDocument,
+{
     let mut report = ReconcileReport {
         recovered: Vec::new(),
         removed: Vec::new(),
         blocked: Vec::new(),
     };
-    for record in &mut journal.resources {
+    for record in journal.resources_mut() {
         match record.state {
             ResourceState::Removed => {}
             ResourceState::Intended => {
@@ -515,7 +535,7 @@ pub fn reconcile(
             },
         }
     }
-    journal.state = if report.is_blocked() {
+    *journal.state_mut() = if report.is_blocked() {
         RunState::Blocked
     } else {
         RunState::Preparing
@@ -1012,13 +1032,13 @@ fn canonical_missing_path(root: &Path) -> Result<PathBuf, LockError> {
 }
 
 fn transition(
-    journal: &mut OwnershipJournal,
+    journal: &mut impl CleanupJournal,
     index: usize,
     from: ResourceState,
     to: ResourceState,
 ) -> Result<(), ReconcileError> {
     let record = journal
-        .resources
+        .resources_mut()
         .get_mut(index)
         .ok_or(ReconcileError::InvalidTransition)?;
     if record.state != from {

@@ -269,6 +269,7 @@ Aggregate cleanup is always safe to run:
 ```bash
 just test-live-one-replica
 just cleanup-live-one-replica
+just test-live-one-replica-recovery
 just test-live-three-replica
 just cleanup-live-three-replica
 just cleanup

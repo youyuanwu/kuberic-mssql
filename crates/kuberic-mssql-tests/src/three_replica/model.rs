@@ -4,6 +4,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::fixture::cleanup::{CleanupJournal, CleanupJournalStore};
+use crate::fixture::ownership::{
+    JournalDocument, JournalStore, NewJournal, ProcessOwnedJournal, ReconcileError,
+};
+
 pub use crate::fixture::model::{
     CombinedFixtureError, FailureCategory, FailureStage, JournalError, ProcessIncarnation,
     ResourceBinding, ResourceKind, ResourceRecord, ResourceState, RunState, SanitizedFailure,
@@ -159,6 +164,55 @@ pub struct OwnershipJournal {
     pub native_intent: Option<NativeTopologyIntent>,
     pub native_binding: Option<NativeTopologyBinding>,
     pub resources: Vec<ResourceRecord>,
+}
+
+impl CleanupJournal for OwnershipJournal {
+    fn state_mut(&mut self) -> &mut RunState {
+        &mut self.state
+    }
+
+    fn resources(&self) -> &[ResourceRecord] {
+        &self.resources
+    }
+
+    fn resources_mut(&mut self) -> &mut Vec<ResourceRecord> {
+        &mut self.resources
+    }
+
+    fn clear_blocked_owner(&mut self) {
+        self.blocked_owner = None;
+        self.blocked_owner_unknown = false;
+    }
+}
+
+impl JournalDocument for OwnershipJournal {
+    fn from_json(bytes: &[u8]) -> Result<Self, JournalError> {
+        Self::from_json(bytes)
+    }
+
+    fn to_json(&self) -> Result<Vec<u8>, JournalError> {
+        self.to_json()
+    }
+}
+
+impl NewJournal<TopologyRun> for OwnershipJournal {
+    fn new_journal(run: TopologyRun) -> Self {
+        Self::new(run)
+    }
+}
+
+impl ProcessOwnedJournal for OwnershipJournal {
+    fn block_for_owner(&mut self, owner: ProcessIncarnation) {
+        self.blocked_owner = Some(owner);
+        self.blocked_owner_unknown = false;
+        self.state = RunState::Blocked;
+    }
+}
+
+impl CleanupJournalStore<OwnershipJournal> for JournalStore {
+    fn save_cleanup_journal(&self, journal: &OwnershipJournal) -> Result<(), ReconcileError> {
+        self.save(journal)
+    }
 }
 
 impl OwnershipJournal {

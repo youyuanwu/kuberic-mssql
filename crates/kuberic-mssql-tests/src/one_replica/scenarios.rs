@@ -193,6 +193,17 @@ pub fn validate_cli_report(
         .get("observed_at_unix_millis")
         .and_then(Value::as_u64)
         .ok_or(OneReplicaScenarioError::CliReport)?;
+    let evaluated_at = report
+        .get("evaluated_at_unix_millis")
+        .and_then(Value::as_u64)
+        .ok_or(OneReplicaScenarioError::CliReport)?;
+    let max_age = report
+        .get("max_age_millis")
+        .and_then(Value::as_u64)
+        .ok_or(OneReplicaScenarioError::CliReport)?;
+    let computed_fresh = evaluated_at
+        .checked_sub(observed_at)
+        .is_some_and(|age| age <= max_age);
     let instance = observation
         .pointer("/value/instance")
         .ok_or(OneReplicaScenarioError::CliReport)?;
@@ -200,7 +211,9 @@ pub fn validate_cli_report(
         .map_err(|_| OneReplicaScenarioError::CliReport)?;
     let valid = report.get("schema_version").and_then(Value::as_u64) == Some(1)
         && report.get("fresh").and_then(Value::as_bool) == Some(true)
-        && report.get("max_age_millis").and_then(Value::as_u64) == Some(60_000)
+        && max_age == 60_000
+        && computed_fresh
+        && evaluated_at <= now_unix_millis
         && observation.get("status").and_then(Value::as_str) == Some("present")
         && now_unix_millis
             .checked_sub(observed_at)
