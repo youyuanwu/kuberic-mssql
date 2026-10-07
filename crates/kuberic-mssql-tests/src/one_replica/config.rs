@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::fixture::config::{FixtureConfig, FixtureConfigError, ResourcePolicy, StageDeadlines};
+use crate::fixture::ownership::{LockError, RootLock, acquire_fixture_root_lock};
 
 pub const ONE_REPLICA_ROOT_ENV: &str = "SQLSERVER_ONE_REPLICA_ROOT";
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -43,9 +44,26 @@ impl OneReplicaConfig {
         self.fixture.root()
     }
 
+    pub fn resources(&self) -> ResourcePolicy {
+        self.fixture.resources()
+    }
+
+    pub fn deadlines(&self) -> StageDeadlines {
+        self.fixture.deadlines()
+    }
+
+    pub fn sql_server_environment(&self) -> [(&'static str, &'static str); 1] {
+        self.fixture.authorization().sql_server_environment()
+    }
+
     pub(crate) fn fixture(&self) -> &FixtureConfig {
         &self.fixture
     }
+}
+
+#[doc(hidden)]
+pub fn acquire_one_replica_root_lock(root: &Path) -> Result<RootLock, LockError> {
+    acquire_fixture_root_lock(root)
 }
 
 pub(crate) fn selected_root(

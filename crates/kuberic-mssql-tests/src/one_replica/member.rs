@@ -25,8 +25,7 @@ use crate::fixture::model::{
 };
 use crate::fixture::ownership::{
     CommandAclController, DirectoryBinding, PrivateDirectoryBinding, RootLock,
-    acquire_fixture_root_lock, create_private_owned_directory, prepare_member_directory,
-    process_incarnation_is_alive,
+    create_private_owned_directory, prepare_member_directory, process_incarnation_is_alive,
 };
 use crate::fixture::preflight::{CommandAclProbe, LocalHostProbe, run_preflight_with_deadline};
 use crate::fixture::process::{BoundedProcessRunner, CommandSpec, ProcessRunner};
@@ -36,7 +35,7 @@ use crate::fixture::tls::{SharedTlsAssets, TlsAssetRecorder, TlsError, TlsGenera
 use super::cleanup::{
     CleanupArtifacts, OneReplicaCleanupBackend, OneReplicaCleanupError, OneReplicaCleanupEvidence,
 };
-use super::config::OneReplicaConfig;
+use super::config::{OneReplicaConfig, acquire_one_replica_root_lock};
 use super::legacy::detect_legacy_state;
 use super::model::{OneReplicaJournal, OneReplicaJournalStore, OneReplicaMember, OneReplicaRun};
 
@@ -130,7 +129,7 @@ impl LaunchContext {
     fn prepare(config: OneReplicaConfig) -> Result<Self, SanitizedFailure> {
         let runner = BoundedProcessRunner;
         let docker = DockerCli::new(runner);
-        let lock = acquire_fixture_root_lock(config.root(), FIXTURE_LABEL)
+        let lock = acquire_one_replica_root_lock(config.root())
             .map_err(|_| failure(FailureCategory::OwnershipMismatch))?;
         detect_legacy_state(
             config.root(),
@@ -159,8 +158,7 @@ impl LaunchContext {
             {
                 return Err(failure(FailureCategory::OwnershipMismatch));
             }
-            let artifacts = CleanupArtifacts::from_journal(&config, &previous)
-                .map_err(|_| failure(FailureCategory::OwnershipMismatch))?;
+            let artifacts = CleanupArtifacts::from_journal(&config, &previous);
             let image_id = previous.run.image_id.clone();
             let backend = OneReplicaCleanupBackend {
                 root: store.root(),
@@ -168,6 +166,7 @@ impl LaunchContext {
                 runner,
                 image_id: &image_id,
                 network: artifacts.network.as_ref(),
+                container_name: artifacts.container_name.as_deref(),
                 container: artifacts.container.as_ref(),
             };
             let report = CleanupCoordinator::new(
@@ -473,17 +472,14 @@ impl LaunchContext {
             name: run.member.network_name.clone(),
             labels: OwnedLabels::network_for_fixture(FIXTURE_LABEL, run.run_id.clone()),
         };
-        if self
-            .docker
-            .inspect_network(
-                &request.name,
-                self.limit(self.config.fixture().deadlines().docker_command)?,
-            )
-            .map_err(|_| OneReplicaLaunchError::Docker)?
-            .is_some()
-        {
-            return Err(OneReplicaLaunchError::Ownership);
-        }
+        refuse_preexisting(
+            self.docker
+                .inspect_network(
+                    &request.name,
+                    self.limit(self.config.fixture().deadlines().docker_command)?,
+                )
+                .map_err(|_| OneReplicaLaunchError::Docker)?,
+        )?;
         let index = self.record_intent(
             ResourceKind::Network,
             "docker-network",
@@ -561,17 +557,14 @@ impl LaunchContext {
                 &CommandAclController::new(self.runner),
             )
             .map_err(|_| OneReplicaLaunchError::DataDirectory)?;
-        if self
-            .docker
-            .inspect_container(
-                &request.name,
-                self.limit(self.config.fixture().deadlines().docker_command)?,
-            )
-            .map_err(|_| OneReplicaLaunchError::Docker)?
-            .is_some()
-        {
-            return Err(OneReplicaLaunchError::Ownership);
-        }
+        refuse_preexisting(
+            self.docker
+                .inspect_container(
+                    &request.name,
+                    self.limit(self.config.fixture().deadlines().docker_command)?,
+                )
+                .map_err(|_| OneReplicaLaunchError::Docker)?,
+        )?;
         let index = self.record_intent(
             ResourceKind::Container,
             "container-1",
@@ -865,22 +858,7 @@ impl LaunchContext {
     }
 
     fn cleanup_report(&mut self) -> CleanupReport {
-        let artifacts = match CleanupArtifacts::from_journal(&self.config, &self.journal) {
-            Ok(artifacts) => artifacts,
-            Err(_) => {
-                return CleanupReport {
-                    removed: Vec::new(),
-                    unresolved: self
-                        .journal
-                        .resources
-                        .iter()
-                        .filter(|resource| resource.state != ResourceState::Removed)
-                        .map(|resource| resource.logical_name.clone())
-                        .collect(),
-                    errors: Vec::new(),
-                };
-            }
-        };
+        let artifacts = CleanupArtifacts::from_journal(&self.config, &self.journal);
         let image_id = self.journal.run.image_id.clone();
         let backend = OneReplicaCleanupBackend {
             root: self.store.root(),
@@ -888,6 +866,7 @@ impl LaunchContext {
             runner: self.runner,
             image_id: &image_id,
             network: artifacts.network.as_ref(),
+            container_name: artifacts.container_name.as_deref(),
             container: artifacts.container.as_ref(),
         };
         CleanupCoordinator::new(
@@ -1047,6 +1026,14 @@ fn failure(category: FailureCategory) -> SanitizedFailure {
     SanitizedFailure::new(FailureStage::Setup, category)
 }
 
+fn refuse_preexisting<T>(inspection: Option<T>) -> Result<(), OneReplicaLaunchError> {
+    if inspection.is_some() {
+        Err(OneReplicaLaunchError::Ownership)
+    } else {
+        Ok(())
+    }
+}
+
 fn new_run(root: &Path, image_id: String) -> OneReplicaRun {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1104,4 +1091,18 @@ os.close(fd)
         )
         .map_err(|_| OneReplicaLaunchError::DataDirectory)?;
     fs::remove_dir_all(&probe).map_err(|_| OneReplicaLaunchError::DataDirectory)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preexisting_resources_are_never_adopted() {
+        assert!(refuse_preexisting::<()>(None).is_ok());
+        assert!(matches!(
+            refuse_preexisting(Some(())),
+            Err(OneReplicaLaunchError::Ownership)
+        ));
+    }
 }

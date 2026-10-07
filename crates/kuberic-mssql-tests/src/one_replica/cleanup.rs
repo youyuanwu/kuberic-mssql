@@ -15,13 +15,12 @@ use crate::fixture::model::{
 };
 use crate::fixture::ownership::{
     CommandAclController, OwnershipInspector, ReconcileError, ResourceObservation,
-    acquire_fixture_root_lock, inspect_member_directory, inspect_owned_directory,
-    process_incarnation_is_alive,
+    inspect_member_directory, inspect_owned_directory, process_incarnation_is_alive,
 };
 use crate::fixture::process::{BoundedProcessRunner, CommandSpec, ProcessRunner};
 use crate::fixture::secrets::PrivateFile;
 
-use super::config::OneReplicaConfig;
+use super::config::{OneReplicaConfig, acquire_one_replica_root_lock};
 use super::legacy::detect_legacy_state;
 use super::model::{OneReplicaJournal, OneReplicaJournalStore};
 
@@ -33,6 +32,18 @@ pub struct OneReplicaCleanupEvidence {
     pub report: CleanupReport,
 }
 
+pub fn format_cleanup_summary(evidence: &OneReplicaCleanupEvidence) -> String {
+    format!(
+        "one-replica cleanup complete: removed={}, unresolved={}, journal={}",
+        evidence.report.removed.len(),
+        evidence.report.unresolved.len(),
+        evidence
+            .journal_path
+            .as_deref()
+            .map_or_else(|| "absent".to_owned(), |path| path.display().to_string())
+    )
+}
+
 #[derive(Debug)]
 pub enum OneReplicaCleanupError {
     Config,
@@ -41,8 +52,6 @@ pub enum OneReplicaCleanupError {
     Journal,
     ActiveOwner,
     UnknownOwner,
-    Secret,
-    Docker,
     Cleanup(CleanupReport),
 }
 
@@ -59,8 +68,6 @@ impl fmt::Display for OneReplicaCleanupError {
             Self::UnknownOwner => {
                 formatter.write_str("one-replica fixture owner identity is unavailable")
             }
-            Self::Secret => formatter.write_str("one-replica credential verification failed"),
-            Self::Docker => formatter.write_str("one-replica Docker verification failed"),
             Self::Cleanup(_) => formatter.write_str("one-replica exact cleanup failed"),
         }
     }
@@ -71,8 +78,31 @@ impl std::error::Error for OneReplicaCleanupError {}
 pub fn cleanup_one_replica_fixture(
     root: impl AsRef<Path>,
 ) -> Result<OneReplicaCleanupEvidence, OneReplicaCleanupError> {
+    let runner = BoundedProcessRunner;
+    let docker = DockerCli::new(runner);
+    cleanup_one_replica_fixture_with(root, &docker, runner)
+}
+
+#[doc(hidden)]
+pub fn cleanup_one_replica_fixture_with<D, R>(
+    root: impl AsRef<Path>,
+    docker: &D,
+    runner: R,
+) -> Result<OneReplicaCleanupEvidence, OneReplicaCleanupError>
+where
+    D: DockerApi,
+    R: ProcessRunner + Copy,
+{
     let config = OneReplicaConfig::for_test_fixture(root.as_ref())
         .map_err(|_| OneReplicaCleanupError::Config)?;
+    let _lock =
+        acquire_one_replica_root_lock(config.root()).map_err(|_| OneReplicaCleanupError::Lock)?;
+    detect_legacy_state(
+        config.root(),
+        docker,
+        config.fixture().deadlines().docker_command,
+    )
+    .map_err(|error| OneReplicaCleanupError::Legacy(error.to_string()))?;
     if !config
         .root()
         .try_exists()
@@ -83,16 +113,6 @@ pub fn cleanup_one_replica_fixture(
             report: empty_report(),
         });
     }
-    let runner = BoundedProcessRunner;
-    let docker = DockerCli::new(runner);
-    let _lock = acquire_fixture_root_lock(config.root(), FIXTURE_LABEL)
-        .map_err(|_| OneReplicaCleanupError::Lock)?;
-    detect_legacy_state(
-        config.root(),
-        &docker,
-        config.fixture().deadlines().docker_command,
-    )
-    .map_err(|error| OneReplicaCleanupError::Legacy(error.to_string()))?;
     let store = OneReplicaJournalStore::initialize(config.root())
         .map_err(|_| OneReplicaCleanupError::Journal)?;
     let Some(mut journal) = store.load().map_err(|_| OneReplicaCleanupError::Journal)? else {
@@ -113,14 +133,15 @@ pub fn cleanup_one_replica_fixture(
             .save(&journal)
             .map_err(|_| OneReplicaCleanupError::Journal)?;
     }
-    let artifacts = CleanupArtifacts::from_journal(&config, &journal)?;
+    let artifacts = CleanupArtifacts::from_journal(&config, &journal);
     let image_id = journal.run.image_id.clone();
     let backend = OneReplicaCleanupBackend {
         root: store.root(),
-        docker: &docker,
+        docker,
         runner,
         image_id: &image_id,
         network: artifacts.network.as_ref(),
+        container_name: artifacts.container_name.as_deref(),
         container: artifacts.container.as_ref(),
     };
     let coordinator = CleanupCoordinator::new(
@@ -149,14 +170,12 @@ fn empty_report() -> CleanupReport {
 
 pub(crate) struct CleanupArtifacts {
     pub network: Option<NetworkRequest>,
+    pub container_name: Option<String>,
     pub container: Option<ContainerRequest>,
 }
 
 impl CleanupArtifacts {
-    pub(crate) fn from_journal(
-        config: &OneReplicaConfig,
-        journal: &OneReplicaJournal,
-    ) -> Result<Self, OneReplicaCleanupError> {
+    pub(crate) fn from_journal(config: &OneReplicaConfig, journal: &OneReplicaJournal) -> Self {
         let run = &journal.run;
         let has_network = journal.resources.iter().any(|resource| {
             resource.kind == ResourceKind::Network && resource.state != ResourceState::Removed
@@ -168,30 +187,35 @@ impl CleanupArtifacts {
             name: run.member.network_name.clone(),
             labels: OwnedLabels::network_for_fixture(FIXTURE_LABEL, run.run_id.clone()),
         });
+        let container_name = has_container.then(|| run.member.container_name.clone());
         let container = if has_container {
-            let password = PrivateFile::inspect(config.root().join("credentials/sa-password"))
+            PrivateFile::inspect(config.root().join("credentials/sa-password"))
                 .and_then(|file| file.read_secret())
-                .map_err(|_| OneReplicaCleanupError::Secret)?;
-            Some(
-                ContainerRequest::sql_server(
-                    SqlServerContainerSpec {
-                        name: run.member.container_name.clone(),
-                        hostname: run.member.server_name.clone(),
-                        network_name: run.member.network_name.clone(),
-                        data_directory: run.member.data_directory.clone(),
-                        environment_file: run.member.environment_file.clone(),
-                        sa_password: password,
-                    },
-                    OwnedLabels::container_for_fixture(FIXTURE_LABEL, run.run_id.clone(), 1),
-                    config.fixture().resources(),
-                    config.fixture().authorization().sql_server_environment(),
-                )
-                .map_err(|_| OneReplicaCleanupError::Docker)?,
-            )
+                .ok()
+                .and_then(|password| {
+                    ContainerRequest::sql_server(
+                        SqlServerContainerSpec {
+                            name: run.member.container_name.clone(),
+                            hostname: run.member.server_name.clone(),
+                            network_name: run.member.network_name.clone(),
+                            data_directory: run.member.data_directory.clone(),
+                            environment_file: run.member.environment_file.clone(),
+                            sa_password: password,
+                        },
+                        OwnedLabels::container_for_fixture(FIXTURE_LABEL, run.run_id.clone(), 1),
+                        config.fixture().resources(),
+                        config.fixture().authorization().sql_server_environment(),
+                    )
+                    .ok()
+                })
         } else {
             None
         };
-        Ok(Self { network, container })
+        Self {
+            network,
+            container_name,
+            container,
+        }
     }
 }
 
@@ -201,6 +225,7 @@ pub(crate) struct OneReplicaCleanupBackend<'a, D, R> {
     pub runner: R,
     pub image_id: &'a str,
     pub network: Option<&'a NetworkRequest>,
+    pub container_name: Option<&'a str>,
     pub container: Option<&'a ContainerRequest>,
 }
 
@@ -319,13 +344,13 @@ where
                 })
             }
             ResourceKind::Container => {
-                let container = self.container.ok_or(ReconcileError::OwnershipMismatch)?;
+                let container_name = self
+                    .container_name
+                    .ok_or(ReconcileError::OwnershipMismatch)?;
                 let identity = resource
                     .binding
                     .as_ref()
-                    .map_or(container.name.as_str(), |binding| {
-                        binding.immutable_id.as_str()
-                    });
+                    .map_or(container_name, |binding| binding.immutable_id.as_str());
                 let Some(inspection) = self
                     .docker
                     .inspect_container(identity, remaining.min(Duration::from_secs(30)))
@@ -333,6 +358,7 @@ where
                 else {
                     return Ok(ResourceObservation::Absent);
                 };
+                let container = self.container.ok_or(ReconcileError::OwnershipMismatch)?;
                 let binding = container
                     .resource_binding(self.image_id, &inspection)
                     .map_err(|_| ReconcileError::OwnershipMismatch)?;
@@ -485,15 +511,19 @@ fn remove_tree_before(path: &Path, deadline: Instant) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::os::unix::fs::PermissionsExt;
 
     use crate::fixture::cleanup::{CleanupClock, CleanupCompletion};
+    use crate::fixture::docker::{ContainerInspection, ContainerMount, ContainerPort};
     use crate::fixture::model::{CombinedFixtureError, ResourceBinding, ResourceState, RunState};
+    use crate::fixture::secrets::PrivateFile;
 
     use super::super::model::{OneReplicaMember, OneReplicaRun};
     use super::*;
 
     struct FakeBackend {
         foreign: bool,
+        attachments: bool,
         removed: Cell<bool>,
     }
 
@@ -518,8 +548,15 @@ mod tests {
                 Ok(ResourceObservation::Foreign)
             } else {
                 Ok(ResourceObservation::Owned {
-                    binding: resource.binding.clone().unwrap(),
-                    foreign_attachments: Vec::new(),
+                    binding: resource.binding.clone().unwrap_or(ResourceBinding {
+                        immutable_id: "late-container-id".to_owned(),
+                        attributes_sha256: "c".repeat(64),
+                    }),
+                    foreign_attachments: if self.attachments {
+                        vec!["foreign-container".to_owned()]
+                    } else {
+                        Vec::new()
+                    },
                 })
             }
         }
@@ -583,11 +620,86 @@ mod tests {
     }
 
     #[test]
+    fn reconstructed_container_request_has_exact_one_replica_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture_root = root.path().join("fixture");
+        let (store, mut journal) = journal(&fixture_root);
+        let credentials = fixture_root.join("credentials");
+        fs::create_dir(&credentials).unwrap();
+        fs::set_permissions(&credentials, fs::Permissions::from_mode(0o700)).unwrap();
+        PrivateFile::create_text(credentials.join("sa-password"), "ValidPassword1!").unwrap();
+        journal.resources[0].intent = Some(ResourceBinding {
+            immutable_id: journal.run.member.container_name.clone(),
+            attributes_sha256: "d".repeat(64),
+        });
+        store.save(&journal).unwrap();
+        let config = OneReplicaConfig::for_test_fixture(&fixture_root).unwrap();
+        let artifacts = CleanupArtifacts::from_journal(&config, &journal);
+        let request = artifacts.container.unwrap();
+        assert_eq!(
+            request.labels.as_map()["io.kuberic.mssql.fixture"],
+            "one-replica"
+        );
+        assert_eq!(request.data_directory, journal.run.member.data_directory);
+        assert_eq!(
+            request.environment_keys().collect::<Vec<_>>(),
+            [
+                "ACCEPT_EULA",
+                "MSSQL_PID",
+                "MSSQL_SA_PASSWORD",
+                "MSSQL_ENABLE_HADR",
+                "MSSQL_MEMORY_LIMIT_MB",
+            ]
+        );
+        let inspection = ContainerInspection {
+            id: "container-id".to_owned(),
+            name: request.name.clone(),
+            hostname: request.hostname.clone(),
+            image_id: journal.run.image_id.clone(),
+            labels: request.labels.as_map(),
+            environment: request
+                .environment_file_contents()
+                .lines()
+                .map(str::to_owned)
+                .collect(),
+            user: "mssql".to_owned(),
+            running: true,
+            restart_policy: "no".to_owned(),
+            network_mode: request.network_name.clone(),
+            network_names: vec![request.network_name.clone()],
+            mounts: vec![ContainerMount {
+                source: request.data_directory.clone(),
+                destination: PathBuf::from("/var/opt/mssql"),
+                read_only: false,
+            }],
+            ports: vec![ContainerPort {
+                container_port: 1433,
+                host_ip: "127.0.0.1".to_owned(),
+                host_port: 14330,
+            }],
+            limits: request.limits,
+        };
+        assert!(
+            request
+                .resource_binding(&journal.run.image_id, &inspection)
+                .is_ok()
+        );
+        let mut replaced = inspection;
+        replaced.hostname = "replacement".to_owned();
+        assert!(
+            request
+                .resource_binding(&journal.run.image_id, &replaced)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn shared_cleanup_removes_owned_one_replica_resources() {
         let root = tempfile::tempdir().unwrap();
         let (store, mut journal) = journal(&root.path().join("fixture"));
         let backend = FakeBackend {
             foreign: false,
+            attachments: false,
             removed: Cell::new(false),
         };
         let report = CleanupCoordinator::default().cleanup_shared(&store, &mut journal, &backend);
@@ -602,6 +714,7 @@ mod tests {
         let (store, mut journal) = journal(&root.path().join("fixture"));
         let backend = FakeBackend {
             foreign: true,
+            attachments: false,
             removed: Cell::new(false),
         };
         let report = CleanupCoordinator::default().cleanup_shared(&store, &mut journal, &backend);
@@ -617,6 +730,7 @@ mod tests {
         let (store, mut journal) = journal(&root.path().join("fixture"));
         let backend = FakeBackend {
             foreign: false,
+            attachments: false,
             removed: Cell::new(false),
         };
         let coordinator =
@@ -633,6 +747,7 @@ mod tests {
         let (store, mut journal) = journal(&root.path().join("fixture"));
         let backend = FakeBackend {
             foreign: false,
+            attachments: false,
             removed: Cell::new(false),
         };
         let result: Result<(), CombinedFixtureError> = CleanupCoordinator::default()
@@ -648,5 +763,68 @@ mod tests {
         assert!(result.is_err());
         assert!(backend.removed.get());
         assert_eq!(journal.state, RunState::Removed);
+    }
+
+    #[test]
+    fn foreign_attachments_block_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut journal) = journal(&root.path().join("fixture"));
+        let backend = FakeBackend {
+            foreign: false,
+            attachments: true,
+            removed: Cell::new(false),
+        };
+        let report = CleanupCoordinator::default().cleanup_shared(&store, &mut journal, &backend);
+        assert!(!report.succeeded());
+        assert!(!backend.removed.get());
+        assert_eq!(journal.resources[0].state, ResourceState::Blocked);
+    }
+
+    #[test]
+    fn dispatched_late_create_is_bound_then_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut journal) = journal(&root.path().join("fixture"));
+        journal.resources[0].state = ResourceState::Dispatched;
+        journal.resources[0].binding = None;
+        store.save(&journal).unwrap();
+        let backend = FakeBackend {
+            foreign: false,
+            attachments: false,
+            removed: Cell::new(false),
+        };
+        let report = CleanupCoordinator::default().cleanup_shared(&store, &mut journal, &backend);
+        assert!(report.succeeded());
+        assert!(backend.removed.get());
+        assert_eq!(journal.resources[0].state, ResourceState::Removed);
+    }
+
+    #[test]
+    fn handled_signal_and_failed_result_still_clean() {
+        for completion in [
+            CleanupCompletion::HandledSignal {
+                signal: crate::fixture::cleanup::HandledCancellationSignal::Terminate,
+                failure: SanitizedFailure::new(
+                    FailureStage::Test,
+                    FailureCategory::DeadlineExceeded,
+                ),
+            },
+            CleanupCompletion::Result(Err(SanitizedFailure::new(
+                FailureStage::Test,
+                FailureCategory::SqlUnavailable,
+            ))),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (store, mut journal) = journal(&root.path().join("fixture"));
+            let backend = FakeBackend {
+                foreign: false,
+                attachments: false,
+                removed: Cell::new(false),
+            };
+            let result: Result<(), CombinedFixtureError> = CleanupCoordinator::default()
+                .coordinate_shared(completion.clone(), &store, &mut journal, &backend);
+            assert!(result.is_err());
+            assert!(backend.removed.get());
+            assert_eq!(journal.state, RunState::Removed);
+        }
     }
 }

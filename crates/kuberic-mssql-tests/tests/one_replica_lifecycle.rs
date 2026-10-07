@@ -1,15 +1,33 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use kuberic_mssql_tests::one_replica::{
     OneReplicaJournal, OneReplicaJournalStore, OneReplicaMember, OneReplicaRun,
-    cleanup_one_replica_fixture,
+    acquire_one_replica_root_lock, cleanup_one_replica_fixture_with,
 };
 use kuberic_mssql_tests::three_replica::{
-    ProcessIncarnation, ResourceBinding, ResourceKind, ResourceRecord, ResourceState, RunState,
-    current_process_incarnation,
+    BoundedProcessRunner, ProcessIncarnation, ResourceBinding, ResourceKind, ResourceRecord,
+    ResourceState, RunState, acquire_root_lock, current_process_incarnation,
 };
+
+mod support;
+use support::FakeDocker;
+
+const CHILD_ROOT_ENV: &str = "KUBERIC_MSSQL_ONE_REPLICA_CHILD_ROOT";
+const CHILD_READY_ENV: &str = "KUBERIC_MSSQL_ONE_REPLICA_CHILD_READY";
+
+fn cleanup(
+    root: &Path,
+) -> Result<
+    kuberic_mssql_tests::one_replica::OneReplicaCleanupEvidence,
+    kuberic_mssql_tests::one_replica::OneReplicaCleanupError,
+> {
+    cleanup_one_replica_fixture_with(root, &FakeDocker::default(), BoundedProcessRunner)
+}
 
 fn sample_run(root: &Path) -> OneReplicaRun {
     OneReplicaRun {
@@ -27,6 +45,57 @@ fn sample_run(root: &Path) -> OneReplicaRun {
     }
 }
 
+#[test]
+fn one_replica_blocked_owner_child() {
+    let Some(root) = std::env::var_os(CHILD_ROOT_ENV).map(std::path::PathBuf::from) else {
+        return;
+    };
+    let ready =
+        std::path::PathBuf::from(std::env::var_os(CHILD_READY_ENV).expect("child ready path"));
+    let store = OneReplicaJournalStore::initialize(&root).unwrap();
+    let mut journal = store.create(sample_run(&root)).unwrap();
+    store.block_for_current_process(&mut journal).unwrap();
+    fs::write(ready, b"ready").unwrap();
+    loop {
+        thread::park();
+    }
+}
+
+#[test]
+fn separate_process_recovery_refuses_live_owner_then_recovers_after_death() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("separate-owner");
+    let ready = parent.path().join("ready");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "one_replica_blocked_owner_child", "--nocapture"])
+        .env(CHILD_ROOT_ENV, &root)
+        .env(CHILD_READY_ENV, &ready)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !ready.is_file() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(ready.is_file());
+    assert!(
+        cleanup(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("still alive")
+    );
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let evidence = cleanup(&root).unwrap();
+    assert!(evidence.report.succeeded());
+    let journal =
+        OneReplicaJournal::from_json(&fs::read(root.join("ownership.json")).unwrap()).unwrap();
+    assert_eq!(journal.state, RunState::Removed);
+    assert!(journal.blocked_owner.is_none());
+}
+
 fn write_journal(root: &Path, journal: &OneReplicaJournal) {
     fs::create_dir_all(root).unwrap();
     fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -39,12 +108,22 @@ fn write_journal(root: &Path, journal: &OneReplicaJournal) {
 fn cleanup_is_idempotent_when_root_is_absent() {
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("absent");
-    let first = cleanup_one_replica_fixture(&root).unwrap();
-    let second = cleanup_one_replica_fixture(&root).unwrap();
+    let first = cleanup(&root).unwrap();
+    let second = cleanup(&root).unwrap();
     assert!(first.report.succeeded());
     assert!(second.report.succeeded());
     assert!(first.journal_path.is_none());
     assert!(second.journal_path.is_none());
+}
+
+#[test]
+fn one_and_three_replica_lifecycles_contend_on_the_same_root_lock() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("shared-root");
+    let three_replica = acquire_root_lock(&root).unwrap();
+    assert!(acquire_one_replica_root_lock(&root).is_err());
+    drop(three_replica);
+    assert!(acquire_one_replica_root_lock(&root).is_ok());
 }
 
 #[test]
@@ -79,8 +158,36 @@ fn cleanup_is_idempotent_after_all_resources_are_removed() {
     ]);
     write_journal(&root, &journal);
 
-    let evidence = cleanup_one_replica_fixture(&root).unwrap();
+    let evidence = cleanup(&root).unwrap();
     assert!(evidence.report.succeeded());
+}
+
+#[test]
+fn absent_container_recovers_even_when_credentials_are_missing() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("missing-credentials");
+    let mut journal = OneReplicaJournal::new(sample_run(&root));
+    journal.resources.push(ResourceRecord {
+        kind: ResourceKind::Container,
+        logical_name: "container-1".to_owned(),
+        path: None,
+        intent: Some(ResourceBinding {
+            immutable_id: journal.run.member.container_name.clone(),
+            attributes_sha256: "a".repeat(64),
+        }),
+        binding: Some(ResourceBinding {
+            immutable_id: "container-id".to_owned(),
+            attributes_sha256: "b".repeat(64),
+        }),
+        state: ResourceState::Bound,
+    });
+    write_journal(&root, &journal);
+
+    let evidence = cleanup(&root).unwrap();
+    assert!(evidence.report.succeeded());
+    let stored =
+        OneReplicaJournal::from_json(&fs::read(root.join("ownership.json")).unwrap()).unwrap();
+    assert_eq!(stored.resources[0].state, ResourceState::Removed);
 }
 
 #[test]
@@ -90,7 +197,7 @@ fn cleanup_rejects_malformed_and_unsupported_journals() {
     fs::create_dir(&malformed).unwrap();
     fs::set_permissions(&malformed, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(malformed.join("ownership.json"), b"{").unwrap();
-    assert!(cleanup_one_replica_fixture(&malformed).is_err());
+    assert!(cleanup(&malformed).is_err());
 
     let unsupported = parent.path().join("unsupported");
     let mut value: serde_json::Value = serde_json::from_slice(
@@ -107,7 +214,7 @@ fn cleanup_rejects_malformed_and_unsupported_journals() {
         serde_json::to_vec(&value).unwrap(),
     )
     .unwrap();
-    assert!(cleanup_one_replica_fixture(&unsupported).is_err());
+    assert!(cleanup(&unsupported).is_err());
 }
 
 #[test]
@@ -182,7 +289,7 @@ fn cleanup_refuses_a_live_exact_owner() {
     journal.blocked_owner = Some(current_process_incarnation().unwrap());
     write_journal(&root, &journal);
 
-    let error = cleanup_one_replica_fixture(&root).unwrap_err().to_string();
+    let error = cleanup(&root).unwrap_err().to_string();
     assert!(error.contains("owner process is still alive"));
 }
 
@@ -199,7 +306,7 @@ fn cleanup_accepts_stale_owner_and_pid_reuse_evidence() {
     });
     write_journal(&root, &journal);
 
-    let evidence = cleanup_one_replica_fixture(&root).unwrap();
+    let evidence = cleanup(&root).unwrap();
     assert!(evidence.report.succeeded());
     let stored =
         OneReplicaJournal::from_json(&fs::read(root.join("ownership.json")).unwrap()).unwrap();
@@ -216,6 +323,6 @@ fn unknown_blocked_owner_remains_fail_closed() {
     journal.blocked_owner_unknown = true;
     write_journal(&root, &journal);
 
-    let error = cleanup_one_replica_fixture(&root).unwrap_err().to_string();
+    let error = cleanup(&root).unwrap_err().to_string();
     assert!(error.contains("owner identity is unavailable"));
 }

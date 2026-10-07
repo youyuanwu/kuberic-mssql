@@ -61,7 +61,7 @@ impl fmt::Display for LockError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::InvalidRoot => "fixture root is invalid",
-            Self::Contended => "another three-replica fixture owns this canonical root",
+            Self::Contended => "another SQL Server fixture owns this canonical root",
             Self::Unavailable => "fixture root lock is unavailable",
         })
     }
@@ -70,21 +70,11 @@ impl fmt::Display for LockError {
 impl Error for LockError {}
 
 pub fn acquire_root_lock(root: &Path) -> Result<RootLock, LockError> {
-    acquire_fixture_root_lock(root, "three-replica")
+    acquire_fixture_root_lock(root)
 }
 
-pub(crate) fn acquire_fixture_root_lock(
-    root: &Path,
-    fixture_name: &str,
-) -> Result<RootLock, LockError> {
+pub(crate) fn acquire_fixture_root_lock(root: &Path) -> Result<RootLock, LockError> {
     if !root.is_absolute() {
-        return Err(LockError::InvalidRoot);
-    }
-    if fixture_name.is_empty()
-        || !fixture_name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    {
         return Err(LockError::InvalidRoot);
     }
     let canonical_root = canonical_missing_path(root)?;
@@ -92,10 +82,7 @@ pub(crate) fn acquire_fixture_root_lock(
     let mut digest = Sha256::new();
     digest.update(canonical_root.as_os_str().as_bytes());
     let digest = hex(&digest.finalize());
-    let lock_path = parent.join(format!(
-        ".kuberic-mssql-{fixture_name}-{}.lock",
-        &digest[..24]
-    ));
+    let lock_path = parent.join(format!(".kuberic-mssql-fixture-{}.lock", &digest[..24]));
     let file = OpenOptions::new()
         .read(true)
         .write(true)

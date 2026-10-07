@@ -58,26 +58,12 @@ pub(crate) fn detect_legacy_state(
     {
         indicators.push("legacy owner marker".to_owned());
     }
-    if !indicators.is_empty() {
-        return Err(LegacyProbeError::Legacy(LegacyStateError {
-            root: root.to_path_buf(),
-            indicators,
-        }));
-    }
-    if root
-        .join("ownership.json")
-        .try_exists()
-        .map_err(|_| LegacyProbeError::Io)?
-    {
-        return Ok(());
-    }
     let container_name = legacy_container_name(root)?;
-    if docker
-        .inspect_container(&container_name, timeout)
-        .map_err(LegacyProbeError::Docker)?
-        .is_some()
-    {
-        indicators.push(format!("container {container_name}"));
+    match docker.inspect_container(&container_name, timeout) {
+        Ok(Some(_)) => indicators.push(format!("container {container_name}")),
+        Ok(None) => {}
+        Err(error) if indicators.is_empty() => return Err(LegacyProbeError::Docker(error)),
+        Err(_) => indicators.push("deterministic container inspection unavailable".to_owned()),
     }
     if !indicators.is_empty() {
         Err(LegacyProbeError::Legacy(LegacyStateError {
@@ -89,7 +75,7 @@ pub(crate) fn detect_legacy_state(
     }
 }
 
-pub(crate) fn legacy_container_name(root: &Path) -> Result<String, LegacyProbeError> {
+pub fn legacy_container_name(root: &Path) -> Result<String, LegacyProbeError> {
     let text = root.to_str().ok_or(LegacyProbeError::InvalidRoot)?;
     let digest = Sha256::digest(text.as_bytes());
     Ok(format!(
@@ -102,7 +88,7 @@ pub(crate) fn legacy_container_name(root: &Path) -> Result<String, LegacyProbeEr
 }
 
 #[derive(Debug)]
-pub(crate) enum LegacyProbeError {
+pub enum LegacyProbeError {
     InvalidRoot,
     Io,
     Docker(DockerError),
