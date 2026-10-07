@@ -1774,6 +1774,28 @@ mod tests {
         }
     }
 
+    struct YieldingSource {
+        inner: StaticSource,
+        yields: usize,
+    }
+
+    #[async_trait]
+    impl SqlServerObservationSource for YieldingSource {
+        fn observer_config(&self) -> &ObserverConfig {
+            self.inner.observer_config()
+        }
+
+        async fn observe(
+            &self,
+        ) -> Result<Observation<InstanceSnapshot>, kuberic_mssql::runtime_error::RuntimeError>
+        {
+            for _ in 0..self.yields {
+                tokio::task::yield_now().await;
+            }
+            self.inner.observe().await
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn delayed_observation_at_remaining_overall_deadline_is_rejected() {
         let root = PathBuf::from("/phase7-deadline-test");
@@ -2121,16 +2143,16 @@ mod tests {
     }
 
     #[test]
-    fn assembly_tolerates_slow_native_authority_validation() {
+    fn assembly_tolerates_suspended_native_authority_validation() {
         run_group_test(async {
             let root = test_root("slow-authority-validation");
             let run = run(&root);
             let native = native_binding(&run);
             let now = unix_millis().unwrap();
             let sources: [Source; 3] = std::array::from_fn(|index| {
-                Arc::new(DelayedSource {
+                Arc::new(YieldingSource {
                     inner: source(&run, index, now),
-                    delay: Duration::from_millis(50),
+                    yields: 100,
                 }) as Source
             });
             let group = MssqlGroup::assemble(
