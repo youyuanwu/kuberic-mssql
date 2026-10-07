@@ -239,6 +239,16 @@ async fn execute_live_lifecycle(
     {
         Ok(Ok(group)) => group,
         Ok(Err(error)) => {
+            if error.agent_termination_unconfirmed() {
+                let diagnostic = format!("partial Kuberic startup failed: {error}");
+                if let Err(block) = launched.block_cleanup() {
+                    return Err(format!(
+                        "{diagnostic}; ownership journal blocking also failed: {block}"
+                    )
+                    .into());
+                }
+                return Err(diagnostic.into());
+            }
             let fixture_cleanup = launched.cleanup_with_coordinator(&cleanup);
             return match fixture_cleanup {
                 Ok(_) => Err(Box::new(error)),
@@ -288,12 +298,16 @@ async fn execute_live_lifecycle(
     };
     let shutdown = group.shutdown_with_coordinator(&cleanup).await;
     if let Err(shutdown) = shutdown {
-        launched.block_cleanup()?;
-        return Err(format!(
+        let diagnostic = format!(
             "{}; Kuberic shutdown failed before fixture cleanup: {shutdown}",
             outcome.description()
-        )
-        .into());
+        );
+        if let Err(block) = launched.block_cleanup() {
+            return Err(
+                format!("{diagnostic}; ownership journal blocking also failed: {block}").into(),
+            );
+        }
+        return Err(diagnostic.into());
     }
     let fixture_cleanup = launched.cleanup_with_coordinator(&cleanup);
     match (outcome, fixture_cleanup) {

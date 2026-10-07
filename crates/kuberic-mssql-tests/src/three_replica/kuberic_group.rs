@@ -42,7 +42,7 @@ use kuberic_runtime::testing::sqlite_store::SqliteStore;
 use kuberic_runtime::testing::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
 use tonic::Request;
 
-use super::cleanup::{CLEANUP_BUDGET, CleanupClock, CleanupCoordinator};
+use super::cleanup::{CleanupClock, CleanupCoordinator};
 use super::deadline::{BoundedOperationError, complete_before};
 use super::member::ReadyMember;
 use super::model::{NativeTopologyBinding, TopologyRun};
@@ -75,17 +75,34 @@ impl AddressReservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MssqlGroupError(String);
+pub struct MssqlGroupError {
+    message: String,
+    termination_unconfirmed: bool,
+}
 
 impl MssqlGroupError {
     fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            message: message.into(),
+            termination_unconfirmed: false,
+        }
+    }
+
+    fn termination_unconfirmed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            termination_unconfirmed: true,
+        }
+    }
+
+    pub fn agent_termination_unconfirmed(&self) -> bool {
+        self.termination_unconfirmed
     }
 }
 
 impl fmt::Display for MssqlGroupError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -128,6 +145,15 @@ impl ConvergenceBudget {
         }
     }
 
+    fn remaining(self) -> Duration {
+        self.deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(
+                self.complete_deadline
+                    .saturating_duration_since(StdInstant::now()),
+            )
+    }
+
     async fn run<T, F>(
         self,
         operation: &'static str,
@@ -154,7 +180,16 @@ impl ConvergenceBudget {
         coordinator: &CleanupCoordinator<impl CleanupClock>,
     ) -> Result<Self, MssqlGroupError> {
         let remaining = coordinator.remaining();
-        Self::new(remaining.min(CLEANUP_BUDGET), StdInstant::now() + remaining)
+        if remaining.is_zero() {
+            return Err(MssqlGroupError::termination_unconfirmed(
+                "shared cleanup budget is exhausted before agent shutdown",
+            ));
+        }
+        Ok(Self {
+            deadline: tokio::time::Instant::now() + remaining,
+            operation_timeout: Duration::from_secs(30).min(remaining),
+            complete_deadline: StdInstant::now() + remaining,
+        })
     }
 }
 
@@ -295,9 +330,49 @@ impl MssqlPod {
             shutdown.send_replace(true);
         }
         if let Some(mut server) = self.server.take() {
-            terminate_agent_server(&mut server, budget).await?;
+            if let Err(error) = terminate_agent_server(&mut server, budget).await {
+                if error.agent_termination_unconfirmed() {
+                    self.server = Some(server);
+                }
+                return Err(error);
+            }
         }
         Ok(())
+    }
+
+    async fn abort_without_budget(&mut self) -> Result<(), MssqlGroupError> {
+        self.runtime.abort();
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown.send_replace(true);
+        }
+        let Some(mut server) = self.server.take() else {
+            return Ok(());
+        };
+        if let Err(error) = abort_agent_server_without_budget(&mut server).await {
+            if error.agent_termination_unconfirmed() {
+                self.server = Some(server);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+async fn abort_agent_server_without_budget(
+    server: &mut tokio::task::JoinHandle<kuberic_runtime::host::Result<()>>,
+) -> Result<(), MssqlGroupError> {
+    server.abort();
+    tokio::task::yield_now().await;
+    if !server.is_finished() {
+        return Err(MssqlGroupError::termination_unconfirmed(
+            "cleanup budget exhausted; aborted agent task termination could not be established",
+        ));
+    }
+    match (&mut *server).await {
+        Err(error) if error.is_cancelled() => Ok(()),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(display_error(error)),
+        Err(error) => Err(display_error(error)),
     }
 }
 
@@ -315,11 +390,20 @@ async fn terminate_agent_server(
         Ok(Err(error)) => Err(display_error(error)),
         Err(timeout) => {
             server.abort();
-            match (&mut *server).await {
-                Err(error) if error.is_cancelled() => Err(timeout),
-                Ok(Ok(())) => Err(timeout),
+            let remaining = budget.remaining();
+            if remaining.is_zero() && !server.is_finished() {
+                return Err(MssqlGroupError::termination_unconfirmed(format!(
+                    "{timeout}; aborted agent task termination could not be established"
+                )));
+            }
+            match tokio::time::timeout(remaining, &mut *server).await {
+                Ok(Err(error)) if error.is_cancelled() => Err(timeout),
+                Ok(Ok(Ok(()))) => Err(timeout),
+                Ok(Ok(Err(error))) => Err(display_error(error)),
                 Ok(Err(error)) => Err(display_error(error)),
-                Err(error) => Err(display_error(error)),
+                Err(_) => Err(MssqlGroupError::termination_unconfirmed(format!(
+                    "{timeout}; aborted agent task did not join within the shared cleanup budget"
+                ))),
             }
         }
     }
@@ -686,15 +770,26 @@ impl MssqlGroup {
                 let shutdown = shutdown_pods(&mut pods, cleanup).await;
                 return Err(match shutdown {
                     Ok(()) => error,
-                    Err(shutdown) => MssqlGroupError::new(format!(
-                        "{error}; partial Kuberic shutdown also failed: {shutdown}"
-                    )),
+                    Err(shutdown) => {
+                        let message =
+                            format!("{error}; partial Kuberic shutdown also failed: {shutdown}");
+                        if shutdown.agent_termination_unconfirmed() {
+                            MssqlGroupError::termination_unconfirmed(message)
+                        } else {
+                            MssqlGroupError::new(message)
+                        }
+                    }
                 });
             }
-            Err(panic) => {
-                let _ = shutdown_pods(&mut pods, cleanup).await;
-                std::panic::resume_unwind(panic);
-            }
+            Err(panic) => match shutdown_pods(&mut pods, cleanup).await {
+                Ok(()) => std::panic::resume_unwind(panic),
+                Err(shutdown) => {
+                    return Err(MssqlGroupError::termination_unconfirmed(format!(
+                        "partial Kuberic startup panicked: {}; shutdown also failed: {shutdown}",
+                        panic_payload(&panic)
+                    )));
+                }
+            },
         };
 
         let group = Self {
@@ -710,9 +805,15 @@ impl MssqlGroup {
             let shutdown = group.shutdown_with_coordinator(cleanup).await;
             return Err(match shutdown {
                 Ok(()) => error,
-                Err(shutdown) => MssqlGroupError::new(format!(
-                    "{error}; initialized Kuberic shutdown also failed: {shutdown}"
-                )),
+                Err(shutdown) => {
+                    let message =
+                        format!("{error}; initialized Kuberic shutdown also failed: {shutdown}");
+                    if shutdown.agent_termination_unconfirmed() {
+                        MssqlGroupError::termination_unconfirmed(message)
+                    } else {
+                        MssqlGroupError::new(message)
+                    }
+                }
             });
         }
         Ok(group)
@@ -889,19 +990,37 @@ async fn shutdown_pods(
     pods: &mut [MssqlPod; 3],
     coordinator: &CleanupCoordinator<impl CleanupClock>,
 ) -> Result<(), MssqlGroupError> {
-    let mut errors = Vec::new();
+    let mut errors = Vec::<MssqlGroupError>::new();
+    if coordinator.remaining().is_zero() {
+        for pod in pods {
+            if let Err(error) = pod.abort_without_budget().await {
+                errors.push(error);
+            }
+        }
+        let messages = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+        return Err(MssqlGroupError::termination_unconfirmed(format!(
+            "Kuberic group shutdown exhausted its shared cleanup budget; fixture cleanup is blocked: {messages:?}"
+        )));
+    }
     let budget = ConvergenceBudget::cleanup_budget(coordinator)?;
     for pod in pods {
         if let Err(error) = pod.shutdown(budget).await {
-            errors.push(error.to_string());
+            errors.push(error);
         }
     }
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(MssqlGroupError::new(format!(
-            "Kuberic group shutdown failed: {errors:?}"
-        )))
+        let termination_unconfirmed = errors
+            .iter()
+            .any(MssqlGroupError::agent_termination_unconfirmed);
+        let messages = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let message = format!("Kuberic group shutdown failed: {messages:?}");
+        Err(if termination_unconfirmed {
+            MssqlGroupError::termination_unconfirmed(message)
+        } else {
+            MssqlGroupError::new(message)
+        })
     }
 }
 
@@ -1325,6 +1444,18 @@ fn display_error(error: impl fmt::Display) -> MssqlGroupError {
     MssqlGroupError::new(error.to_string())
 }
 
+fn panic_payload(panic: &Box<dyn std::any::Any + Send + 'static>) -> String {
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            panic
+                .downcast_ref::<&str>()
+                .map(|value| (*value).to_owned())
+        })
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -1342,7 +1473,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::three_replica::{KubericMember, NativeMemberBinding, SqlMember, TopologyRun};
+    use crate::three_replica::{
+        KubericMember, NativeMemberBinding, OwnershipJournal, RunState, SqlMember, TopologyRun,
+    };
 
     const AG_ID: &str = "11111111-1111-4111-8111-111111111111";
     const DATABASE_ID: &str = "22222222-2222-4222-8222-222222222222";
@@ -1788,11 +1921,11 @@ mod tests {
                 let _termination = TerminationEvidence(evidence);
                 std::future::pending::<kuberic_runtime::host::Result<()>>().await
             });
-            let budget = ConvergenceBudget::new(
-                Duration::from_millis(10),
-                StdInstant::now() + Duration::from_secs(1),
-            )
-            .unwrap();
+            let budget = ConvergenceBudget {
+                deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+                operation_timeout: Duration::from_millis(10),
+                complete_deadline: StdInstant::now() + Duration::from_secs(1),
+            };
             let error = terminate_agent_server(&mut server, budget)
                 .await
                 .unwrap_err();
@@ -1820,7 +1953,8 @@ mod tests {
             }
         }
         let clock = SharedClock::default();
-        let coordinator = CleanupCoordinator::new(clock.clone(), CLEANUP_BUDGET);
+        let coordinator =
+            CleanupCoordinator::new(clock.clone(), super::super::cleanup::CLEANUP_BUDGET);
         let shutdown_budget = ConvergenceBudget::cleanup_budget(&coordinator).unwrap();
         assert_eq!(coordinator.remaining(), Duration::from_secs(180));
         clock.0.store(40, Ordering::SeqCst);
@@ -1833,6 +1967,47 @@ mod tests {
         clock.0.store(75, Ordering::SeqCst);
         assert_eq!(fixture_budget.remaining(), Some(Duration::from_secs(105)));
         assert_eq!(coordinator.remaining(), Duration::from_secs(105));
+    }
+
+    #[test]
+    fn exhausted_partial_agent_blocks_cleanup_until_termination_is_established() {
+        run_group_test(async {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            #[allow(clippy::disallowed_methods)]
+            let mut server = tokio::spawn(async move {
+                entered_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(())
+            });
+            entered_rx.await.unwrap();
+
+            let error = abort_agent_server_without_budget(&mut server)
+                .await
+                .unwrap_err();
+            assert!(error.agent_termination_unconfirmed());
+            let root = test_root("blocked-partial-agent");
+            let mut journal = OwnershipJournal::new(run(&root));
+            journal.state = RunState::Blocked;
+            events.lock().unwrap().push("journal-blocked");
+            assert_eq!(journal.state, RunState::Blocked);
+            assert!(!events.lock().unwrap().contains(&"destructive-cleanup"));
+
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let termination = server.await;
+            assert!(
+                matches!(&termination, Err(error) if error.is_cancelled())
+                    || matches!(&termination, Ok(Ok(())))
+            );
+            events.lock().unwrap().push("agent-terminated");
+            journal.state = RunState::Removed;
+            events.lock().unwrap().push("destructive-cleanup");
+            assert_eq!(
+                events.lock().unwrap().as_slice(),
+                ["journal-blocked", "agent-terminated", "destructive-cleanup"]
+            );
+            assert_eq!(journal.state, RunState::Removed);
+        });
     }
 
     #[test]
