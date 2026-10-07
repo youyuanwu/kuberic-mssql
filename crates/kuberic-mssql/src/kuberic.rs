@@ -925,7 +925,7 @@ impl SqlServerReplicator {
         generation: u64,
         require_progress_role: bool,
         requested_role: Option<ReplicaRole>,
-    ) -> Result<AvailabilityGroupSnapshot, KubericAdapterError> {
+    ) -> Result<(AvailabilityGroupSnapshot, u64), KubericAdapterError> {
         let observation = self
             .source
             .observe()
@@ -949,16 +949,7 @@ impl SqlServerReplicator {
                 "snapshot and attempt timestamps differ",
             ));
         }
-        let now = self
-            .clock
-            .now_unix_millis()
-            .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))?;
-        let Some(age) = now.checked_sub(observed_at) else {
-            return Err(KubericAdapterError::ObservationFromFuture);
-        };
-        if age > self.source.observer_config().max_age_millis() {
-            return Err(KubericAdapterError::ObservationStale);
-        }
+        self.ensure_observation_fresh(observed_at)?;
         let group = match snapshot.availability_group {
             Observation::Present {
                 value,
@@ -1012,7 +1003,21 @@ impl SqlServerReplicator {
                 validate_native_role(role, group.local_replica.role.clone())?;
             }
         }
-        Ok(group)
+        Ok((group, observed_at))
+    }
+
+    fn ensure_observation_fresh(&self, observed_at: u64) -> Result<(), KubericAdapterError> {
+        let now = self
+            .clock
+            .now_unix_millis()
+            .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))?;
+        let Some(age) = now.checked_sub(observed_at) else {
+            return Err(KubericAdapterError::ObservationFromFuture);
+        };
+        if age > self.source.observer_config().max_age_millis() {
+            return Err(KubericAdapterError::ObservationStale);
+        }
+        Ok(())
     }
 
     async fn runtime_authority_context(
@@ -1030,11 +1035,12 @@ impl SqlServerReplicator {
 
     async fn validate_and_set_role(&self, role: ReplicaRole) -> KubericResult<()> {
         let generation = self.begin_operation()?;
-        let group = self.observed_group(generation, false, Some(role)).await?;
+        let (group, observed_at) = self.observed_group(generation, false, Some(role)).await?;
         let _lifecycle = self.finish_operation(generation)?;
         if self.binding.is_none() {
             validate_native_role(role, group.local_replica.role)?;
         }
+        self.ensure_observation_fresh(observed_at)?;
         self.set_role(role);
         Ok(())
     }
@@ -1068,19 +1074,22 @@ impl Replicator for SqlServerReplicator {
 
     async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> KubericResult<()> {
         let generation = self.begin_operation()?;
-        if let Some(binding) = &self.binding {
-            self.observed_group(generation, false, Some(role)).await?;
+        let observed_at = if let Some(binding) = &self.binding {
+            let (_, observed_at) = self.observed_group(generation, false, Some(role)).await?;
             if epoch != binding.configuration.epoch {
                 return Err(KubericAdapterError::TopologyBindingMismatch(
                     "role-change epoch differs from the frozen epoch",
                 )
                 .into());
             }
+            observed_at
         } else {
-            let group = self.observed_group(generation, false, Some(role)).await?;
+            let (group, observed_at) = self.observed_group(generation, false, Some(role)).await?;
             validate_native_role(role, group.local_replica.role)?;
-        }
+            observed_at
+        };
         let _lifecycle = self.finish_operation(generation)?;
+        self.ensure_observation_fresh(observed_at)?;
         self.set_role(role);
         *self
             .epoch
@@ -1091,16 +1100,22 @@ impl Replicator for SqlServerReplicator {
 
     async fn update_epoch(&self, epoch: Epoch) -> KubericResult<()> {
         let generation = self.begin_operation()?;
-        if let Some(binding) = &self.binding {
-            self.observed_group(generation, false, None).await?;
+        let observed_at = if let Some(binding) = &self.binding {
+            let (_, observed_at) = self.observed_group(generation, false, None).await?;
             if epoch != binding.configuration.epoch {
                 return Err(KubericAdapterError::TopologyBindingMismatch(
                     "updated epoch differs from the frozen epoch",
                 )
                 .into());
             }
-        }
+            Some(observed_at)
+        } else {
+            None
+        };
         let _lifecycle = self.finish_operation(generation)?;
+        if let Some(observed_at) = observed_at {
+            self.ensure_observation_fresh(observed_at)?;
+        }
         *self
             .epoch
             .lock()
@@ -1129,12 +1144,10 @@ impl Replicator for SqlServerReplicator {
 
     async fn current_progress(&self) -> KubericResult<i64> {
         let generation = self.begin_operation()?;
-        let value = self
-            .observed_group(generation, true, None)
-            .await?
-            .configuration_sequence
-            .value();
+        let (group, observed_at) = self.observed_group(generation, true, None).await?;
+        let value = group.configuration_sequence.value();
         let _lifecycle = self.finish_operation(generation)?;
+        self.ensure_observation_fresh(observed_at)?;
         Ok(value)
     }
 
@@ -1165,12 +1178,10 @@ impl Replicator for SqlServerReplicator {
                 .into());
             }
         }
-        let value = self
-            .observed_group(generation, true, None)
-            .await?
-            .configuration_sequence
-            .value();
+        let (group, observed_at) = self.observed_group(generation, true, None).await?;
+        let value = group.configuration_sequence.value();
         let authority = self.runtime_authority_context(generation).await?;
+        self.ensure_observation_fresh(observed_at)?;
         let _lifecycle = self.finish_operation(generation)?;
         let admitted = self
             .admitted_configuration
@@ -1191,6 +1202,7 @@ impl Replicator for SqlServerReplicator {
             )
             .into());
         }
+        self.ensure_observation_fresh(observed_at)?;
         Ok(value)
     }
 }
@@ -1221,8 +1233,9 @@ impl PrimaryReplicator for SqlServerReplicator {
             return self.unsupported(ObserveOnlyOperation::CurrentConfiguration);
         };
         let generation = self.begin_operation()?;
-        self.observed_group(generation, false, None).await?;
+        let (_, observed_at) = self.observed_group(generation, false, None).await?;
         let authority = self.runtime_authority_context(generation).await?;
+        self.ensure_observation_fresh(observed_at)?;
         let _lifecycle = self.finish_operation(generation)?;
         validate_current_configuration(binding, &current)?;
         validate_runtime_authority(binding, &current, &authority)?;
@@ -1237,7 +1250,9 @@ impl PrimaryReplicator for SqlServerReplicator {
                 )
                 .into());
             }
+            self.ensure_observation_fresh(observed_at)?;
         } else {
+            self.ensure_observation_fresh(observed_at)?;
             *admitted = Some(current);
         }
         Ok(())

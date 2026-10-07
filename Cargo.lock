@@ -781,8 +781,6 @@ dependencies = [
 [[package]]
 name = "kuberic-runtime"
 version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75961bc39badfbd3d6439835d6cb5b261c1d25da2e1e16422da1ca972d92756a"
 dependencies = [
  "async-trait",
  "bytes",

@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -33,8 +34,11 @@ use kuberic_runtime::replicator::{
     PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode,
     Replicator,
 };
-use kuberic_runtime::testing::effects::RuntimeEffectAction;
+use kuberic_runtime::testing::authority::AdmittedAuthority;
+use kuberic_runtime::testing::describe_peer;
+use kuberic_runtime::testing::effects::{RuntimeEffect, RuntimeEffectAction};
 use kuberic_runtime::testing::hosting::PodRuntime;
+use kuberic_runtime::testing::runtime_adapter::RuntimeAdapter;
 use kuberic_runtime::testing::sqlite_store::SqliteStore;
 use kuberic_runtime::testing::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
 use tokio::sync::oneshot;
@@ -49,6 +53,25 @@ const DATABASE_ID: &str = "55555555-5555-4555-8555-555555555555";
 const DATABASE_GUID: &str = "66666666-6666-4666-8666-666666666666";
 const FAMILY_GUID: &str = "77777777-7777-4777-8777-777777777777";
 const FORK_ID: &str = "88888888-8888-4888-8888-888888888888";
+
+fn run_runtime_effect_test<F>(future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("kuberic-runtime-effect-test".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(future);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
 
 struct ScriptedSource {
     config: ObserverConfig,
@@ -138,6 +161,44 @@ impl RuntimeAuthorityContextSource for StoreAuthorityContextSource {
     }
 }
 
+struct GatedStoreAuthorityContextSource {
+    store: Arc<SqliteStore>,
+    lookups: AtomicUsize,
+    gate_at: usize,
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+#[async_trait]
+impl RuntimeAuthorityContextSource for GatedStoreAuthorityContextSource {
+    async fn current_authority_context(
+        &self,
+    ) -> kuberic_runtime::Result<Option<RuntimeAuthorityContext>> {
+        let lookup = self.lookups.fetch_add(1, Ordering::SeqCst);
+        if lookup == self.gate_at {
+            self.entered
+                .lock()
+                .unwrap()
+                .take()
+                .expect("authority gate must be entered once")
+                .send(())
+                .expect("test must wait for the authority gate");
+            let release = self
+                .release
+                .lock()
+                .unwrap()
+                .take()
+                .expect("authority gate must be released once");
+            release.await.expect("test must release the authority gate");
+        }
+        StoreAuthorityContextSource {
+            store: self.store.clone(),
+        }
+        .current_authority_context()
+        .await
+    }
+}
+
 struct GatedSource {
     config: ObserverConfig,
     samples: Mutex<VecDeque<Result<Observation<InstanceSnapshot>, RuntimeError>>>,
@@ -189,12 +250,36 @@ struct ScriptedClock {
 
 impl ObservationClock for ScriptedClock {
     fn now_unix_millis(&self) -> Result<u64, RuntimeError> {
-        Ok(self
-            .times
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("test must provide one request-time clock value"))
+        let mut times = self.times.lock().unwrap();
+        if times.len() > 1 {
+            Ok(times.pop_front().unwrap())
+        } else {
+            Ok(*times
+                .front()
+                .expect("test must provide a request-time clock value"))
+        }
+    }
+}
+
+struct MutableClock {
+    now: AtomicU64,
+}
+
+impl MutableClock {
+    fn new(now: u64) -> Self {
+        Self {
+            now: AtomicU64::new(now),
+        }
+    }
+
+    fn set(&self, now: u64) {
+        self.now.store(now, Ordering::SeqCst);
+    }
+}
+
+impl ObservationClock for MutableClock {
+    fn now_unix_millis(&self) -> Result<u64, RuntimeError> {
+        Ok(self.now.load(Ordering::SeqCst))
     }
 }
 
@@ -499,6 +584,115 @@ fn bound_replica_set(binding: &HealthyTopologyBinding) -> ReplicaSetConfiguratio
     }
 }
 
+fn admitted_authority(binding: &HealthyTopologyBinding) -> AdmittedAuthority {
+    AdmittedAuthority {
+        local_identity: binding.local_identity().clone(),
+        transition_kind: None,
+        previous_configuration: None,
+        current_configuration: binding.configuration().clone(),
+        switchover_handoff: None,
+        secondary_removal: None,
+        scale_up: None,
+    }
+}
+
+fn runtime_effect(operation_id: &str, sequence: u64, action: RuntimeEffectAction) -> RuntimeEffect {
+    RuntimeEffect {
+        operation_id: OperationId::new(operation_id),
+        sequence,
+        action,
+    }
+}
+
+async fn describe_bound_peers(runtime: &PodRuntime, binding: &HealthyTopologyBinding) {
+    for member in binding
+        .members()
+        .iter()
+        .filter(|member| member.kuberic_identity() != binding.local_identity())
+    {
+        let mut description = ReplicaInformation::new(
+            OperationId::default(),
+            member.kuberic_identity().clone(),
+            member.replication_address().to_owned(),
+        );
+        description.process_session_id = member.process_session_id().clone();
+        description.role = member.stable_role();
+        describe_peer(runtime, description)
+            .await
+            .expect("describe exact bound peer");
+    }
+}
+
+async fn open_effect_runtime<F>(
+    binding: HealthyTopologyBinding,
+    effective_policy: EffectivePolicy,
+    source: Arc<dyn SqlServerObservationSource>,
+    clock: Arc<dyn ObservationClock>,
+    authority_context: F,
+) -> (
+    tempfile::TempDir,
+    Arc<SqliteStore>,
+    Arc<SqlServerService>,
+    Arc<PodRuntime>,
+    Arc<RuntimeAdapter>,
+)
+where
+    F: FnOnce(Arc<SqliteStore>) -> Arc<dyn RuntimeAuthorityContextSource>,
+{
+    let directory = tempfile::tempdir().expect("create isolated Kuberic testing directory");
+    let database = SqliteStore::metadata_database_path(directory.path());
+    let state = AgentState::new(StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: binding.resource_uid().clone(),
+        pod_uid: PodUid::new("contract-pod"),
+        pvc_uid: PvcUid::new("contract-pvc"),
+        initialization_id: InitializationId::new("contract-initialization"),
+        local_identity: binding.local_identity().clone(),
+        effective_policy,
+    });
+    drop(SqliteStore::create_authorized(&database, state).unwrap());
+    let store = Arc::new(SqliteStore::open_existing(&database, None).unwrap());
+    let authority_context = authority_context(store.clone());
+    let service = Arc::new(
+        SqlServerService::with_observation_source_and_binding(
+            SqlServerServiceConfig::new(binding.resource_uid().clone(), "replica-1.example:5022")
+                .unwrap(),
+            source,
+            clock,
+            binding.clone(),
+            authority_context,
+        )
+        .unwrap(),
+    );
+    let runtime = Arc::new(PodRuntime::new(
+        binding.local_identity().clone(),
+        service.clone(),
+        store.clone(),
+    ));
+    runtime
+        .bind_replica_session(
+            binding.resource_uid().clone(),
+            binding
+                .members()
+                .iter()
+                .find(|member| member.kuberic_identity() == binding.local_identity())
+                .expect("binding contains local member")
+                .process_session_id()
+                .clone(),
+        )
+        .unwrap();
+    let adapter = Arc::new(RuntimeAdapter::new(store.clone(), runtime.clone()));
+    adapter
+        .execute(runtime_effect(
+            "open",
+            1,
+            RuntimeEffectAction::Open(OpenMode::Existing),
+        ))
+        .await
+        .unwrap();
+    (directory, store, service, runtime, adapter)
+}
+
 fn replicator_with(
     samples: Vec<Result<Observation<InstanceSnapshot>, RuntimeError>>,
     times: Vec<u64>,
@@ -758,6 +952,38 @@ async fn freshness_uses_request_time_and_accepts_the_exact_age_boundary() {
             ),
         }
     }
+}
+
+#[tokio::test]
+async fn progress_role_and_epoch_recheck_freshness_immediately_before_success() {
+    let stale_times = vec![OBSERVED_AT, OBSERVED_AT + MAX_AGE + 1];
+
+    let progress =
+        opened_bound_replicator(vec![Ok(present(bound_snapshot()))], stale_times.clone()).await;
+    assert!(application_error(progress.current_progress().await.unwrap_err()).contains("stale"));
+
+    let binding = topology_binding();
+    let role =
+        opened_bound_replicator(vec![Ok(present(bound_snapshot()))], stale_times.clone()).await;
+    assert!(
+        application_error(
+            role.change_role(binding.configuration().epoch, ReplicaRole::Primary)
+                .await
+                .unwrap_err()
+        )
+        .contains("stale")
+    );
+
+    let epoch = opened_bound_replicator(vec![Ok(present(bound_snapshot()))], stale_times).await;
+    assert!(
+        application_error(
+            epoch
+                .update_epoch(binding.configuration().epoch)
+                .await
+                .unwrap_err()
+        )
+        .contains("stale")
+    );
 }
 
 #[tokio::test]
@@ -1395,95 +1621,238 @@ async fn capability_rechecks_the_exact_runtime_effective_policy() {
     assert!(message.contains("effective policy"), "{message}");
 }
 
-#[tokio::test]
-async fn pod_runtime_wrong_policy_cannot_admit_or_report_capability() {
-    let exact = topology_binding();
-    let binding = HealthyTopologyBinding::new(
-        ResourceUid::new("partition-generation-1"),
-        exact.local_identity().clone(),
-        exact.configuration().clone(),
-        exact.effective_policy().clone(),
-        exact.availability_group().clone(),
-        exact.database_lineage().clone(),
-        exact.members().to_vec(),
-    )
-    .unwrap();
-    let current = bound_replica_set(&binding);
-    let directory = tempfile::tempdir().expect("create isolated Kuberic testing directory");
-    let database = SqliteStore::metadata_database_path(directory.path());
-    let wrong_policy = EffectivePolicy::fixed(3, 31).unwrap();
-    let mut state = AgentState::new(StorageIdentity {
-        schema_version: SCHEMA_VERSION,
-        resource_uid: binding.resource_uid().clone(),
-        pod_uid: PodUid::new("contract-pod"),
-        pvc_uid: PvcUid::new("contract-pvc"),
-        initialization_id: InitializationId::new("contract-initialization"),
-        local_identity: binding.local_identity().clone(),
-        effective_policy: wrong_policy.clone(),
-    });
-    state.current_configuration = Some(binding.configuration().clone());
-    state.admitted_policy = Some(wrong_policy);
-    drop(SqliteStore::create_authorized(&database, state).unwrap());
-    let store = Arc::new(SqliteStore::open_existing(&database, None).unwrap());
-    let service = Arc::new(
-        SqlServerService::with_observation_source_and_binding(
-            SqlServerServiceConfig::new(binding.resource_uid().clone(), "replica-1.example:5022")
-                .unwrap(),
+#[test]
+fn pod_runtime_wrong_policy_cannot_admit_or_report_capability() {
+    run_runtime_effect_test(async {
+        let exact = topology_binding();
+        let binding = HealthyTopologyBinding::new(
+            ResourceUid::new("partition-generation-1"),
+            exact.local_identity().clone(),
+            exact.configuration().clone(),
+            exact.effective_policy().clone(),
+            exact.availability_group().clone(),
+            exact.database_lineage().clone(),
+            exact.members().to_vec(),
+        )
+        .unwrap();
+        let wrong_policy = EffectivePolicy::fixed(3, 31).unwrap();
+        let (_directory, store, service, runtime, adapter) = open_effect_runtime(
+            binding.clone(),
+            wrong_policy,
             Arc::new(ScriptedSource {
                 config: observer_config(),
-                samples: Mutex::new(
-                    vec![
-                        Ok(present(bound_snapshot())),
-                        Ok(present(bound_snapshot())),
-                        Ok(present(bound_snapshot())),
-                    ]
-                    .into(),
-                ),
+                samples: Mutex::new((0..10).map(|_| Ok(present(bound_snapshot()))).collect()),
             }),
             Arc::new(ScriptedClock {
-                times: Mutex::new(vec![OBSERVED_AT; 3].into()),
+                times: Mutex::new(vec![OBSERVED_AT].into()),
             }),
-            binding.clone(),
-            Arc::new(StoreAuthorityContextSource {
-                store: store.clone(),
-            }),
+            |store| Arc::new(StoreAuthorityContextSource { store }),
         )
-        .unwrap(),
-    );
-    let runtime = Arc::new(PodRuntime::new(
-        binding.local_identity().clone(),
-        service.clone(),
-        store.clone(),
-    ));
-    runtime
-        .reconstruct(
-            OpenMode::Existing,
-            ReplicaRole::None,
-            AccessStatus::NotPrimary,
-            AccessStatus::NotPrimary,
-            None,
-        )
-        .await
-        .unwrap();
-    let error = runtime
-        .primary_replicator()
-        .await
-        .unwrap()
-        .update_current_replica_set_configuration(current.clone())
-        .await
-        .unwrap_err();
-    assert!(
-        application_error(error).contains("effective policy"),
-        "wrong PodRuntime policy must reject current admission"
-    );
+        .await;
+        describe_bound_peers(&runtime, &binding).await;
 
-    let replicator = service.replicator().unwrap();
-    let message = application_error(replicator.catch_up_capability().await.unwrap_err());
-    assert!(
-        message.contains("not been admitted") || message.contains("effective policy"),
-        "{message}"
-    );
-    assert_eq!(current.configuration, binding.configuration().clone());
+        let error = adapter
+            .execute(runtime_effect(
+                "wrong-policy-admission",
+                2,
+                RuntimeEffectAction::AdmitAuthority(Box::new(admitted_authority(&binding))),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("effective policy"),
+            "wrong PodRuntime policy must reject current admission"
+        );
+
+        assert!(
+            runtime.snapshot().await.authority.is_none(),
+            "failed effect must not publish runtime authority"
+        );
+        let durable = store.load_state().await.unwrap();
+        assert!(durable.current_configuration.is_none());
+        assert!(durable.admitted_policy.is_none());
+        assert!(durable.pending_effect.is_some());
+        assert!(
+            application_error(
+                service
+                    .replicator()
+                    .unwrap()
+                    .catch_up_capability()
+                    .await
+                    .unwrap_err()
+            )
+            .contains("not been admitted")
+        );
+    });
+}
+
+#[test]
+fn runtime_adapter_retries_missing_peer_addresses_and_admits_only_the_exact_topology() {
+    run_runtime_effect_test(async {
+        let binding = topology_binding();
+        let source = Arc::new(CountingSource {
+            inner: ScriptedSource {
+                config: observer_config(),
+                samples: Mutex::new((0..10).map(|_| Ok(present(bound_snapshot()))).collect()),
+            },
+            observations: AtomicUsize::new(0),
+        });
+        let (_directory, store, _service, runtime, adapter) = open_effect_runtime(
+            binding.clone(),
+            binding.effective_policy().clone(),
+            source.clone(),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+            |store| Arc::new(StoreAuthorityContextSource { store }),
+        )
+        .await;
+
+        let error = adapter
+            .execute(runtime_effect(
+                "exact-admission",
+                2,
+                RuntimeEffectAction::AdmitAuthority(Box::new(admitted_authority(&binding))),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("session, address, or role"),
+            "{error}"
+        );
+        assert!(runtime.snapshot().await.authority.is_none());
+        let failed = store.load_state().await.unwrap();
+        assert!(failed.current_configuration.is_none());
+        assert!(failed.admitted_policy.is_none());
+
+        describe_bound_peers(&runtime, &binding).await;
+        let result = adapter.resume_pending().await.unwrap().unwrap();
+        assert_eq!(
+            result.postcondition.authority,
+            Some(admitted_authority(&binding))
+        );
+        assert_eq!(
+            runtime.snapshot().await.authority,
+            Some(admitted_authority(&binding))
+        );
+        let admitted = store.load_state().await.unwrap();
+        assert_eq!(
+            admitted.current_configuration,
+            Some(binding.configuration().clone())
+        );
+        assert_eq!(
+            admitted.admitted_policy,
+            Some(binding.effective_policy().clone())
+        );
+        assert!(admitted.pending_effect.is_none());
+        assert_eq!(source.observations.load(Ordering::SeqCst), 4);
+    });
+}
+
+#[test]
+fn runtime_adapter_admission_rejects_evidence_that_stales_during_authority_lookup() {
+    run_runtime_effect_test(async {
+        let binding = topology_binding();
+        let clock = Arc::new(MutableClock::new(OBSERVED_AT));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (_directory, store, _service, runtime, adapter) = open_effect_runtime(
+            binding.clone(),
+            binding.effective_policy().clone(),
+            Arc::new(ScriptedSource {
+                config: observer_config(),
+                samples: Mutex::new((0..10).map(|_| Ok(present(bound_snapshot()))).collect()),
+            }),
+            clock.clone(),
+            move |store| {
+                Arc::new(GatedStoreAuthorityContextSource {
+                    store,
+                    lookups: AtomicUsize::new(0),
+                    gate_at: 0,
+                    entered: Mutex::new(Some(entered_tx)),
+                    release: Mutex::new(Some(release_rx)),
+                })
+            },
+        )
+        .await;
+        describe_bound_peers(&runtime, &binding).await;
+
+        let task = tokio::spawn({
+            let adapter = adapter.clone();
+            let authority = admitted_authority(&binding);
+            async move {
+                adapter
+                    .execute(runtime_effect(
+                        "late-stale-admission",
+                        2,
+                        RuntimeEffectAction::AdmitAuthority(Box::new(authority)),
+                    ))
+                    .await
+            }
+        });
+        entered_rx.await.unwrap();
+        clock.set(OBSERVED_AT + MAX_AGE + 1);
+        release_tx.send(()).unwrap();
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("stale"), "{error}");
+        assert!(runtime.snapshot().await.authority.is_none());
+        let durable = store.load_state().await.unwrap();
+        assert!(durable.current_configuration.is_none());
+        assert!(durable.admitted_policy.is_none());
+    });
+}
+
+#[test]
+fn capability_rejects_evidence_that_stales_during_authority_lookup() {
+    run_runtime_effect_test(async {
+        let binding = topology_binding();
+        let clock = Arc::new(MutableClock::new(OBSERVED_AT));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (_directory, _store, service, runtime, adapter) = open_effect_runtime(
+            binding.clone(),
+            binding.effective_policy().clone(),
+            Arc::new(ScriptedSource {
+                config: observer_config(),
+                samples: Mutex::new((0..10).map(|_| Ok(present(bound_snapshot()))).collect()),
+            }),
+            clock.clone(),
+            move |store| {
+                Arc::new(GatedStoreAuthorityContextSource {
+                    store,
+                    lookups: AtomicUsize::new(0),
+                    gate_at: 1,
+                    entered: Mutex::new(Some(entered_tx)),
+                    release: Mutex::new(Some(release_rx)),
+                })
+            },
+        )
+        .await;
+        describe_bound_peers(&runtime, &binding).await;
+        adapter
+            .execute(runtime_effect(
+                "capability-admission",
+                2,
+                RuntimeEffectAction::AdmitAuthority(Box::new(admitted_authority(&binding))),
+            ))
+            .await
+            .unwrap();
+        let replicator = service.replicator().unwrap();
+        replicator
+            .change_role(binding.configuration().epoch, ReplicaRole::Primary)
+            .await
+            .unwrap();
+
+        let task = tokio::spawn({
+            let replicator = replicator.clone();
+            async move { replicator.catch_up_capability().await }
+        });
+        entered_rx.await.unwrap();
+        clock.set(OBSERVED_AT + MAX_AGE + 1);
+        release_tx.send(()).unwrap();
+        let error = task.await.unwrap().unwrap_err();
+        assert!(application_error(error).contains("stale"));
+    });
 }
 
 #[tokio::test]
