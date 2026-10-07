@@ -415,7 +415,7 @@ mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59
 ```
 
 It currently also pins Kuberic Git commit
-`71599f8395953d121081634736e50299610f0d26`, associated with the open
+`301d7f364744aea4dd2513dcc8179d3588fd7dd7`, associated with the open
 [Kuberic PR #124](https://github.com/youyuanwu/kuberic/pull/124). This is a
 temporary dependency until a suitable upstream merge or release is available;
 it does not promise that the PR will merge.

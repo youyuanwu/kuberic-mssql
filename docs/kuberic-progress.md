@@ -216,7 +216,7 @@ The final ignored test additionally proves the three fenced Kuberic reports and
 exact cleanup/recovery behavior.
 
 The workspace temporarily pins Kuberic commit
-`71599f8395953d121081634736e50299610f0d26`, tracked by open
+`301d7f364744aea4dd2513dcc8179d3588fd7dd7`, tracked by open
 [Kuberic PR #124](https://github.com/youyuanwu/kuberic/pull/124), so custom
 authority validation completes before durable publication. The pin remains
 until a suitable upstream merge or release is available and does not predict
