@@ -763,19 +763,26 @@ name = "kuberic-mssql-tests"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "futures",
  "kuberic-mssql",
  "kuberic-runtime",
+ "libc",
+ "rustix",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
+ "tiberius",
  "tokio",
  "tokio-util",
+ "tonic",
+ "zeroize",
 ]
 
 [[package]]
 name = "kuberic-runtime"
 version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75961bc39badfbd3d6439835d6cb5b261c1d25da2e1e16422da1ca972d92756a"
+source = "git+https://github.com/youyuanwu/kuberic.git?branch=main#b2cbbf266d4791ef15df908a9ae23b79fed33c5c"
 dependencies = [
  "async-trait",
  "bytes",

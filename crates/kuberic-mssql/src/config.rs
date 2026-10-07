@@ -57,6 +57,20 @@ pub enum MutationMode {
     Enabled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqlServerEulaAcknowledgement(());
+
+impl SqlServerEulaAcknowledgement {
+    pub fn new(accepted: bool) -> Result<Self, ContractError> {
+        require("EULA acceptance", accepted, "true", accepted)?;
+        Ok(Self(()))
+    }
+
+    pub const fn accepted(self) -> bool {
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlServerSupportConfig {
     pub engine_major: u16,
@@ -102,12 +116,7 @@ impl SqlServerSupportConfig {
                 package.version(),
             )?;
         }
-        require(
-            "EULA acceptance",
-            self.eula_accepted,
-            "true",
-            self.eula_accepted,
-        )?;
+        SqlServerEulaAcknowledgement::new(self.eula_accepted)?;
         require(
             "cluster type",
             self.cluster_type == ClusterType::External,

@@ -4,6 +4,7 @@ use kuberic_mssql::runtime_config::ObserverConfig;
 use serde_json::{Value, json};
 
 pub mod tds;
+pub mod three_replica;
 
 pub struct Fixture {
     directory: tempfile::TempDir,

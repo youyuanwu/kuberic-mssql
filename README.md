@@ -385,6 +385,94 @@ Without an explicit directory or `SQLSERVER_FIXTURE_DIR`, CI uses
 `$RUNNER_TEMP/sqlserver-observer`; local runs use
 `~/.local/state/kuberic-mssql/fixture`.
 
+### Three-replica licensed happy path
+
+The dedicated three-replica fixture is separate from the reusable
+single-container fixture above. The legacy fixture creates one metadata-only AG
+with two unstarted peer definitions and keeps its
+`SQLSERVER_TEST_EULA_ACCEPTED` compatibility gate. The three-replica path starts
+three real SQL Server processes, creates certificate-authenticated endpoints,
+joins one external AG, automatically seeds one database, runs three in-process
+Kuberic agents, and proves a marker is readable from every member.
+
+The live path is ignored by default and is not part of `just`, `just check`, or
+direct Cargo test runs. The happy path runs after the legacy live validation in
+`just ci`; fault, signal, and recovery recipes remain explicit. It requires
+local Linux x86-64 with cgroup v2, a local Docker engine
+that enforces memory/no-additional-swap/CPU limits, `setfacl`/`getfacl`, at
+least 10 GiB effective available memory, two effective CPUs, 15 GiB free on the
+fixture filesystem, and Docker-root capacity of 8 GiB before an absent-image
+pull and 2 GiB after the image is present. Each container is capped at 3 GiB,
+two CPUs, and 2 GiB SQL Server memory; compilation uses one Cargo build job.
+Before creating run resources, preflight also requires noninteractive `sudo`
+for exactly `python3` running the UID-10001 access probe and recursive physical
+`setfacl --modify` used to restore host cleanup access. Missing, denied, or
+expired authorization fails closed; the member-directory binding is journaled
+before the fallible UID probe so exact cleanup remains possible.
+
+The fixture pins:
+
+```text
+mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726
+```
+
+It currently tracks the Kuberic `main` branch. `Cargo.lock` resolves the exact
+revision used by reproducible builds; the current revision includes formal
+authority fix `0784b7b8fc18c3f68c34c3bc1e1035412c027de9` and merged
+[Kuberic PR #127](https://github.com/youyuanwu/kuberic/pull/127), which supplies
+the testing listener handoff required by this fixture.
+
+The test crate constructs an affirmative `SqlServerEulaAcknowledgement` through
+the clearly test-only `FixtureConfig` path and injects exactly
+`ACCEPT_EULA=Y` into each SQL Server container. It does not read an
+acknowledgement file or environment variable, and repeated authorization
+revalidation is idempotent.
+
+Run the exact dedicated command with an optional fixture root:
+
+```bash
+just test-live-three-replica [root]
+```
+
+For example:
+
+```bash
+just test-live-three-replica
+just test-live-three-replica target/my-mssql-three-replica
+```
+
+Production and future launchers retain explicit
+`SqlServerEulaAcknowledgement` semantics. The strict file-backed constructor
+and its negative contract tests remain available for those launchers. The
+shipped example intentionally contains `accepted: false` as production-contract
+documentation; it is not required by the test command.
+
+The fixture root is private and exclusively locked. An atomic ownership journal
+records intent before each resource create and binds exact container, network,
+path, native SQL, and process-incarnation evidence. Normal completion, setup
+failure, panic, SIGINT, and SIGTERM attempt bounded cleanup; an uncatchable
+termination is recovered from that journal on the next command.
+
+Use the actual recovery recipes rather than deleting Docker resources or the
+journal manually:
+
+```bash
+just cleanup-live-three-replica
+just cleanup-live-three-replica target/my-mssql-three-replica
+just test-live-three-replica-signal
+just test-live-three-replica-signal target/my-mssql-three-replica-signal
+just test-live-three-replica-recovery target/my-mssql-three-replica-recovery
+just test-live-three-replica-faults target/my-mssql-three-replica-faults
+```
+
+Cleanup removes only exactly journaled resources. Foreign, replaced, or
+otherwise unverifiable resources remain untouched and block reuse. The signal
+signal recipe interrupts an owned launch with SIGTERM, recovers it, reruns the
+complete happy path, and verifies idempotent cleanup. The recovery recipe also
+executes real SIGINT and SIGKILL subprocess cases. The fault recipe injects a
+post-AG failure, an actual panic after agent startup, and a report-stage failure;
+each is followed by a separate exact cleanup process and a final retry.
+
 Direct test commands remain available:
 
 ```bash
@@ -395,5 +483,7 @@ cargo test --locked -p kuberic-mssql-tests --test live_observation -- --ignored
 An explicitly requested live test fails if any of its prerequisites are
 missing; it never silently skips. Rust tests use observation principals and
 issue no setup/mutation SQL. The fixture helper owns its exact test AG metadata
-and cleanup. Local three-node failover, lease expiry, old-primary
-fencing, and fault injection are stage 4, not claims of this PR.
+and cleanup. The dedicated three-replica fixture performs test-only endpoint,
+AG, database, seeding, and marker mutation; production remains observe-only.
+Local three-node failover, lease expiry, old-primary fencing, and fault
+injection remain unsupported and are not claims of this work.

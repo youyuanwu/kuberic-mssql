@@ -18,9 +18,15 @@ pub mod types;
 pub use config::{
     AvailabilityMode, ClusterType, Edition, FailoverMode, MutationMode, SUPPORTED_DATABASE_COUNT,
     SUPPORTED_ENGINE_MAJOR, SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT,
-    SUPPORTED_REQUIRED_SECONDARIES, SeedingMode, SqlServerSupportConfig,
+    SUPPORTED_REQUIRED_SECONDARIES, SeedingMode, SqlServerEulaAcknowledgement,
+    SqlServerSupportConfig,
 };
 pub use error::ContractError;
+#[cfg(feature = "kuberic")]
+pub use kuberic::{
+    HealthyTopologyBinding, HealthyTopologyMemberBinding, RuntimeAuthorityContext,
+    RuntimeAuthorityContextSource, SqlServerStartIncarnation,
+};
 pub use operation::{
     DestructiveApproval, EffectSignature, FenceReference, InputSignature,
     OPERATION_CONTRACT_VERSION, OperationEnvelope, OperationPayload, OperationRecord,

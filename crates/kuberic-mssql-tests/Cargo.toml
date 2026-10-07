@@ -13,11 +13,24 @@ name = "sqlserver-observer-test"
 path = "src/bin/sqlserver-observer.rs"
 test = false
 
+[[bin]]
+name = "mssql-three-replica-fixture"
+path = "src/bin/mssql-three-replica-fixture.rs"
+test = false
+
 [dependencies]
 async-trait.workspace = true
+futures.workspace = true
 kuberic-mssql = { workspace = true, features = ["kuberic-testing"] }
 kuberic-runtime = { workspace = true, features = ["testing"] }
+libc.workspace = true
+rustix.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
+tiberius.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-util = { workspace = true, features = ["compat", "rt"] }
+tonic.workspace = true
+zeroize.workspace = true

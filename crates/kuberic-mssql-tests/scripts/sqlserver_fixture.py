@@ -1043,6 +1043,8 @@ def live_test_command(*, include_ag, include_kuberic):
     else:
         args += ["--test", "live_observation"]
     args += ["--", "--ignored"]
+    if include_kuberic:
+        args += ["--skip", "three_replica_"]
     if not include_ag:
         args += [
             "--skip", "live_present_availability_group",

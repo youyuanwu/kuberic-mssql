@@ -6,7 +6,7 @@ export PATH := env_var("HOME") + "/.local/bin:" + env_var("HOME") + "/.cargo/bin
 default: check
 
 # Run the complete CI pipeline locally or on the CI runner.
-ci fixture="": setup check (validate-live fixture)
+ci fixture="": setup check (validate-live fixture) test-live-three-replica
 
 # Install only missing/mismatched shared Rust, just and compiler prerequisites.
 setup:
@@ -16,8 +16,8 @@ setup:
 provision fixture="":
     python3 -B crates/kuberic-mssql-tests/scripts/sqlserver_fixture.py provision {{quote(fixture)}}
 
-# Release only owned fixture state; borrowed instances are preserved.
-cleanup fixture="":
+# Release both owned fixture families; borrowed instances are preserved.
+cleanup fixture="": cleanup-live-three-replica
     python3 -B crates/kuberic-mssql-tests/scripts/sqlserver_fixture.py cleanup {{quote(fixture)}}
 
 # Ensure readiness, run shared live checks, and release owned resources.
@@ -57,6 +57,41 @@ test-live-all fixture="":
 # Run the feature-enabled Kuberic happy path against the same ready fixture.
 test-live-kuberic fixture="":
     python3 -B crates/kuberic-mssql-tests/scripts/sqlserver_fixture.py test-kuberic {{quote(fixture)}}
+
+# Launch, validate, and clean up the dedicated real three-member topology.
+test-live-three-replica root="target/mssql-three-replica":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_happy_path -- --ignored --exact --test-threads=1
+
+# Interrupt a real live subprocess during owned launch, recover, retry, and clean up.
+test-live-three-replica-signal root="target/mssql-three-replica-signal":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_sigterm_during_owned_launch_is_recoverable -- --ignored --exact --test-threads=1 --nocapture
+
+# Exercise handled and uncatchable subprocess interruption with cleanup and retry.
+test-live-three-replica-recovery root="target/mssql-three-replica-recovery":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
+        three_replica_sig -- --ignored --test-threads=1 --nocapture
+
+# Exercise post-AG, post-agent panic, and report fault checkpoints with exact recovery.
+test-live-three-replica-faults root="target/mssql-three-replica-faults":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
+        three_replica_post_ag_and_report_fault_checkpoints_recover -- --ignored --exact --test-threads=1 --nocapture
+
+# Recover and remove only the exactly journaled real three-member topology.
+cleanup-live-three-replica root="target/mssql-three-replica":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED CARGO_BUILD_JOBS=1 \
+        cargo run --locked -p kuberic-mssql-tests --bin mssql-three-replica-fixture -- cleanup --root "$(realpath -m {{quote(root)}})"
 
 # Compile once and run direct observation plus Kuberic against one fixture lifetime.
 test-live-shared fixture="":
