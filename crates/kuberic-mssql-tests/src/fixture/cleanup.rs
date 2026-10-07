@@ -416,13 +416,17 @@ where
         };
         if let Some(expected) = &record.binding {
             if expected != &binding {
-                block_with_detail(
-                    journal,
-                    index,
-                    &record,
-                    &mut report,
-                    Some("journaled immutable binding changed"),
-                );
+                let detail = match record.kind {
+                    ResourceKind::Container => "container immutable binding changed",
+                    ResourceKind::Network => "network immutable binding changed",
+                    ResourceKind::DataDirectory
+                    | ResourceKind::Directory
+                    | ResourceKind::SecretFile => "path immutable binding changed",
+                    ResourceKind::AvailabilityGroup | ResourceKind::Database => {
+                        "native SQL immutable binding changed"
+                    }
+                };
+                block_with_detail(journal, index, &record, &mut report, Some(detail));
                 continue;
             }
         } else if matches!(

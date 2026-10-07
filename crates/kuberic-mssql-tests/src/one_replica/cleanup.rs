@@ -266,27 +266,25 @@ where
             Err(_) => return Err(ReconcileError::Io),
         }
         let binding = match resource.kind {
-            ResourceKind::DataDirectory => {
-                inspect_member_directory(
-                    self.root,
-                    path,
-                    unsafe { libc::geteuid() },
-                    SQL_SERVER_UID,
-                    remaining.min(Duration::from_secs(30)),
-                    &CommandAclController::new(self.runner),
-                )
-                .map_err(|_| ReconcileError::OwnershipMismatch)?
-                .binding
-            }
-            ResourceKind::Directory => {
-                inspect_owned_directory(self.root, path)
-                    .map_err(|_| ReconcileError::OwnershipMismatch)?
-                    .binding
-            }
-            ResourceKind::SecretFile => PrivateFile::inspect_owned(path)
-                .map_err(|_| ReconcileError::OwnershipMismatch)?
-                .binding()
-                .clone(),
+            ResourceKind::DataDirectory => match inspect_member_directory(
+                self.root,
+                path,
+                unsafe { libc::geteuid() },
+                SQL_SERVER_UID,
+                remaining.min(Duration::from_secs(30)),
+                &CommandAclController::new(self.runner),
+            ) {
+                Ok(binding) => binding.binding,
+                Err(_) => return Ok(ResourceObservation::Foreign),
+            },
+            ResourceKind::Directory => match inspect_owned_directory(self.root, path) {
+                Ok(binding) => binding.binding,
+                Err(_) => return Ok(ResourceObservation::Foreign),
+            },
+            ResourceKind::SecretFile => match PrivateFile::inspect_owned(path) {
+                Ok(file) => file.binding().clone(),
+                Err(_) => return Ok(ResourceObservation::Foreign),
+            },
             _ => return Err(ReconcileError::OwnershipMismatch),
         };
         Ok(ResourceObservation::Owned {
@@ -336,16 +334,28 @@ where
                     .map_or(network.name.as_str(), |binding| {
                         binding.immutable_id.as_str()
                     });
-                let Some(inspection) = self
+                let inspection = self
                     .docker
                     .inspect_network(identity, remaining.min(Duration::from_secs(30)))
-                    .map_err(|_| ReconcileError::Io)?
-                else {
-                    return Ok(ResourceObservation::Absent);
+                    .map_err(|_| ReconcileError::Io)?;
+                let inspection = match inspection {
+                    Some(inspection) => inspection,
+                    None if identity != network.name => {
+                        match self
+                            .docker
+                            .inspect_network(&network.name, remaining.min(Duration::from_secs(30)))
+                            .map_err(|_| ReconcileError::Io)?
+                        {
+                            Some(inspection) => inspection,
+                            None => return Ok(ResourceObservation::Absent),
+                        }
+                    }
+                    None => return Ok(ResourceObservation::Absent),
                 };
-                let binding = network
-                    .resource_binding(&inspection)
-                    .map_err(|_| ReconcileError::OwnershipMismatch)?;
+                let binding = match network.resource_binding(&inspection) {
+                    Ok(binding) => binding,
+                    Err(_) => return Ok(ResourceObservation::Foreign),
+                };
                 if resource
                     .binding
                     .as_ref()
@@ -366,17 +376,34 @@ where
                     .binding
                     .as_ref()
                     .map_or(container_name, |binding| binding.immutable_id.as_str());
-                let Some(inspection) = self
+                let inspection = self
                     .docker
                     .inspect_container(identity, remaining.min(Duration::from_secs(30)))
-                    .map_err(|_| ReconcileError::Io)?
-                else {
-                    return Ok(ResourceObservation::Absent);
+                    .map_err(|_| ReconcileError::Io)?;
+                let inspection = match inspection {
+                    Some(inspection) => inspection,
+                    None if identity != container_name => {
+                        match self
+                            .docker
+                            .inspect_container(
+                                container_name,
+                                remaining.min(Duration::from_secs(30)),
+                            )
+                            .map_err(|_| ReconcileError::Io)?
+                        {
+                            Some(inspection) => inspection,
+                            None => return Ok(ResourceObservation::Absent),
+                        }
+                    }
+                    None => return Ok(ResourceObservation::Absent),
                 };
                 let container = self.container.ok_or(ReconcileError::OwnershipMismatch)?;
-                container
+                if container
                     .verify_inspection(&inspection, self.image_id, inspection.running)
-                    .map_err(|_| ReconcileError::OwnershipMismatch)?;
+                    .is_err()
+                {
+                    return Ok(ResourceObservation::Foreign);
+                }
                 let binding = if let Some(expected) = resource.binding.as_ref() {
                     if inspection.id != expected.immutable_id
                         || resource.intent.as_ref()
@@ -545,6 +572,7 @@ mod tests {
     struct FakeBackend {
         foreign: bool,
         attachments: bool,
+        persist_after_remove: bool,
         removed: Cell<bool>,
     }
 
@@ -583,7 +611,9 @@ mod tests {
         }
 
         fn remove_container(&self, _: &ResourceRecord, _: Duration) -> Result<(), CleanupError> {
-            self.removed.set(true);
+            if !self.persist_after_remove {
+                self.removed.set(true);
+            }
             Ok(())
         }
 
@@ -721,6 +751,7 @@ mod tests {
         let backend = FakeBackend {
             foreign: false,
             attachments: false,
+            persist_after_remove: false,
             removed: Cell::new(false),
         };
         let report = CleanupCoordinator::default().cleanup(&store, &mut journal, &backend);
@@ -736,6 +767,7 @@ mod tests {
         let backend = FakeBackend {
             foreign: true,
             attachments: false,
+            persist_after_remove: false,
             removed: Cell::new(false),
         };
         let report = CleanupCoordinator::default().cleanup(&store, &mut journal, &backend);
@@ -755,6 +787,7 @@ mod tests {
         let backend = FakeBackend {
             foreign: false,
             attachments: false,
+            persist_after_remove: false,
             removed: Cell::new(false),
         };
         let coordinator =
@@ -777,6 +810,7 @@ mod tests {
         let backend = FakeBackend {
             foreign: false,
             attachments: false,
+            persist_after_remove: false,
             removed: Cell::new(false),
         };
         let result: Result<(), CombinedFixtureError> = CleanupCoordinator::default().coordinate(
@@ -800,6 +834,7 @@ mod tests {
         let backend = FakeBackend {
             foreign: false,
             attachments: true,
+            persist_after_remove: false,
             removed: Cell::new(false),
         };
         let report = CleanupCoordinator::default().cleanup(&store, &mut journal, &backend);
@@ -823,6 +858,7 @@ mod tests {
         let backend = FakeBackend {
             foreign: true,
             attachments: false,
+            persist_after_remove: false,
             removed: Cell::new(false),
         };
         let report = CleanupCoordinator::default().cleanup(&store, &mut journal, &backend);
@@ -842,12 +878,46 @@ mod tests {
         let backend = FakeBackend {
             foreign: false,
             attachments: false,
+            persist_after_remove: false,
             removed: Cell::new(false),
         };
         let report = CleanupCoordinator::default().cleanup(&store, &mut journal, &backend);
         assert!(report.succeeded());
         assert!(backend.removed.get());
         assert_eq!(journal.resources[0].state, ResourceState::Removed);
+    }
+
+    #[test]
+    fn ambiguous_dispatched_absence_is_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut journal) = journal(&root.path().join("fixture"));
+        journal.resources[0].state = ResourceState::Dispatched;
+        journal.resources[0].binding = None;
+        store.save(&journal).unwrap();
+        let backend = FakeBackend {
+            foreign: false,
+            attachments: false,
+            persist_after_remove: false,
+            removed: Cell::new(true),
+        };
+        let report = CleanupCoordinator::default().cleanup(&store, &mut journal, &backend);
+        let diagnostic = OneReplicaCleanupError::Cleanup(report).to_string();
+        assert!(diagnostic.contains("create dispatch outcome is ambiguous"));
+    }
+
+    #[test]
+    fn resource_remaining_after_remove_is_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut journal) = journal(&root.path().join("fixture"));
+        let backend = FakeBackend {
+            foreign: false,
+            attachments: false,
+            persist_after_remove: true,
+            removed: Cell::new(false),
+        };
+        let report = CleanupCoordinator::default().cleanup(&store, &mut journal, &backend);
+        let diagnostic = OneReplicaCleanupError::Cleanup(report).to_string();
+        assert!(diagnostic.contains("resource remained present after removal"));
     }
 
     #[test]
@@ -870,6 +940,7 @@ mod tests {
             let backend = FakeBackend {
                 foreign: false,
                 attachments: false,
+                persist_after_remove: false,
                 removed: Cell::new(false),
             };
             let result: Result<(), CombinedFixtureError> = CleanupCoordinator::default()

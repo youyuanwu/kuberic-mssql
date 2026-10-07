@@ -10,8 +10,8 @@ use kuberic_mssql_tests::one_replica::{
     acquire_one_replica_root_lock, cleanup_one_replica_fixture_with,
 };
 use kuberic_mssql_tests::three_replica::{
-    BoundedProcessRunner, ProcessIncarnation, ResourceBinding, ResourceKind, ResourceRecord,
-    ResourceState, RunState, acquire_root_lock, current_process_incarnation,
+    BoundedProcessRunner, PrivateFile, ProcessIncarnation, ResourceBinding, ResourceKind,
+    ResourceRecord, ResourceState, RunState, acquire_root_lock, current_process_incarnation,
 };
 
 mod support;
@@ -188,6 +188,65 @@ fn absent_container_recovers_even_when_credentials_are_missing() {
     let stored =
         OneReplicaJournal::from_json(&fs::read(root.join("ownership.json")).unwrap()).unwrap();
     assert_eq!(stored.resources[0].state, ResourceState::Removed);
+}
+
+#[test]
+fn standalone_cleanup_reports_replacement_found_by_stable_name() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("replacement");
+    fs::create_dir_all(root.join("credentials")).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(root.join("credentials"), fs::Permissions::from_mode(0o700)).unwrap();
+    PrivateFile::create_text(root.join("credentials/sa-password"), "ValidPassword1!").unwrap();
+    let mut journal = OneReplicaJournal::new(sample_run(&root));
+    journal.resources.push(ResourceRecord {
+        kind: ResourceKind::Container,
+        logical_name: "container-1".to_owned(),
+        path: None,
+        intent: Some(ResourceBinding {
+            immutable_id: journal.run.member.container_name.clone(),
+            attributes_sha256: "a".repeat(64),
+        }),
+        binding: Some(ResourceBinding {
+            immutable_id: "removed-original-id".to_owned(),
+            attributes_sha256: "b".repeat(64),
+        }),
+        state: ResourceState::Bound,
+    });
+    write_journal(&root, &journal);
+    let docker = FakeDocker::default().with_container(journal.run.member.container_name.clone());
+
+    let error = cleanup_one_replica_fixture_with(&root, &docker, BoundedProcessRunner)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("container-1"));
+    assert!(error.contains("container identity or immutable attributes changed"));
+}
+
+#[test]
+fn standalone_cleanup_reports_replaced_path_binding() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("path-replacement");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = root.join("secret");
+    let original = PrivateFile::create_text(&path, "original").unwrap();
+    let mut journal = OneReplicaJournal::new(sample_run(&root));
+    journal.resources.push(ResourceRecord {
+        kind: ResourceKind::SecretFile,
+        logical_name: "secret-file".to_owned(),
+        path: Some(path.clone()),
+        intent: None,
+        binding: Some(original.binding().clone()),
+        state: ResourceState::Bound,
+    });
+    write_journal(&root, &journal);
+    fs::remove_file(&path).unwrap();
+    PrivateFile::create_text(&path, "replacement").unwrap();
+
+    let error = cleanup(&root).unwrap_err().to_string();
+    assert!(error.contains("secret-file"));
+    assert!(error.contains("path immutable binding changed"));
 }
 
 #[test]

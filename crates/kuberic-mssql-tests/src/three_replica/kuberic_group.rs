@@ -2155,7 +2155,7 @@ mod tests {
             let sources: [Source; 3] = std::array::from_fn(|index| {
                 Arc::new(YieldingSource {
                     inner: source(&run, index, now),
-                    yields: 3,
+                    yields: 1,
                 }) as Source
             });
             let group = MssqlGroup::assemble(
