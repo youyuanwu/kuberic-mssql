@@ -3,7 +3,6 @@ members = [
     "crates/kuberic-mssql",
     "crates/kuberic-mssql-tests",
 ]
-exclude = ["vendor/kuberic-runtime"]
 resolver = "3"
 
 [workspace.package]
@@ -32,6 +31,5 @@ tokio-util = "0.7"
 zeroize = "1"
 
 [patch.crates-io]
-# The locked 0.0.1 runtime persists custom authority before its configuration callback.
-# Keep the exact release locally with admission preparation moved before durable publication.
-kuberic-runtime = { path = "vendor/kuberic-runtime" }
+# Custom authority validation must complete before durable authority publication.
+kuberic-runtime = { git = "https://github.com/youyuanwu/kuberic.git", rev = "57c96ce45a596a66334d0ae4c3d4b8a09cca79c1" }
