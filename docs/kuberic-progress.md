@@ -142,19 +142,17 @@ durable Kuberic authority.
 
 ## Live Validation Paths
 
-### Legacy single-container observation fixture
+### One-replica observer and CLI fixture
 
-`just ci` retains one digest-pinned SQL Server 2025 Enterprise Developer
-container. It creates one metadata-only EXTERNAL AG with one local primary
-definition and two configured but unstarted peers. It has no managed database,
-running HADR endpoint, join, seeding, write lease, or failover. This fixture
-proves real-engine observation and single-runtime configuration-progress
-publication, not data replication or HA.
+`just ci` first runs one Rust-owned digest-pinned SQL Server 2025 Enterprise
+Developer container. It creates no AG, endpoint or database. Separate allowed,
+partially privileged and invalid-CA configurations prove absent-group behavior,
+permission-denied classification, TLS rejection and fresh production CLI
+provenance. This fixture does not publish Kuberic progress.
 
-Its private ownership record persists the nonce-bearing AG name before create,
-then binds the exact group ID and profile. Cleanup revalidates those values in
-the destructive batch. This fixture also retains its ambient
-`SQLSERVER_TEST_EULA_ACCEPTED` compatibility gate.
+Its schema-versioned journal records exact intent and immutable identity for
+the container, network, files and directories. Cleanup removes only verified
+owned resources and refuses legacy Python, foreign, replaced or attached state.
 
 ### Three-member native and Kuberic happy path
 
@@ -239,23 +237,20 @@ Build or test the adapter through the feature:
 cargo test --locked -p kuberic-mssql-tests --test kuberic_contract
 ```
 
-Run the complete server-free and single-container gate:
+Run the complete server-free and Rust-owned live gates:
 
 ```bash
-just ci /absolute/path/to/fixture-directory
+just ci
 ```
 
-Targeted prepared-fixture commands are:
+Run or clean up the one-member observer/CLI path:
 
 ```bash
-just test-live
-just test-live-all
-just test-live-kuberic
-just test-live-shared
+just test-live-one-replica [root]
+just cleanup-live-one-replica [root]
 ```
 
-Live tests remain ignored for direct Cargo invocation and require explicit
-licensed fixture provisioning.
+Live tests remain ignored for ordinary Cargo invocation.
 
 Run the real three-member path with an optional fixture root:
 
@@ -275,8 +270,8 @@ Exercise handled SIGTERM, recovery, retry, and idempotent cleanup:
 just test-live-three-replica-signal [root]
 ```
 
-The happy path runs after legacy `validate-live` in `just ci`. Signal, recovery,
-and fault recipes remain explicit. The shipped acknowledgement example still
+The three-replica happy path runs after the one-replica observer/CLI validation
+in `just ci`. Signal, recovery, and fault recipes remain explicit. The shipped acknowledgement example still
 contains `accepted: false` as documentation for the production/file-backed
 contract, but tests do not require it.
 

@@ -22,7 +22,7 @@ The repository is a two-member Cargo workspace:
 - `crates/kuberic-mssql` contains the observe-only runtime library and the
   production `sqlserver-observer` binary.
 - `crates/kuberic-mssql-tests` contains shared test support, integration and
-  ignored licensed live tests, and the SQL Server container fixture scripts.
+  ignored licensed live tests, and Rust-owned SQL Server fixture lifecycles.
 
 Dependency versions are declared once in the root `Cargo.toml`; member
 manifests select only the features they need.
@@ -81,26 +81,22 @@ when that record reports a driver panic. No trust or encryption check is bypasse
 
 ### Container observation fixtures
 
-Repository live tests run on the host against a SQL Server container. The fixture
-pins `mcr.microsoft.com/mssql/server:2025-CU9-ubuntu-24.04` by registry digest;
-the image reports SQL Server `17.0.5005.3`. Docker publishes only
-`127.0.0.1:1433`, while Cargo tests, `sqlserver-observer` and the pinned `sqlcmd`
-client remain ordinary host processes.
+Repository live tests use Rust-owned fixtures and run production observation
+code on the host. Both fixtures pin
+`mcr.microsoft.com/mssql/server:2025-CU9-ubuntu-24.04` by registry digest; the
+image reports SQL Server `17.0.5005.3`.
 
-The fixture accepts the EULA for a non-production Enterprise Developer instance,
-limits the container to 3 GiB and SQL Server to 2 GiB, enables HADR and mounts
-verified TLS configuration. Separate allowed and denied observation principals
-exercise absence, permission and TLS behavior. For the progress happy path it
-creates one metadata-only EXTERNAL AG with three replica definitions, no
-database and no local mirroring endpoint. It performs no join, seeding,
-promotion, lease or failover operation.
+The one-replica fixture owns one loopback-only container and validates the four
+behaviors not supplied by the topology test: absent requested AG, partial
+metadata permission denial, invalid CA rejection, and fresh production CLI
+output with exact provenance. It creates no AG, endpoint, database, Kuberic
+runtime, lease, role transition or failover operation.
 
-Container writable storage is intentionally ephemeral. A container created for a
-validation run is removed afterward, deleting its SQL Server data. Host-side
-certificates, credentials and configs are private and retained locally for faster
-subsequent runs; CI removes its runner-temporary fixture directory. An exact
-container ID, image ID/digest, labels, loopback port, limits and read-only mounts
-are verified before reuse, stop or removal.
+The three-replica fixture remains the positive topology and Kuberic progress
+proof. Both lifecycles use durable exact-ownership journals, bounded cleanup and
+recovery. They never borrow, start, stop or preserve a pre-existing container.
+Test-only code accepts the EULA for non-production Enterprise Developer
+containers; production remains observe-only.
 
 ### Configuration
 
@@ -240,33 +236,18 @@ authenticated command protocol.
 
 ## Testing
 
-Ordinary tests need neither SQL Server nor Kubernetes:
-
-The same bootstrap script is used by CI and local runs. It reuses matching
-installed tools and installs only missing/mismatched prerequisites: the pinned
-Rust toolchain/components, C and protobuf compiler tools, Docker and
-checksum-pinned `just` 1.21.0.
-CI retains `actions-rust-lang/setup-rust-toolchain@v2`; the bootstrap reuses its
-prepared toolchain.
+Ordinary tests need neither SQL Server nor Kubernetes. The shared bootstrap
+installs or reuses the pinned Rust toolchain, compiler tools, Docker and
+checksum-pinned `just`.
 
 ```bash
 bash crates/kuberic-mssql-tests/scripts/setup_environment.sh
-```
-
-On Ubuntu 24.04, `sudo apt-get install just` is also supported. Recipes put the
-standard user-local Rust/just directories on `PATH`.
-
-```bash
-just --list
-just build
 just check
-just test
-just test-ci-helpers
 ```
 
-Plain `just` runs `check`: formatting, strict Clippy, ordinary Rust tests and
-server-free CI helper tests. Builds default to one job; an explicitly supplied
-`CARGO_BUILD_JOBS` is preserved. The underlying Cargo commands remain available:
+`just check` runs formatting, strict Clippy and locked all-feature Rust tests.
+Builds default to one job; an explicitly supplied `CARGO_BUILD_JOBS` is
+preserved. Licensed live tests remain ignored during ordinary Cargo execution.
 
 ```bash
 cargo fmt --all -- --check
@@ -274,129 +255,61 @@ cargo test --locked --workspace --all-features
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 ```
 
-The `justfile` is the shared interface for every repository-owned CI step.
-The workflow checks out the repository, prepares Rust, runs the shared bootstrap,
-then invokes `just ci`. Local runs use that same command:
+The complete local and CI pipeline is:
 
 ```bash
-just ci /absolute/path/to/fixture-directory
-# Alternatively configure once:
-export SQLSERVER_FIXTURE_DIR=/absolute/path/to/fixture-directory
 just ci
 ```
 
-`ci` runs shared setup, server-free checks, build, fixture readiness, live cases,
-CLI verification and ownership-aware cleanup. `just check` remains the
-server-free-only command. Individual phases are also shared:
+It runs server-free checks, the Rust one-replica observer/CLI validation, then
+the Rust three-replica topology/Kuberic validation. Both live recipes create
+only resources owned by that invocation and clean them before returning.
+Aggregate cleanup is always safe to run:
 
 ```bash
-just provision /absolute/path/to/fixture-directory  # ensure readiness; no tests
-just test-live /absolute/path/to/fixture-directory
-just validate-live /absolute/path/to/fixture-directory  # ensure + tests + cleanup
-just cleanup /absolute/path/to/fixture-directory
+just test-live-one-replica
+just cleanup-live-one-replica
+just test-live-three-replica
+just cleanup-live-three-replica
+just cleanup
 ```
 
-### Container CI validation
+Override fixture roots with each recipe's optional `root` argument. The
+one-replica environment override is `SQLSERVER_ONE_REPLICA_ROOT`; the
+three-replica override is `KUBERIC_MSSQL_THREE_REPLICA_ROOT`.
 
-The SQL Server 2025 container observation job runs on every pull request,
-main-branch push and manual `CI` dispatch. The shared fixture helper supplies
-`SQLSERVER_TEST_EULA_ACCEPTED=true` to live tests and sets `ACCEPT_EULA=Y`
-when provisioning its disposable non-production Enterprise Developer container.
-This CI deployment policy does not enable EULA acceptance or provisioning in the
-observer, and does not grant production licensing rights.
+### Legacy Python fixture cleanup
 
-The shared job uses a disposable GitHub-hosted `ubuntu-24.04` x86-64 runner, the
-digest-pinned SQL Server image and a checksum-pinned host SQL client. The same
-provisioning operation runs locally and in CI. An unrelated container, modified
-fixture profile or occupied host port is refused. It provisions one loopback-only
-container with HADR, verified TLS and separate allowed/denied observation principals.
-Credentials are generated per run, kept in private temporary files, and never
-passed in arguments or published as artifacts.
+The removed Python fixture is not adopted by the Rust lifecycle. If an older
+checkout left `fixture-run.json`, the exact legacy owner marker or its
+deterministic container, the Rust command refuses to mutate that root.
 
-The job exercises absent and present AG observation, permission denial,
-invalid-CA rejection, Kuberic progress publication, and the actual CLI's fresh
-SQL Server 2025 output. Each fixture records a private nonce-bearing AG name
-before creation and later binds its exact SQL Server group ID. The fixture AG
-contains metadata only and makes no endpoint, database, join, seeding, role,
-lease-renewal or failover changes.
-An always-run cleanup
-step removes the owned container and its SQL data; the disposable runner
-is the final containment boundary. This is real-engine observation validation, not
-three-replica AG or HA validation. CI uses its generated runner-temporary fixture
-directory and disposes only files it created there. Local runs retain fixture files
-for reuse. The command implementation and test selection are identical; only
-lifecycle retention policy differs.
-
-Live observation tests are explicitly ignored by default. They require
-externally provisioned, isolated SQL Server fixtures, mounted credentials,
-valid TLS configuration, and explicit test-environment/EULA acknowledgement.
-Set the following environment variables (only references/acknowledgements,
-never credential contents):
-
-| Variable | Required fixture or acknowledgement |
-|---|---|
-| `SQLSERVER_TEST_EULA_ACCEPTED` | `true`, supplied automatically by shared `just` recipes and the fixture helper; set explicitly only for direct Cargo invocation |
-| `SQLSERVER_TEST_IMAGE` | Required container image reference pinned with `@sha256:` |
-| `SQLSERVER_LIVE_ABSENT_CONFIG` | Absolute config path for a supported HADR-enabled instance without the requested AG |
-| `SQLSERVER_LIVE_AG_CONFIG` | Absolute config path for a preconfigured supported EXTERNAL AG |
-| `SQLSERVER_LIVE_DENIED_CONFIG` | Config with a valid login/TLS connection but missing observation permissions |
-| `SQLSERVER_LIVE_BAD_TLS_CONFIG` | Config for a reachable instance with a mismatched CA or TLS hostname |
-
-The image acknowledgement is fixture-owner metadata, not runtime attestation
-through TDS. Image pinning and EULA acceptance are the provisioning owner's
-responsibility. Once the fixture is configured:
+Use the immutable pre-migration commit in a temporary worktree:
 
 ```bash
-just test-live      # absent AG, permission denial, invalid CA
-just test-live-all  # all direct-observation cases, including the fixture AG
-just test-live-kuberic  # Kuberic progress through the published testing runtime
-just test-live-shared   # direct and Kuberic cases in one Cargo invocation
-just test-live-cli /absolute/path/to/observation.json
-just verify-live-cli /absolute/path/to/fresh-observation.json
+git worktree add --detach /tmp/kuberic-mssql-legacy-cleanup \
+  b835bd411864dd7697b4f44dde8377940bd8997a
+python3 /tmp/kuberic-mssql-legacy-cleanup/crates/kuberic-mssql-tests/scripts/sqlserver_fixture.py \
+  cleanup /absolute/path/to/legacy-fixture
+git worktree remove /tmp/kuberic-mssql-legacy-cleanup
 ```
 
-`just provision`/`validate-live` own the container lifecycle. `test-live` and
-`test-live-cli` require that prepared fixture and run entirely on the host.
-All recipes automatically supply the test EULA acknowledgement. Missing or
-modified prerequisites fail explicitly instead of silently skipping.
-
-`test-live-cli` builds the observer, reads `SQLSERVER_LIVE_ABSENT_CONFIG`, writes
-the report to the supplied path and runs `verify-live-cli` only after a successful
-observation. Both CLI recipes verify the pinned Enterprise Developer engine's
-exact version and native output shape.
-
-### Reuse a local container fixture
-
-One command prepares the container, runs host tests and CLI validation, and
-releases resources:
-
-```bash
-just validate-live /absolute/path/to/fixture-directory
-```
-
-The private fixture directory contains host configs, credentials, TLS material,
-the pinned SQL client and read-only container mount files. If its exact managed
-container is already running, validation borrows and preserves it. If stopped,
-validation starts and later stops it. If absent, validation creates and later
-removes it. Replacement container IDs and changed image/profile settings are
-refused during use and cleanup. Concurrent lifecycle runners are refused.
-
-Without an explicit directory or `SQLSERVER_FIXTURE_DIR`, CI uses
-`$RUNNER_TEMP/sqlserver-observer`; local runs use
-`~/.local/state/kuberic-mssql/fixture`.
+Before removing retained files, independently verify that `fixture-run.json`
+and the deterministic legacy container are absent, the root is canonical,
+user-owned and not a symlink, and `owner` contains exactly
+`kuberic-sqlserver-observer-container-v1`. Ambiguous state must remain
+untouched.
 
 ### Three-replica licensed happy path
 
-The dedicated three-replica fixture is separate from the reusable
-single-container fixture above. The legacy fixture creates one metadata-only AG
-with two unstarted peer definitions and keeps its
-`SQLSERVER_TEST_EULA_ACCEPTED` compatibility gate. The three-replica path starts
-three real SQL Server processes, creates certificate-authenticated endpoints,
-joins one external AG, automatically seeds one database, runs three in-process
-Kuberic agents, and proves a marker is readable from every member.
+The dedicated three-replica fixture complements the one-replica observer/CLI
+path above. It starts three real SQL Server processes, creates
+certificate-authenticated endpoints, joins one external AG, automatically
+seeds one database, runs three in-process Kuberic agents, and proves a marker
+is readable from every member.
 
 The live path is ignored by default and is not part of `just`, `just check`, or
-direct Cargo test runs. The happy path runs after the legacy live validation in
+direct Cargo test runs. The happy path runs after one-replica validation in
 `just ci`; fault, signal, and recovery recipes remain explicit. It requires
 local Linux x86-64 with cgroup v2, a local Docker engine
 that enforces memory/no-additional-swap/CPU limits, `setfacl`/`getfacl`, at

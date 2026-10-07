@@ -159,3 +159,35 @@ fn successful_cleanup_summary_is_stable_and_secret_free() {
     assert!(!summary.contains("password"));
     assert!(!summary.contains("ACCEPT_EULA"));
 }
+
+#[test]
+fn repository_routes_one_replica_validation_without_python_fixture_helpers() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .unwrap();
+    let justfile = fs::read_to_string(root.join("justfile")).unwrap();
+    assert!(justfile.contains("test-live-one-replica root=\"target/mssql-one-replica\":"));
+    assert!(
+        justfile.contains("cargo test --locked -p kuberic-mssql-tests --test live_one_replica")
+    );
+    assert!(justfile.contains(
+        "cargo run --locked -p kuberic-mssql-tests --bin mssql-one-replica-fixture -- cleanup --root"
+    ));
+    for removed in [
+        "sqlserver_fixture.py",
+        "test-ci-helpers",
+        "SQLSERVER_FIXTURE_DIR",
+        "SQLSERVER_LIVE_ABSENT_CONFIG",
+        "test-live-kuberic",
+        "test-live-shared",
+        "verify-live-cli",
+    ] {
+        assert!(!justfile.contains(removed), "{removed}");
+    }
+
+    let workflow = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    assert!(workflow.contains("Run Rust-owned one- and three-replica validation"));
+    assert!(workflow.contains("just ci"));
+    assert!(workflow.contains("just cleanup"));
+}

@@ -98,20 +98,20 @@ contract for later stages, not an enabled execution path.
 `SqlServerEulaAcknowledgement` is the shared semantic acknowledgement contract:
 it can be constructed only from an explicit affirmative value. The production
 crate deliberately provides no container or Pod launcher and never translates
-that value into `ACCEPT_EULA=Y`. Only the dedicated three-replica fixture uses a
-clearly test-only constructor to create the affirmative semantic value in code
-and inject exactly `ACCEPT_EULA=Y`; its sourceless revalidation is idempotent.
+that value into `ACCEPT_EULA=Y`. Only the Rust-owned one- and three-replica fixtures use a clearly test-only
+constructor to create the affirmative semantic value in code and inject exactly
+`ACCEPT_EULA=Y`; sourceless revalidation is idempotent.
 The strict file-backed constructor and negative contract tests remain for future
-production launchers. The retained single-container fixture's ambient
-acknowledgement remains a documented legacy compatibility exception.
+production launchers.
 
-The licensed three-replica fixture in `kuberic-mssql-tests` is the only new
-mutation path. It creates certificate-authenticated endpoints, joins an
-external AG, grants automatic-seeding database creation, seeds one database,
-and writes a proof marker. These effects exist solely to provision and verify
-an isolated test topology. Production `SqlExecutor`, `TdsExecutor`, observer,
-service, and replicator paths receive no administrative SQL or container
-authority.
+The licensed one-replica fixture owns one container, TLS assets and test
+principals solely to validate absence, permission denial, TLS rejection and CLI
+output. It creates no AG, endpoint or database. The licensed three-replica
+fixture creates certificate-authenticated endpoints, joins an external AG,
+grants automatic-seeding database creation, seeds one database, and writes a
+proof marker. These effects exist solely in isolated test infrastructure.
+Production `SqlExecutor`, `TdsExecutor`, observer, service, and replicator paths
+receive no administrative SQL or container authority.
 
 The crate remained independent when the classic runtime was removed. The
 `sqlserver-observer` binary
@@ -382,36 +382,13 @@ permissions, transport and sample deadlines, freshness, cancellation, CLI
 output, and credential redaction. A dedicated server-free observer workflow
 runs these without provisioning PostgreSQL or Kubernetes.
 
-Live tests run in the shared validation job alongside server-free checks.
-The job runs on PRs, main-branch pushes and manual dispatches, with automatic
-EULA acceptance for one digest-pinned SQL Server 2025 Enterprise Developer
-container fixture for absence, a metadata-only present AG, Kuberic progress,
-denied permissions, invalid TLS and CLI output validation. Shared
-`just ci`/`provision`/`validate-live`/`cleanup`
-commands own image verification, container creation, HADR/TLS/principal setup
-and cleanup outside the observer. Tests and CLI remain host processes. The helper
-refuses unrelated or modified containers. The fixture helper creates and owns
-one metadata-only AG with a private per-fixture nonce-bearing name, three
-configured replicas, no database and no mirroring endpoint. Its ownership
-record persists that name before create dispatch, binds the exact group ID and
-profile after creation, and revalidates all three in the destructive drop
-batch. Production runtime code creates no AG. This does not enable runtime
-mutation or validate HA. The same ensure-ready operation is used locally:
-it preserves an already-running exact fixture, starts/stops a verified stopped
-container, or creates/removes an absent one. A private ownership record lets
-cleanup distinguish borrowed, started and newly created containers. Lifecycle checks are
-test-environment safeguards, not production fencing attestation.
-The Kuberic adapter likewise publishes no client service address from role
-changes; its replication address is confined to replicator open metadata.
-That job must pin the engine image, tools, and helper
-artifacts; confine automatic EULA acceptance to test fixture code; isolate
-credentials; and fail rather
-than skip when requested prerequisites are missing. Mutation support cannot be
-declared complete until live tests cover crash points before and after intent
-persistence, native dispatch, postcondition observation, result persistence,
-reply, and routing publication.
+Live tests run sequentially in the shared validation job after server-free
+checks. The Rust one-replica lifecycle owns one digest-pinned SQL Server 2025
+Enterprise Developer container and validates absent AG, partial permission
+denial, invalid TLS and fresh production CLI provenance. It creates no
+availability group and never adopts or borrows an existing container.
 
-Separately, the explicitly invoked ignored three-replica test pins
+The Rust three-replica lifecycle pins
 `mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726`
 and automatically accepts the EULA only through the test crate's sourceless
 authorization constructor. It creates three resource-bounded instances, real
@@ -421,10 +398,11 @@ secondaries, common identities and lineage, completed seeding, and a marker
 readable from all members. Three in-process Kuberic agents then admit only the
 frozen current topology and publish bracketed, fenced reports. Exact ownership
 is persisted before create dispatch, cleanup revalidates immutable IDs and
-attributes, and the SIGTERM regression proves journal recovery and retry.
-
-Its happy path runs in ordinary Shared CI after the legacy live validation;
-fault, signal, and recovery cases remain explicitly invoked. This does not
+attributes. Both fixture families persist intent before create dispatch, refuse
+foreign or replaced resources, and perform bounded recovery without requiring
+SQL Server availability. `just cleanup` invokes both exact cleanup binaries.
+Three-replica fault, signal and recovery cases remain explicitly invoked.
+This does not
 advance the production delivery sequence. It provides healthy-path evidence
 only: it does not test
 write-lease expiry, old-primary fencing, switchover, failover, replica
