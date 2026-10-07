@@ -14,8 +14,7 @@ use futures::FutureExt;
 use kuberic_mssql::instance::SqlServerInstanceManager;
 use kuberic_mssql::kuberic::{
     HealthyTopologyBinding, HealthyTopologyMemberBinding, ObservationClock,
-    RuntimeAuthorityContext, RuntimeAuthorityContextSource, SqlServerMemberEndpoint,
-    SqlServerObservationSource, SqlServerService, SqlServerServiceConfig,
+    SqlServerMemberEndpoint, SqlServerObservationSource, SqlServerService, SqlServerServiceConfig,
     SqlServerStartIncarnation, SystemObservationClock,
 };
 use kuberic_mssql::observation::InstanceSnapshot;
@@ -803,7 +802,6 @@ impl MssqlGroup {
                     resource_uid.clone(),
                     pod.identity.clone(),
                     configuration.clone(),
-                    effective_policy.clone(),
                     availability_group.clone(),
                     database_lineage.clone(),
                     members.clone(),
@@ -814,12 +812,7 @@ impl MssqlGroup {
                     .run(
                         "healthy topology binding",
                         budget.operation_timeout,
-                        pod.application.bind_topology(
-                            binding,
-                            Arc::new(StoreAuthorityContextSource {
-                                store: pod.store.clone(),
-                            }),
-                        ),
+                        pod.application.bind_topology(binding),
                     )
                     .await?
                     .map_err(display_error)?;
@@ -1175,44 +1168,6 @@ async fn shutdown_pods(
         } else {
             MssqlGroupError::new(message)
         })
-    }
-}
-
-struct StoreAuthorityContextSource {
-    store: Arc<SqliteStore>,
-}
-
-#[async_trait]
-impl RuntimeAuthorityContextSource for StoreAuthorityContextSource {
-    async fn current_authority_context(
-        &self,
-    ) -> kuberic_runtime::Result<Option<RuntimeAuthorityContext>> {
-        let state = self
-            .store
-            .load_state()
-            .await
-            .map_err(|error| kuberic_runtime::RuntimeError::Application(error.to_string()))?;
-        let pending = state.pending_effect.as_ref().and_then(|pending| {
-            if let RuntimeEffectAction::AdmitAuthority(authority) = &pending.effect.action {
-                Some(authority.as_ref())
-            } else {
-                None
-            }
-        });
-        let configuration = pending
-            .map(|authority| authority.current_configuration.clone())
-            .or(state.current_configuration);
-        let Some(configuration) = configuration else {
-            return Ok(None);
-        };
-        let policy = state
-            .admitted_policy
-            .unwrap_or_else(|| state.identity.effective_policy.clone());
-        Ok(Some(RuntimeAuthorityContext::new(
-            state.identity.local_identity,
-            configuration,
-            policy,
-        )))
     }
 }
 
@@ -1908,47 +1863,6 @@ mod tests {
     }
 
     #[test]
-    fn store_policy_mismatch_fails_before_authority_is_durable() {
-        run_group_test(async {
-            let root = test_root("policy");
-            let run = run(&root);
-            let native = native_binding(&run);
-            let now = unix_millis().unwrap();
-            let sources: [Source; 3] = std::array::from_fn(|index| {
-                Arc::new(source(&run, index, now)) as Arc<dyn SqlServerObservationSource>
-            });
-            let error = match MssqlGroup::assemble_with_store_policies(
-                &root,
-                &run,
-                &native,
-                sources,
-                std::array::from_fn(|_| Arc::new(FixedClock(AtomicU64::new(now))) as Clock),
-                [
-                    exact_policy(),
-                    EffectivePolicy::fixed(3, MSSQL_FAILOVER_DELAY_SECONDS + 1).unwrap(),
-                    exact_policy(),
-                ],
-                ConvergenceBudget::new(
-                    Duration::from_secs(60),
-                    StdInstant::now() + Duration::from_secs(120),
-                )
-                .unwrap(),
-                &CleanupCoordinator::default(),
-            )
-            .await
-            {
-                Ok(group) => {
-                    group.shutdown().await.unwrap();
-                    panic!("policy mismatch unexpectedly assembled")
-                }
-                Err(error) => error,
-            };
-            assert!(error.to_string().contains("effective policy"), "{error}");
-            fs::remove_dir_all(&root).unwrap();
-        });
-    }
-
-    #[test]
     fn report_observation_failure_remains_fenced_and_shutdown_is_clean() {
         run_group_test(async {
             let root = test_root("report-failure");
@@ -2146,9 +2060,9 @@ mod tests {
     }
 
     #[test]
-    fn assembly_tolerates_suspended_native_authority_validation() {
+    fn assembly_tolerates_suspended_native_observation() {
         run_group_test(async {
-            let root = test_root("slow-authority-validation");
+            let root = test_root("slow-observation");
             let run = run(&root);
             let native = native_binding(&run);
             let now = unix_millis().unwrap();

@@ -1,14 +1,14 @@
 use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use kuberic_mssql::kuberic::{
     HealthyTopologyBinding, HealthyTopologyMemberBinding, ObservationClock,
-    RuntimeAuthorityContext, RuntimeAuthorityContextSource, SqlServerMemberEndpoint,
-    SqlServerObservationSource, SqlServerReplicator, SqlServerReplicatorFactory, SqlServerService,
-    SqlServerServiceConfig, SqlServerStartIncarnation,
+    SqlServerMemberEndpoint, SqlServerObservationSource, SqlServerReplicator,
+    SqlServerReplicatorFactory, SqlServerService, SqlServerServiceConfig,
+    SqlServerStartIncarnation,
 };
 use kuberic_mssql::observation::{
     AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, DatabaseSnapshot, InstanceMetadata,
@@ -110,95 +110,6 @@ impl SqlServerObservationSource for CountingSource {
     }
 }
 
-struct FixedAuthorityContextSource {
-    context: Mutex<Option<RuntimeAuthorityContext>>,
-}
-
-#[async_trait]
-impl RuntimeAuthorityContextSource for FixedAuthorityContextSource {
-    async fn current_authority_context(
-        &self,
-    ) -> kuberic_runtime::Result<Option<RuntimeAuthorityContext>> {
-        Ok(self.context.lock().unwrap().clone())
-    }
-}
-
-struct StoreAuthorityContextSource {
-    store: Arc<SqliteStore>,
-}
-
-#[async_trait]
-impl RuntimeAuthorityContextSource for StoreAuthorityContextSource {
-    async fn current_authority_context(
-        &self,
-    ) -> kuberic_runtime::Result<Option<RuntimeAuthorityContext>> {
-        let state = self
-            .store
-            .load_state()
-            .await
-            .map_err(|error| KubericRuntimeError::Application(error.to_string()))?;
-        let pending = state.pending_effect.as_ref().and_then(|pending| {
-            if let RuntimeEffectAction::AdmitAuthority(authority) = &pending.effect.action {
-                Some(authority.as_ref())
-            } else {
-                None
-            }
-        });
-        let configuration = pending
-            .map(|authority| authority.current_configuration.clone())
-            .or(state.current_configuration);
-        let Some(configuration) = configuration else {
-            return Ok(None);
-        };
-        let effective_policy = state
-            .admitted_policy
-            .unwrap_or_else(|| state.identity.effective_policy.clone());
-        Ok(Some(RuntimeAuthorityContext::new(
-            state.identity.local_identity,
-            configuration,
-            effective_policy,
-        )))
-    }
-}
-
-struct GatedStoreAuthorityContextSource {
-    store: Arc<SqliteStore>,
-    lookups: AtomicUsize,
-    gate_at: usize,
-    entered: Mutex<Option<oneshot::Sender<()>>>,
-    release: Mutex<Option<oneshot::Receiver<()>>>,
-}
-
-#[async_trait]
-impl RuntimeAuthorityContextSource for GatedStoreAuthorityContextSource {
-    async fn current_authority_context(
-        &self,
-    ) -> kuberic_runtime::Result<Option<RuntimeAuthorityContext>> {
-        let lookup = self.lookups.fetch_add(1, Ordering::SeqCst);
-        if lookup == self.gate_at {
-            self.entered
-                .lock()
-                .unwrap()
-                .take()
-                .expect("authority gate must be entered once")
-                .send(())
-                .expect("test must wait for the authority gate");
-            let release = self
-                .release
-                .lock()
-                .unwrap()
-                .take()
-                .expect("authority gate must be released once");
-            release.await.expect("test must release the authority gate");
-        }
-        StoreAuthorityContextSource {
-            store: self.store.clone(),
-        }
-        .current_authority_context()
-        .await
-    }
-}
-
 struct GatedSource {
     config: ObserverConfig,
     samples: Mutex<VecDeque<Result<Observation<InstanceSnapshot>, RuntimeError>>>,
@@ -258,28 +169,6 @@ impl ObservationClock for ScriptedClock {
                 .front()
                 .expect("test must provide a request-time clock value"))
         }
-    }
-}
-
-struct MutableClock {
-    now: AtomicU64,
-}
-
-impl MutableClock {
-    fn new(now: u64) -> Self {
-        Self {
-            now: AtomicU64::new(now),
-        }
-    }
-
-    fn set(&self, now: u64) {
-        self.now.store(now, Ordering::SeqCst);
-    }
-}
-
-impl ObservationClock for MutableClock {
-    fn now_unix_millis(&self) -> Result<u64, RuntimeError> {
-        Ok(self.now.load(Ordering::SeqCst))
     }
 }
 
@@ -446,28 +335,11 @@ fn topology_binding() -> HealthyTopologyBinding {
     topology_binding_for(0)
 }
 
-fn authority_context_for(binding: &HealthyTopologyBinding) -> RuntimeAuthorityContext {
-    RuntimeAuthorityContext::new(
-        binding.local_identity().clone(),
-        binding.configuration().clone(),
-        binding.effective_policy().clone(),
-    )
-}
-
-fn fixed_authority_source(
-    context: Option<RuntimeAuthorityContext>,
-) -> Arc<dyn RuntimeAuthorityContextSource> {
-    Arc::new(FixedAuthorityContextSource {
-        context: Mutex::new(context),
-    })
-}
-
 fn topology_binding_for(local_index: usize) -> HealthyTopologyBinding {
     HealthyTopologyBinding::new(
         ResourceUid::new("resource-a"),
         kuberic_identity(local_index as i64 + 1),
         configuration(),
-        EffectivePolicy::fixed(3, 30).unwrap(),
         AvailabilityGroupIdentity {
             name: AvailabilityGroupName::new("test-ag").unwrap(),
             group_id: guid(AG_ID),
@@ -608,41 +480,18 @@ fn runtime_effect(operation_id: &str, sequence: u64, action: RuntimeEffectAction
     }
 }
 
-async fn describe_bound_peers(runtime: &PodRuntime, binding: &HealthyTopologyBinding) {
-    for member in binding
-        .members()
-        .iter()
-        .filter(|member| member.kuberic_identity() != binding.local_identity())
-    {
-        let mut description = ReplicaInformation::new(
-            OperationId::default(),
-            member.kuberic_identity().clone(),
-            member.replication_address().to_owned(),
-        );
-        description.process_session_id = member.process_session_id().clone();
-        description.role = member.stable_role();
-        describe_peer(runtime, description)
-            .await
-            .expect("describe exact bound peer");
-    }
-}
-
-async fn open_effect_runtime<F>(
+async fn open_effect_runtime(
     binding: HealthyTopologyBinding,
     effective_policy: EffectivePolicy,
     source: Arc<dyn SqlServerObservationSource>,
     clock: Arc<dyn ObservationClock>,
-    authority_context: F,
 ) -> (
     tempfile::TempDir,
     Arc<SqliteStore>,
     Arc<SqlServerService>,
     Arc<PodRuntime>,
     Arc<RuntimeAdapter>,
-)
-where
-    F: FnOnce(Arc<SqliteStore>) -> Arc<dyn RuntimeAuthorityContextSource>,
-{
+) {
     let directory = tempfile::tempdir().expect("create isolated Kuberic testing directory");
     let database = SqliteStore::metadata_database_path(directory.path());
     let state = AgentState::new(StorageIdentity {
@@ -656,7 +505,6 @@ where
     });
     drop(SqliteStore::create_authorized(&database, state).unwrap());
     let store = Arc::new(SqliteStore::open_existing(&database, None).unwrap());
-    let authority_context = authority_context(store.clone());
     let service = Arc::new(
         SqlServerService::with_observation_source_and_binding(
             SqlServerServiceConfig::new(binding.resource_uid().clone(), "replica-1.example:5022")
@@ -664,7 +512,6 @@ where
             source,
             clock,
             binding.clone(),
-            authority_context,
         )
         .unwrap(),
     );
@@ -736,8 +583,7 @@ fn bound_replicator_for(
             Arc::new(ScriptedClock {
                 times: Mutex::new(times.into()),
             }),
-            binding.clone(),
-            fixed_authority_source(Some(authority_context_for(&binding))),
+            binding,
         )
         .unwrap(),
     )
@@ -769,8 +615,7 @@ fn gated_bound_replicator(
             Arc::new(ScriptedClock {
                 times: Mutex::new(times.into()),
             }),
-            binding.clone(),
-            fixed_authority_source(Some(authority_context_for(&binding))),
+            binding,
         )
         .unwrap(),
     );
@@ -1161,7 +1006,7 @@ async fn resource_identity_and_native_roles_are_exact() {
 }
 
 #[test]
-fn bound_constructors_reject_resource_address_policy_and_local_mapping_drift() {
+fn bound_constructors_reject_resource_address_quorum_and_local_mapping_drift() {
     let source = || {
         Arc::new(ScriptedSource {
             config: observer_config(),
@@ -1180,7 +1025,6 @@ fn bound_constructors_reject_resource_address_policy_and_local_mapping_drift() {
             source(),
             clock(),
             topology_binding(),
-            fixed_authority_source(Some(authority_context_for(&topology_binding()))),
         )
         .is_ok()
     );
@@ -1191,31 +1035,22 @@ fn bound_constructors_reject_resource_address_policy_and_local_mapping_drift() {
             source(),
             clock(),
             topology_binding(),
-            fixed_authority_source(Some(authority_context_for(&topology_binding()))),
         )
         .is_err()
     );
     let binding = topology_binding();
     assert!(
-        SqlServerReplicator::new_bound(
-            "wrong.example:5022".into(),
-            source(),
-            clock(),
-            binding.clone(),
-            fixed_authority_source(Some(authority_context_for(&binding))),
-        )
-        .is_err()
+        SqlServerReplicator::new_bound("wrong.example:5022".into(), source(), clock(), binding,)
+            .is_err()
     );
-
     let exact = topology_binding();
-    let mut changed_policy = exact.effective_policy().clone();
-    changed_policy.write_quorum = 1;
+    let mut changed_configuration = exact.configuration().clone();
+    changed_configuration.write_quorum = 1;
     assert!(
         HealthyTopologyBinding::new(
             exact.resource_uid().clone(),
             exact.local_identity().clone(),
-            exact.configuration().clone(),
-            changed_policy,
+            changed_configuration,
             exact.availability_group().clone(),
             exact.database_lineage().clone(),
             exact.members().to_vec(),
@@ -1227,22 +1062,6 @@ fn bound_constructors_reject_resource_address_policy_and_local_mapping_drift() {
             exact.resource_uid().clone(),
             kuberic_identity(9),
             exact.configuration().clone(),
-            exact.effective_policy().clone(),
-            exact.availability_group().clone(),
-            exact.database_lineage().clone(),
-            exact.members().to_vec(),
-        )
-        .is_err()
-    );
-
-    let mut changed_policy = exact.effective_policy().clone();
-    changed_policy.read_quorum = 1;
-    assert!(
-        HealthyTopologyBinding::new(
-            exact.resource_uid().clone(),
-            exact.local_identity().clone(),
-            exact.configuration().clone(),
-            changed_policy,
             exact.availability_group().clone(),
             exact.database_lineage().clone(),
             exact.members().to_vec(),
@@ -1275,7 +1094,6 @@ fn bound_constructors_reject_resource_address_policy_and_local_mapping_drift() {
             exact.resource_uid().clone(),
             exact.local_identity().clone(),
             duplicate_descriptor,
-            exact.effective_policy().clone(),
             exact.availability_group().clone(),
             exact.database_lineage().clone(),
             exact.members().to_vec(),
@@ -1307,7 +1125,6 @@ fn bound_constructors_reject_resource_address_policy_and_local_mapping_drift() {
             exact.resource_uid().clone(),
             exact.local_identity().clone(),
             descriptor_without_local,
-            exact.effective_policy().clone(),
             exact.availability_group().clone(),
             exact.database_lineage().clone(),
             exact.members().to_vec(),
@@ -1324,7 +1141,6 @@ async fn bound_service_open_rejects_a_different_runtime_local_identity() {
         resource.clone(),
         exact.local_identity().clone(),
         exact.configuration().clone(),
-        exact.effective_policy().clone(),
         exact.availability_group().clone(),
         exact.database_lineage().clone(),
         exact.members().to_vec(),
@@ -1341,7 +1157,6 @@ async fn bound_service_open_rejects_a_different_runtime_local_identity() {
                 times: Mutex::new(VecDeque::new()),
             }),
             binding.clone(),
-            fixed_authority_source(Some(authority_context_for(&binding))),
         )
         .unwrap(),
     );
@@ -1349,7 +1164,7 @@ async fn bound_service_open_rejects_a_different_runtime_local_identity() {
         service,
         resource,
         kuberic_identity(9),
-        binding.effective_policy().clone(),
+        EffectivePolicy::fixed(3, 30).unwrap(),
     );
     let result = runtime
         .reconstruct(
@@ -1526,161 +1341,37 @@ async fn bound_topology_admits_exact_current_replays_and_reports_fresh_capabilit
 }
 
 #[tokio::test]
-async fn bound_admission_requires_the_exact_runtime_effective_policy() {
+async fn failed_current_admission_does_not_poison_an_exact_retry() {
     let binding = topology_binding();
     let current = bound_replica_set(&binding);
-    let mut policies = Vec::new();
-    let mut changed = binding.effective_policy().clone();
-    changed.replica_set_size = 5;
-    policies.push(changed);
-    let mut changed = binding.effective_policy().clone();
-    changed.write_quorum = 1;
-    policies.push(changed);
-    let mut changed = binding.effective_policy().clone();
-    changed.read_quorum = 1;
-    policies.push(changed);
-    let mut changed = binding.effective_policy().clone();
-    changed.failover_delay_seconds += 1;
-    policies.push(changed);
-
-    for policy in policies {
-        let authority = RuntimeAuthorityContext::new(
-            binding.local_identity().clone(),
-            binding.configuration().clone(),
-            policy,
-        );
-        let replicator = Arc::new(
-            SqlServerReplicator::new_bound(
-                "replica-1.example:5022".into(),
-                Arc::new(ScriptedSource {
-                    config: observer_config(),
-                    samples: Mutex::new(vec![Ok(present(bound_snapshot()))].into()),
-                }),
-                Arc::new(ScriptedClock {
-                    times: Mutex::new(vec![OBSERVED_AT].into()),
-                }),
-                binding.clone(),
-                fixed_authority_source(Some(authority)),
-            )
-            .unwrap(),
-        );
-        replicator.open().await.unwrap();
-        let message = application_error(
-            replicator
-                .update_current_replica_set_configuration(current.clone())
-                .await
-                .unwrap_err(),
-        );
-        assert!(message.contains("effective policy"), "{message}");
+    let mut mismatched = bound_snapshot();
+    if let Observation::Present { value, .. } = &mut mismatched.availability_group {
+        value.configuration_sequence = ConfigurationSequence::parse("43").unwrap();
     }
-}
+    let replicator = opened_bound_replicator(
+        vec![
+            Ok(present(mismatched)),
+            Ok(present(bound_snapshot())),
+            Ok(present(bound_snapshot())),
+        ],
+        vec![OBSERVED_AT; 3],
+    )
+    .await;
 
-#[tokio::test]
-async fn capability_rechecks_the_exact_runtime_effective_policy() {
-    let binding = topology_binding();
-    let current = bound_replica_set(&binding);
-    let authority = Arc::new(FixedAuthorityContextSource {
-        context: Mutex::new(Some(authority_context_for(&binding))),
-    });
-    let replicator = Arc::new(
-        SqlServerReplicator::new_bound(
-            "replica-1.example:5022".into(),
-            Arc::new(ScriptedSource {
-                config: observer_config(),
-                samples: Mutex::new(
-                    vec![
-                        Ok(present(bound_snapshot())),
-                        Ok(present(bound_snapshot())),
-                        Ok(present(bound_snapshot())),
-                    ]
-                    .into(),
-                ),
-            }),
-            Arc::new(ScriptedClock {
-                times: Mutex::new(vec![OBSERVED_AT; 3].into()),
-            }),
-            binding.clone(),
-            authority.clone(),
-        )
-        .unwrap(),
+    let error = replicator
+        .update_current_replica_set_configuration(current.clone())
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("configuration sequence"));
+    assert!(
+        application_error(replicator.catch_up_capability().await.unwrap_err())
+            .contains("not been admitted")
     );
-    replicator.open().await.unwrap();
+
     replicator
         .update_current_replica_set_configuration(current)
         .await
         .unwrap();
-    replicator
-        .change_role(binding.configuration().epoch, ReplicaRole::Primary)
-        .await
-        .unwrap();
-
-    let mut wrong_policy = binding.effective_policy().clone();
-    wrong_policy.failover_delay_seconds += 1;
-    *authority.context.lock().unwrap() = Some(RuntimeAuthorityContext::new(
-        binding.local_identity().clone(),
-        binding.configuration().clone(),
-        wrong_policy,
-    ));
-    let message = application_error(replicator.catch_up_capability().await.unwrap_err());
-    assert!(message.contains("effective policy"), "{message}");
-}
-
-#[test]
-fn pod_runtime_wrong_policy_cannot_admit_or_report_capability() {
-    run_runtime_effect_test(async {
-        let exact = topology_binding();
-        let binding = HealthyTopologyBinding::new(
-            ResourceUid::new("partition-generation-1"),
-            exact.local_identity().clone(),
-            exact.configuration().clone(),
-            exact.effective_policy().clone(),
-            exact.availability_group().clone(),
-            exact.database_lineage().clone(),
-            exact.members().to_vec(),
-        )
-        .unwrap();
-        let wrong_policy = EffectivePolicy::fixed(3, 31).unwrap();
-        let (_directory, store, service, runtime, adapter) = open_effect_runtime(
-            binding.clone(),
-            wrong_policy,
-            Arc::new(ScriptedSource {
-                config: observer_config(),
-                samples: Mutex::new((0..10).map(|_| Ok(present(bound_snapshot()))).collect()),
-            }),
-            Arc::new(ScriptedClock {
-                times: Mutex::new(vec![OBSERVED_AT].into()),
-            }),
-            |store| Arc::new(StoreAuthorityContextSource { store }),
-        )
-        .await;
-        describe_bound_peers(&runtime, &binding).await;
-
-        let error = adapter
-            .execute(runtime_effect(
-                "wrong-policy-admission",
-                2,
-                RuntimeEffectAction::AdmitAuthority(Box::new(admitted_authority(&binding))),
-            ))
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("effective policy"),
-            "wrong PodRuntime policy must reject current admission"
-        );
-
-        assert!(
-            runtime.snapshot().await.authority.is_none(),
-            "failed effect must not publish runtime authority"
-        );
-        let durable = store.load_state().await.unwrap();
-        assert!(durable.current_configuration.is_none());
-        assert!(durable.admitted_policy.is_none());
-        assert!(durable.pending_effect.is_some());
-        assert!(
-            service.replicator().is_none(),
-            "stateful custom-authority failure must close the application"
-        );
-    });
 }
 
 #[test]
@@ -1696,12 +1387,11 @@ fn runtime_adapter_contains_missing_peer_authority_failure_before_persistence() 
         });
         let (_directory, store, _service, runtime, adapter) = open_effect_runtime(
             binding.clone(),
-            binding.effective_policy().clone(),
+            EffectivePolicy::fixed(3, 30).unwrap(),
             source.clone(),
             Arc::new(ScriptedClock {
                 times: Mutex::new(vec![OBSERVED_AT].into()),
             }),
-            |store| Arc::new(StoreAuthorityContextSource { store }),
         )
         .await;
 
@@ -1737,112 +1427,6 @@ fn runtime_adapter_contains_missing_peer_authority_failure_before_persistence() 
         );
         assert!(failed.pending_effect.is_some());
         assert_eq!(source.observations.load(Ordering::SeqCst), 2);
-    });
-}
-
-#[test]
-fn runtime_adapter_admission_rejects_evidence_that_stales_during_authority_lookup() {
-    run_runtime_effect_test(async {
-        let binding = topology_binding();
-        let clock = Arc::new(MutableClock::new(OBSERVED_AT));
-        let (entered_tx, entered_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        let (_directory, store, _service, runtime, adapter) = open_effect_runtime(
-            binding.clone(),
-            binding.effective_policy().clone(),
-            Arc::new(ScriptedSource {
-                config: observer_config(),
-                samples: Mutex::new((0..10).map(|_| Ok(present(bound_snapshot()))).collect()),
-            }),
-            clock.clone(),
-            move |store| {
-                Arc::new(GatedStoreAuthorityContextSource {
-                    store,
-                    lookups: AtomicUsize::new(0),
-                    gate_at: 0,
-                    entered: Mutex::new(Some(entered_tx)),
-                    release: Mutex::new(Some(release_rx)),
-                })
-            },
-        )
-        .await;
-        describe_bound_peers(&runtime, &binding).await;
-
-        let task = tokio::spawn({
-            let adapter = adapter.clone();
-            let authority = admitted_authority(&binding);
-            async move {
-                adapter
-                    .execute(runtime_effect(
-                        "late-stale-admission",
-                        2,
-                        RuntimeEffectAction::AdmitAuthority(Box::new(authority)),
-                    ))
-                    .await
-            }
-        });
-        entered_rx.await.unwrap();
-        clock.set(OBSERVED_AT + MAX_AGE + 1);
-        release_tx.send(()).unwrap();
-        let error = task.await.unwrap().unwrap_err();
-        assert!(error.to_string().contains("stale"), "{error}");
-        assert!(runtime.snapshot().await.authority.is_none());
-        let durable = store.load_state().await.unwrap();
-        assert!(durable.current_configuration.is_none());
-        assert!(durable.admitted_policy.is_none());
-    });
-}
-
-#[test]
-fn capability_rejects_evidence_that_stales_during_authority_lookup() {
-    run_runtime_effect_test(async {
-        let binding = topology_binding();
-        let clock = Arc::new(MutableClock::new(OBSERVED_AT));
-        let (entered_tx, entered_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        let (_directory, _store, service, runtime, adapter) = open_effect_runtime(
-            binding.clone(),
-            binding.effective_policy().clone(),
-            Arc::new(ScriptedSource {
-                config: observer_config(),
-                samples: Mutex::new((0..10).map(|_| Ok(present(bound_snapshot()))).collect()),
-            }),
-            clock.clone(),
-            move |store| {
-                Arc::new(GatedStoreAuthorityContextSource {
-                    store,
-                    lookups: AtomicUsize::new(0),
-                    gate_at: 1,
-                    entered: Mutex::new(Some(entered_tx)),
-                    release: Mutex::new(Some(release_rx)),
-                })
-            },
-        )
-        .await;
-        describe_bound_peers(&runtime, &binding).await;
-        adapter
-            .execute(runtime_effect(
-                "capability-admission",
-                2,
-                RuntimeEffectAction::AdmitAuthority(Box::new(admitted_authority(&binding))),
-            ))
-            .await
-            .unwrap();
-        let replicator = service.replicator().unwrap();
-        replicator
-            .change_role(binding.configuration().epoch, ReplicaRole::Primary)
-            .await
-            .unwrap();
-
-        let task = tokio::spawn({
-            let replicator = replicator.clone();
-            async move { replicator.catch_up_capability().await }
-        });
-        entered_rx.await.unwrap();
-        clock.set(OBSERVED_AT + MAX_AGE + 1);
-        release_tx.send(()).unwrap();
-        let error = task.await.unwrap().unwrap_err();
-        assert!(application_error(error).contains("stale"));
     });
 }
 
@@ -2389,7 +1973,6 @@ async fn supported_bound_callbacks_use_one_fresh_observation_and_no_mutation_int
                 times: Mutex::new(vec![OBSERVED_AT; 4].into()),
             }),
             binding.clone(),
-            fixed_authority_source(Some(authority_context_for(&binding))),
         )
         .unwrap(),
     );

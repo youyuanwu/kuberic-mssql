@@ -6,7 +6,7 @@ use kuberic_runtime::application::{
     OpenContext, RoleChange, StateProvider, StatefulServiceReplica,
 };
 use kuberic_runtime::protocol::types::{
-    ConfigurationDescriptor, EffectivePolicy, Epoch, PartitionId, ProcessSessionId, ReplicaId,
+    ConfigurationDescriptor, Epoch, PartitionId, ProcessSessionId, ReplicaId,
     ReplicaIdentity as KubericReplicaIdentity, ReplicaRole, ResourceUid,
 };
 use kuberic_runtime::replicator::{
@@ -163,44 +163,6 @@ impl<E: SqlExecutor> SqlServerObservationSource for SqlServerInstanceManager<E> 
     async fn observe(&self) -> Result<Observation<InstanceSnapshot>, RuntimeError> {
         SqlServerInstanceManager::observe(self).await
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeAuthorityContext {
-    local_identity: KubericReplicaIdentity,
-    current_configuration: ConfigurationDescriptor,
-    effective_policy: EffectivePolicy,
-}
-
-impl RuntimeAuthorityContext {
-    pub fn new(
-        local_identity: KubericReplicaIdentity,
-        current_configuration: ConfigurationDescriptor,
-        effective_policy: EffectivePolicy,
-    ) -> Self {
-        Self {
-            local_identity,
-            current_configuration,
-            effective_policy,
-        }
-    }
-
-    pub fn local_identity(&self) -> &KubericReplicaIdentity {
-        &self.local_identity
-    }
-
-    pub fn current_configuration(&self) -> &ConfigurationDescriptor {
-        &self.current_configuration
-    }
-
-    pub fn effective_policy(&self) -> &EffectivePolicy {
-        &self.effective_policy
-    }
-}
-
-#[async_trait]
-pub trait RuntimeAuthorityContextSource: Send + Sync {
-    async fn current_authority_context(&self) -> KubericResult<Option<RuntimeAuthorityContext>>;
 }
 
 pub trait ObservationClock: Send + Sync {
@@ -393,7 +355,6 @@ pub struct HealthyTopologyBinding {
     resource_uid: ResourceUid,
     local_identity: KubericReplicaIdentity,
     configuration: ConfigurationDescriptor,
-    effective_policy: EffectivePolicy,
     availability_group: AvailabilityGroupIdentity,
     database_lineage: DatabaseLineage,
     members: Vec<HealthyTopologyMemberBinding>,
@@ -404,7 +365,6 @@ impl HealthyTopologyBinding {
         resource_uid: ResourceUid,
         local_identity: KubericReplicaIdentity,
         configuration: ConfigurationDescriptor,
-        effective_policy: EffectivePolicy,
         availability_group: AvailabilityGroupIdentity,
         database_lineage: DatabaseLineage,
         mut members: Vec<HealthyTopologyMemberBinding>,
@@ -422,9 +382,6 @@ impl HealthyTopologyBinding {
         if configuration.members.len() != usize::from(SUPPORTED_REPLICA_COUNT)
             || members.len() != usize::from(SUPPORTED_REPLICA_COUNT)
             || configuration.write_quorum != 2
-            || effective_policy.replica_set_size != u32::from(SUPPORTED_REPLICA_COUNT)
-            || effective_policy.write_quorum != 2
-            || effective_policy.read_quorum != 2
         {
             return Err(KubericAdapterError::InvalidConfiguration(
                 "bound topology requires exactly three members and quorum two",
@@ -550,7 +507,6 @@ impl HealthyTopologyBinding {
             resource_uid,
             local_identity,
             configuration,
-            effective_policy,
             availability_group,
             database_lineage,
             members,
@@ -567,10 +523,6 @@ impl HealthyTopologyBinding {
 
     pub fn configuration(&self) -> &ConfigurationDescriptor {
         &self.configuration
-    }
-
-    pub fn effective_policy(&self) -> &EffectivePolicy {
-        &self.effective_policy
     }
 
     pub fn availability_group(&self) -> &AvailabilityGroupIdentity {
@@ -635,7 +587,6 @@ pub struct SqlServerService {
     source: Arc<dyn SqlServerObservationSource>,
     clock: Arc<dyn ObservationClock>,
     binding: Mutex<Option<Arc<HealthyTopologyBinding>>>,
-    authority_context: Mutex<Option<Arc<dyn RuntimeAuthorityContextSource>>>,
     open_attempt: tokio::sync::Mutex<()>,
     lifecycle: Mutex<ServiceLifecycle>,
 }
@@ -659,14 +610,12 @@ impl SqlServerService {
         config: SqlServerServiceConfig,
         manager: SqlServerInstanceManager<E>,
         binding: HealthyTopologyBinding,
-        authority_context: Arc<dyn RuntimeAuthorityContextSource>,
     ) -> Result<Self, KubericAdapterError> {
         Self::with_observation_source_and_binding(
             config,
             Arc::new(manager),
             Arc::new(SystemObservationClock),
             binding,
-            authority_context,
         )
     }
 
@@ -675,7 +624,7 @@ impl SqlServerService {
         source: Arc<dyn SqlServerObservationSource>,
         clock: Arc<dyn ObservationClock>,
     ) -> Self {
-        Self::with_optional_binding(config, source, clock, None, None)
+        Self::with_optional_binding(config, source, clock, None)
     }
 
     pub fn with_observation_source_and_binding(
@@ -683,7 +632,6 @@ impl SqlServerService {
         source: Arc<dyn SqlServerObservationSource>,
         clock: Arc<dyn ObservationClock>,
         binding: HealthyTopologyBinding,
-        authority_context: Arc<dyn RuntimeAuthorityContextSource>,
     ) -> Result<Self, KubericAdapterError> {
         if config.resource_uid != binding.resource_uid
             || config.replication_address != binding.local_member().replication_address
@@ -697,7 +645,6 @@ impl SqlServerService {
             source,
             clock,
             Some(Arc::new(binding)),
-            Some(authority_context),
         ))
     }
 
@@ -706,14 +653,12 @@ impl SqlServerService {
         source: Arc<dyn SqlServerObservationSource>,
         clock: Arc<dyn ObservationClock>,
         binding: Option<Arc<HealthyTopologyBinding>>,
-        authority_context: Option<Arc<dyn RuntimeAuthorityContextSource>>,
     ) -> Self {
         Self {
             config,
             source,
             clock,
             binding: Mutex::new(binding),
-            authority_context: Mutex::new(authority_context),
             open_attempt: tokio::sync::Mutex::new(()),
             lifecycle: Mutex::new(ServiceLifecycle::Created),
         }
@@ -722,7 +667,6 @@ impl SqlServerService {
     pub async fn bind_topology(
         &self,
         binding: HealthyTopologyBinding,
-        authority_context: Arc<dyn RuntimeAuthorityContextSource>,
     ) -> Result<(), KubericAdapterError> {
         let _attempt = self.open_attempt.lock().await;
         if self.config.resource_uid != binding.resource_uid
@@ -745,17 +689,12 @@ impl SqlServerService {
             .binding
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut stored_context = self
-            .authority_context
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if stored_binding.is_some() || stored_context.is_some() {
+        if stored_binding.is_some() {
             return Err(KubericAdapterError::InvalidConfiguration(
                 "topology binding is already installed",
             ));
         }
         *stored_binding = Some(Arc::new(binding));
-        *stored_context = Some(authority_context);
         drop(lifecycle);
         Ok(())
     }
@@ -807,10 +746,6 @@ impl StatefulServiceReplica for SqlServerService {
             )
             .with_optional_binding(
                 self.binding
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone(),
-                self.authority_context
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone(),
@@ -937,7 +872,6 @@ pub struct SqlServerReplicator {
     source: Arc<dyn SqlServerObservationSource>,
     clock: Arc<dyn ObservationClock>,
     binding: Option<Arc<HealthyTopologyBinding>>,
-    authority_context: Option<Arc<dyn RuntimeAuthorityContextSource>>,
     lifecycle: RwLock<ReplicatorLifecycle>,
     role: Mutex<Option<ReplicaRole>>,
     epoch: Mutex<Option<Epoch>>,
@@ -956,7 +890,7 @@ impl SqlServerReplicator {
         source: Arc<dyn SqlServerObservationSource>,
         clock: Arc<dyn ObservationClock>,
     ) -> Self {
-        Self::with_parts(replication_address, source, clock, None, None)
+        Self::with_parts(replication_address, source, clock, None)
     }
 
     pub fn new_bound(
@@ -964,7 +898,6 @@ impl SqlServerReplicator {
         source: Arc<dyn SqlServerObservationSource>,
         clock: Arc<dyn ObservationClock>,
         binding: HealthyTopologyBinding,
-        authority_context: Arc<dyn RuntimeAuthorityContextSource>,
     ) -> Result<Self, KubericAdapterError> {
         if replication_address != binding.local_member().replication_address {
             return Err(KubericAdapterError::InvalidConfiguration(
@@ -976,17 +909,11 @@ impl SqlServerReplicator {
             source,
             clock,
             Some(Arc::new(binding)),
-            Some(authority_context),
         ))
     }
 
-    fn with_optional_binding(
-        mut self,
-        binding: Option<Arc<HealthyTopologyBinding>>,
-        authority_context: Option<Arc<dyn RuntimeAuthorityContextSource>>,
-    ) -> Self {
+    fn with_optional_binding(mut self, binding: Option<Arc<HealthyTopologyBinding>>) -> Self {
         self.binding = binding;
-        self.authority_context = authority_context;
         self
     }
 
@@ -995,14 +922,12 @@ impl SqlServerReplicator {
         source: Arc<dyn SqlServerObservationSource>,
         clock: Arc<dyn ObservationClock>,
         binding: Option<Arc<HealthyTopologyBinding>>,
-        authority_context: Option<Arc<dyn RuntimeAuthorityContextSource>>,
     ) -> Self {
         Self {
             replication_address,
             source,
             clock,
             binding,
-            authority_context,
             lifecycle: RwLock::new(ReplicatorLifecycle {
                 state: CREATED,
                 generation: 0,
@@ -1138,19 +1063,6 @@ impl SqlServerReplicator {
             return Err(KubericAdapterError::ObservationStale);
         }
         Ok(())
-    }
-
-    async fn runtime_authority_context(
-        &self,
-        generation: u64,
-    ) -> KubericResult<RuntimeAuthorityContext> {
-        let source = self
-            .authority_context
-            .as_ref()
-            .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
-        let context = source.current_authority_context().await?;
-        drop(self.finish_operation(generation)?);
-        context.ok_or_else(|| KubericAdapterError::TopologyNotAdmitted.into())
     }
 
     async fn validate_and_set_role(&self, role: ReplicaRole) -> KubericResult<()> {
@@ -1300,7 +1212,6 @@ impl Replicator for SqlServerReplicator {
         }
         let (group, observed_at) = self.observed_group(generation, true, None).await?;
         let value = group.configuration_sequence.value();
-        let authority = self.runtime_authority_context(generation).await?;
         self.ensure_observation_fresh(observed_at)?;
         let _lifecycle = self.finish_operation(generation)?;
         let admitted = self
@@ -1310,7 +1221,7 @@ impl Replicator for SqlServerReplicator {
         let Some(current) = admitted.as_ref() else {
             return Err(KubericAdapterError::TopologyNotAdmitted.into());
         };
-        validate_runtime_authority(binding, current, &authority)?;
+        validate_current_configuration(binding, current)?;
         if *self
             .role
             .lock()
@@ -1354,11 +1265,9 @@ impl PrimaryReplicator for SqlServerReplicator {
         };
         let generation = self.begin_operation()?;
         let (_, observed_at) = self.observed_group(generation, false, None).await?;
-        let authority = self.runtime_authority_context(generation).await?;
         self.ensure_observation_fresh(observed_at)?;
         let _lifecycle = self.finish_operation(generation)?;
         validate_current_configuration(binding, &current)?;
-        validate_runtime_authority(binding, &current, &authority)?;
         let mut admitted = self
             .admitted_configuration
             .lock()
@@ -1434,31 +1343,6 @@ fn validate_current_configuration(
                 "current replica session, address, or role differs from the frozen member",
             ));
         }
-    }
-    Ok(())
-}
-
-fn validate_runtime_authority(
-    binding: &HealthyTopologyBinding,
-    current: &ReplicaSetConfiguration,
-    authority: &RuntimeAuthorityContext,
-) -> Result<(), KubericAdapterError> {
-    if authority.local_identity != binding.local_identity {
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "runtime authority local identity differs from the frozen local member",
-        ));
-    }
-    if authority.current_configuration != binding.configuration
-        || authority.current_configuration != current.configuration
-    {
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "runtime admitted descriptor differs from the exact current descriptor",
-        ));
-    }
-    if authority.effective_policy != binding.effective_policy {
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "runtime admitted effective policy differs from the frozen policy",
-        ));
     }
     Ok(())
 }
