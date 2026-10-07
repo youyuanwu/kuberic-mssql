@@ -745,7 +745,8 @@ class FixtureTests(unittest.TestCase):
             self.assertIn("--all-features", shared)
             self.assertIn("--tests", shared)
             self.assertNotIn("--test", shared)
-            self.assertNotIn("--skip", shared)
+            self.assertIn("--skip", shared)
+            self.assertIn("three_replica_", shared)
             ordinary = fixture.live_test_command(include_ag=False, include_kuberic=False)
             self.assertNotIn("--all-features", ordinary)
             self.assertIn(

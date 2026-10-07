@@ -2130,7 +2130,7 @@ mod tests {
             let sources: [Source; 3] = std::array::from_fn(|index| {
                 Arc::new(DelayedSource {
                     inner: source(&run, index, now),
-                    delay: Duration::from_millis(200),
+                    delay: Duration::from_millis(50),
                 }) as Source
             });
             let group = MssqlGroup::assemble(
