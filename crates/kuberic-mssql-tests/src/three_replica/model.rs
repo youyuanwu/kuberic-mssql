@@ -88,6 +88,17 @@ pub enum IncarnationError {
     SqlRestarted,
 }
 
+impl fmt::Display for IncarnationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ContainerReplaced => "container identity changed",
+            Self::SqlRestarted => "SQL Server start identity changed",
+        })
+    }
+}
+
+impl Error for IncarnationError {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeTopologyBinding {
@@ -276,6 +287,15 @@ impl SanitizedFailure {
             category,
             detail: Some(detail.into()),
         }
+    }
+
+    pub fn with_context(mut self, context: impl Into<String>) -> Self {
+        let context = context.into();
+        self.detail = Some(match self.detail.take() {
+            Some(detail) => format!("{context}: {detail}"),
+            None => context,
+        });
+        self
     }
 }
 

@@ -42,15 +42,27 @@ impl fmt::Display for DataError {
         formatter.write_str(match self {
             Self::Deadline => "replicated marker deadline exceeded",
             Self::Random => "replicated marker nonce generation failed",
-            Self::Secret(_) => "replicated marker credential changed",
-            Self::Admin(_) => "replicated marker SQL operation failed",
+            Self::Secret(error) => {
+                return write!(formatter, "replicated marker credential changed: {error}");
+            }
+            Self::Admin(error) => {
+                return write!(formatter, "replicated marker SQL operation failed: {error}");
+            }
             Self::WrongDatabase => "direct member connection selected the wrong database",
             Self::MarkerMismatch => "replicated marker did not converge on all members",
         })
     }
 }
 
-impl std::error::Error for DataError {}
+impl std::error::Error for DataError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Secret(error) => Some(error),
+            Self::Admin(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 pub(crate) struct DataContext<'a> {
     pub run: &'a TopologyRun,

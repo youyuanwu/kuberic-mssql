@@ -41,22 +41,26 @@ pub trait CleanupClock {
     fn now(&self) -> Duration;
 }
 
-pub(crate) struct OperationBudget<'a, C> {
+pub struct OperationBudget<'a, C> {
     clock: &'a C,
     deadline: Duration,
 }
 
 impl<'a, C: CleanupClock> OperationBudget<'a, C> {
-    pub(crate) fn new(clock: &'a C, budget: Duration) -> Self {
+    pub fn new(clock: &'a C, budget: Duration) -> Self {
         Self {
             clock,
             deadline: clock.now().saturating_add(budget),
         }
     }
 
-    pub(crate) fn remaining(&self) -> Option<Duration> {
+    pub fn remaining(&self) -> Option<Duration> {
         let remaining = self.deadline.saturating_sub(self.clock.now());
         (!remaining.is_zero()).then_some(remaining)
+    }
+
+    pub fn limit(&self, local: Duration) -> Option<Duration> {
+        self.remaining().map(|remaining| remaining.min(local))
     }
 }
 
@@ -141,6 +145,10 @@ impl<C: CleanupClock> CleanupCoordinator<C> {
     pub fn remaining(&self) -> Duration {
         self.budget
             .saturating_sub(self.clock.now().saturating_sub(self.started_at))
+    }
+
+    pub fn clock(&self) -> &C {
+        &self.clock
     }
 
     pub fn cleanup(
@@ -409,7 +417,12 @@ pub fn combine_with_cleanup<T>(
     let cleanup_failures = cleanup
         .errors
         .iter()
-        .map(|error| error.failure.clone())
+        .map(|error| {
+            error
+                .failure
+                .clone()
+                .with_context(format!("resource {}", error.resource))
+        })
         .collect::<Vec<_>>();
     match primary {
         Ok(value) if cleanup.succeeded() => Ok(value),

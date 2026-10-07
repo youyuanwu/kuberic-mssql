@@ -59,7 +59,8 @@ pub use ownership::{
     AclController, AclEvidence, CommandAclController, DirectoryBinding, JournalStore, LockError,
     MemberDirectoryError, OwnershipInspector, ReconcileError, ReconcileReport, ResourceObservation,
     RootLock, acquire_root_lock, inspect_member_directory, parse_acl_evidence,
-    prepare_member_directory, reconcile, verify_member_directory,
+    prepare_member_directory, prepare_member_directory_with_clock, reconcile,
+    verify_member_directory,
 };
 pub use preflight::{
     AclProbe, CommandAclProbe, HostPlatform, HostProbe, LocalHostProbe, PreflightError,

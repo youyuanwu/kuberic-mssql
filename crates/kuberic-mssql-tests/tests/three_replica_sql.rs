@@ -10,12 +10,12 @@ use kuberic_mssql_tests::three_replica::{
     BoundedProcessRunner, ChildDisposition, CommandSpec, ContainerInspection, ContainerLimits,
     ContainerMount, ContainerPort, ContainerRequest, DataError, DatabaseEvidence, DockerApi,
     DockerCli, DockerError, EndpointEvidence, EnvironmentVariable, EvidenceError, IncarnationError,
-    KubericMember, LoginFiles, MemberEvidence, MemberReadinessEvidence, OwnedLabels, PrivateFile,
-    ProcessError, ProcessResult, ProcessRunner, ReadyMember, ReplicaProfileEvidence,
-    ResourcePolicy, SQL_SERVER_UID, SecretValue, SeedingEvidence, SqlMember, SqlMemberIncarnation,
-    SqlServerContainerSpec, TlsAssets, TopologyRun, validate_binding_incarnations,
-    validate_endpoint_evidence, validate_marker_observations, validate_native_evidence,
-    validated_identifier,
+    KubericMember, LoginFiles, MemberEvidence, MemberReadinessEvidence, NativeLaunchError,
+    NativePhaseError, OwnedLabels, PrivateFile, ProcessError, ProcessResult, ProcessRunner,
+    ReadyMember, ReplicaProfileEvidence, ResourcePolicy, SQL_SERVER_UID, SecretError, SecretValue,
+    SeedingEvidence, SqlMember, SqlMemberIncarnation, SqlServerContainerSpec, TlsAssets, TlsError,
+    TopologyRun, validate_binding_incarnations, validate_endpoint_evidence,
+    validate_marker_observations, validate_native_evidence, validated_identifier,
 };
 
 #[derive(Default)]
@@ -293,6 +293,36 @@ fn readiness_rejects_wrong_identity_version_edition_hadr_and_start() {
     ];
     for (evidence, expected) in cases {
         assert_eq!(evidence.verify("km0123456789n1").unwrap_err(), expected);
+    }
+}
+
+#[test]
+fn lifecycle_diagnostics_preserve_safe_typed_causes() {
+    let wrong_identity = NativePhaseError::AvailabilityGroup(AvailabilityGroupError::Admin(
+        AdminError::WrongIdentity,
+    ));
+    let deadline = NativePhaseError::AvailabilityGroup(AvailabilityGroupError::Admin(
+        AdminError::QueryDeadline,
+    ));
+    assert!(
+        wrong_identity
+            .to_string()
+            .contains("identity does not match")
+    );
+    assert!(deadline.to_string().contains("SQL deadline exceeded"));
+    assert_ne!(wrong_identity.to_string(), deadline.to_string());
+    assert!(std::error::Error::source(&wrong_identity).is_some());
+
+    let docker = NativeLaunchError::Docker(DockerError::OwnershipMismatch);
+    let tls = NativeLaunchError::Tls(TlsError::Secret(SecretError::Replaced));
+    assert!(docker.to_string().contains("ownership does not match"));
+    assert!(tls.to_string().contains("private file identity changed"));
+    assert!(std::error::Error::source(&docker).is_some());
+    assert!(std::error::Error::source(&tls).is_some());
+    for rendered in [docker.to_string(), tls.to_string()] {
+        assert!(!rendered.contains("SELECT"));
+        assert!(!rendered.contains("Password"));
+        assert!(!rendered.contains("ACCEPT_EULA"));
     }
 }
 

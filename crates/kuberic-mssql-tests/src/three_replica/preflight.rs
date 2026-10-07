@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use super::cleanup::{CleanupClock, OperationBudget, SystemCleanupClock};
 use super::config::FixtureConfig;
 use super::docker::{DockerApi, DockerCapabilities, ImageInspection, SQL_SERVER_UID};
 use super::process::{CommandSpec, ProcessRunner};
@@ -345,19 +346,27 @@ impl<R> CommandAclProbe<R> {
     pub fn new(runner: R) -> Self {
         Self { runner }
     }
-}
 
-impl<R: ProcessRunner> AclProbe for CommandAclProbe<R> {
-    fn verify(
+    pub fn runner(&self) -> &R {
+        &self.runner
+    }
+
+    pub fn verify_with_clock(
         &self,
         filesystem_path: &Path,
         host_uid: u32,
         sql_uid: u32,
         timeout: Duration,
-    ) -> Result<(), PreflightError> {
+        clock: &impl CleanupClock,
+    ) -> Result<(), PreflightError>
+    where
+        R: ProcessRunner,
+    {
+        let budget = OperationBudget::new(clock, timeout);
+        let limit = || budget.limit(timeout).ok_or(PreflightError::Deadline);
         for tool in ["setfacl", "getfacl"] {
             self.runner
-                .run(&CommandSpec::new(tool, "verify ACL helper", timeout).arg("--version"))
+                .run(&CommandSpec::new(tool, "verify ACL helper", limit()?).arg("--version"))
                 .map_err(|_| PreflightError::AclTools)?;
         }
         let parent = existing_ancestor(filesystem_path)?;
@@ -375,7 +384,7 @@ impl<R: ProcessRunner> AclProbe for CommandAclProbe<R> {
         let result = (|| {
             self.runner
                 .run(
-                    &CommandSpec::new("setfacl", "configure ACL probe", timeout)
+                    &CommandSpec::new("setfacl", "configure ACL probe", limit()?)
                         .args(["-m", &acl])
                         .arg(&probe),
                 )
@@ -386,7 +395,7 @@ impl<R: ProcessRunner> AclProbe for CommandAclProbe<R> {
             let output = self
                 .runner
                 .run(
-                    &CommandSpec::new("getfacl", "inspect ACL probe", timeout)
+                    &CommandSpec::new("getfacl", "inspect ACL probe", limit()?)
                         .args(["--absolute-names", "--numeric"])
                         .arg(&nested),
                 )
@@ -406,14 +415,14 @@ os.close(fd)
 "#;
             self.runner
                 .run(
-                    &CommandSpec::new("sudo", "verify SQL UID privilege", timeout)
+                    &CommandSpec::new("sudo", "verify SQL UID privilege", limit()?)
                         .args(["-n", "python3", "-c", UID_PROBE])
                         .arg(&probe),
                 )
                 .map_err(|_| PreflightError::Privilege)?;
             self.runner
                 .run(
-                    &CommandSpec::new("sudo", "verify cleanup ACL privilege", timeout)
+                    &CommandSpec::new("sudo", "verify cleanup ACL privilege", limit()?)
                         .args([
                             "-n",
                             "setfacl",
@@ -435,6 +444,24 @@ os.close(fd)
             let _ = fs::remove_dir_all(&probe);
         }
         result
+    }
+}
+
+impl<R: ProcessRunner> AclProbe for CommandAclProbe<R> {
+    fn verify(
+        &self,
+        filesystem_path: &Path,
+        host_uid: u32,
+        sql_uid: u32,
+        timeout: Duration,
+    ) -> Result<(), PreflightError> {
+        self.verify_with_clock(
+            filesystem_path,
+            host_uid,
+            sql_uid,
+            timeout,
+            &SystemCleanupClock::default(),
+        )
     }
 }
 

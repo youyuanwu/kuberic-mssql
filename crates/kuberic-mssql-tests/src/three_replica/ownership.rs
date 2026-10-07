@@ -15,6 +15,7 @@ use std::time::SystemTime;
 use rustix::fs::{FlockOperation, flock};
 use sha2::{Digest, Sha256};
 
+use super::cleanup::{CleanupClock, OperationBudget, SystemCleanupClock};
 use super::model::{
     JournalError, OwnershipJournal, ResourceBinding, ResourceRecord, ResourceState, RunState,
     TopologyRun,
@@ -556,20 +557,52 @@ pub fn prepare_member_directory(
     timeout: Duration,
     acl: &impl AclController,
 ) -> Result<DirectoryBinding, MemberDirectoryError> {
+    prepare_member_directory_with_clock(
+        root,
+        path,
+        host_uid,
+        sql_uid,
+        timeout,
+        acl,
+        &SystemCleanupClock::default(),
+    )
+}
+
+pub fn prepare_member_directory_with_clock(
+    root: &Path,
+    path: &Path,
+    host_uid: u32,
+    sql_uid: u32,
+    timeout: Duration,
+    acl: &impl AclController,
+    clock: &impl CleanupClock,
+) -> Result<DirectoryBinding, MemberDirectoryError> {
+    let budget = OperationBudget::new(clock, timeout);
+    budget.remaining().ok_or(MemberDirectoryError::Io)?;
     let canonical_root = root.canonicalize().map_err(|_| MemberDirectoryError::Io)?;
+    budget.remaining().ok_or(MemberDirectoryError::Io)?;
     verify_private_root(&canonical_root)?;
+    budget.remaining().ok_or(MemberDirectoryError::Io)?;
     if path.parent() != Some(canonical_root.as_path()) || path.exists() {
         return Err(MemberDirectoryError::Escape);
     }
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
+    budget.remaining().ok_or(MemberDirectoryError::Io)?;
     builder.create(path).map_err(|_| MemberDirectoryError::Io)?;
     let result = (|| {
+        budget.remaining().ok_or(MemberDirectoryError::Io)?;
         let canonical_path = path.canonicalize().map_err(|_| MemberDirectoryError::Io)?;
         if !canonical_path.starts_with(&canonical_root) || canonical_path == canonical_root {
             return Err(MemberDirectoryError::Escape);
         }
-        acl.apply(&canonical_path, host_uid, sql_uid, timeout)?;
+        acl.apply(
+            &canonical_path,
+            host_uid,
+            sql_uid,
+            budget.remaining().ok_or(MemberDirectoryError::Io)?,
+        )?;
+        budget.remaining().ok_or(MemberDirectoryError::Io)?;
         let metadata =
             fs::symlink_metadata(&canonical_path).map_err(|_| MemberDirectoryError::Io)?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -580,6 +613,7 @@ pub fn prepare_member_directory(
         }
         let marker_path = canonical_path.join(DIRECTORY_MARKER);
         let marker_value = directory_marker_value(&canonical_path);
+        budget.remaining().ok_or(MemberDirectoryError::Io)?;
         let mut marker = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -587,11 +621,13 @@ pub fn prepare_member_directory(
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(&marker_path)
             .map_err(|_| MemberDirectoryError::Io)?;
+        budget.remaining().ok_or(MemberDirectoryError::Io)?;
         marker
             .write_all(marker_value.as_bytes())
             .map_err(|_| MemberDirectoryError::Io)?;
+        budget.remaining().ok_or(MemberDirectoryError::Io)?;
         marker.sync_all().map_err(|_| MemberDirectoryError::Io)?;
-        directory_binding(&canonical_path, host_uid, sql_uid, timeout, acl)
+        directory_binding_with_budget(&canonical_path, host_uid, sql_uid, timeout, acl, &budget)
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(path);
@@ -743,21 +779,44 @@ fn directory_binding(
     timeout: Duration,
     acl: &impl AclController,
 ) -> Result<DirectoryBinding, MemberDirectoryError> {
+    let clock = SystemCleanupClock::default();
+    let budget = OperationBudget::new(&clock, timeout);
+    directory_binding_with_budget(canonical_path, host_uid, sql_uid, timeout, acl, &budget)
+}
+
+fn directory_binding_with_budget(
+    canonical_path: &Path,
+    host_uid: u32,
+    sql_uid: u32,
+    local_timeout: Duration,
+    acl: &impl AclController,
+    budget: &OperationBudget<'_, impl CleanupClock>,
+) -> Result<DirectoryBinding, MemberDirectoryError> {
+    budget.remaining().ok_or(MemberDirectoryError::Io)?;
     let metadata =
         fs::symlink_metadata(canonical_path).map_err(|_| MemberDirectoryError::Replaced)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != host_uid {
         return Err(MemberDirectoryError::Replaced);
     }
-    let evidence = acl.inspect(canonical_path, host_uid, sql_uid, timeout)?;
+    let evidence = acl.inspect(
+        canonical_path,
+        host_uid,
+        sql_uid,
+        budget
+            .limit(local_timeout)
+            .ok_or(MemberDirectoryError::Io)?,
+    )?;
     if !evidence.complete() {
         return Err(MemberDirectoryError::Acl);
     }
     let marker_path = canonical_path.join(DIRECTORY_MARKER);
+    budget.remaining().ok_or(MemberDirectoryError::Io)?;
     let marker_metadata =
         fs::symlink_metadata(&marker_path).map_err(|_| MemberDirectoryError::Replaced)?;
     if !marker_metadata.is_file() || marker_metadata.file_type().is_symlink() {
         return Err(MemberDirectoryError::Replaced);
     }
+    budget.remaining().ok_or(MemberDirectoryError::Io)?;
     let marker = fs::read(&marker_path).map_err(|_| MemberDirectoryError::Replaced)?;
     let marker_sha256 = hex(&Sha256::digest(&marker));
     let mut digest = Sha256::new();

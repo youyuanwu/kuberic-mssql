@@ -88,6 +88,21 @@ impl LaunchedMembers {
         self.context.cleanup_exact()
     }
 
+    pub fn cleanup_with_coordinator<C: CleanupClock + Clone>(
+        mut self,
+        coordinator: &CleanupCoordinator<C>,
+    ) -> Result<CleanupEvidence, CombinedFixtureError> {
+        self.context.cleanup_exact_with_coordinator(coordinator)
+    }
+
+    pub fn block_cleanup(&mut self) -> Result<(), NativeLaunchError> {
+        self.context.journal.state = RunState::Blocked;
+        self.context
+            .store
+            .save(&self.context.journal)
+            .map_err(|_| NativeLaunchError::Journal)
+    }
+
     pub async fn provision_native_topology(&mut self) -> Result<NativeDataProof, NativePhaseError> {
         let topology = self.provision_availability_group().await?;
         let marker = self
@@ -184,7 +199,15 @@ impl fmt::Display for NativePhaseError {
     }
 }
 
-impl std::error::Error for NativePhaseError {}
+impl std::error::Error for NativePhaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AvailabilityGroup(error) => Some(error),
+            Self::Data(error) => Some(error),
+            Self::Unavailable => None,
+        }
+    }
+}
 
 pub async fn launch_three_members(
     config: FixtureConfig,
@@ -1303,11 +1326,18 @@ impl LaunchContext {
     fn cleanup_report(&mut self) -> CleanupReport {
         let clock = SystemCleanupClock::default();
         let coordinator = CleanupCoordinator::new(clock.clone(), CLEANUP_BUDGET);
+        self.cleanup_report_with_coordinator(&coordinator)
+    }
+
+    fn cleanup_report_with_coordinator<C: CleanupClock + Clone>(
+        &mut self,
+        coordinator: &CleanupCoordinator<C>,
+    ) -> CleanupReport {
         let backend = NativeCleanupBackend {
             root: self.store.root(),
             docker: &self.docker,
             runner: &self.runner,
-            clock,
+            clock: coordinator.clock().clone(),
             image_id: &self.image_id,
             network: self.network.as_ref(),
             containers: &self.containers,
@@ -1316,6 +1346,14 @@ impl LaunchContext {
     }
 
     fn cleanup_exact(&mut self) -> Result<CleanupEvidence, CombinedFixtureError> {
+        let coordinator = CleanupCoordinator::default();
+        self.cleanup_exact_with_coordinator(&coordinator)
+    }
+
+    fn cleanup_exact_with_coordinator<C: CleanupClock + Clone>(
+        &mut self,
+        coordinator: &CleanupCoordinator<C>,
+    ) -> Result<CleanupEvidence, CombinedFixtureError> {
         let removed_container_ids = self
             .containers
             .iter()
@@ -1331,7 +1369,7 @@ impl LaunchContext {
             removed_network_id,
             journal_path: self.store.path().to_path_buf(),
         };
-        let report = self.cleanup_report();
+        let report = self.cleanup_report_with_coordinator(coordinator);
         combine_with_cleanup(Ok(evidence), &report)
     }
 }
@@ -1985,10 +2023,27 @@ impl fmt::Display for NativeLaunchError {
             }
             Self::Journal => "three-replica ownership journal failed",
             Self::DataDirectory => "three-replica member data directory failed",
-            Self::Secret(_) => "three-replica private credential operation failed",
-            Self::Tls(_) => "three-replica TLS asset operation failed",
-            Self::Docker(_) => "three-replica Docker operation failed",
-            Self::Admin(_) => "three-replica SQL administration failed",
+            Self::Secret(error) => {
+                return write!(
+                    formatter,
+                    "three-replica private credential operation failed: {error}"
+                );
+            }
+            Self::Tls(error) => {
+                return write!(
+                    formatter,
+                    "three-replica TLS asset operation failed: {error}"
+                );
+            }
+            Self::Docker(error) => {
+                return write!(formatter, "three-replica Docker operation failed: {error}");
+            }
+            Self::Admin(error) => {
+                return write!(
+                    formatter,
+                    "three-replica SQL administration failed: {error}"
+                );
+            }
             Self::Ownership => "three-replica resource ownership verification failed",
             Self::Readiness => "three-replica SQL readiness failed",
             Self::Deadline => "three-replica setup deadline exceeded",
@@ -1998,7 +2053,18 @@ impl fmt::Display for NativeLaunchError {
     }
 }
 
-impl std::error::Error for NativeLaunchError {}
+impl std::error::Error for NativeLaunchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Preflight(error) => Some(error),
+            Self::Secret(error) => Some(error),
+            Self::Tls(error) => Some(error),
+            Self::Docker(error) => Some(error),
+            Self::Admin(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl NativeLaunchError {
     fn sanitized(&self) -> SanitizedFailure {

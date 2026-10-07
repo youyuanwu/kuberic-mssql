@@ -6,11 +6,11 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use kuberic_mssql_tests::three_replica::{
-    ACKNOWLEDGEMENT_SCHEMA_VERSION, CombinedFixtureError, FailureCategory, FailureStage,
-    FixtureConfig, FixtureConfigError, JOURNAL_SCHEMA_VERSION, JournalError, KubericMember,
-    LaunchAuthorization, OwnershipJournal, PINNED_SQL_SERVER_IMAGE, ResourceBinding, ResourceKind,
-    ResourcePolicy, ResourceRecord, ResourceState, RunState, SanitizedFailure, SqlMember,
-    StageDeadlines, TopologyRun,
+    ACKNOWLEDGEMENT_SCHEMA_VERSION, CleanupError, CleanupReport, CombinedFixtureError,
+    FailureCategory, FailureStage, FixtureConfig, FixtureConfigError, JOURNAL_SCHEMA_VERSION,
+    JournalError, KubericMember, LaunchAuthorization, OwnershipJournal, PINNED_SQL_SERVER_IMAGE,
+    ResourceBinding, ResourceKind, ResourcePolicy, ResourceRecord, ResourceState, RunState,
+    SanitizedFailure, SqlMember, StageDeadlines, TopologyRun, combine_with_cleanup,
 };
 
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
@@ -381,4 +381,29 @@ fn binding_survives_cleaning_and_combined_errors_are_sanitized() {
         error.to_string(),
         "setup: container creation failed; cleanup: container removal failed"
     );
+}
+
+#[test]
+fn combined_cleanup_diagnostics_include_the_logical_resource_name() {
+    let report = CleanupReport {
+        removed: Vec::new(),
+        unresolved: vec!["member-data-2".to_owned()],
+        errors: vec![CleanupError {
+            resource: "member-data-2".to_owned(),
+            failure: SanitizedFailure::new(
+                FailureStage::Cleanup,
+                FailureCategory::OwnershipMismatch,
+            ),
+        }],
+    };
+    let error = combine_with_cleanup::<()>(
+        Err(SanitizedFailure::new(
+            FailureStage::Setup,
+            FailureCategory::ContainerCreation,
+        )),
+        &report,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("resource member-data-2"));
+    assert!(!error.to_string().contains("Password"));
 }

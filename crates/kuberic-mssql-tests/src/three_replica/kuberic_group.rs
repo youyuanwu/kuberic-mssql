@@ -4,11 +4,13 @@ use std::fs;
 use std::future::Future;
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use kuberic_mssql::instance::SqlServerInstanceManager;
 use kuberic_mssql::kuberic::{
     HealthyTopologyBinding, HealthyTopologyMemberBinding, ObservationClock,
@@ -40,6 +42,7 @@ use kuberic_runtime::testing::sqlite_store::SqliteStore;
 use kuberic_runtime::testing::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
 use tonic::Request;
 
+use super::cleanup::{CLEANUP_BUDGET, CleanupClock, CleanupCoordinator};
 use super::deadline::{BoundedOperationError, complete_before};
 use super::member::ReadyMember;
 use super::model::{NativeTopologyBinding, TopologyRun};
@@ -147,11 +150,11 @@ impl ConvergenceBudget {
             })
     }
 
-    fn cleanup_budget() -> Result<Self, MssqlGroupError> {
-        Self::new(
-            Duration::from_secs(180),
-            StdInstant::now() + Duration::from_secs(180),
-        )
+    fn cleanup_budget(
+        coordinator: &CleanupCoordinator<impl CleanupClock>,
+    ) -> Result<Self, MssqlGroupError> {
+        let remaining = coordinator.remaining();
+        Self::new(remaining.min(CLEANUP_BUDGET), StdInstant::now() + remaining)
     }
 }
 
@@ -353,6 +356,28 @@ impl MssqlGroup {
         convergence_timeout: Duration,
         complete_deadline: StdInstant,
     ) -> Result<Self, MssqlGroupError> {
+        let cleanup = CleanupCoordinator::default();
+        Self::from_live_with_coordinator(
+            root,
+            run,
+            native_binding,
+            members,
+            convergence_timeout,
+            complete_deadline,
+            &cleanup,
+        )
+        .await
+    }
+
+    pub async fn from_live_with_coordinator(
+        root: &Path,
+        run: &TopologyRun,
+        native_binding: &NativeTopologyBinding,
+        members: &[ReadyMember; 3],
+        convergence_timeout: Duration,
+        complete_deadline: StdInstant,
+        cleanup: &CleanupCoordinator<impl CleanupClock>,
+    ) -> Result<Self, MssqlGroupError> {
         let budget = ConvergenceBudget::new(convergence_timeout, complete_deadline)?;
         let mut sources = Vec::with_capacity(3);
         for member in members {
@@ -379,6 +404,7 @@ impl MssqlGroup {
             std::array::from_fn(|_| Arc::new(SystemObservationClock) as Clock),
             std::array::from_fn(|_| exact_policy()),
             budget,
+            cleanup,
         )
         .await
     }
@@ -393,6 +419,7 @@ impl MssqlGroup {
         complete_deadline: StdInstant,
     ) -> Result<Self, MssqlGroupError> {
         let budget = ConvergenceBudget::new(convergence_timeout, complete_deadline)?;
+        let cleanup = CleanupCoordinator::default();
         Self::assemble_with_store_policies(
             root,
             run,
@@ -401,10 +428,12 @@ impl MssqlGroup {
             clocks,
             std::array::from_fn(|_| exact_policy()),
             budget,
+            &cleanup,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn assemble_with_store_policies(
         root: &Path,
         run: &TopologyRun,
@@ -413,6 +442,7 @@ impl MssqlGroup {
         clocks: [Clock; 3],
         store_policies: [EffectivePolicy; 3],
         budget: ConvergenceBudget,
+        cleanup: &CleanupCoordinator<impl CleanupClock>,
     ) -> Result<Self, MssqlGroupError> {
         validate_run_binding(run, native_binding)?;
         budget.check("Kuberic topology assembly")?;
@@ -524,127 +554,148 @@ impl MssqlGroup {
             .try_into()
             .map_err(|_| MssqlGroupError::new("exactly three Kuberic pods required"))?;
 
-        let initial = observe_sources(&pods, budget).await?;
-        let members = build_member_bindings(run, native_binding, &pods, &initial, &roles)?;
-        let availability_group = availability_group_identity(native_binding)?;
-        let database_lineage = database_lineage(native_binding)?;
-        let mut topology_bindings = Vec::with_capacity(3);
-        for pod in &pods {
-            let binding = HealthyTopologyBinding::new(
-                resource_uid.clone(),
-                pod.identity.clone(),
-                configuration.clone(),
-                effective_policy.clone(),
-                availability_group.clone(),
-                database_lineage.clone(),
-                members.clone(),
-            )
-            .map_err(display_error)?;
-            topology_bindings.push(binding.clone());
-            budget
-                .run(
-                    "healthy topology binding",
-                    budget.operation_timeout,
-                    pod.application.bind_topology(
-                        binding,
-                        Arc::new(StoreAuthorityContextSource {
-                            store: pod.store.clone(),
-                        }),
-                    ),
+        let initialization = AssertUnwindSafe(async {
+            let initial = observe_sources(&pods, budget).await?;
+            let members = build_member_bindings(run, native_binding, &pods, &initial, &roles)?;
+            let availability_group = availability_group_identity(native_binding)?;
+            let database_lineage = database_lineage(native_binding)?;
+            let mut topology_bindings = Vec::with_capacity(3);
+            for pod in &pods {
+                let binding = HealthyTopologyBinding::new(
+                    resource_uid.clone(),
+                    pod.identity.clone(),
+                    configuration.clone(),
+                    effective_policy.clone(),
+                    availability_group.clone(),
+                    database_lineage.clone(),
+                    members.clone(),
                 )
-                .await?
                 .map_err(display_error)?;
-        }
-        let topology_bindings: [HealthyTopologyBinding; 3] = topology_bindings
-            .try_into()
-            .map_err(|_| MssqlGroupError::new("exactly three topology bindings required"))?;
-
-        for pod in &pods {
-            pod.effect(RuntimeEffectAction::Open(OpenMode::New), budget)
-                .await?;
-        }
-        for source_index in 0..3 {
-            for target_index in 0..3 {
-                if source_index == target_index {
-                    continue;
-                }
-                let target = &pods[target_index];
-                pods[source_index]
-                    .effect(
-                        RuntimeEffectAction::RegisterPeerSession {
-                            identity: target.identity.clone(),
-                            session: target.session.clone(),
-                        },
-                        budget,
-                    )
-                    .await?;
-                let mut description = ReplicaInformation::new(
-                    OperationId::default(),
-                    target.identity.clone(),
-                    target.replication_address.to_string(),
-                );
-                description.process_session_id = target.session.clone();
-                description.role = roles[target_index];
+                topology_bindings.push(binding.clone());
                 budget
                     .run(
-                        "peer description",
+                        "healthy topology binding",
                         budget.operation_timeout,
-                        kuberic_runtime::testing::describe_peer(
-                            &pods[source_index].runtime,
-                            description,
+                        pod.application.bind_topology(
+                            binding,
+                            Arc::new(StoreAuthorityContextSource {
+                                store: pod.store.clone(),
+                            }),
                         ),
                     )
                     .await?
                     .map_err(display_error)?;
             }
-        }
-        for pod in &pods {
-            budget
-                .run(
-                    "settle peer configuration work",
-                    budget.operation_timeout,
-                    pod.runtime.cancel_configuration_work(),
+            let topology_bindings: [HealthyTopologyBinding; 3] = topology_bindings
+                .try_into()
+                .map_err(|_| MssqlGroupError::new("exactly three topology bindings required"))?;
+
+            for pod in &pods {
+                pod.effect(RuntimeEffectAction::Open(OpenMode::New), budget)
+                    .await?;
+            }
+            for source_index in 0..3 {
+                for target_index in 0..3 {
+                    if source_index == target_index {
+                        continue;
+                    }
+                    let target = &pods[target_index];
+                    pods[source_index]
+                        .effect(
+                            RuntimeEffectAction::RegisterPeerSession {
+                                identity: target.identity.clone(),
+                                session: target.session.clone(),
+                            },
+                            budget,
+                        )
+                        .await?;
+                    let mut description = ReplicaInformation::new(
+                        OperationId::default(),
+                        target.identity.clone(),
+                        target.replication_address.to_string(),
+                    );
+                    description.process_session_id = target.session.clone();
+                    description.role = roles[target_index];
+                    budget
+                        .run(
+                            "peer description",
+                            budget.operation_timeout,
+                            kuberic_runtime::testing::describe_peer(
+                                &pods[source_index].runtime,
+                                description,
+                            ),
+                        )
+                        .await?
+                        .map_err(display_error)?;
+                }
+            }
+            for pod in &pods {
+                budget
+                    .run(
+                        "settle peer configuration work",
+                        budget.operation_timeout,
+                        pod.runtime.cancel_configuration_work(),
+                    )
+                    .await?
+                    .map_err(display_error)?;
+            }
+            for pod in &pods {
+                pod.effect(
+                    RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                        local_identity: pod.identity.clone(),
+                        transition_kind: None,
+                        previous_configuration: None,
+                        current_configuration: configuration.clone(),
+                        switchover_handoff: None,
+                        secondary_removal: None,
+                        scale_up: None,
+                    })),
+                    budget,
                 )
-                .await?
-                .map_err(display_error)?;
-        }
-        for pod in &pods {
-            pod.effect(
-                RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
-                    local_identity: pod.identity.clone(),
-                    transition_kind: None,
-                    previous_configuration: None,
-                    current_configuration: configuration.clone(),
-                    switchover_handoff: None,
-                    secondary_removal: None,
-                    scale_up: None,
-                })),
-                budget,
-            )
-            .await?;
-        }
-        observe_sources(&pods, budget).await?;
-        for (pod, role) in pods.iter().zip(roles) {
-            pod.effect(RuntimeEffectAction::ChangeRole(role), budget)
                 .await?;
-            pod.effect(
-                RuntimeEffectAction::SetAccessStatus {
-                    read: AccessStatus::ReconfigurationPending,
-                    write: if role == ReplicaRole::Primary {
-                        AccessStatus::ReconfigurationPending
-                    } else {
-                        AccessStatus::NotPrimary
+            }
+            observe_sources(&pods, budget).await?;
+            for (pod, role) in pods.iter().zip(roles) {
+                pod.effect(RuntimeEffectAction::ChangeRole(role), budget)
+                    .await?;
+                pod.effect(
+                    RuntimeEffectAction::SetAccessStatus {
+                        read: AccessStatus::ReconfigurationPending,
+                        write: if role == ReplicaRole::Primary {
+                            AccessStatus::ReconfigurationPending
+                        } else {
+                            AccessStatus::NotPrimary
+                        },
                     },
-                },
-                budget,
-            )
-            .await?;
-            pod.effect(RuntimeEffectAction::RefreshApplicationProgress, budget)
+                    budget,
+                )
                 .await?;
-        }
-        for pod in &mut pods {
-            pod.start_agent(budget).await?;
-        }
+                pod.effect(RuntimeEffectAction::RefreshApplicationProgress, budget)
+                    .await?;
+            }
+            for pod in &mut pods {
+                pod.start_agent(budget).await?;
+            }
+            Ok::<_, MssqlGroupError>(topology_bindings)
+        })
+        .catch_unwind()
+        .await;
+        let topology_bindings = match initialization {
+            Ok(Ok(bindings)) => bindings,
+            Ok(Err(error)) => {
+                let shutdown = shutdown_pods(&mut pods, cleanup).await;
+                return Err(match shutdown {
+                    Ok(()) => error,
+                    Err(shutdown) => MssqlGroupError::new(format!(
+                        "{error}; partial Kuberic shutdown also failed: {shutdown}"
+                    )),
+                });
+            }
+            Err(panic) => {
+                let _ = shutdown_pods(&mut pods, cleanup).await;
+                std::panic::resume_unwind(panic);
+            }
+        };
 
         let group = Self {
             resource_uid,
@@ -655,7 +706,15 @@ impl MssqlGroup {
             topology_bindings,
             convergence_budget: budget,
         };
-        group.validate_durable_state().await?;
+        if let Err(error) = group.validate_durable_state().await {
+            let shutdown = group.shutdown_with_coordinator(cleanup).await;
+            return Err(match shutdown {
+                Ok(()) => error,
+                Err(shutdown) => MssqlGroupError::new(format!(
+                    "{error}; initialized Kuberic shutdown also failed: {shutdown}"
+                )),
+            });
+        }
         Ok(group)
     }
 
@@ -760,21 +819,16 @@ impl MssqlGroup {
         Ok(())
     }
 
-    pub async fn shutdown(mut self) -> Result<(), MssqlGroupError> {
-        let mut errors = Vec::new();
-        let budget = ConvergenceBudget::cleanup_budget()?;
-        for pod in &mut self.pods {
-            if let Err(error) = pod.shutdown(budget).await {
-                errors.push(error.to_string());
-            }
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(MssqlGroupError::new(format!(
-                "Kuberic group shutdown failed: {errors:?}"
-            )))
-        }
+    pub async fn shutdown(self) -> Result<(), MssqlGroupError> {
+        let coordinator = CleanupCoordinator::default();
+        self.shutdown_with_coordinator(&coordinator).await
+    }
+
+    pub async fn shutdown_with_coordinator(
+        mut self,
+        coordinator: &CleanupCoordinator<impl CleanupClock>,
+    ) -> Result<(), MssqlGroupError> {
+        shutdown_pods(&mut self.pods, coordinator).await
     }
 
     fn validate_report(
@@ -828,6 +882,26 @@ impl MssqlGroup {
                 .ok_or_else(|| MssqlGroupError::new("current configuration is missing"))?,
             &self.configuration,
         )
+    }
+}
+
+async fn shutdown_pods(
+    pods: &mut [MssqlPod; 3],
+    coordinator: &CleanupCoordinator<impl CleanupClock>,
+) -> Result<(), MssqlGroupError> {
+    let mut errors = Vec::new();
+    let budget = ConvergenceBudget::cleanup_budget(coordinator)?;
+    for pod in pods {
+        if let Err(error) = pod.shutdown(budget).await {
+            errors.push(error.to_string());
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(MssqlGroupError::new(format!(
+            "Kuberic group shutdown failed: {errors:?}"
+        )))
     }
 }
 
@@ -1254,8 +1328,8 @@ fn display_error(error: impl fmt::Display) -> MssqlGroupError {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
-    use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Barrier, Mutex};
 
     use kuberic_mssql::observation::{
         AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, DatabaseSnapshot, InstanceMetadata,
@@ -1550,6 +1624,7 @@ mod tests {
                     StdInstant::now() + Duration::from_secs(120),
                 )
                 .unwrap(),
+                &CleanupCoordinator::default(),
             )
             .await
             {
@@ -1701,7 +1776,16 @@ mod tests {
     #[test]
     fn stalled_agent_shutdown_is_aborted_and_joined() {
         run_group_test(async {
-            let mut server = tokio::spawn(async {
+            struct TerminationEvidence(Arc<Mutex<Vec<&'static str>>>);
+            impl Drop for TerminationEvidence {
+                fn drop(&mut self) {
+                    self.0.lock().unwrap().push("agent-terminated");
+                }
+            }
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let evidence = events.clone();
+            let mut server = tokio::spawn(async move {
+                let _termination = TerminationEvidence(evidence);
                 std::future::pending::<kuberic_runtime::host::Result<()>>().await
             });
             let budget = ConvergenceBudget::new(
@@ -1717,7 +1801,38 @@ mod tests {
                 "{error}"
             );
             assert!(server.is_finished(), "aborted agent task must be joined");
+            events.lock().unwrap().push("journal-blocked");
+            assert_eq!(
+                events.lock().unwrap().as_slice(),
+                ["agent-terminated", "journal-blocked"]
+            );
+            assert!(!events.lock().unwrap().contains(&"destructive-cleanup"));
         });
+    }
+
+    #[test]
+    fn group_shutdown_and_fixture_cleanup_share_one_absolute_clock() {
+        #[derive(Clone, Default)]
+        struct SharedClock(Arc<AtomicU64>);
+        impl CleanupClock for SharedClock {
+            fn now(&self) -> Duration {
+                Duration::from_secs(self.0.load(Ordering::SeqCst))
+            }
+        }
+        let clock = SharedClock::default();
+        let coordinator = CleanupCoordinator::new(clock.clone(), CLEANUP_BUDGET);
+        let shutdown_budget = ConvergenceBudget::cleanup_budget(&coordinator).unwrap();
+        assert_eq!(coordinator.remaining(), Duration::from_secs(180));
+        clock.0.store(40, Ordering::SeqCst);
+        shutdown_budget.check("shared cleanup").unwrap();
+        assert_eq!(coordinator.remaining(), Duration::from_secs(140));
+        let fixture_budget = super::super::cleanup::OperationBudget::new(
+            coordinator.clock(),
+            coordinator.remaining(),
+        );
+        clock.0.store(75, Ordering::SeqCst);
+        assert_eq!(fixture_budget.remaining(), Some(Duration::from_secs(105)));
+        assert_eq!(coordinator.remaining(), Duration::from_secs(105));
     }
 
     #[test]
@@ -1739,8 +1854,8 @@ mod tests {
                 &native,
                 sources,
                 std::array::from_fn(|_| Arc::new(FixedClock(AtomicU64::new(now))) as Clock),
-                Duration::from_secs(10),
-                StdInstant::now() + Duration::from_secs(30),
+                Duration::from_secs(30),
+                StdInstant::now() + Duration::from_secs(60),
             )
             .await
             .unwrap();

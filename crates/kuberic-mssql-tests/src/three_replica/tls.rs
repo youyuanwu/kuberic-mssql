@@ -339,12 +339,21 @@ impl fmt::Display for TlsError {
             Self::Deadline => "TLS helper deadline exceeded",
             Self::Helper => "OpenSSL TLS helper failed",
             Self::Journal => "TLS ownership journal update failed",
-            Self::Secret(_) => "TLS private asset operation failed",
+            Self::Secret(error) => {
+                return write!(formatter, "TLS private asset operation failed: {error}");
+            }
         })
     }
 }
 
-impl std::error::Error for TlsError {}
+impl std::error::Error for TlsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Secret(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 fn run_openssl<I, S>(
     runner: &impl ProcessRunner,

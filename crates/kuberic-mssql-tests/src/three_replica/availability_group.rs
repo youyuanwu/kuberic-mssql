@@ -59,6 +59,7 @@ pub enum AvailabilityGroupError {
     CertificateExchange,
     Helper,
     FrozenMember,
+    Data(super::data::DataError),
     Evidence(EvidenceError),
     Incarnation(IncarnationError),
 }
@@ -69,18 +70,49 @@ impl fmt::Display for AvailabilityGroupError {
             Self::Deadline => "native availability-group deadline exceeded",
             Self::Intent => "native availability-group intent is invalid",
             Self::Journal => "native availability-group journal update failed",
-            Self::Admin(_) => "native availability-group SQL operation failed",
-            Self::Secret(_) => "native availability-group credential changed",
+            Self::Admin(error) => {
+                return write!(
+                    formatter,
+                    "native availability-group SQL operation failed: {error}"
+                );
+            }
+            Self::Secret(error) => {
+                return write!(
+                    formatter,
+                    "native availability-group credential changed: {error}"
+                );
+            }
             Self::CertificateExchange => "native endpoint certificate exchange failed",
             Self::Helper => "native endpoint certificate permission helper failed",
             Self::FrozenMember => "native frozen SQL Server member evidence changed",
-            Self::Evidence(_) => "native availability-group evidence validation failed",
-            Self::Incarnation(_) => "native SQL Server incarnation changed",
+            Self::Data(error) => {
+                return write!(formatter, "native direct-data validation failed: {error}");
+            }
+            Self::Evidence(error) => {
+                return write!(
+                    formatter,
+                    "native availability-group evidence validation failed: {error}"
+                );
+            }
+            Self::Incarnation(error) => {
+                return write!(formatter, "native SQL Server incarnation changed: {error}");
+            }
         })
     }
 }
 
-impl std::error::Error for AvailabilityGroupError {}
+impl std::error::Error for AvailabilityGroupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Admin(error) => Some(error),
+            Self::Secret(error) => Some(error),
+            Self::Evidence(error) => Some(error),
+            Self::Incarnation(error) => Some(error),
+            Self::Data(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 pub(crate) struct ProvisionContext<'a, R> {
     pub run: &'a TopologyRun,
@@ -177,10 +209,7 @@ pub(crate) async fn provision<R: ProcessRunner>(
         formation_deadline,
     )
     .await
-    .map_err(|error| match error {
-        super::data::DataError::Deadline => AvailabilityGroupError::Deadline,
-        _ => AvailabilityGroupError::Evidence(EvidenceError::ObservationFailed),
-    })?;
+    .map_err(AvailabilityGroupError::Data)?;
     let evidence = loop {
         let observations = observe_direct_members(
             context.run,

@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use kuberic_mssql_tests::three_replica::{
-    CancellationSignals, CombinedFixtureError, FixtureConfig, HandledCancellationSignal,
-    JournalStore, MssqlGroup, MssqlGroupError, OwnershipJournal, ResourceState, RunState,
-    cleanup_three_replica_fixture, launch_three_members,
+    CLEANUP_BUDGET, CancellationSignals, CleanupCoordinator, CombinedFixtureError, FixtureConfig,
+    HandledCancellationSignal, JournalStore, MssqlGroup, OwnershipJournal, ResourceState, RunState,
+    SystemCleanupClock, cleanup_three_replica_fixture, launch_three_members,
 };
 use kuberic_runtime::control::proto;
 
@@ -191,106 +191,126 @@ async fn run_three_replica_mssql_happy_path() {
             .expect("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT must be explicitly configured"),
     );
     let config = FixtureConfig::new(&root, acknowledgement).expect("validated fixture config");
-    let execution = AssertUnwindSafe(execute_live_lifecycle(&root, config)).catch_unwind();
-    let outcome = {
-        tokio::pin!(execution);
-        tokio::select! {
-            outcome = &mut execution => ExecutionOutcome::Completed(outcome),
-            signal = cancellation.recv() => ExecutionOutcome::Interrupted(signal),
-        }
-    };
-    match outcome {
-        ExecutionOutcome::Completed(Ok(Ok(()))) => {}
-        ExecutionOutcome::Completed(Ok(Err(error))) => {
+    match AssertUnwindSafe(execute_live_lifecycle(&root, config, &mut cancellation))
+        .catch_unwind()
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
             panic!("three-replica lifecycle failed: {error}")
         }
-        ExecutionOutcome::Completed(Err(panic)) => {
-            std::panic::resume_unwind(panic);
-        }
-        ExecutionOutcome::Interrupted(signal) => {
-            panic!("three-replica lifecycle interrupted by {signal:?}");
-        }
+        Err(panic) => std::panic::resume_unwind(panic),
     }
 }
 
-enum ExecutionOutcome {
-    Completed(Result<Result<(), TestError>, Box<dyn std::any::Any + Send + 'static>>),
-    Interrupted(HandledCancellationSignal),
-}
-
-async fn execute_live_lifecycle(root: &Path, config: FixtureConfig) -> Result<(), TestError> {
+async fn execute_live_lifecycle(
+    root: &Path,
+    config: FixtureConfig,
+    cancellation: &mut CancellationSignals,
+) -> Result<(), TestError> {
     let mut launched = launch_three_members(config)
         .await
         .map_err(|error| -> TestError { Box::new(error) })?;
-
-    let lifecycle = AssertUnwindSafe(async {
-        let topology = launched.provision_availability_group().await?;
-        if fault_checkpoint("fail-after-ag") {
-            return Err::<(), TestError>("injected failure after AG provisioning".into());
+    let topology = launched.provision_availability_group().await?;
+    if fault_checkpoint("fail-after-ag") {
+        return Err("injected failure after AG provisioning".into());
+    }
+    let native_binding = launched
+        .journal()
+        .native_binding
+        .clone()
+        .ok_or("exact native topology binding was not journaled")?;
+    if native_binding != topology.binding {
+        return Err("journaled native binding changed".into());
+    }
+    let cleanup_clock = SystemCleanupClock::default();
+    let cleanup = CleanupCoordinator::new(cleanup_clock, CLEANUP_BUDGET);
+    let group = match AssertUnwindSafe(MssqlGroup::from_live_with_coordinator(
+        root,
+        &launched.run,
+        &native_binding,
+        &launched.members,
+        launched.kuberic_convergence_timeout(),
+        launched.complete_deadline(),
+        &cleanup,
+    ))
+    .catch_unwind()
+    .await
+    {
+        Ok(Ok(group)) => group,
+        Ok(Err(error)) => {
+            let fixture_cleanup = launched.cleanup_with_coordinator(&cleanup);
+            return match fixture_cleanup {
+                Ok(_) => Err(Box::new(error)),
+                Err(cleanup) => Err(format!(
+                    "partial Kuberic startup failed: {error}; cleanup also failed: {cleanup}"
+                )
+                .into()),
+            };
         }
-        let native_binding = launched
-            .journal()
-            .native_binding
-            .clone()
-            .ok_or("exact native topology binding was not journaled")?;
-        if native_binding != topology.binding {
-            return Err::<(), TestError>("journaled native binding changed".into());
+        Err(panic) => {
+            let fixture_cleanup = launched.cleanup_with_coordinator(&cleanup);
+            if let Err(cleanup) = fixture_cleanup {
+                let primary = panic_message(&panic);
+                panic!(
+                    "partial Kuberic startup panicked: {primary}; cleanup also failed: {cleanup}"
+                );
+            }
+            std::panic::resume_unwind(panic);
         }
-
-        let group = MssqlGroup::from_live(
-            root,
-            &launched.run,
-            &native_binding,
-            &launched.members,
-            launched.kuberic_convergence_timeout(),
-            launched.complete_deadline(),
-        )
-        .await?;
-        if fault_checkpoint("panic-after-agent-start") {
-            panic!("injected panic after agent startup");
-        }
-        let runtime_result = AssertUnwindSafe(async {
+    };
+    let outcome = {
+        let runtime = AssertUnwindSafe(async {
+            if fault_checkpoint("panic-after-agent-start") {
+                panic!("injected panic after agent startup");
+            }
             if fault_checkpoint("fail-during-report") {
                 return Err::<(), TestError>("injected failure during bracketed reporting".into());
             }
             let reports = group.reports_bracketed().await?;
             assert_exact_reports(&group, &reports, native_binding.configuration_sequence)?;
-
             let marker = launched
                 .commit_replicated_marker(&topology.evidence)
                 .await?;
             if marker.primary_ordinal != topology.evidence.primary_ordinal
                 || marker.readable_ordinals != [1, 2, 3]
             {
-                return Err::<(), TestError>(
-                    "post-runtime marker was not readable from all exact members".into(),
-                );
+                return Err("post-runtime marker was not readable from all exact members".into());
             }
             Ok(())
         })
-        .catch_unwind()
-        .await;
-        finish_runtime(runtime_result, group.shutdown().await)
-    })
-    .catch_unwind();
-    let outcome = lifecycle.await;
-
-    let cleanup = launched.cleanup();
-    match (outcome, cleanup) {
-        (Ok(Ok(())), Ok(cleanup)) => {
+        .catch_unwind();
+        tokio::pin!(runtime);
+        tokio::select! {
+            result = &mut runtime => RuntimeOutcome::Completed(result),
+            signal = cancellation.recv() => RuntimeOutcome::Interrupted(signal),
+        }
+    };
+    let shutdown = group.shutdown_with_coordinator(&cleanup).await;
+    if let Err(shutdown) = shutdown {
+        launched.block_cleanup()?;
+        return Err(format!(
+            "{}; Kuberic shutdown failed before fixture cleanup: {shutdown}",
+            outcome.description()
+        )
+        .into());
+    }
+    let fixture_cleanup = launched.cleanup_with_coordinator(&cleanup);
+    match (outcome, fixture_cleanup) {
+        (RuntimeOutcome::Completed(Ok(Ok(()))), Ok(cleanup)) => {
             assert_eq!(cleanup.removed_container_ids.len(), 3);
             assert!(!cleanup.removed_network_id.is_empty());
             assert_removed(root);
             Ok(())
         }
-        (Ok(Err(error)), cleanup) => {
+        (RuntimeOutcome::Completed(Ok(Err(error))), cleanup) => {
             if let Err(cleanup) = cleanup {
                 Err(combined_error(error, cleanup))
             } else {
                 Err(error)
             }
         }
-        (Err(panic), cleanup) => {
+        (RuntimeOutcome::Completed(Err(panic)), cleanup) => {
             if let Err(cleanup) = cleanup {
                 let primary = panic_message(&panic);
                 panic!(
@@ -299,26 +319,35 @@ async fn execute_live_lifecycle(root: &Path, config: FixtureConfig) -> Result<()
             }
             std::panic::resume_unwind(panic);
         }
-        (Ok(Ok(())), Err(error)) => Err(Box::new(error)),
+        (RuntimeOutcome::Completed(Ok(Ok(()))), Err(error)) => Err(Box::new(error)),
+        (RuntimeOutcome::Interrupted(signal), Ok(_)) => {
+            Err(format!("three-replica lifecycle interrupted by {signal:?}").into())
+        }
+        (RuntimeOutcome::Interrupted(signal), Err(cleanup)) => Err(format!(
+            "three-replica lifecycle interrupted by {signal:?}; cleanup also failed: {cleanup}"
+        )
+        .into()),
+    }
+}
+
+enum RuntimeOutcome {
+    Completed(Result<Result<(), TestError>, Box<dyn std::any::Any + Send + 'static>>),
+    Interrupted(HandledCancellationSignal),
+}
+
+impl RuntimeOutcome {
+    fn description(&self) -> String {
+        match self {
+            Self::Completed(Ok(Ok(()))) => "runtime completed".to_owned(),
+            Self::Completed(Ok(Err(error))) => format!("runtime failed: {error}"),
+            Self::Completed(Err(panic)) => format!("runtime panicked: {}", panic_message(panic)),
+            Self::Interrupted(signal) => format!("runtime interrupted by {signal:?}"),
+        }
     }
 }
 
 fn combined_error(primary: TestError, cleanup: CombinedFixtureError) -> TestError {
     format!("{primary}; cleanup also failed: {cleanup}").into()
-}
-
-fn finish_runtime(
-    runtime_result: Result<Result<(), TestError>, Box<dyn std::any::Any + Send + 'static>>,
-    shutdown: Result<(), MssqlGroupError>,
-) -> Result<(), TestError> {
-    match (runtime_result, shutdown) {
-        (Ok(primary), shutdown) => combine_primary_and_shutdown(primary, shutdown),
-        (Err(panic), Ok(())) => std::panic::resume_unwind(panic),
-        (Err(panic), Err(shutdown)) => {
-            let primary = panic_message(&panic);
-            panic!("three-replica runtime panicked: {primary}; shutdown also failed: {shutdown}");
-        }
-    }
 }
 
 fn combine_primary_and_shutdown<E>(

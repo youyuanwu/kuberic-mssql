@@ -6,25 +6,27 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use kuberic_mssql_tests::three_replica::{
     ACKNOWLEDGEMENT_SCHEMA_VERSION, AclController, AclEvidence, AclProbe, BoundedProcessRunner,
     ChildDisposition, CleanupBackend, CleanupClock, CleanupCompletion, CleanupCoordinator,
-    CleanupError, CommandAclController, CommandSpec, ContainerInspection, ContainerLimits,
-    ContainerMount, ContainerPort, ContainerRequest, DockerApi, DockerCapabilities, DockerCli,
-    DockerError, FailureCategory, FailureStage, FixtureConfig, HandledCancellationSignal,
-    HostPlatform, HostProbe, ImageInspection, JournalStore, KubericMember, LockError,
-    NetworkInspection, NetworkRequest, OwnedLabels, OwnershipInspector, OwnershipJournal,
-    PINNED_SQL_SERVER_IMAGE, PreflightError, ProcessError, ProcessErrorKind, ProcessResult,
-    ProcessRunner, ReconcileError, ResourceBinding, ResourceKind, ResourceObservation,
-    ResourcePolicy, ResourceRecord, ResourceState, RunState, SQL_SERVER_UID, SanitizedFailure,
-    SecretValue, SqlMember, SqlServerContainerSpec, TopologyRun, acquire_root_lock,
-    cgroup_v2_available_memory, cgroup_v2_effective_cpu_quota, cgroup_v2_effective_cpuset,
-    cgroup_v2_path_from, cleanup, combine_with_cleanup, effective_cpu_count,
-    inspect_member_directory, parse_acl_evidence, parse_cpu_list, prepare_member_directory,
-    reconcile, run_preflight, run_preflight_with_deadline, verify_member_directory,
+    CleanupError, CommandAclController, CommandAclProbe, CommandSpec, ContainerInspection,
+    ContainerLimits, ContainerMount, ContainerPort, ContainerRequest, DockerApi,
+    DockerCapabilities, DockerCli, DockerError, FailureCategory, FailureStage, FixtureConfig,
+    HandledCancellationSignal, HostPlatform, HostProbe, ImageInspection, JournalStore,
+    KubericMember, LockError, NetworkInspection, NetworkRequest, OwnedLabels, OwnershipInspector,
+    OwnershipJournal, PINNED_SQL_SERVER_IMAGE, PreflightError, ProcessError, ProcessErrorKind,
+    ProcessResult, ProcessRunner, ReconcileError, ResourceBinding, ResourceKind,
+    ResourceObservation, ResourcePolicy, ResourceRecord, ResourceState, RunState, SQL_SERVER_UID,
+    SanitizedFailure, SecretValue, SqlMember, SqlServerContainerSpec, TopologyRun,
+    acquire_root_lock, cgroup_v2_available_memory, cgroup_v2_effective_cpu_quota,
+    cgroup_v2_effective_cpuset, cgroup_v2_path_from, cleanup, combine_with_cleanup,
+    effective_cpu_count, inspect_member_directory, parse_acl_evidence, parse_cpu_list,
+    prepare_member_directory, prepare_member_directory_with_clock, reconcile, run_preflight,
+    run_preflight_with_deadline, verify_member_directory,
 };
 
 fn effective_uid() -> u32 {
@@ -747,6 +749,42 @@ impl ProcessRunner for ScriptedRunner {
     }
 }
 
+#[derive(Clone, Default)]
+struct AdvancingClock {
+    now: Arc<Mutex<Duration>>,
+}
+
+impl AdvancingClock {
+    fn advance(&self, duration: Duration) {
+        *self.now.lock().unwrap() += duration;
+    }
+}
+
+impl CleanupClock for AdvancingClock {
+    fn now(&self) -> Duration {
+        *self.now.lock().unwrap()
+    }
+}
+
+struct AdvancingRunner {
+    clock: AdvancingClock,
+    timeouts: Mutex<Vec<Duration>>,
+}
+
+impl ProcessRunner for AdvancingRunner {
+    fn run(&self, command: &CommandSpec) -> Result<ProcessResult, ProcessError> {
+        self.timeouts.lock().unwrap().push(command.timeout());
+        self.clock.advance(Duration::from_secs(1));
+        successful(format!(
+            "user:{}:rwx\nuser:{SQL_SERVER_UID}:rwx\nmask::rwx\n\
+             default:user:{}:rwx\ndefault:user:{SQL_SERVER_UID}:rwx\n\
+             default:mask::rwx\n",
+            effective_uid(),
+            effective_uid()
+        ))
+    }
+}
+
 fn successful(stdout: impl Into<String>) -> Result<ProcessResult, ProcessError> {
     Ok(ProcessResult {
         status: 0,
@@ -1201,6 +1239,96 @@ fn command_acl_controller_validates_inheritance_and_masks_deterministically() {
             .unwrap()
             .complete()
     );
+}
+
+#[test]
+fn command_acl_probe_uses_one_decreasing_absolute_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let clock = AdvancingClock::default();
+    let runner = AdvancingRunner {
+        clock: clock.clone(),
+        timeouts: Mutex::new(Vec::new()),
+    };
+    let probe = CommandAclProbe::new(runner);
+    probe
+        .verify_with_clock(
+            directory.path(),
+            effective_uid(),
+            SQL_SERVER_UID,
+            Duration::from_secs(10),
+            &clock,
+        )
+        .unwrap();
+    assert_eq!(
+        probe.runner().timeouts.lock().unwrap().as_slice(),
+        [
+            Duration::from_secs(10),
+            Duration::from_secs(9),
+            Duration::from_secs(8),
+            Duration::from_secs(7),
+            Duration::from_secs(6),
+            Duration::from_secs(5),
+        ]
+    );
+}
+
+struct BudgetAclController {
+    clock: AdvancingClock,
+    timeouts: RefCell<Vec<Duration>>,
+}
+
+impl AclController for BudgetAclController {
+    fn apply(
+        &self,
+        _: &Path,
+        _: u32,
+        _: u32,
+        timeout: Duration,
+    ) -> Result<(), kuberic_mssql_tests::three_replica::MemberDirectoryError> {
+        self.timeouts.borrow_mut().push(timeout);
+        self.clock.advance(Duration::from_secs(3));
+        Ok(())
+    }
+
+    fn inspect(
+        &self,
+        _: &Path,
+        _: u32,
+        _: u32,
+        timeout: Duration,
+    ) -> Result<AclEvidence, kuberic_mssql_tests::three_replica::MemberDirectoryError> {
+        self.timeouts.borrow_mut().push(timeout);
+        self.clock.advance(Duration::from_secs(2));
+        Ok(complete_acl())
+    }
+}
+
+#[test]
+fn member_directory_preparation_recomputes_before_apply_and_inspection() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fixture");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let clock = AdvancingClock::default();
+    let acl = BudgetAclController {
+        clock: clock.clone(),
+        timeouts: RefCell::new(Vec::new()),
+    };
+    prepare_member_directory_with_clock(
+        &root,
+        &root.join("member-1"),
+        effective_uid(),
+        SQL_SERVER_UID,
+        Duration::from_secs(10),
+        &acl,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(
+        acl.timeouts.borrow().as_slice(),
+        [Duration::from_secs(10), Duration::from_secs(7)]
+    );
+    assert_eq!(clock.now(), Duration::from_secs(5));
 }
 
 #[test]
@@ -1948,6 +2076,6 @@ fn partial_deletion_and_cleanup_failures_remain_durable_and_combined() {
     .unwrap_err();
     assert_eq!(
         combined.to_string(),
-        "setup: container creation failed; cleanup: container removal failed"
+        "setup: container creation failed; cleanup: container removal failed (resource sql-1)"
     );
 }
