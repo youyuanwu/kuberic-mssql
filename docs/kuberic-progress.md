@@ -163,8 +163,12 @@ The dedicated ignored path starts three real containers from:
 `mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726`
 
 The SQL Server image reports version `17.0.5005.3`. The fixture requires a
-strict version-one affirmative acknowledgement file; it does not accept the
-legacy ambient variable.
+clearly test-only `FixtureConfig` constructor that creates an affirmative
+`SqlServerEulaAcknowledgement` in code and injects exactly `ACCEPT_EULA=Y`.
+It consumes no acknowledgement file or environment variable, and repeated
+revalidation is idempotent. Production and future launchers remain responsible
+for explicit acknowledgement; the strict file-backed constructor and negative
+tests remain available for that purpose.
 
 Fixture-only administration creates and proves:
 
@@ -254,10 +258,10 @@ just test-live-shared
 Live tests remain ignored for direct Cargo invocation and require explicit
 licensed fixture provisioning.
 
-Run the real three-member path with a reviewed acknowledgement file:
+Run the real three-member path with an optional fixture root:
 
 ```bash
-just test-live-three-replica <file> [root]
+just test-live-three-replica [root]
 ```
 
 Recover the default or a selected journaled root:
@@ -269,12 +273,13 @@ just cleanup-live-three-replica [root]
 Exercise handled SIGTERM, recovery, retry, and idempotent cleanup:
 
 ```bash
-just test-live-three-replica-signal <file> [root]
+just test-live-three-replica-signal [root]
 ```
 
-The shipped acknowledgement example contains `accepted: false`; it parses but
-cannot authorize launch until a contributor reviews the license and explicitly
-changes the value to `true`.
+The happy path runs after legacy `validate-live` in `just ci`. Signal, recovery,
+and fault recipes remain explicit. The shipped acknowledgement example still
+contains `accepted: false` as documentation for the production/file-backed
+contract, but tests do not require it.
 
 ## Deferred Work
 

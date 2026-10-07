@@ -5,6 +5,7 @@ use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::sync::Mutex;
 
+use kuberic_mssql::SqlServerEulaAcknowledgement;
 use kuberic_mssql_tests::three_replica::{
     ACKNOWLEDGEMENT_SCHEMA_VERSION, CleanupError, CleanupReport, CombinedFixtureError,
     FailureCategory, FailureStage, FixtureConfig, FixtureConfigError, JOURNAL_SCHEMA_VERSION,
@@ -57,16 +58,39 @@ fn affirmative_file_authorizes_exactly_one_acceptance_setting() {
         authorization.sql_server_environment(),
         [("ACCEPT_EULA", "Y")]
     );
-    assert_eq!(authorization.source().path(), path.canonicalize().unwrap());
-    assert_ne!(authorization.source().sha256(), &[0; 32]);
+    let source = authorization.source().expect("file-backed source");
+    assert_eq!(source.path(), path.canonicalize().unwrap());
+    assert_ne!(source.sha256(), &[0; 32]);
     authorization.revalidate().unwrap();
 }
 
 #[test]
-fn denied_missing_malformed_or_unsupported_input_never_authorizes_launch() {
+fn test_fixture_authorization_is_affirmative_sourceless_and_idempotent() {
+    let directory = tempfile::tempdir().unwrap();
+    let authorization = LaunchAuthorization::for_test_fixture();
+    assert_eq!(authorization.source(), None);
+    assert_eq!(
+        authorization.sql_server_environment(),
+        [("ACCEPT_EULA", "Y")]
+    );
+    authorization.revalidate().unwrap();
+    authorization.revalidate().unwrap();
+
+    let config = FixtureConfig::for_test_fixture(directory.path().join("fixture")).unwrap();
+    assert_eq!(config.authorization().source(), None);
+    assert_eq!(
+        config.authorization().sql_server_environment(),
+        [("ACCEPT_EULA", "Y")]
+    );
+    config.authorization().revalidate().unwrap();
+}
+
+#[test]
+fn production_and_file_negative_paths_remain_explicit() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("acknowledgement.json");
 
+    assert!(SqlServerEulaAcknowledgement::new(false).is_err());
     assert_eq!(
         LaunchAuthorization::load(&path).unwrap_err(),
         FixtureConfigError::AcknowledgementUnavailable
@@ -247,21 +271,28 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         .and_then(Path::parent)
         .unwrap();
     let justfile = fs::read_to_string(root.join("justfile")).unwrap();
-    assert!(
-        justfile.contains(
-            "test-live-three-replica acknowledgement root=\"target/mssql-three-replica\":"
-        )
-    );
+    assert!(justfile.contains("test-live-three-replica root=\"target/mssql-three-replica\":"));
     assert!(justfile.contains("cleanup-live-three-replica root=\"target/mssql-three-replica\":"));
-    assert!(justfile.contains(
-        "test-live-three-replica-signal acknowledgement root=\"target/mssql-three-replica-signal\":"
-    ));
-    assert!(justfile.contains("env -u SQLSERVER_TEST_EULA_ACCEPTED"));
     assert!(
-        justfile.contains(
-            "KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT=\"$(realpath {{quote(acknowledgement)}})\""
-        )
+        justfile
+            .contains("test-live-three-replica-signal root=\"target/mssql-three-replica-signal\":")
     );
+    assert!(justfile.contains(
+        "test-live-three-replica-recovery root=\"target/mssql-three-replica-recovery\":"
+    ));
+    assert!(
+        justfile
+            .contains("test-live-three-replica-faults root=\"target/mssql-three-replica-faults\":")
+    );
+    assert_eq!(
+        justfile
+            .lines()
+            .filter(|line| line.contains("env -u SQLSERVER_TEST_EULA_ACCEPTED"))
+            .count(),
+        5
+    );
+    assert!(!justfile.contains("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT"));
+    assert!(!justfile.contains("acknowledgement root="));
     assert!(
         justfile.contains("KUBERIC_MSSQL_THREE_REPLICA_ROOT=\"$(realpath -m {{quote(root)}})\"")
     );
@@ -286,7 +317,17 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         .lines()
         .find(|line| line.starts_with("ci fixture="))
         .unwrap();
-    assert!(!ci.contains("test-live-three-replica"));
+    assert_eq!(
+        ci,
+        "ci fixture=\"\": setup check (validate-live fixture) test-live-three-replica"
+    );
+    assert!(
+        ci.find("(validate-live fixture)").unwrap() < ci.find("test-live-three-replica").unwrap()
+    );
+
+    let workflow = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    assert!(workflow.contains("just cleanup\n"));
+    assert!(workflow.contains("just cleanup-live-three-replica\n"));
 }
 
 #[test]

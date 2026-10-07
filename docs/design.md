@@ -98,11 +98,12 @@ contract for later stages, not an enabled execution path.
 `SqlServerEulaAcknowledgement` is the shared semantic acknowledgement contract:
 it can be constructed only from an explicit affirmative value. The production
 crate deliberately provides no container or Pod launcher and never translates
-that value into `ACCEPT_EULA=Y`. The dedicated three-replica test launcher owns
-a stricter version-one JSON transport, regular-file identity and digest
-revalidation, and test-only acceptance-setting injection. The retained
-single-container fixture's ambient acknowledgement remains a documented legacy
-compatibility exception; it does not authorize the new launcher.
+that value into `ACCEPT_EULA=Y`. Only the dedicated three-replica fixture uses a
+clearly test-only constructor to create the affirmative semantic value in code
+and inject exactly `ACCEPT_EULA=Y`; its sourceless revalidation is idempotent.
+The strict file-backed constructor and negative contract tests remain for future
+production launchers. The retained single-container fixture's ambient
+acknowledgement remains a documented legacy compatibility exception.
 
 The licensed three-replica fixture in `kuberic-mssql-tests` is the only new
 mutation path. It creates certificate-authenticated endpoints, joins an
@@ -403,7 +404,8 @@ test-environment safeguards, not production fencing attestation.
 The Kuberic adapter likewise publishes no client service address from role
 changes; its replication address is confined to replicator open metadata.
 That job must pin the engine image, tools, and helper
-artifacts; accept the EULA explicitly; isolate credentials; and fail rather
+artifacts; confine automatic EULA acceptance to test fixture code; isolate
+credentials; and fail rather
 than skip when requested prerequisites are missing. Mutation support cannot be
 declared complete until live tests cover crash points before and after intent
 persistence, native dispatch, postcondition observation, result persistence,
@@ -411,18 +413,20 @@ reply, and routing publication.
 
 Separately, the explicitly invoked ignored three-replica test pins
 `mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726`
-and requires a strict affirmative acknowledgement file. It creates three
-resource-bounded instances, real endpoints, one synchronous external AG and one
-automatically seeded database. Fresh direct observations must prove one primary,
-two synchronized healthy secondaries, common identities and lineage, completed
-seeding, and a marker readable from all members. Three in-process Kuberic agents
-then admit only the frozen current topology and publish bracketed, fenced
-reports. Exact ownership is persisted before create dispatch, cleanup
-revalidates immutable IDs and attributes, and the SIGTERM regression proves
-journal recovery and retry.
+and automatically accepts the EULA only through the test crate's sourceless
+authorization constructor. It creates three resource-bounded instances, real
+endpoints, one synchronous external AG and one automatically seeded database.
+Fresh direct observations must prove one primary, two synchronized healthy
+secondaries, common identities and lineage, completed seeding, and a marker
+readable from all members. Three in-process Kuberic agents then admit only the
+frozen current topology and publish bracketed, fenced reports. Exact ownership
+is persisted before create dispatch, cleanup revalidates immutable IDs and
+attributes, and the SIGTERM regression proves journal recovery and retry.
 
-This fixture is not part of ordinary CI and does not advance the production
-delivery sequence. It provides healthy-path evidence only: it does not test
+Its happy path runs in ordinary Shared CI after the legacy live validation;
+fault, signal, and recovery cases remain explicitly invoked. This does not
+advance the production delivery sequence. It provides healthy-path evidence
+only: it does not test
 write-lease expiry, old-primary fencing, switchover, failover, replica
 replacement, Kubernetes lifecycle, or client routing.
 

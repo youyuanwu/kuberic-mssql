@@ -6,7 +6,7 @@ export PATH := env_var("HOME") + "/.local/bin:" + env_var("HOME") + "/.cargo/bin
 default: check
 
 # Run the complete CI pipeline locally or on the CI runner.
-ci fixture="": setup check (validate-live fixture)
+ci fixture="": setup check (validate-live fixture) test-live-three-replica
 
 # Install only missing/mismatched shared Rust, just and compiler prerequisites.
 setup:
@@ -59,34 +59,30 @@ test-live-kuberic fixture="":
     python3 -B crates/kuberic-mssql-tests/scripts/sqlserver_fixture.py test-kuberic {{quote(fixture)}}
 
 # Launch, validate, and clean up the dedicated real three-member topology.
-test-live-three-replica acknowledgement root="target/mssql-three-replica":
+test-live-three-replica root="target/mssql-three-replica":
     env -u SQLSERVER_TEST_EULA_ACCEPTED \
-        KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT="$(realpath {{quote(acknowledgement)}})" \
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_happy_path -- --ignored --exact --test-threads=1
 
 # Interrupt a real live subprocess during owned launch, recover, retry, and clean up.
-test-live-three-replica-signal acknowledgement root="target/mssql-three-replica-signal":
+test-live-three-replica-signal root="target/mssql-three-replica-signal":
     env -u SQLSERVER_TEST_EULA_ACCEPTED \
-        KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT="$(realpath {{quote(acknowledgement)}})" \
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_sigterm_during_owned_launch_is_recoverable -- --ignored --exact --test-threads=1 --nocapture
 
 # Exercise handled and uncatchable subprocess interruption with cleanup and retry.
-test-live-three-replica-recovery acknowledgement root="target/mssql-three-replica-recovery":
+test-live-three-replica-recovery root="target/mssql-three-replica-recovery":
     env -u SQLSERVER_TEST_EULA_ACCEPTED \
-        KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT="$(realpath {{quote(acknowledgement)}})" \
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
         three_replica_sig -- --ignored --test-threads=1 --nocapture
 
 # Exercise post-AG, post-agent panic, and report fault checkpoints with exact recovery.
-test-live-three-replica-faults acknowledgement root="target/mssql-three-replica-faults":
+test-live-three-replica-faults root="target/mssql-three-replica-faults":
     env -u SQLSERVER_TEST_EULA_ACCEPTED \
-        KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT="$(realpath {{quote(acknowledgement)}})" \
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica \

@@ -102,7 +102,7 @@ impl AcknowledgementSource {
 
 #[derive(Debug, Clone)]
 pub struct LaunchAuthorization {
-    source: AcknowledgementSource,
+    source: Option<AcknowledgementSource>,
     acknowledgement: SqlServerEulaAcknowledgement,
 }
 
@@ -113,20 +113,31 @@ impl LaunchAuthorization {
         let acknowledgement = SqlServerEulaAcknowledgement::new(accepted)
             .map_err(|_| FixtureConfigError::AcknowledgementDenied)?;
         Ok(Self {
-            source,
+            source: Some(source),
             acknowledgement,
         })
     }
 
-    pub fn source(&self) -> &AcknowledgementSource {
-        &self.source
+    pub fn for_test_fixture() -> Self {
+        Self {
+            source: None,
+            acknowledgement: SqlServerEulaAcknowledgement::new(true)
+                .expect("test fixture acknowledgement is affirmative"),
+        }
+    }
+
+    pub fn source(&self) -> Option<&AcknowledgementSource> {
+        self.source.as_ref()
     }
 
     pub fn revalidate(&self) -> Result<(), FixtureConfigError> {
-        let (current, accepted) = read_acknowledgement(&self.source.path)?;
+        let Some(source) = &self.source else {
+            return Ok(());
+        };
+        let (current, accepted) = read_acknowledgement(&source.path)?;
         SqlServerEulaAcknowledgement::new(accepted)
             .map_err(|_| FixtureConfigError::AcknowledgementChanged)?;
-        if current != self.source {
+        if current != *source {
             return Err(FixtureConfigError::AcknowledgementChanged);
         }
         Ok(())
@@ -212,14 +223,11 @@ impl FixtureConfig {
         root: impl Into<PathBuf>,
         acknowledgement: impl AsRef<Path>,
     ) -> Result<Self, FixtureConfigError> {
-        let root = canonical_fixture_root(root.into())?;
-        Ok(Self {
-            root,
-            authorization: LaunchAuthorization::load(acknowledgement)?,
-            image: PINNED_SQL_SERVER_IMAGE,
-            resources: ResourcePolicy::default(),
-            deadlines: StageDeadlines::default(),
-        })
+        Self::with_authorization(root.into(), LaunchAuthorization::load(acknowledgement)?)
+    }
+
+    pub fn for_test_fixture(root: impl Into<PathBuf>) -> Result<Self, FixtureConfigError> {
+        Self::with_authorization(root.into(), LaunchAuthorization::for_test_fixture())
     }
 
     pub fn root(&self) -> &Path {
@@ -240,6 +248,19 @@ impl FixtureConfig {
 
     pub fn deadlines(&self) -> StageDeadlines {
         self.deadlines
+    }
+
+    fn with_authorization(
+        root: PathBuf,
+        authorization: LaunchAuthorization,
+    ) -> Result<Self, FixtureConfigError> {
+        Ok(Self {
+            root: canonical_fixture_root(root)?,
+            authorization,
+            image: PINNED_SQL_SERVER_IMAGE,
+            resources: ResourcePolicy::default(),
+            deadlines: StageDeadlines::default(),
+        })
     }
 }
 

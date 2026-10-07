@@ -32,4 +32,10 @@ jobs:
         run: just ci
       - name: Release owned fixture resources after failure or cancellation
         if: always() && steps.validation.outcome != 'skipped' && steps.validation.outcome != ''
-        run: just cleanup
+        run: |
+          set +e
+          just cleanup
+          legacy_status=$?
+          just cleanup-live-three-replica
+          three_replica_status=$?
+          exit $((legacy_status != 0 || three_replica_status != 0))

@@ -754,6 +754,28 @@ class FixtureTests(unittest.TestCase):
             )
             self.assertIn("live_present_availability_group", ordinary)
 
+        repository = Path(fixture.__file__).resolve().parents[3]
+        justfile = (repository / "justfile").read_text()
+        self.assertIn(
+            'ci fixture="": setup check (validate-live fixture) test-live-three-replica',
+            justfile,
+        )
+        for recipe in (
+            'test-live-three-replica root="target/mssql-three-replica":',
+            'test-live-three-replica-signal root="target/mssql-three-replica-signal":',
+            'test-live-three-replica-recovery root="target/mssql-three-replica-recovery":',
+            'test-live-three-replica-faults root="target/mssql-three-replica-faults":',
+        ):
+            self.assertIn(recipe, justfile)
+        self.assertEqual(
+            justfile.count("env -u SQLSERVER_TEST_EULA_ACCEPTED"),
+            5,
+        )
+        self.assertNotIn("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT", justfile)
+        workflow = (repository / ".github/workflows/ci.yml").read_text()
+        self.assertIn("just cleanup\n", workflow)
+        self.assertIn("just cleanup-live-three-replica\n", workflow)
+
     def test_cargo_resolution_honors_configuration_path_and_fallback(self):
         with patch.dict(os.environ, {"CARGO": "custom-cargo"}, clear=True), patch.object(
             fixture.shutil, "which", return_value="/tools/custom-cargo"

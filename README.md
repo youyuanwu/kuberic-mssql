@@ -396,7 +396,9 @@ joins one external AG, automatically seeds one database, runs three in-process
 Kuberic agents, and proves a marker is readable from every member.
 
 The live path is ignored by default and is not part of `just`, `just check`, or
-`just ci`. It requires local Linux x86-64 with cgroup v2, a local Docker engine
+direct Cargo test runs. The happy path runs after the legacy live validation in
+`just ci`; fault, signal, and recovery recipes remain explicit. It requires
+local Linux x86-64 with cgroup v2, a local Docker engine
 that enforces memory/no-additional-swap/CPU limits, `setfacl`/`getfacl`, at
 least 10 GiB effective available memory, two effective CPUs, 15 GiB free on the
 fixture filesystem, and Docker-root capacity of 8 GiB before an absent-image
@@ -420,43 +422,30 @@ It currently also pins Kuberic Git commit
 temporary dependency until a suitable upstream merge or release is available;
 it does not promise that the PR will merge.
 
-Start from the strict version-one example, which intentionally denies
-authorization:
+The test crate constructs an affirmative `SqlServerEulaAcknowledgement` through
+the clearly test-only `FixtureConfig` path and injects exactly
+`ACCEPT_EULA=Y` into each SQL Server container. It does not read an
+acknowledgement file or environment variable, and repeated authorization
+revalidation is idempotent.
+
+Run the exact dedicated command with an optional fixture root:
 
 ```bash
-cp crates/kuberic-mssql-tests/fixtures/eula-acknowledgement.example.json \
-  .local-eula-acknowledgement.json
-```
-
-```json
-{
-  "schema_version": 1,
-  "sql_server_eula": {
-    "accepted": false
-  }
-}
-```
-
-After reviewing the applicable SQL Server license, change only `accepted` to
-`true` if you affirmatively accept it. Unknown, duplicate, missing, false, or
-changed fields fail closed. The launcher records and revalidates the regular
-file's identity and digest before every container create; the ambient legacy
-variable cannot authorize this path.
-
-Run the exact dedicated command with the acknowledgement file and an optional
-fixture root:
-
-```bash
-just test-live-three-replica <file> [root]
+just test-live-three-replica [root]
 ```
 
 For example:
 
 ```bash
-just test-live-three-replica .local-eula-acknowledgement.json
-just test-live-three-replica \
-  .local-eula-acknowledgement.json target/my-mssql-three-replica
+just test-live-three-replica
+just test-live-three-replica target/my-mssql-three-replica
 ```
+
+Production and future launchers retain explicit
+`SqlServerEulaAcknowledgement` semantics. The strict file-backed constructor
+and its negative contract tests remain available for those launchers. The
+shipped example intentionally contains `accepted: false` as production-contract
+documentation; it is not required by the test command.
 
 The fixture root is private and exclusively locked. An atomic ownership journal
 records intent before each resource create and binds exact container, network,
@@ -470,13 +459,10 @@ journal manually:
 ```bash
 just cleanup-live-three-replica
 just cleanup-live-three-replica target/my-mssql-three-replica
-just test-live-three-replica-signal .local-eula-acknowledgement.json
-just test-live-three-replica-signal \
-  .local-eula-acknowledgement.json target/my-mssql-three-replica-signal
-just test-live-three-replica-recovery \
-  .local-eula-acknowledgement.json target/my-mssql-three-replica-recovery
-just test-live-three-replica-faults \
-  .local-eula-acknowledgement.json target/my-mssql-three-replica-faults
+just test-live-three-replica-signal
+just test-live-three-replica-signal target/my-mssql-three-replica-signal
+just test-live-three-replica-recovery target/my-mssql-three-replica-recovery
+just test-live-three-replica-faults target/my-mssql-three-replica-faults
 ```
 
 Cleanup removes only exactly journaled resources. Foreign, replaced, or
