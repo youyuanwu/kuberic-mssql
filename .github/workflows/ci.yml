@@ -27,9 +27,9 @@ jobs:
           build-warnings: ""
       - name: Bootstrap shared tools
         run: bash crates/kuberic-mssql-tests/scripts/setup_environment.sh
-      - name: Run Rust-owned one- and three-replica validation
+      - name: Run the same complete pipeline used locally
         id: validation
         run: just ci
-      - name: Release Rust-owned fixture resources after failure or cancellation
+      - name: Release owned fixture resources after failure or cancellation
         if: always() && steps.validation.outcome != 'skipped' && steps.validation.outcome != ''
         run: just cleanup

@@ -187,7 +187,6 @@ fn repository_routes_one_replica_validation_without_python_fixture_helpers() {
     }
 
     let workflow = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
-    assert!(workflow.contains("Run Rust-owned one- and three-replica validation"));
     assert!(workflow.contains("just ci"));
     assert!(workflow.contains("just cleanup"));
 }
