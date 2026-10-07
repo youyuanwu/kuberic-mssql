@@ -357,71 +357,19 @@ fn journal_round_trips_without_secret_values() {
 
 #[test]
 fn schema_seven_serialized_shape_and_previous_schema_migration_remain_stable() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut journal = OwnershipJournal::new(sample_run(directory.path()));
-    journal.resources.push(ResourceRecord {
-        kind: ResourceKind::Container,
-        logical_name: "sql-1".into(),
-        path: None,
-        intent: Some(ResourceBinding {
-            immutable_id: "container-name".into(),
-            attributes_sha256: "a".repeat(64),
-        }),
-        binding: Some(ResourceBinding {
-            immutable_id: "container-id".into(),
-            attributes_sha256: "b".repeat(64),
-        }),
-        state: ResourceState::Bound,
-    });
-
-    let value: serde_json::Value = serde_json::from_slice(&journal.to_json().unwrap()).unwrap();
-    let keys = value
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
+    let current_bytes = include_bytes!("../fixtures/ownership-journal-schema-7.json");
+    let current = OwnershipJournal::from_json(current_bytes).unwrap();
+    assert_eq!(current.schema_version, JOURNAL_SCHEMA_VERSION);
     assert_eq!(
-        keys,
-        [
-            "blocked_owner",
-            "blocked_owner_unknown",
-            "native_binding",
-            "native_intent",
-            "resources",
-            "run",
-            "schema_version",
-            "sql_member_incarnations",
-            "state",
-        ]
-    );
-    let resource_keys = value["resources"][0]
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(
-        resource_keys,
-        ["binding", "intent", "kind", "logical_name", "path", "state"]
-    );
-    assert!(
-        value["run"]["members"]
-            .as_array()
-            .is_some_and(|members| members.len() == 3)
-    );
-    assert!(
-        value["run"]["kuberic_members"]
-            .as_array()
-            .is_some_and(|members| members.len() == 3)
+        serde_json::from_slice::<serde_json::Value>(&current.to_json().unwrap()).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(current_bytes).unwrap()
     );
 
-    let mut previous = value;
-    previous["schema_version"] = serde_json::json!(6);
-    let migrated = OwnershipJournal::from_json(&serde_json::to_vec(&previous).unwrap()).unwrap();
-    assert_eq!(migrated.schema_version, JOURNAL_SCHEMA_VERSION);
-    assert_eq!(migrated.run, journal.run);
-    assert_eq!(migrated.resources, journal.resources);
+    let previous = OwnershipJournal::from_json(include_bytes!(
+        "../fixtures/ownership-journal-schema-6.json"
+    ))
+    .unwrap();
+    assert_eq!(previous, current);
 }
 
 #[test]

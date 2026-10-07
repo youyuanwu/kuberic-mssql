@@ -1,0 +1,72 @@
+{
+  "schema_version": 7,
+  "run": {
+    "run_id": "compatibility-run",
+    "resource_uid": "compatibility-resource",
+    "members": [
+      {
+        "ordinal": 1,
+        "server_name": "sql-1",
+        "container_name": "container-1",
+        "data_directory": "/fixture/member-1"
+      },
+      {
+        "ordinal": 2,
+        "server_name": "sql-2",
+        "container_name": "container-2",
+        "data_directory": "/fixture/member-2"
+      },
+      {
+        "ordinal": 3,
+        "server_name": "sql-3",
+        "container_name": "container-3",
+        "data_directory": "/fixture/member-3"
+      }
+    ],
+    "kuberic_members": [
+      {
+        "ordinal": 1,
+        "replica_id": 1,
+        "instance_id": "instance-1",
+        "pod_uid": "pod-1",
+        "pvc_uid": "pvc-1"
+      },
+      {
+        "ordinal": 2,
+        "replica_id": 2,
+        "instance_id": "instance-2",
+        "pod_uid": "pod-2",
+        "pvc_uid": "pvc-2"
+      },
+      {
+        "ordinal": 3,
+        "replica_id": 3,
+        "instance_id": "instance-3",
+        "pod_uid": "pod-3",
+        "pvc_uid": "pvc-3"
+      }
+    ]
+  },
+  "state": "ready",
+  "blocked_owner": null,
+  "blocked_owner_unknown": false,
+  "sql_member_incarnations": null,
+  "native_intent": null,
+  "native_binding": null,
+  "resources": [
+    {
+      "kind": "container",
+      "logical_name": "sql-1",
+      "path": null,
+      "intent": {
+        "immutable_id": "container-name",
+        "attributes_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "binding": {
+        "immutable_id": "container-id",
+        "attributes_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "state": "bound"
+    }
+  ]
+}
