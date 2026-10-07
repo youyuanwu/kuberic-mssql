@@ -4,9 +4,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tiberius::ToSql;
 use tokio::time::sleep;
+
+use kuberic_mssql::runtime_config::ObserverConfig;
 
 use crate::fixture::admin::{
     AdminDeadlines, AdminEndpoint, AdminSession, LoginFiles, MemberReadinessEvidence,
@@ -41,6 +44,7 @@ use super::model::{OneReplicaJournal, OneReplicaJournalStore, OneReplicaMember, 
 
 const FIXTURE_LABEL: &str = "one-replica";
 const READINESS_RETRY: Duration = Duration::from_secs(2);
+pub const ONE_REPLICA_FAULT_ENV: &str = "SQLSERVER_ONE_REPLICA_FAULT";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OneReplicaFixtureFiles {
@@ -52,6 +56,9 @@ pub struct OneReplicaFixtureFiles {
     pub observer_password: PathBuf,
     pub denied_username: PathBuf,
     pub denied_password: PathBuf,
+    pub absent_config: PathBuf,
+    pub denied_config: PathBuf,
+    pub bad_tls_config: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,6 +231,17 @@ impl LaunchContext {
         let readiness = self
             .initialize_member(host_port, &run, &credentials, &tls)
             .await?;
+        check_fault("after-readiness")?;
+        let configs = self.write_observer_configs(
+            host_port,
+            &run,
+            &inspection.id,
+            &readiness,
+            &credentials,
+            &tls,
+            &bad_ca_certificate,
+        )?;
+        check_fault("after-observer-configs")?;
         self.journal.state = RunState::Ready;
         self.store
             .save(&self.journal)
@@ -245,6 +263,9 @@ impl LaunchContext {
                     observer_password: credentials.observer_password.path().to_path_buf(),
                     denied_username: credentials.denied_username.path().to_path_buf(),
                     denied_password: credentials.denied_password.path().to_path_buf(),
+                    absent_config: configs.absent,
+                    denied_config: configs.denied,
+                    bad_tls_config: configs.bad_tls,
                 },
             },
         ))
@@ -588,6 +609,7 @@ impl LaunchContext {
         self.store
             .bind(&mut self.journal, index, binding)
             .map_err(|_| OneReplicaLaunchError::Journal)?;
+        check_fault("after-container-create")?;
         self.docker
             .start_container(&inspection.id, timeout)
             .map_err(|_| OneReplicaLaunchError::Docker)?;
@@ -599,6 +621,7 @@ impl LaunchContext {
         request
             .verify_inspection(&running, &self.journal.run.image_id, true)
             .map_err(|_| OneReplicaLaunchError::Ownership)?;
+        check_fault("after-container-start")?;
         self.container_request = Some(request);
         Ok(running)
     }
@@ -705,6 +728,122 @@ impl LaunchContext {
             .verify(&run.member.server_name)
             .map_err(|_| OneReplicaLaunchError::Admin)?;
         Ok(evidence)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_observer_configs(
+        &mut self,
+        port: u16,
+        run: &OneReplicaRun,
+        container_id: &str,
+        readiness: &MemberReadinessEvidence,
+        credentials: &OneReplicaCredentials,
+        tls: &SharedTlsAssets,
+        bad_ca_certificate: &PrivateFile,
+    ) -> Result<OneReplicaObserverConfigs, OneReplicaLaunchError> {
+        let directory = self.store.root().join("observer");
+        self.create_recorded_directory("observer-directory", &directory)?;
+        let availability_group = format!("km_absent_{}", run.run_id);
+        let incarnation = format!("{container_id}:{}", readiness.sql_start_unix_millis);
+        let absent = self.write_observer_config(
+            "observer-config-absent",
+            &directory.join("absent.json"),
+            ObserverDocument {
+                mode: "observe_only",
+                host: "localhost",
+                port,
+                availability_group: &availability_group,
+                expected_server_name: &run.member.server_name,
+                replica_id: "1",
+                incarnation: &incarnation,
+                observer_username_file: credentials.observer_username.path(),
+                observer_password_file: credentials.observer_password.path(),
+                ca_certificate_file: tls.ca_certificate.path(),
+                connect_timeout_ms: self.config.fixture().deadlines().sql_connect.as_millis()
+                    as u64,
+                query_timeout_ms: self.config.fixture().deadlines().sql_batch.as_millis() as u64,
+                sample_timeout_ms: self
+                    .config
+                    .fixture()
+                    .deadlines()
+                    .member_readiness
+                    .as_millis() as u64,
+                poll_interval_ms: 2_000,
+                max_age_ms: 60_000,
+            },
+        )?;
+        let denied = self.write_observer_config(
+            "observer-config-denied",
+            &directory.join("denied.json"),
+            ObserverDocument {
+                mode: "observe_only",
+                host: "localhost",
+                port,
+                availability_group: &availability_group,
+                expected_server_name: &run.member.server_name,
+                replica_id: "1",
+                incarnation: &incarnation,
+                observer_username_file: credentials.denied_username.path(),
+                observer_password_file: credentials.denied_password.path(),
+                ca_certificate_file: tls.ca_certificate.path(),
+                connect_timeout_ms: self.config.fixture().deadlines().sql_connect.as_millis()
+                    as u64,
+                query_timeout_ms: self.config.fixture().deadlines().sql_batch.as_millis() as u64,
+                sample_timeout_ms: self
+                    .config
+                    .fixture()
+                    .deadlines()
+                    .member_readiness
+                    .as_millis() as u64,
+                poll_interval_ms: 2_000,
+                max_age_ms: 60_000,
+            },
+        )?;
+        let bad_tls = self.write_observer_config(
+            "observer-config-bad-tls",
+            &directory.join("bad-tls.json"),
+            ObserverDocument {
+                mode: "observe_only",
+                host: "localhost",
+                port,
+                availability_group: &availability_group,
+                expected_server_name: &run.member.server_name,
+                replica_id: "1",
+                incarnation: &incarnation,
+                observer_username_file: credentials.observer_username.path(),
+                observer_password_file: credentials.observer_password.path(),
+                ca_certificate_file: bad_ca_certificate.path(),
+                connect_timeout_ms: self.config.fixture().deadlines().sql_connect.as_millis()
+                    as u64,
+                query_timeout_ms: self.config.fixture().deadlines().sql_batch.as_millis() as u64,
+                sample_timeout_ms: self
+                    .config
+                    .fixture()
+                    .deadlines()
+                    .member_readiness
+                    .as_millis() as u64,
+                poll_interval_ms: 2_000,
+                max_age_ms: 60_000,
+            },
+        )?;
+        Ok(OneReplicaObserverConfigs {
+            absent,
+            denied,
+            bad_tls,
+        })
+    }
+
+    fn write_observer_config(
+        &mut self,
+        logical_name: &str,
+        path: &Path,
+        document: ObserverDocument<'_>,
+    ) -> Result<PathBuf, OneReplicaLaunchError> {
+        let bytes =
+            serde_json::to_vec_pretty(&document).map_err(|_| OneReplicaLaunchError::Readiness)?;
+        ObserverConfig::from_json(&bytes).map_err(|_| OneReplicaLaunchError::Readiness)?;
+        self.create_recorded_bytes_file(logical_name, path, &bytes, false)?;
+        Ok(path.to_path_buf())
     }
 
     fn record_intent(
@@ -888,6 +1027,31 @@ struct OneReplicaCredentials {
     denied_password: PrivateFile,
 }
 
+struct OneReplicaObserverConfigs {
+    absent: PathBuf,
+    denied: PathBuf,
+    bad_tls: PathBuf,
+}
+
+#[derive(Serialize)]
+struct ObserverDocument<'a> {
+    mode: &'static str,
+    host: &'static str,
+    port: u16,
+    availability_group: &'a str,
+    expected_server_name: &'a str,
+    replica_id: &'a str,
+    incarnation: &'a str,
+    observer_username_file: &'a Path,
+    observer_password_file: &'a Path,
+    ca_certificate_file: &'a Path,
+    connect_timeout_ms: u64,
+    query_timeout_ms: u64,
+    sample_timeout_ms: u64,
+    poll_interval_ms: u64,
+    max_age_ms: u64,
+}
+
 struct OneReplicaAssetRecorder<'a> {
     store: &'a OneReplicaJournalStore,
     journal: &'a mut OneReplicaJournal,
@@ -993,8 +1157,10 @@ enum OneReplicaLaunchError {
     Docker,
     Ownership,
     Admin,
+    Readiness,
     Journal,
     Deadline,
+    InjectedFault,
 }
 
 impl OneReplicaLaunchError {
@@ -1006,9 +1172,10 @@ impl OneReplicaLaunchError {
             Self::Tls | Self::TlsHelper => FailureCategory::Tls,
             Self::Docker => FailureCategory::ContainerCreation,
             Self::Ownership => FailureCategory::OwnershipMismatch,
-            Self::Admin => FailureCategory::SqlUnavailable,
+            Self::Admin | Self::Readiness => FailureCategory::SqlUnavailable,
             Self::Journal => FailureCategory::Journal,
             Self::Deadline => FailureCategory::DeadlineExceeded,
+            Self::InjectedFault => FailureCategory::ContainerCreation,
         };
         failure(category)
     }
@@ -1032,6 +1199,18 @@ fn refuse_preexisting<T>(inspection: Option<T>) -> Result<(), OneReplicaLaunchEr
     } else {
         Ok(())
     }
+}
+
+fn check_fault(point: &str) -> Result<(), OneReplicaLaunchError> {
+    if fault_matches(std::env::var(ONE_REPLICA_FAULT_ENV).ok().as_deref(), point) {
+        Err(OneReplicaLaunchError::InjectedFault)
+    } else {
+        Ok(())
+    }
+}
+
+fn fault_matches(configured: Option<&str>, point: &str) -> bool {
+    configured == Some(point)
 }
 
 fn new_run(root: &Path, image_id: String) -> OneReplicaRun {
@@ -1104,5 +1283,18 @@ mod tests {
             refuse_preexisting(Some(())),
             Err(OneReplicaLaunchError::Ownership)
         ));
+    }
+
+    #[test]
+    fn fault_points_require_an_exact_match() {
+        assert!(fault_matches(
+            Some("after-container-create"),
+            "after-container-create"
+        ));
+        assert!(!fault_matches(
+            Some("after-container-start"),
+            "after-container-create"
+        ));
+        assert!(!fault_matches(None, "after-container-create"));
     }
 }

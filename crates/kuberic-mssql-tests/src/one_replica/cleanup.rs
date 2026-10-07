@@ -359,16 +359,22 @@ where
                     return Ok(ResourceObservation::Absent);
                 };
                 let container = self.container.ok_or(ReconcileError::OwnershipMismatch)?;
-                let binding = container
-                    .resource_binding(self.image_id, &inspection)
+                container
+                    .verify_inspection(&inspection, self.image_id, inspection.running)
                     .map_err(|_| ReconcileError::OwnershipMismatch)?;
-                if resource
-                    .binding
-                    .as_ref()
-                    .is_some_and(|expected| expected != &binding)
-                {
-                    return Ok(ResourceObservation::Foreign);
-                }
+                let binding = if let Some(expected) = resource.binding.as_ref() {
+                    if inspection.id != expected.immutable_id
+                        || resource.intent.as_ref()
+                            != Some(&container.intent_binding(self.image_id))
+                    {
+                        return Ok(ResourceObservation::Foreign);
+                    }
+                    expected.clone()
+                } else {
+                    container
+                        .resource_binding(self.image_id, &inspection)
+                        .map_err(|_| ReconcileError::OwnershipMismatch)?
+                };
                 Ok(ResourceObservation::Owned {
                     binding,
                     foreign_attachments: Vec::new(),
