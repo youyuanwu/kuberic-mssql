@@ -398,6 +398,7 @@ fn cleanup_with_coordinator(
         && report.errors.is_empty()
     {
         journal.blocked_owner = None;
+        journal.blocked_owner_unknown = false;
         RunState::Removed
     } else {
         RunState::Blocked

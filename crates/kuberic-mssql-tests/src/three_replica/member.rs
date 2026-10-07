@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -268,6 +268,22 @@ pub fn cleanup_three_replica_fixture(root: &Path) -> Result<CleanupEvidence, Com
             journal_path: store.path().to_path_buf(),
         });
     }
+    if journal.state == RunState::Blocked && journal.blocked_owner_unknown {
+        store.save(&journal).map_err(|_| {
+            CombinedFixtureError::new(
+                SanitizedFailure::new(FailureStage::Cleanup, FailureCategory::Journal),
+                Vec::new(),
+            )
+        })?;
+        return Err(CombinedFixtureError::new(
+            SanitizedFailure::with_detail(
+                FailureStage::Cleanup,
+                FailureCategory::OwnershipMismatch,
+                "legacy blocked journal has no exact owner process incarnation; automatic destructive cleanup is permanently refused and requires manual safety review/recovery",
+            ),
+            Vec::new(),
+        ));
+    }
     if journal.state == RunState::Blocked
         && let Some(owner) = journal.blocked_owner
     {
@@ -404,10 +420,11 @@ pub fn cleanup_three_replica_fixture(root: &Path) -> Result<CleanupEvidence, Com
 
 #[doc(hidden)]
 pub async fn create_blocked_owner_regression_fixture(root: &Path) -> Result<PathBuf, String> {
-    let _lock = acquire_root_lock(root).map_err(|error| error.to_string())?;
+    let lock = acquire_root_lock(root).map_err(|error| error.to_string())?;
     let store = JournalStore::initialize(root).map_err(|error| error.to_string())?;
+    let run = topology_run(store.root()).map_err(|error| error.to_string())?;
     let mut journal = store
-        .create(topology_run(store.root()).map_err(|error| error.to_string())?)
+        .create(run.clone())
         .map_err(|error| error.to_string())?;
     let path = store.root().join("owner-process-regression");
     let binding =
@@ -421,14 +438,61 @@ pub async fn create_blocked_owner_regression_fixture(root: &Path) -> Result<Path
         state: ResourceState::Bound,
     });
     store.save(&journal).map_err(|error| error.to_string())?;
-    let shutdown = super::kuberic_group::exercise_unconfirmed_partial_agent_shutdown().await;
+    let shutdown =
+        super::kuberic_group::exercise_unconfirmed_partial_agent_shutdown(&path, &run).await;
     if !shutdown.agent_termination_unconfirmed() {
         return Err("partial-agent shutdown did not retain the termination fence".to_owned());
     }
-    store
-        .block_for_current_process(&mut journal)
+    let acknowledgement = store.root().join("owner-regression-acknowledgement.json");
+    fs::write(
+        &acknowledgement,
+        br#"{"schema_version":1,"sql_server_eula":{"accepted":true}}"#,
+    )
+    .map_err(|error| error.to_string())?;
+    fs::set_permissions(&acknowledgement, fs::Permissions::from_mode(0o600))
         .map_err(|error| error.to_string())?;
+    let config =
+        FixtureConfig::new(store.root(), acknowledgement).map_err(|error| error.to_string())?;
+    let context = LaunchContext {
+        config,
+        _lock: lock,
+        store,
+        journal,
+        docker: DockerCli::new(BoundedProcessRunner),
+        runner: BoundedProcessRunner,
+        image_id: String::new(),
+        deadline: Instant::now() + Duration::from_secs(60),
+        private_files: Vec::new(),
+        credentials: None,
+        tls: None,
+        network: None,
+        containers: Vec::new(),
+        member_directories: Vec::new(),
+    };
+    let members = std::array::from_fn(|index| ReadyMember {
+        ordinal: (index + 1) as u8,
+        server_name: run.members[index].server_name.clone(),
+        container_id: format!("partial-container-{}", index + 1),
+        host_port: 0,
+        sql_start_time: "1970-01-01T00:00:00".to_owned(),
+        sql_start_unix_millis: 1,
+        observer_config: store_root_observer_path(root, index),
+    });
+    let mut launched = LaunchedMembers {
+        context,
+        run,
+        network_id: String::new(),
+        members,
+    };
+    launched
+        .block_cleanup()
+        .map_err(|error| error.to_string())?;
+    drop(launched);
     Ok(path)
+}
+
+fn store_root_observer_path(root: &Path, index: usize) -> PathBuf {
+    root.join(format!("partial-observer-{}.json", index + 1))
 }
 
 #[doc(hidden)]

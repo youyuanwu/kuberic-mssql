@@ -53,6 +53,23 @@ const AGENT_TOKEN: &str = "mssql-three-replica-agent";
 type Source = Arc<dyn SqlServerObservationSource>;
 type Clock = Arc<dyn ObservationClock>;
 
+struct ShutdownOnlySource {
+    config: ObserverConfig,
+}
+
+#[async_trait]
+impl SqlServerObservationSource for ShutdownOnlySource {
+    fn observer_config(&self) -> &ObserverConfig {
+        &self.config
+    }
+
+    async fn observe(
+        &self,
+    ) -> Result<Observation<InstanceSnapshot>, kuberic_mssql::runtime_error::RuntimeError> {
+        unreachable!("shutdown-only source is never observed")
+    }
+}
+
 struct AddressReservation {
     listener: TcpListener,
 }
@@ -378,24 +395,138 @@ async fn abort_agent_server_without_budget(
 }
 
 #[doc(hidden)]
-pub async fn exercise_unconfirmed_partial_agent_shutdown() -> MssqlGroupError {
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    #[allow(clippy::disallowed_methods)]
-    let mut server = tokio::spawn(async move {
-        entered_tx.send(()).ok();
-        std::thread::sleep(Duration::from_secs(30));
-        Ok(())
-    });
-    let _ = entered_rx.await;
-    match abort_agent_server_without_budget(&mut server).await {
-        Err(error) if error.agent_termination_unconfirmed() => error,
-        Err(error) => MssqlGroupError::termination_unconfirmed(format!(
-            "stalled partial-agent shutdown returned an unexpected failure: {error}"
-        )),
-        Ok(()) => MssqlGroupError::termination_unconfirmed(
-            "stalled partial-agent shutdown unexpectedly established termination",
-        ),
+pub async fn exercise_unconfirmed_partial_agent_shutdown(
+    root: &Path,
+    run: &TopologyRun,
+) -> MssqlGroupError {
+    #[derive(Clone)]
+    struct ExhaustedClock;
+    impl CleanupClock for ExhaustedClock {
+        fn now(&self) -> Duration {
+            Duration::ZERO
+        }
     }
+
+    let resource_uid = ResourceUid::new(run.resource_uid.clone());
+    let policy = exact_policy();
+    let mut pods = Vec::new();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let mut entered_tx = Some(entered_tx);
+    for index in 0..3 {
+        let identity = kuberic_identity(run, index);
+        let store_root = root.join(format!("partial-agent-store-{}", index + 1));
+        let application_root = root.join(format!("partial-agent-application-{}", index + 1));
+        create_private_directory(&store_root).expect("partial-agent store root");
+        create_private_directory(&application_root).expect("partial-agent application root");
+        let pod_uid = PodUid::new(format!("partial-pod-{}", index + 1));
+        let pvc_uid = PvcUid::new(format!("partial-pvc-{}", index + 1));
+        let initialization_id =
+            InitializationId::new(format!("partial-initialization-{}", index + 1));
+        let store = Arc::new(
+            SqliteStore::create_authorized(
+                SqliteStore::metadata_database_path(&store_root),
+                AgentState::new(StorageIdentity {
+                    schema_version: SCHEMA_VERSION,
+                    resource_uid: resource_uid.clone(),
+                    local_identity: identity.clone(),
+                    pod_uid: pod_uid.clone(),
+                    pvc_uid: pvc_uid.clone(),
+                    initialization_id: initialization_id.clone(),
+                    effective_policy: policy.clone(),
+                }),
+            )
+            .expect("partial-agent store"),
+        );
+        let config = ObserverConfig::from_json(
+            format!(
+                r#"{{
+                    "host":"localhost",
+                    "port":1433,
+                    "availability_group":"partial_ag",
+                    "expected_server_name":"partial-{index}",
+                    "replica_id":"{}",
+                    "incarnation":"partial-incarnation-{index}",
+                    "observer_username_file":"/secrets/username",
+                    "observer_password_file":"/secrets/password",
+                    "sample_timeout_ms":1000,
+                    "connect_timeout_ms":1000,
+                    "query_timeout_ms":1000,
+                    "poll_interval_ms":1000,
+                    "max_age_ms":300000
+                }}"#,
+                index + 1
+            )
+            .as_bytes(),
+        )
+        .expect("partial-agent observer config");
+        let source = Arc::new(ShutdownOnlySource { config }) as Source;
+        let application = Arc::new(SqlServerService::with_observation_source(
+            SqlServerServiceConfig::new(
+                resource_uid.clone(),
+                format!("127.0.0.1:{}", 40_000 + index),
+            )
+            .expect("partial-agent service config"),
+            source.clone(),
+            Arc::new(SystemObservationClock),
+        ));
+        let runtime = Arc::new(PodRuntime::new(
+            identity.clone(),
+            application.clone(),
+            store.clone(),
+        ));
+        let agent = AgentService::new(store.clone(), runtime.clone(), runtime.clone(), AGENT_TOKEN)
+            .expect("partial-agent service");
+        let session = agent.sessions().local_session().clone();
+        runtime
+            .bind_replica_session(resource_uid.clone(), session.clone())
+            .expect("partial-agent session");
+        let (shutdown, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = if index == 0 {
+            let entered = entered_tx.take().expect("single stalled agent");
+            #[allow(clippy::disallowed_methods)]
+            Some(tokio::spawn(async move {
+                entered.send(()).ok();
+                std::thread::sleep(Duration::from_secs(30));
+                Ok(())
+            }))
+        } else {
+            None
+        };
+        pods.push(MssqlPod {
+            ordinal: (index + 1) as u8,
+            identity,
+            session,
+            pod_uid,
+            pvc_uid,
+            initialization_id,
+            store,
+            runtime,
+            application,
+            store_root,
+            application_root,
+            control_address: format!("127.0.0.1:{}", 41_000 + index)
+                .parse()
+                .expect("partial control address"),
+            replication_address: format!("127.0.0.1:{}", 42_000 + index)
+                .parse()
+                .expect("partial replication address"),
+            control_reservation: None,
+            replication_reservation: None,
+            source,
+            agent,
+            shutdown: Some(shutdown),
+            server,
+        });
+    }
+    let _ = entered_rx.await;
+    let mut pods: [MssqlPod; 3] = match pods.try_into() {
+        Ok(pods) => pods,
+        Err(_) => panic!("three partial agents"),
+    };
+    let coordinator = CleanupCoordinator::new(ExhaustedClock, Duration::ZERO);
+    shutdown_pods(&mut pods, &coordinator)
+        .await
+        .expect_err("exhausted partial-agent shutdown must fail")
 }
 
 async fn terminate_agent_server(
@@ -1495,9 +1626,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::three_replica::{
-        KubericMember, NativeMemberBinding, OwnershipJournal, RunState, SqlMember, TopologyRun,
-    };
+    use crate::three_replica::{KubericMember, NativeMemberBinding, SqlMember, TopologyRun};
 
     const AG_ID: &str = "11111111-1111-4111-8111-111111111111";
     const DATABASE_ID: &str = "22222222-2222-4222-8222-222222222222";
@@ -1989,47 +2118,6 @@ mod tests {
         clock.0.store(75, Ordering::SeqCst);
         assert_eq!(fixture_budget.remaining(), Some(Duration::from_secs(105)));
         assert_eq!(coordinator.remaining(), Duration::from_secs(105));
-    }
-
-    #[test]
-    fn exhausted_partial_agent_blocks_cleanup_until_termination_is_established() {
-        run_group_test(async {
-            let events = Arc::new(Mutex::new(Vec::new()));
-            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-            #[allow(clippy::disallowed_methods)]
-            let mut server = tokio::spawn(async move {
-                entered_tx.send(()).unwrap();
-                std::thread::sleep(Duration::from_millis(100));
-                Ok(())
-            });
-            entered_rx.await.unwrap();
-
-            let error = abort_agent_server_without_budget(&mut server)
-                .await
-                .unwrap_err();
-            assert!(error.agent_termination_unconfirmed());
-            let root = test_root("blocked-partial-agent");
-            let mut journal = OwnershipJournal::new(run(&root));
-            journal.state = RunState::Blocked;
-            events.lock().unwrap().push("journal-blocked");
-            assert_eq!(journal.state, RunState::Blocked);
-            assert!(!events.lock().unwrap().contains(&"destructive-cleanup"));
-
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            let termination = server.await;
-            assert!(
-                matches!(&termination, Err(error) if error.is_cancelled())
-                    || matches!(&termination, Ok(Ok(())))
-            );
-            events.lock().unwrap().push("agent-terminated");
-            journal.state = RunState::Removed;
-            events.lock().unwrap().push("destructive-cleanup");
-            assert_eq!(
-                events.lock().unwrap().as_slice(),
-                ["journal-blocked", "agent-terminated", "destructive-cleanup"]
-            );
-            assert_eq!(journal.state, RunState::Removed);
-        });
     }
 
     #[test]

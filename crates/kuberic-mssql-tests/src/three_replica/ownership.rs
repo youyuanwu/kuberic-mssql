@@ -199,6 +199,7 @@ impl JournalStore {
     ) -> Result<(), ReconcileError> {
         journal.blocked_owner =
             Some(current_process_incarnation().map_err(|_| ReconcileError::Io)?);
+        journal.blocked_owner_unknown = false;
         journal.state = RunState::Blocked;
         self.save(journal)
     }

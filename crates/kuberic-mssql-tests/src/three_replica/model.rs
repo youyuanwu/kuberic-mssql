@@ -4,8 +4,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const JOURNAL_SCHEMA_VERSION: u32 = 6;
-const PREVIOUS_JOURNAL_SCHEMA_VERSION: u32 = 5;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 7;
+const LEGACY_JOURNAL_SCHEMA_VERSION: u32 = 5;
+const PREVIOUS_JOURNAL_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -205,6 +206,8 @@ pub struct OwnershipJournal {
     pub state: RunState,
     #[serde(default)]
     pub blocked_owner: Option<ProcessIncarnation>,
+    #[serde(default)]
+    pub blocked_owner_unknown: bool,
     pub sql_member_incarnations: Option<[SqlMemberIncarnation; 3]>,
     pub native_intent: Option<NativeTopologyIntent>,
     pub native_binding: Option<NativeTopologyBinding>,
@@ -374,6 +377,7 @@ impl OwnershipJournal {
             run,
             state: RunState::Preparing,
             blocked_owner: None,
+            blocked_owner_unknown: false,
             sql_member_incarnations: None,
             native_intent: None,
             native_binding: None,
@@ -384,7 +388,11 @@ impl OwnershipJournal {
     pub fn from_json(bytes: &[u8]) -> Result<Self, JournalError> {
         let mut journal: Self =
             serde_json::from_slice(bytes).map_err(|_| JournalError::Malformed)?;
-        if journal.schema_version == PREVIOUS_JOURNAL_SCHEMA_VERSION {
+        if journal.schema_version == LEGACY_JOURNAL_SCHEMA_VERSION {
+            journal.blocked_owner_unknown =
+                journal.state == RunState::Blocked && journal.blocked_owner.is_none();
+            journal.schema_version = JOURNAL_SCHEMA_VERSION;
+        } else if journal.schema_version == PREVIOUS_JOURNAL_SCHEMA_VERSION {
             journal.schema_version = JOURNAL_SCHEMA_VERSION;
         } else if journal.schema_version != JOURNAL_SCHEMA_VERSION {
             return Err(JournalError::UnsupportedSchema(journal.schema_version));

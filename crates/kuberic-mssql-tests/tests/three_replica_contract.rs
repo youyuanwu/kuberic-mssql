@@ -342,6 +342,13 @@ fn schema_five_journal_migrates_without_inventing_a_blocked_owner() {
     let migrated = OwnershipJournal::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
     assert_eq!(migrated.schema_version, JOURNAL_SCHEMA_VERSION);
     assert!(migrated.blocked_owner.is_none());
+    assert!(!migrated.blocked_owner_unknown);
+
+    value["state"] = serde_json::json!("blocked");
+    let blocked = OwnershipJournal::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_eq!(blocked.schema_version, JOURNAL_SCHEMA_VERSION);
+    assert!(blocked.blocked_owner.is_none());
+    assert!(blocked.blocked_owner_unknown);
 }
 
 #[test]

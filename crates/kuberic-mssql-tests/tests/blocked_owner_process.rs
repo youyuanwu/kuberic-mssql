@@ -53,7 +53,7 @@ fn blocked_owner_child() {
 
 #[test]
 fn live_owner_process_blocks_cleanup_until_death_then_allows_recovery_and_retry() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = project_tempdir("blocked-owner");
     let root = temporary.path().join("fixture");
     let ready = temporary.path().join("ready");
     let refused = temporary.path().join("same-process-refused");
@@ -111,6 +111,53 @@ fn live_owner_process_blocks_cleanup_until_death_then_allows_recovery_and_retry(
 }
 
 #[test]
+fn schema_five_unknown_owner_refuses_cleanup_while_live_and_after_death() {
+    let temporary = project_tempdir("schema-five-owner");
+    let root = temporary.path().join("fixture");
+    let ready = temporary.path().join("ready");
+    let refused = temporary.path().join("same-process-refused");
+    let mut child = spawn_child(&root, &ready, &refused, false);
+    wait_for(Duration::from_secs(20), || {
+        ready.is_file() && refused.is_file()
+    });
+    let resource = PathBuf::from(String::from_utf8(fs::read(&ready).unwrap()).unwrap());
+    let journal_path = root.join("ownership.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    value["schema_version"] = serde_json::json!(5);
+    let object = value.as_object_mut().unwrap();
+    object.remove("blocked_owner");
+    object.remove("blocked_owner_unknown");
+    fs::write(&journal_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+    let live_refusal = cleanup_process(&root);
+    assert!(!live_refusal.status.success());
+    assert!(String::from_utf8_lossy(&live_refusal.stderr).contains("manual safety review"));
+    assert!(resource.is_dir());
+    let migrated_value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    assert_eq!(migrated_value["schema_version"], serde_json::json!(7));
+    assert_eq!(
+        migrated_value["blocked_owner_unknown"],
+        serde_json::json!(true)
+    );
+    let migrated = load_journal(&root);
+    assert!(migrated.blocked_owner_unknown);
+    assert!(
+        migrated.resources.iter().all(
+            |record| record.state != kuberic_mssql_tests::three_replica::ResourceState::Removed
+        )
+    );
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let dead_refusal = cleanup_process(&root);
+    assert!(!dead_refusal.status.success());
+    assert!(String::from_utf8_lossy(&dead_refusal.stderr).contains("manual safety review"));
+    assert!(resource.is_dir());
+}
+
+#[test]
 fn process_incarnation_matching_rejects_pid_reuse_starttime_mismatch() {
     let pid = 4242;
     let exact = proc_stat(pid, 123_456);
@@ -150,7 +197,25 @@ fn spawn_child(root: &Path, ready: &Path, refused: &Path, retry: bool) -> Child 
     } else {
         command.env(CHILD_MODE, "1");
     }
+
     command.spawn().unwrap()
+}
+
+fn cleanup_process(root: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_mssql-three-replica-fixture"))
+        .args(["cleanup", "--root"])
+        .arg(root)
+        .output()
+        .unwrap()
+}
+
+fn project_tempdir(prefix: &str) -> tempfile::TempDir {
+    let target = std::env::current_dir().unwrap().join("target");
+    fs::create_dir_all(&target).unwrap();
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(target)
+        .unwrap()
 }
 
 fn wait_for(timeout: Duration, mut predicate: impl FnMut() -> bool) {
