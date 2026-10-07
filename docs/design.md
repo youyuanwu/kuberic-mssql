@@ -88,9 +88,29 @@ runtime:
 The production crate connects to already provisioned SQL Server instances. It
 does not create an AG, seed a database, renew a write lease, change a native
 role, or integrate with either Kuberic operator. The optional Kuberic runtime
-adapter validates role and progress callbacks without mutating SQL Server.
-Mutation configuration is therefore only a contract for later stages, not an
-enabled execution path.
+adapter validates role, progress, and one exactly bound current-configuration
+callback without mutating SQL Server. A bound healthy topology may also report
+`catch_up_capability` equal to freshly validated current configuration progress;
+it does not claim earlier retained history, database catch-up, build, recovery,
+lease, or failover capability. Mutation configuration is therefore only a
+contract for later stages, not an enabled execution path.
+
+`SqlServerEulaAcknowledgement` is the shared semantic acknowledgement contract:
+it can be constructed only from an explicit affirmative value. The production
+crate deliberately provides no container or Pod launcher and never translates
+that value into `ACCEPT_EULA=Y`. The dedicated three-replica test launcher owns
+a stricter version-one JSON transport, regular-file identity and digest
+revalidation, and test-only acceptance-setting injection. The retained
+single-container fixture's ambient acknowledgement remains a documented legacy
+compatibility exception; it does not authorize the new launcher.
+
+The licensed three-replica fixture in `kuberic-mssql-tests` is the only new
+mutation path. It creates certificate-authenticated endpoints, joins an
+external AG, grants automatic-seeding database creation, seeds one database,
+and writes a proof marker. These effects exist solely to provision and verify
+an isolated test topology. Production `SqlExecutor`, `TdsExecutor`, observer,
+service, and replicator paths receive no administrative SQL or container
+authority.
 
 The crate remained independent when the classic runtime was removed. The
 `sqlserver-observer` binary
@@ -300,6 +320,31 @@ operations still require:
 The current SQL Server code remains an independently testable adapter library
 and laboratory tool. It does not claim automatic Kubernetes failover.
 
+The three-member laboratory path freezes one `HealthyTopologyBinding` per
+member. The binding correlates exact Kuberic resource/replica identities,
+process sessions, addresses, current descriptor, effective policy and stable
+roles with SQL Server names, process-start incarnations, native replica GUIDs,
+AG identity and database lineage. `update_current_replica_set_configuration`
+accepts only that current descriptor and value-identical replay.
+`catch_up_capability` is available only after exact current admission and role
+publication; both callbacks reobserve SQL Server and revalidate durable runtime
+authority. Previous/current transitions, catch-up quorum, build, removal, data
+loss, recovery, failover and lease behavior remain explicit observe-only
+errors.
+
+Role is not write authority. The healthy reports expose one primary and two
+active secondaries, but read access remains reconfiguration-pending and write
+access is never granted. There is no external write lease. The fixture's marker
+write uses its private administrator connection to the directly observed native
+primary and is not a Kuberic client-access decision.
+
+The current implementation temporarily pins Kuberic Git commit
+`2eed72e2e2e906c286e9d12b5dd7950e9dc2ddc9` for the authority-validation
+ordering tracked by
+[youyuanwu/kuberic#124](https://github.com/youyuanwu/kuberic/pull/124). This pin
+remains an upstream dependency until an appropriate merge or release is
+available; no merge outcome is assumed.
+
 ## Delivery Sequence
 
 1. **Support and safety contract** — implemented: types, validation,
@@ -363,6 +408,23 @@ than skip when requested prerequisites are missing. Mutation support cannot be
 declared complete until live tests cover crash points before and after intent
 persistence, native dispatch, postcondition observation, result persistence,
 reply, and routing publication.
+
+Separately, the explicitly invoked ignored three-replica test pins
+`mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726`
+and requires a strict affirmative acknowledgement file. It creates three
+resource-bounded instances, real endpoints, one synchronous external AG and one
+automatically seeded database. Fresh direct observations must prove one primary,
+two synchronized healthy secondaries, common identities and lineage, completed
+seeding, and a marker readable from all members. Three in-process Kuberic agents
+then admit only the frozen current topology and publish bracketed, fenced
+reports. Exact ownership is persisted before create dispatch, cleanup
+revalidates immutable IDs and attributes, and the SIGTERM regression proves
+journal recovery and retry.
+
+This fixture is not part of ordinary CI and does not advance the production
+delivery sequence. It provides healthy-path evidence only: it does not test
+write-lease expiry, old-primary fencing, switchover, failover, replica
+replacement, Kubernetes lifecycle, or client routing.
 
 ## References
 

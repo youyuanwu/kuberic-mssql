@@ -96,6 +96,20 @@ fn denied_missing_malformed_or_unsupported_input_never_authorizes_launch() {
 }
 
 #[test]
+fn shipped_false_acknowledgement_example_parses_but_cannot_authorize_launch() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/eula-acknowledgement.example.json");
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).expect("example is valid JSON");
+    assert_eq!(document["schema_version"], 1);
+    assert_eq!(document["sql_server_eula"]["accepted"], false);
+    assert_eq!(
+        LaunchAuthorization::load(&path).unwrap_err(),
+        FixtureConfigError::AcknowledgementDenied
+    );
+}
+
+#[test]
 fn strict_document_rejects_missing_duplicate_and_unknown_fields() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("acknowledgement.json");

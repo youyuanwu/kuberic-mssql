@@ -90,8 +90,31 @@ Successful role validation always returns no client service address. The
 configured replication address belongs only to `Replicator::open`; it is not a
 listener, routing endpoint, or application address.
 
-All topology callbacks return explicit observe-only errors. No callback returns
-a dummy success or a fabricated catch-up value.
+An exactly bound healthy topology enables two additional current-only
+operations. `HealthyTopologyBinding` freezes the shared resource, local and peer
+Kuberic identities, process sessions, replication addresses, stable roles,
+current configuration, effective policy, SQL Server process incarnations,
+native replica GUIDs, AG identity, and database lineage.
+
+`update_current_replica_set_configuration` accepts only the frozen current
+descriptor and exact peer descriptions; after admission, only value-identical
+replay is accepted. `catch_up_capability` is then reported as a fresh
+configuration sequence equal to current progress. Both paths reobserve SQL
+Server and revalidate the durable runtime authority and effective policy. Any
+identity, session, epoch, role, health, synchronization, lineage, incarnation,
+freshness, or policy drift fails closed.
+
+This is a conservative current-only capability: the adapter claims no earlier
+retained configuration history. It is not a database LSN and does not imply
+replica build, repair, catch-up, data-loss recovery, lease, or failover support.
+The locked controller comparison treats a member at the current sequence or one
+behind as not requiring full repair, and a member two or more behind as
+requiring it. Contract tests preserve that exact boundary.
+
+Unbound adapters still reject both operations. Previous/current transitions,
+catch-up configuration and quorum, build, removal, data loss, recovery, lease,
+switchover, and failover callbacks remain explicit observe-only errors. No
+callback returns a dummy success or fabricated value.
 
 ## Ownership Model
 
@@ -117,42 +140,87 @@ Kuberic's replica-local runtime, rather than the Kubernetes controller, should
 eventually own SQL bootstrap, join, seeding, lease, and role transitions under
 durable Kuberic authority.
 
-## Container Happy Path
+## Live Validation Paths
 
-`just ci` uses one digest-pinned SQL Server 2025 Enterprise Developer container.
-The Rust tests, Kuberic testing runtime, observer, and SQL client remain host
-processes.
+### Legacy single-container observation fixture
 
-The fixture creates one metadata-only EXTERNAL availability group under a
-private per-fixture nonce-bearing name:
+`just ci` retains one digest-pinned SQL Server 2025 Enterprise Developer
+container. It creates one metadata-only EXTERNAL AG with one local primary
+definition and two configured but unstarted peers. It has no managed database,
+running HADR endpoint, join, seeding, write lease, or failover. This fixture
+proves real-engine observation and single-runtime configuration-progress
+publication, not data replication or HA.
 
-- one local PRIMARY replica definition;
-- two configured but unstarted peer definitions;
-- synchronous commit, EXTERNAL failover, and automatic seeding for all three;
+Its private ownership record persists the nonce-bearing AG name before create,
+then binds the exact group ID and profile. Cleanup revalidates those values in
+the destructive batch. This fixture also retains its ambient
+`SQLSERVER_TEST_EULA_ACCEPTED` compatibility gate.
+
+### Three-member native and Kuberic happy path
+
+The dedicated ignored path starts three real containers from:
+
+`mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726`
+
+The SQL Server image reports version `17.0.5005.3`. The fixture requires a
+strict version-one affirmative acknowledgement file; it does not accept the
+legacy ambient variable.
+
+Fixture-only administration creates and proves:
+
+- one certificate-authenticated, started HADR endpoint on every member;
+- peer certificate users/logins with exact endpoint `CONNECT`;
+- one three-replica `CLUSTER_TYPE = EXTERNAL` AG;
+- synchronous commit, EXTERNAL failover metadata, automatic seeding, and
+  readable secondary connections for every replica;
 - required synchronized secondaries equal to one;
-- no managed database; and
-- no database-mirroring endpoint, endpoint certificate, database master key,
-  write lease operation, join, seeding, or failover.
+- both secondary joins and `GRANT CREATE ANY DATABASE`;
+- one full-recovery database;
+- two completed successful automatic-seeding operations;
+- exactly one native primary and two synchronized healthy secondaries; and
+- one marker committed on the native primary and read directly from all three
+  members.
 
-SQL Server accepts endpoint URL metadata without a running endpoint. This is
-enough to expose and test the AG configuration sequence, but it proves no data
-replication or HA behavior.
+Production observation code supplies the proof. Each member is observed
+directly, and the three observations must agree on AG identity and configuration
+sequence, replica identities/profile, group-database identity, family GUID,
+recovery fork, roles, synchronization health, and seeding history. A SQL process
+restart, container replacement, AG/database recreation, role drift, stale
+sample, sequence mismatch, suspended database, or unhealthy synchronization
+invalidates the binding.
 
-Before create dispatch, the fixture ownership record persists the private AG
-name. Only that unguessable recorded name plus the exact expected profile may be
-bound, after which the exact SQL Server group ID is also recorded. Cleanup
-revalidates the name, group ID, and profile in the destructive SQL batch before
-dropping the AG. Absence, replacement, interruption, or ambiguous cleanup keeps
-the record and fails closed. A pre-dispatch interruption with no AG is the sole
-case that can be recorded as clean without a group ID. Removing a
-fixture-created container removes its writable SQL metadata.
+`MssqlGroup` then creates three isolated SQLite stores, services, replicators,
+runtimes, process sessions, and agent servers for one shared Kuberic resource.
+Every ordered peer pair is registered and described before the exact current
+configuration is admitted. Reports are bracketed by fresh direct observations
+and must show:
 
-The required live Kuberic test:
+- one shared resource and current configuration with no previous
+  configuration;
+- three exact identities and process sessions;
+- one Kuberic primary and two active secondaries matching native roles;
+- current progress and catch-up capability equal to the corresponding fresh
+  native configuration sequence;
+- healthy initialized durable state; and
+- fenced access: read remains reconfiguration-pending and write is never
+  granted.
 
-1. opens the observe-only service through Kuberic's published testing runtime;
-2. obtains current progress through the Kuberic runtime snapshot;
-3. makes a fresh direct SQL observation; and
-4. verifies both paths report the same positive configuration sequence.
+Role is not write authority. No SQL external write lease is acquired. The
+replicated marker is written only by the fixture administrator against the
+directly observed native primary.
+
+The pre-implementation feasibility run completed the native path on the same
+pinned image with one primary, two synchronized healthy secondaries, common
+configuration sequence `4294967307`, and the same marker visible on all three.
+The final ignored test additionally proves the three fenced Kuberic reports and
+exact cleanup/recovery behavior.
+
+The workspace temporarily pins Kuberic commit
+`2eed72e2e2e906c286e9d12b5dd7950e9dc2ddc9`, tracked by open
+[Kuberic PR #124](https://github.com/youyuanwu/kuberic/pull/124), so custom
+authority validation completes before durable publication. The pin remains
+until a suitable upstream merge or release is available and does not predict
+the pull request's outcome.
 
 ## Usage
 
@@ -186,23 +254,48 @@ just test-live-shared
 Live tests remain ignored for direct Cargo invocation and require explicit
 licensed fixture provisioning.
 
+Run the real three-member path with a reviewed acknowledgement file:
+
+```bash
+just test-live-three-replica <file> [root]
+```
+
+Recover the default or a selected journaled root:
+
+```bash
+just cleanup-live-three-replica [root]
+```
+
+Exercise handled SIGTERM, recovery, retry, and idempotent cleanup:
+
+```bash
+just test-live-three-replica-signal <file> [root]
+```
+
+The shipped acknowledgement example contains `accepted: false`; it parses but
+cannot authorize launch until a contributor reviews the license and explicitly
+changes the value to `true`.
+
 ## Deferred Work
 
 This integration does not yet provide:
 
 - a production executable hosting SQL Server through `ReplicaHost`;
 - SQL Server process ownership or restart containment;
-- a managed user database;
-- endpoint certificate provisioning or rotation;
-- replica join, automatic seeding, rebuild, or reseed;
+- production managed-database creation;
+- production endpoint certificate provisioning or rotation;
+- production replica join, automatic seeding, rebuild, or reseed;
 - database-progress build and catch-up proofs;
 - application read/write access fencing;
 - external write-lease renewal and expiry evidence;
 - sequence quorum collection across exact replica sessions;
 - planned switchover, automatic or forced failover, or data-loss recovery;
 - Kubernetes Pod, PVC, Secret, Service, listener, routing, or installation
-  convergence; or
-- multi-container and Kubernetes fault testing.
+  convergence;
+- a Kuberic sidecar;
+- Kubernetes fault testing; and
+- multi-member failure, replacement, network-partition, old-primary, or
+  write-lease-expiry testing.
 
 Those stages require separate design and safety review.
 
