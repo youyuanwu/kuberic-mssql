@@ -230,6 +230,18 @@ impl FixtureConfig {
         Self::with_authorization(root.into(), LaunchAuthorization::for_test_fixture())
     }
 
+    pub(crate) fn for_test_fixture_with_policy(
+        root: impl Into<PathBuf>,
+        resources: ResourcePolicy,
+        deadlines: StageDeadlines,
+    ) -> Result<Self, FixtureConfigError> {
+        let mut config =
+            Self::with_authorization(root.into(), LaunchAuthorization::for_test_fixture())?;
+        config.resources = resources;
+        config.deadlines = deadlines;
+        Ok(config)
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

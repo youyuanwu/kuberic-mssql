@@ -70,7 +70,21 @@ impl fmt::Display for LockError {
 impl Error for LockError {}
 
 pub fn acquire_root_lock(root: &Path) -> Result<RootLock, LockError> {
+    acquire_fixture_root_lock(root, "three-replica")
+}
+
+pub(crate) fn acquire_fixture_root_lock(
+    root: &Path,
+    fixture_name: &str,
+) -> Result<RootLock, LockError> {
     if !root.is_absolute() {
+        return Err(LockError::InvalidRoot);
+    }
+    if fixture_name.is_empty()
+        || !fixture_name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
         return Err(LockError::InvalidRoot);
     }
     let canonical_root = canonical_missing_path(root)?;
@@ -79,7 +93,7 @@ pub fn acquire_root_lock(root: &Path) -> Result<RootLock, LockError> {
     digest.update(canonical_root.as_os_str().as_bytes());
     let digest = hex(&digest.finalize());
     let lock_path = parent.join(format!(
-        ".kuberic-mssql-three-replica-{}.lock",
+        ".kuberic-mssql-{fixture_name}-{}.lock",
         &digest[..24]
     ));
     let file = OpenOptions::new()
@@ -138,6 +152,12 @@ impl JournalStore {
     }
 
     pub fn load(&self) -> Result<Option<OwnershipJournal>, ReconcileError> {
+        self.load_bytes()?
+            .map(|bytes| OwnershipJournal::from_json(&bytes).map_err(ReconcileError::Journal))
+            .transpose()
+    }
+
+    pub(crate) fn load_bytes(&self) -> Result<Option<Vec<u8>>, ReconcileError> {
         self.verify_root_identity()?;
         match self.openat(
             JOURNAL_FILE,
@@ -148,9 +168,7 @@ impl JournalStore {
                 let mut bytes = Vec::new();
                 file.read_to_end(&mut bytes)
                     .map_err(|_| ReconcileError::Io)?;
-                OwnershipJournal::from_json(&bytes)
-                    .map(Some)
-                    .map_err(ReconcileError::Journal)
+                Ok(Some(bytes))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(_) => Err(ReconcileError::Io),
@@ -164,8 +182,12 @@ impl JournalStore {
     }
 
     pub fn save(&self, journal: &OwnershipJournal) -> Result<(), ReconcileError> {
-        self.verify_root_identity()?;
         let bytes = journal.to_json().map_err(ReconcileError::Journal)?;
+        self.save_bytes(&bytes)
+    }
+
+    pub(crate) fn save_bytes(&self, bytes: &[u8]) -> Result<(), ReconcileError> {
+        self.verify_root_identity()?;
         let temporary = format!(
             ".{JOURNAL_FILE}.{}.{}.new",
             std::process::id(),
@@ -179,7 +201,7 @@ impl JournalStore {
             )
             .map_err(|_| ReconcileError::Io)?;
         let result = (|| {
-            file.write_all(&bytes).map_err(|_| ReconcileError::Io)?;
+            file.write_all(bytes).map_err(|_| ReconcileError::Io)?;
             file.sync_all().map_err(|_| ReconcileError::Io)?;
             self.verify_root_identity()?;
             self.renameat(&temporary, JOURNAL_FILE)?;

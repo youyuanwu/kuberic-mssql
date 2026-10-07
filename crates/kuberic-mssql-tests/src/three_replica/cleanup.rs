@@ -35,6 +35,42 @@ pub trait CleanupBackend: OwnershipInspector {
     ) -> Result<(), CleanupError>;
 }
 
+pub(crate) trait CleanupJournal {
+    fn state_mut(&mut self) -> &mut RunState;
+    fn resources(&self) -> &[ResourceRecord];
+    fn resources_mut(&mut self) -> &mut Vec<ResourceRecord>;
+    fn clear_blocked_owner(&mut self);
+}
+
+impl CleanupJournal for OwnershipJournal {
+    fn state_mut(&mut self) -> &mut RunState {
+        &mut self.state
+    }
+
+    fn resources(&self) -> &[ResourceRecord] {
+        &self.resources
+    }
+
+    fn resources_mut(&mut self) -> &mut Vec<ResourceRecord> {
+        &mut self.resources
+    }
+
+    fn clear_blocked_owner(&mut self) {
+        self.blocked_owner = None;
+        self.blocked_owner_unknown = false;
+    }
+}
+
+pub(crate) trait CleanupJournalStore<J> {
+    fn save_cleanup_journal(&self, journal: &J) -> Result<(), ReconcileError>;
+}
+
+impl CleanupJournalStore<OwnershipJournal> for JournalStore {
+    fn save_cleanup_journal(&self, journal: &OwnershipJournal) -> Result<(), ReconcileError> {
+        self.save(journal)
+    }
+}
+
 pub const CLEANUP_BUDGET: Duration = Duration::from_secs(180);
 
 pub trait CleanupClock {
@@ -157,6 +193,19 @@ impl<C: CleanupClock> CleanupCoordinator<C> {
         journal: &mut OwnershipJournal,
         backend: &impl CleanupBackend,
     ) -> CleanupReport {
+        self.cleanup_shared(store, journal, backend)
+    }
+
+    pub(crate) fn cleanup_shared<J, S>(
+        &self,
+        store: &S,
+        journal: &mut J,
+        backend: &impl CleanupBackend,
+    ) -> CleanupReport
+    where
+        J: CleanupJournal,
+        S: CleanupJournalStore<J>,
+    {
         cleanup_with_coordinator(store, journal, backend, self)
     }
 
@@ -167,12 +216,26 @@ impl<C: CleanupClock> CleanupCoordinator<C> {
         journal: &mut OwnershipJournal,
         backend: &impl CleanupBackend,
     ) -> Result<T, CombinedFixtureError> {
+        self.coordinate_shared(completion, store, journal, backend)
+    }
+
+    pub(crate) fn coordinate_shared<T, J, S>(
+        &self,
+        completion: CleanupCompletion<T>,
+        store: &S,
+        journal: &mut J,
+        backend: &impl CleanupBackend,
+    ) -> Result<T, CombinedFixtureError>
+    where
+        J: CleanupJournal,
+        S: CleanupJournalStore<J>,
+    {
         let primary = match completion {
             CleanupCompletion::Result(result) => result,
             CleanupCompletion::CaughtPanic(failure)
             | CleanupCompletion::HandledSignal { failure, .. } => Err(failure),
         };
-        combine_with_cleanup(primary, &self.cleanup(store, journal, backend))
+        combine_with_cleanup(primary, &self.cleanup_shared(store, journal, backend))
     }
 }
 
@@ -230,19 +293,23 @@ pub fn cleanup(
     CleanupCoordinator::default().cleanup(store, journal, backend)
 }
 
-fn cleanup_with_coordinator(
-    store: &JournalStore,
-    journal: &mut OwnershipJournal,
+fn cleanup_with_coordinator<J, S>(
+    store: &S,
+    journal: &mut J,
     backend: &impl CleanupBackend,
     coordinator: &CleanupCoordinator<impl CleanupClock>,
-) -> CleanupReport {
+) -> CleanupReport
+where
+    J: CleanupJournal,
+    S: CleanupJournalStore<J>,
+{
     let mut report = CleanupReport {
         removed: Vec::new(),
         unresolved: Vec::new(),
         errors: Vec::new(),
     };
-    journal.state = RunState::Cleaning;
-    if store.save(journal).is_err() {
+    *journal.state_mut() = RunState::Cleaning;
+    if store.save_cleanup_journal(journal).is_err() {
         report.errors.push(CleanupError {
             resource: "ownership-journal".to_owned(),
             failure: SanitizedFailure::new(FailureStage::Cleanup, FailureCategory::Journal),
@@ -250,17 +317,17 @@ fn cleanup_with_coordinator(
         return report;
     }
 
-    let mut cleanup_order = (0..journal.resources.len())
+    let mut cleanup_order = (0..journal.resources().len())
         .rev()
-        .filter(|index| journal.resources[*index].kind == ResourceKind::Container)
+        .filter(|index| journal.resources()[*index].kind == ResourceKind::Container)
         .collect::<Vec<_>>();
     cleanup_order.extend(
-        (0..journal.resources.len())
+        (0..journal.resources().len())
             .rev()
-            .filter(|index| journal.resources[*index].kind != ResourceKind::Container),
+            .filter(|index| journal.resources()[*index].kind != ResourceKind::Container),
     );
     for index in cleanup_order {
-        let record = journal.resources[index].clone();
+        let record = journal.resources()[index].clone();
         if record.state == ResourceState::Removed {
             continue;
         }
@@ -269,9 +336,9 @@ fn cleanup_with_coordinator(
             continue;
         }
         if record.state == ResourceState::Intended {
-            journal.resources[index].state = ResourceState::Removed;
+            journal.resources_mut()[index].state = ResourceState::Removed;
             report.removed.push(record.logical_name.clone());
-            if store.save(journal).is_err() {
+            if store.save_cleanup_journal(journal).is_err() {
                 report.errors.push(CleanupError::journal(&record));
             }
             continue;
@@ -285,7 +352,7 @@ fn cleanup_with_coordinator(
         ) && !containers_proven_absent(journal)
         {
             block(journal, index, &record, &mut report);
-            let _ = store.save(journal);
+            let _ = store.save_cleanup_journal(journal);
             continue;
         }
         if matches!(
@@ -294,7 +361,7 @@ fn cleanup_with_coordinator(
         ) && !descendants_proven_removed(journal, &record)
         {
             block(journal, index, &record, &mut report);
-            let _ = store.save(journal);
+            let _ = store.save_cleanup_journal(journal);
             continue;
         }
         let observation = match backend.inspect_cleanup(&record, coordinator.remaining()) {
@@ -323,9 +390,9 @@ fn cleanup_with_coordinator(
                 {
                     block(journal, index, &record, &mut report);
                 } else {
-                    journal.resources[index].state = ResourceState::Removed;
+                    journal.resources_mut()[index].state = ResourceState::Removed;
                     report.removed.push(record.logical_name.clone());
-                    if store.save(journal).is_err() {
+                    if store.save_cleanup_journal(journal).is_err() {
                         report.errors.push(CleanupError::journal(&record));
                     }
                 }
@@ -355,33 +422,37 @@ fn cleanup_with_coordinator(
             record.state,
             ResourceState::Dispatched | ResourceState::Blocked
         ) {
-            journal.resources[index].binding = Some(binding);
+            journal.resources_mut()[index].binding = Some(binding);
         } else {
             block(journal, index, &record, &mut report);
             continue;
         }
-        journal.resources[index].state = ResourceState::Cleaning;
-        if store.save(journal).is_err() {
+        journal.resources_mut()[index].state = ResourceState::Cleaning;
+        if store.save_cleanup_journal(journal).is_err() {
             report.errors.push(CleanupError::journal(&record));
             block(journal, index, &record, &mut report);
             continue;
         }
-        if let Err(error) = remove(backend, &journal.resources[index], coordinator.remaining()) {
-            journal.resources[index].state = ResourceState::Blocked;
+        if let Err(error) = remove(
+            backend,
+            &journal.resources()[index],
+            coordinator.remaining(),
+        ) {
+            journal.resources_mut()[index].state = ResourceState::Blocked;
             report.unresolved.push(record.logical_name.clone());
             report.errors.push(error);
-            let _ = store.save(journal);
+            let _ = store.save_cleanup_journal(journal);
             continue;
         }
         if coordinator.remaining().is_zero() {
             exhaust_budget(journal, index, &record, &mut report);
             continue;
         }
-        match backend.inspect_cleanup(&journal.resources[index], coordinator.remaining()) {
+        match backend.inspect_cleanup(&journal.resources()[index], coordinator.remaining()) {
             Ok(ResourceObservation::Absent) => {
-                journal.resources[index].state = ResourceState::Removed;
+                journal.resources_mut()[index].state = ResourceState::Removed;
                 report.removed.push(record.logical_name.clone());
-                if store.save(journal).is_err() {
+                if store.save_cleanup_journal(journal).is_err() {
                     report.errors.push(CleanupError::journal(&record));
                 }
             }
@@ -391,19 +462,19 @@ fn cleanup_with_coordinator(
         }
     }
 
-    journal.state = if journal
-        .resources
+    let final_state = if journal
+        .resources()
         .iter()
         .all(|resource| resource.state == ResourceState::Removed)
         && report.errors.is_empty()
     {
-        journal.blocked_owner = None;
-        journal.blocked_owner_unknown = false;
+        journal.clear_blocked_owner();
         RunState::Removed
     } else {
         RunState::Blocked
     };
-    if store.save(journal).is_err() {
+    *journal.state_mut() = final_state;
+    if store.save_cleanup_journal(journal).is_err() {
         report.errors.push(CleanupError {
             resource: "ownership-journal".to_owned(),
             failure: SanitizedFailure::new(FailureStage::Cleanup, FailureCategory::Journal),
@@ -459,17 +530,17 @@ fn remove(
     }
 }
 
-fn containers_proven_absent(journal: &OwnershipJournal) -> bool {
-    journal.resources.iter().all(|resource| {
+fn containers_proven_absent(journal: &impl CleanupJournal) -> bool {
+    journal.resources().iter().all(|resource| {
         resource.kind != ResourceKind::Container || resource.state == ResourceState::Removed
     })
 }
 
-fn descendants_proven_removed(journal: &OwnershipJournal, directory: &ResourceRecord) -> bool {
+fn descendants_proven_removed(journal: &impl CleanupJournal, directory: &ResourceRecord) -> bool {
     let Some(directory_path) = directory.path.as_ref() else {
         return false;
     };
-    journal.resources.iter().all(|resource| {
+    journal.resources().iter().all(|resource| {
         resource.logical_name == directory.logical_name
             || resource.path.as_ref().is_none_or(|path| {
                 !path.starts_with(directory_path) || resource.state == ResourceState::Removed
@@ -478,12 +549,12 @@ fn descendants_proven_removed(journal: &OwnershipJournal, directory: &ResourceRe
 }
 
 fn exhaust_budget(
-    journal: &mut OwnershipJournal,
+    journal: &mut impl CleanupJournal,
     index: usize,
     record: &ResourceRecord,
     report: &mut CleanupReport,
 ) {
-    journal.resources[index].state = ResourceState::Blocked;
+    journal.resources_mut()[index].state = ResourceState::Blocked;
     if !report.unresolved.contains(&record.logical_name) {
         report.unresolved.push(record.logical_name.clone());
     }
@@ -494,12 +565,12 @@ fn exhaust_budget(
 }
 
 fn block(
-    journal: &mut OwnershipJournal,
+    journal: &mut impl CleanupJournal,
     index: usize,
     record: &ResourceRecord,
     report: &mut CleanupReport,
 ) {
-    journal.resources[index].state = ResourceState::Blocked;
+    journal.resources_mut()[index].state = ResourceState::Blocked;
     if !report.unresolved.contains(&record.logical_name) {
         report.unresolved.push(record.logical_name.clone());
     }
