@@ -397,6 +397,7 @@ fn cleanup_with_coordinator(
         .all(|resource| resource.state == ResourceState::Removed)
         && report.errors.is_empty()
     {
+        journal.blocked_owner = None;
         RunState::Removed
     } else {
         RunState::Blocked

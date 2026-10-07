@@ -368,11 +368,33 @@ async fn abort_agent_server_without_budget(
             "cleanup budget exhausted; aborted agent task termination could not be established",
         ));
     }
+
     match (&mut *server).await {
         Err(error) if error.is_cancelled() => Ok(()),
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(display_error(error)),
         Err(error) => Err(display_error(error)),
+    }
+}
+
+#[doc(hidden)]
+pub async fn exercise_unconfirmed_partial_agent_shutdown() -> MssqlGroupError {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    #[allow(clippy::disallowed_methods)]
+    let mut server = tokio::spawn(async move {
+        entered_tx.send(()).ok();
+        std::thread::sleep(Duration::from_secs(30));
+        Ok(())
+    });
+    let _ = entered_rx.await;
+    match abort_agent_server_without_budget(&mut server).await {
+        Err(error) if error.agent_termination_unconfirmed() => error,
+        Err(error) => MssqlGroupError::termination_unconfirmed(format!(
+            "stalled partial-agent shutdown returned an unexpected failure: {error}"
+        )),
+        Ok(()) => MssqlGroupError::termination_unconfirmed(
+            "stalled partial-agent shutdown unexpectedly established termination",
+        ),
     }
 }
 

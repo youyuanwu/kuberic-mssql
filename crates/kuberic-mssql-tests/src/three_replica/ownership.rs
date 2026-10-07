@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 
 use super::cleanup::{CleanupClock, OperationBudget, SystemCleanupClock};
 use super::model::{
-    JournalError, OwnershipJournal, ResourceBinding, ResourceRecord, ResourceState, RunState,
-    TopologyRun,
+    JournalError, OwnershipJournal, ProcessIncarnation, ResourceBinding, ResourceRecord,
+    ResourceState, RunState, TopologyRun,
 };
 use super::process::{CommandSpec, ProcessRunner};
 
@@ -193,6 +193,16 @@ impl JournalStore {
         result
     }
 
+    pub fn block_for_current_process(
+        &self,
+        journal: &mut OwnershipJournal,
+    ) -> Result<(), ReconcileError> {
+        journal.blocked_owner =
+            Some(current_process_incarnation().map_err(|_| ReconcileError::Io)?);
+        journal.state = RunState::Blocked;
+        self.save(journal)
+    }
+
     fn verify_root_identity(&self) -> Result<(), ReconcileError> {
         let metadata = fs::symlink_metadata(&self.root).map_err(|_| ReconcileError::Io)?;
         if !metadata.is_dir()
@@ -302,6 +312,92 @@ impl JournalStore {
         record.state = ResourceState::Bound;
         self.save(journal)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessIncarnationError {
+    Unsupported,
+    Io,
+    Malformed,
+}
+
+impl fmt::Display for ProcessIncarnationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Unsupported => "process incarnation proof requires Linux /proc",
+            Self::Io => "process incarnation evidence is unavailable",
+            Self::Malformed => "process incarnation evidence is malformed",
+        })
+    }
+}
+
+impl Error for ProcessIncarnationError {}
+
+pub fn current_process_incarnation() -> Result<ProcessIncarnation, ProcessIncarnationError> {
+    process_incarnation(std::process::id())
+}
+
+pub fn process_incarnation(pid: u32) -> Result<ProcessIncarnation, ProcessIncarnationError> {
+    if !cfg!(target_os = "linux") {
+        return Err(ProcessIncarnationError::Unsupported);
+    }
+    let stat =
+        fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|_| ProcessIncarnationError::Io)?;
+    parse_process_incarnation(pid, &stat)
+}
+
+pub fn process_incarnation_is_alive(
+    expected: ProcessIncarnation,
+) -> Result<bool, ProcessIncarnationError> {
+    if !cfg!(target_os = "linux") {
+        return Err(ProcessIncarnationError::Unsupported);
+    }
+    let stat = match fs::read_to_string(format!("/proc/{}/stat", expected.pid)) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(ProcessIncarnationError::Io),
+    };
+    process_incarnation_matches_stat(expected, &stat)
+}
+
+pub fn process_incarnation_matches_stat(
+    expected: ProcessIncarnation,
+    stat: &str,
+) -> Result<bool, ProcessIncarnationError> {
+    Ok(parse_process_incarnation(expected.pid, stat)? == expected)
+}
+
+pub fn parse_process_incarnation(
+    expected_pid: u32,
+    stat: &str,
+) -> Result<ProcessIncarnation, ProcessIncarnationError> {
+    let (pid, remainder) = stat
+        .split_once(' ')
+        .ok_or(ProcessIncarnationError::Malformed)?;
+    if pid
+        .parse::<u32>()
+        .map_err(|_| ProcessIncarnationError::Malformed)?
+        != expected_pid
+    {
+        return Err(ProcessIncarnationError::Malformed);
+    }
+    let close = remainder
+        .rfind(')')
+        .ok_or(ProcessIncarnationError::Malformed)?;
+    let fields = remainder
+        .get(close + 1..)
+        .ok_or(ProcessIncarnationError::Malformed)?
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let starttime_ticks = fields
+        .get(19)
+        .ok_or(ProcessIncarnationError::Malformed)?
+        .parse::<u64>()
+        .map_err(|_| ProcessIncarnationError::Malformed)?;
+    Ok(ProcessIncarnation {
+        pid: expected_pid,
+        starttime_ticks,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -4,7 +4,15 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const JOURNAL_SCHEMA_VERSION: u32 = 5;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 6;
+const PREVIOUS_JOURNAL_SCHEMA_VERSION: u32 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessIncarnation {
+    pub pid: u32,
+    pub starttime_ticks: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -195,6 +203,8 @@ pub struct OwnershipJournal {
     pub schema_version: u32,
     pub run: TopologyRun,
     pub state: RunState,
+    #[serde(default)]
+    pub blocked_owner: Option<ProcessIncarnation>,
     pub sql_member_incarnations: Option<[SqlMemberIncarnation; 3]>,
     pub native_intent: Option<NativeTopologyIntent>,
     pub native_binding: Option<NativeTopologyBinding>,
@@ -363,6 +373,7 @@ impl OwnershipJournal {
             schema_version: JOURNAL_SCHEMA_VERSION,
             run,
             state: RunState::Preparing,
+            blocked_owner: None,
             sql_member_incarnations: None,
             native_intent: None,
             native_binding: None,
@@ -371,8 +382,11 @@ impl OwnershipJournal {
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self, JournalError> {
-        let journal: Self = serde_json::from_slice(bytes).map_err(|_| JournalError::Malformed)?;
-        if journal.schema_version != JOURNAL_SCHEMA_VERSION {
+        let mut journal: Self =
+            serde_json::from_slice(bytes).map_err(|_| JournalError::Malformed)?;
+        if journal.schema_version == PREVIOUS_JOURNAL_SCHEMA_VERSION {
+            journal.schema_version = JOURNAL_SCHEMA_VERSION;
+        } else if journal.schema_version != JOURNAL_SCHEMA_VERSION {
             return Err(JournalError::UnsupportedSchema(journal.schema_version));
         }
         Ok(journal)

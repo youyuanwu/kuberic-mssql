@@ -47,19 +47,23 @@ pub use evidence::{
 pub use kuberic_group::{MSSQL_FAILOVER_DELAY_SECONDS, MssqlGroup, MssqlGroupError, MssqlPod};
 pub use member::{
     CleanupEvidence as NativeCleanupEvidence, LaunchedMembers, NativeDataProof, NativeLaunchError,
-    NativePhaseError, ReadyMember, cleanup_three_replica_fixture, launch_three_members,
+    NativePhaseError, ReadyMember, cleanup_three_replica_fixture,
+    create_blocked_owner_regression_fixture, launch_three_members, retry_owner_regression_fixture,
 };
 pub use model::{
     CombinedFixtureError, FailureCategory, FailureStage, IncarnationError, JOURNAL_SCHEMA_VERSION,
     JournalError, KubericMember, NativeMemberBinding, NativeMemberIntent, NativeTopologyBinding,
-    NativeTopologyIntent, OwnershipJournal, ResourceBinding, ResourceKind, ResourceRecord,
-    ResourceState, RunState, SanitizedFailure, SqlMember, SqlMemberIncarnation, TopologyRun,
+    NativeTopologyIntent, OwnershipJournal, ProcessIncarnation, ResourceBinding, ResourceKind,
+    ResourceRecord, ResourceState, RunState, SanitizedFailure, SqlMember, SqlMemberIncarnation,
+    TopologyRun,
 };
 pub use ownership::{
     AclController, AclEvidence, CommandAclController, DirectoryBinding, JournalStore, LockError,
-    MemberDirectoryError, OwnershipInspector, ReconcileError, ReconcileReport, ResourceObservation,
-    RootLock, acquire_root_lock, inspect_member_directory, parse_acl_evidence,
-    prepare_member_directory, prepare_member_directory_with_clock, reconcile,
+    MemberDirectoryError, OwnershipInspector, ProcessIncarnationError, ReconcileError,
+    ReconcileReport, ResourceObservation, RootLock, acquire_root_lock, current_process_incarnation,
+    inspect_member_directory, parse_acl_evidence, parse_process_incarnation,
+    prepare_member_directory, prepare_member_directory_with_clock, process_incarnation,
+    process_incarnation_is_alive, process_incarnation_matches_stat, reconcile,
     verify_member_directory,
 };
 pub use preflight::{

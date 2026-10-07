@@ -37,7 +37,7 @@ use super::ownership::{
     CommandAclController, DirectoryBinding, JournalStore, OwnershipInspector,
     PrivateDirectoryBinding, ReconcileError, ResourceObservation, RootLock, acquire_root_lock,
     create_private_owned_directory, inspect_member_directory, inspect_owned_directory,
-    prepare_member_directory,
+    prepare_member_directory, process_incarnation_is_alive,
 };
 use super::preflight::{CommandAclProbe, LocalHostProbe, run_preflight_with_deadline};
 use super::process::{BoundedProcessRunner, CommandSpec, ProcessRunner};
@@ -96,10 +96,9 @@ impl LaunchedMembers {
     }
 
     pub fn block_cleanup(&mut self) -> Result<(), NativeLaunchError> {
-        self.context.journal.state = RunState::Blocked;
         self.context
             .store
-            .save(&self.context.journal)
+            .block_for_current_process(&mut self.context.journal)
             .map_err(|_| NativeLaunchError::Journal)
     }
 
@@ -242,6 +241,7 @@ pub fn cleanup_three_replica_fixture(root: &Path) -> Result<CleanupEvidence, Com
             journal_path: root.join("ownership.json"),
         });
     }
+
     let store = JournalStore::initialize(root).map_err(|_| {
         CombinedFixtureError::new(
             SanitizedFailure::new(FailureStage::Cleanup, FailureCategory::Journal),
@@ -267,6 +267,44 @@ pub fn cleanup_three_replica_fixture(root: &Path) -> Result<CleanupEvidence, Com
             removed_network_id: String::new(),
             journal_path: store.path().to_path_buf(),
         });
+    }
+    if journal.state == RunState::Blocked
+        && let Some(owner) = journal.blocked_owner
+    {
+        match process_incarnation_is_alive(owner) {
+            Ok(true) => {
+                return Err(CombinedFixtureError::new(
+                    SanitizedFailure::with_detail(
+                        FailureStage::Cleanup,
+                        FailureCategory::OwnershipMismatch,
+                        format!(
+                            "blocked owner process incarnation is still alive: pid={}, starttime_ticks={}",
+                            owner.pid, owner.starttime_ticks
+                        ),
+                    ),
+                    Vec::new(),
+                ));
+            }
+            Ok(false) => {
+                journal.blocked_owner = None;
+                store.save(&journal).map_err(|_| {
+                    CombinedFixtureError::new(
+                        SanitizedFailure::new(FailureStage::Cleanup, FailureCategory::Journal),
+                        Vec::new(),
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(CombinedFixtureError::new(
+                    SanitizedFailure::with_detail(
+                        FailureStage::Cleanup,
+                        FailureCategory::OwnershipMismatch,
+                        error.to_string(),
+                    ),
+                    Vec::new(),
+                ));
+            }
+        }
     }
 
     let runner = BoundedProcessRunner;
@@ -362,6 +400,61 @@ pub fn cleanup_three_replica_fixture(root: &Path) -> Result<CleanupEvidence, Com
         }),
         &report,
     )
+}
+
+#[doc(hidden)]
+pub async fn create_blocked_owner_regression_fixture(root: &Path) -> Result<PathBuf, String> {
+    let _lock = acquire_root_lock(root).map_err(|error| error.to_string())?;
+    let store = JournalStore::initialize(root).map_err(|error| error.to_string())?;
+    let mut journal = store
+        .create(topology_run(store.root()).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let path = store.root().join("owner-process-regression");
+    let binding =
+        create_private_owned_directory(store.root(), &path).map_err(|error| error.to_string())?;
+    journal.resources.push(ResourceRecord {
+        kind: ResourceKind::Directory,
+        logical_name: "owner-process-regression".to_owned(),
+        path: Some(path.clone()),
+        intent: Some(binding.binding.clone()),
+        binding: Some(binding.binding),
+        state: ResourceState::Bound,
+    });
+    store.save(&journal).map_err(|error| error.to_string())?;
+    let shutdown = super::kuberic_group::exercise_unconfirmed_partial_agent_shutdown().await;
+    if !shutdown.agent_termination_unconfirmed() {
+        return Err("partial-agent shutdown did not retain the termination fence".to_owned());
+    }
+    store
+        .block_for_current_process(&mut journal)
+        .map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+#[doc(hidden)]
+pub fn retry_owner_regression_fixture(root: &Path) -> Result<(), String> {
+    {
+        let _lock = acquire_root_lock(root).map_err(|error| error.to_string())?;
+        let store = JournalStore::initialize(root).map_err(|error| error.to_string())?;
+        let mut journal = store
+            .create(topology_run(store.root()).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        let path = store.root().join("owner-process-retry");
+        let binding = create_private_owned_directory(store.root(), &path)
+            .map_err(|error| error.to_string())?;
+        journal.resources.push(ResourceRecord {
+            kind: ResourceKind::Directory,
+            logical_name: "owner-process-retry".to_owned(),
+            path: Some(path),
+            intent: Some(binding.binding.clone()),
+            binding: Some(binding.binding),
+            state: ResourceState::Bound,
+        });
+        store.save(&journal).map_err(|error| error.to_string())?;
+    }
+    cleanup_three_replica_fixture(root)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn recover_image_id<D, C>(

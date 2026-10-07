@@ -333,6 +333,18 @@ fn journal_rejects_unknown_or_unsupported_schemas() {
 }
 
 #[test]
+fn schema_five_journal_migrates_without_inventing_a_blocked_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal = OwnershipJournal::new(sample_run(directory.path()));
+    let mut value: serde_json::Value = serde_json::from_slice(&journal.to_json().unwrap()).unwrap();
+    value["schema_version"] = serde_json::json!(5);
+    value.as_object_mut().unwrap().remove("blocked_owner");
+    let migrated = OwnershipJournal::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_eq!(migrated.schema_version, JOURNAL_SCHEMA_VERSION);
+    assert!(migrated.blocked_owner.is_none());
+}
+
+#[test]
 fn nested_binding_unknown_fields_are_rejected_without_echoing_values() {
     let directory = tempfile::tempdir().unwrap();
     let mut journal = OwnershipJournal::new(sample_run(directory.path()));
