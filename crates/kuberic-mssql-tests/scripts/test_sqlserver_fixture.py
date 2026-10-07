@@ -772,9 +772,13 @@ class FixtureTests(unittest.TestCase):
             5,
         )
         self.assertNotIn("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT", justfile)
+        self.assertIn(
+            'cleanup fixture="": cleanup-live-three-replica',
+            justfile,
+        )
         workflow = (repository / ".github/workflows/ci.yml").read_text()
         self.assertIn("just cleanup\n", workflow)
-        self.assertIn("just cleanup-live-three-replica\n", workflow)
+        self.assertNotIn("just cleanup-live-three-replica\n", workflow)
 
     def test_cargo_resolution_honors_configuration_path_and_fallback(self):
         with patch.dict(os.environ, {"CARGO": "custom-cargo"}, clear=True), patch.object(

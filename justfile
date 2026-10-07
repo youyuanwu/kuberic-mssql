@@ -16,8 +16,8 @@ setup:
 provision fixture="":
     python3 -B crates/kuberic-mssql-tests/scripts/sqlserver_fixture.py provision {{quote(fixture)}}
 
-# Release only owned fixture state; borrowed instances are preserved.
-cleanup fixture="":
+# Release both owned fixture families; borrowed instances are preserved.
+cleanup fixture="": cleanup-live-three-replica
     python3 -B crates/kuberic-mssql-tests/scripts/sqlserver_fixture.py cleanup {{quote(fixture)}}
 
 # Ensure readiness, run shared live checks, and release owned resources.

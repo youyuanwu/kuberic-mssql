@@ -324,10 +324,11 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
     assert!(
         ci.find("(validate-live fixture)").unwrap() < ci.find("test-live-three-replica").unwrap()
     );
+    assert!(justfile.contains("cleanup fixture=\"\": cleanup-live-three-replica"));
 
     let workflow = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
     assert!(workflow.contains("just cleanup\n"));
-    assert!(workflow.contains("just cleanup-live-three-replica\n"));
+    assert!(!workflow.contains("just cleanup-live-three-replica\n"));
 }
 
 #[test]
