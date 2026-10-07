@@ -775,6 +775,7 @@ dependencies = [
  "tiberius",
  "tokio",
  "tokio-util",
+ "tonic",
  "zeroize",
 ]
 

@@ -6,6 +6,7 @@ mod data;
 mod deadline;
 mod docker;
 mod evidence;
+mod kuberic_group;
 mod member;
 mod model;
 mod ownership;
@@ -43,9 +44,10 @@ pub use evidence::{
     DatabaseEvidence, EvidenceError, MemberEvidence, ReplicaProfileEvidence, SeedingEvidence,
     ValidatedNativeEvidence, validate_native_evidence,
 };
+pub use kuberic_group::{MSSQL_FAILOVER_DELAY_SECONDS, MssqlGroup, MssqlGroupError, MssqlPod};
 pub use member::{
     CleanupEvidence as NativeCleanupEvidence, LaunchedMembers, NativeDataProof, NativeLaunchError,
-    NativePhaseError, ReadyMember, launch_three_members,
+    NativePhaseError, ReadyMember, cleanup_three_replica_fixture, launch_three_members,
 };
 pub use model::{
     CombinedFixtureError, FailureCategory, FailureStage, IncarnationError, JOURNAL_SCHEMA_VERSION,

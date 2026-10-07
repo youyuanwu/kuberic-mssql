@@ -21,7 +21,7 @@ use super::cleanup::{
     CLEANUP_BUDGET, CleanupBackend, CleanupClock, CleanupCoordinator, CleanupError, CleanupReport,
     OperationBudget, SystemCleanupClock, combine_with_cleanup,
 };
-use super::config::FixtureConfig;
+use super::config::{FixtureConfig, PINNED_SQL_SERVER_IMAGE};
 use super::data::{DataContext, DataError, MarkerEvidence, prove_replicated_marker};
 use super::docker::{
     ContainerInspection, ContainerRequest, DockerApi, DockerCli, DockerError, NetworkRequest,
@@ -79,6 +79,17 @@ impl LaunchedMembers {
     }
 
     pub async fn provision_native_topology(&mut self) -> Result<NativeDataProof, NativePhaseError> {
+        let topology = self.provision_availability_group().await?;
+        let marker = self
+            .commit_replicated_marker(&topology.evidence)
+            .await
+            .map_err(NativePhaseError::Data)?;
+        Ok(NativeDataProof { topology, marker })
+    }
+
+    pub async fn provision_availability_group(
+        &mut self,
+    ) -> Result<ProvisionedAvailabilityGroup, NativePhaseError> {
         let credentials = self
             .context
             .credentials
@@ -108,7 +119,20 @@ impl LaunchedMembers {
         })
         .await
         .map_err(NativePhaseError::AvailabilityGroup)?;
-        let marker = prove_replicated_marker(
+        Ok(provisioned)
+    }
+
+    pub async fn commit_replicated_marker(
+        &self,
+        evidence: &super::evidence::ValidatedNativeEvidence,
+    ) -> Result<MarkerEvidence, DataError> {
+        let credentials = self
+            .context
+            .credentials
+            .as_ref()
+            .ok_or(DataError::WrongDatabase)?;
+        let tls = self.context.tls.as_ref().ok_or(DataError::WrongDatabase)?;
+        prove_replicated_marker(
             &DataContext {
                 run: &self.run,
                 members: &self.members,
@@ -117,14 +141,9 @@ impl LaunchedMembers {
                 deadlines: self.context.config.deadlines(),
                 complete_deadline: self.context.deadline,
             },
-            &provisioned.evidence,
+            evidence,
         )
         .await
-        .map_err(NativePhaseError::Data)?;
-        Ok(NativeDataProof {
-            topology: provisioned,
-            marker,
-        })
     }
 }
 
@@ -170,6 +189,171 @@ pub async fn launch_three_members(
             combine_with_cleanup::<()>(Err(primary.sanitized()), &report).map(|_| unreachable!())
         }
     }
+}
+
+pub fn cleanup_three_replica_fixture(root: &Path) -> Result<CleanupEvidence, CombinedFixtureError> {
+    let _lock = acquire_root_lock(root).map_err(|_| {
+        CombinedFixtureError::new(
+            SanitizedFailure::new(FailureStage::Cleanup, FailureCategory::OwnershipMismatch),
+            Vec::new(),
+        )
+    })?;
+    if !root.exists() {
+        return Ok(CleanupEvidence {
+            removed_container_ids: Vec::new(),
+            removed_network_id: String::new(),
+            journal_path: root.join("ownership.json"),
+        });
+    }
+    let store = JournalStore::initialize(root).map_err(|_| {
+        CombinedFixtureError::new(
+            SanitizedFailure::new(FailureStage::Cleanup, FailureCategory::Journal),
+            Vec::new(),
+        )
+    })?;
+    let Some(mut journal) = store.load().map_err(|_| {
+        CombinedFixtureError::new(
+            SanitizedFailure::new(FailureStage::Cleanup, FailureCategory::Journal),
+            Vec::new(),
+        )
+    })?
+    else {
+        return Ok(CleanupEvidence {
+            removed_container_ids: Vec::new(),
+            removed_network_id: String::new(),
+            journal_path: store.path().to_path_buf(),
+        });
+    };
+    if journal.state == RunState::Removed {
+        return Ok(CleanupEvidence {
+            removed_container_ids: Vec::new(),
+            removed_network_id: String::new(),
+            journal_path: store.path().to_path_buf(),
+        });
+    }
+
+    let runner = BoundedProcessRunner;
+    let docker = DockerCli::new(runner);
+    let image_id = recover_image_id(&docker, &journal)?;
+    let network_request = NetworkRequest {
+        name: format!("km-three-{}", journal.run.run_id),
+        labels: OwnedLabels::network(&journal.run.run_id),
+    };
+    let network_id = journal
+        .resources
+        .iter()
+        .find(|record| record.kind == ResourceKind::Network)
+        .and_then(|record| record.binding.as_ref())
+        .map(|binding| binding.immutable_id.clone());
+    let network = OwnedNetwork {
+        request: network_request,
+        id: network_id.clone(),
+    };
+    let sa_password = PrivateFile::inspect_owned(store.root().join("credentials/sa-password"))
+        .and_then(|file| file.read_secret())
+        .unwrap_or_else(|_| SecretValue::from_test("cleanup-only-unavailable-secret"));
+    let environment_file = store.root().join("credentials/container.env");
+    let containers = journal
+        .run
+        .members
+        .iter()
+        .map(|member| {
+            let request = ContainerRequest::sql_server(
+                SqlServerContainerSpec {
+                    name: member.container_name.clone(),
+                    hostname: member.server_name.clone(),
+                    network_name: network.request.name.clone(),
+                    data_directory: member.data_directory.clone(),
+                    environment_file: environment_file.clone(),
+                    sa_password: sa_password.clone(),
+                },
+                OwnedLabels::container(&journal.run.run_id, member.ordinal),
+                super::config::ResourcePolicy::default(),
+                [("ACCEPT_EULA", "Y")],
+            )
+            .map_err(|_| cleanup_setup_error(FailureCategory::OwnershipMismatch))?;
+            let id = journal
+                .resources
+                .iter()
+                .find(|record| {
+                    record.kind == ResourceKind::Container
+                        && record
+                            .intent
+                            .as_ref()
+                            .is_some_and(|intent| intent.immutable_id == member.container_name)
+                })
+                .and_then(|record| record.binding.as_ref())
+                .map(|binding| binding.immutable_id.clone());
+            Ok(OwnedContainer {
+                request,
+                id,
+                frozen_running_inspection: None,
+            })
+        })
+        .collect::<Result<Vec<_>, CombinedFixtureError>>()?;
+    let removed_container_ids = containers
+        .iter()
+        .filter_map(|container| container.id.clone())
+        .collect();
+    let clock = SystemCleanupClock::default();
+    let backend = NativeCleanupBackend {
+        root: store.root(),
+        docker: &docker,
+        runner: &runner,
+        clock: clock.clone(),
+        image_id: &image_id,
+        network: Some(&network),
+        containers: &containers,
+    };
+    let report =
+        CleanupCoordinator::new(clock, CLEANUP_BUDGET).cleanup(&store, &mut journal, &backend);
+    combine_with_cleanup(
+        Ok(CleanupEvidence {
+            removed_container_ids,
+            removed_network_id: network_id.unwrap_or_default(),
+            journal_path: store.path().to_path_buf(),
+        }),
+        &report,
+    )
+}
+
+fn recover_image_id(
+    docker: &DockerCli<BoundedProcessRunner>,
+    journal: &OwnershipJournal,
+) -> Result<String, CombinedFixtureError> {
+    if let Some(image) = docker
+        .inspect_image(PINNED_SQL_SERVER_IMAGE, Duration::from_secs(30))
+        .map_err(|_| cleanup_setup_error(FailureCategory::ContainerRemoval))?
+    {
+        image
+            .verify_pinned_sql_server()
+            .map_err(|_| cleanup_setup_error(FailureCategory::OwnershipMismatch))?;
+        return Ok(image.id);
+    }
+    for member in &journal.run.members {
+        let Some(container) = docker
+            .inspect_container(&member.container_name, Duration::from_secs(30))
+            .map_err(|_| cleanup_setup_error(FailureCategory::ContainerRemoval))?
+        else {
+            continue;
+        };
+        let image = docker
+            .inspect_image(&container.image_id, Duration::from_secs(30))
+            .map_err(|_| cleanup_setup_error(FailureCategory::ContainerRemoval))?
+            .ok_or_else(|| cleanup_setup_error(FailureCategory::OwnershipMismatch))?;
+        image
+            .verify_pinned_sql_server()
+            .map_err(|_| cleanup_setup_error(FailureCategory::OwnershipMismatch))?;
+        return Ok(container.image_id);
+    }
+    Ok(String::new())
+}
+
+fn cleanup_setup_error(category: FailureCategory) -> CombinedFixtureError {
+    CombinedFixtureError::new(
+        SanitizedFailure::new(FailureStage::Cleanup, category),
+        Vec::new(),
+    )
 }
 
 struct OwnedNetwork {
@@ -249,13 +433,26 @@ struct LaunchContext {
 
 impl LaunchContext {
     fn prepare(config: FixtureConfig) -> Result<Self, NativeLaunchError> {
-        let lock = acquire_root_lock(config.root()).map_err(|_| NativeLaunchError::RootLock)?;
-        let store =
+        let mut lock = acquire_root_lock(config.root()).map_err(|_| NativeLaunchError::RootLock)?;
+        let mut store =
             JournalStore::initialize(config.root()).map_err(|_| NativeLaunchError::Journal)?;
         if let Some(existing) = store.load().map_err(|_| NativeLaunchError::Journal)?
             && existing.state != RunState::Removed
         {
-            return Err(NativeLaunchError::PriorRunUnresolved);
+            drop(store);
+            drop(lock);
+            cleanup_three_replica_fixture(config.root())
+                .map_err(|_| NativeLaunchError::PriorRunUnresolved)?;
+            lock = acquire_root_lock(config.root()).map_err(|_| NativeLaunchError::RootLock)?;
+            store =
+                JournalStore::initialize(config.root()).map_err(|_| NativeLaunchError::Journal)?;
+            if store
+                .load()
+                .map_err(|_| NativeLaunchError::Journal)?
+                .is_some_and(|journal| journal.state != RunState::Removed)
+            {
+                return Err(NativeLaunchError::PriorRunUnresolved);
+            }
         }
         let runner = BoundedProcessRunner;
         let docker = DockerCli::new(runner);
@@ -1052,6 +1249,12 @@ impl LaunchContext {
 
 impl Drop for LaunchContext {
     fn drop(&mut self) {
+        if !matches!(self.journal.state, RunState::Removed | RunState::Blocked) {
+            let report = self.cleanup_report();
+            if report.succeeded() {
+                return;
+            }
+        }
         if self.journal.state != RunState::Removed {
             eprintln!(
                 "three-replica fixture journal retained at {} with state {:?}; explicit cleanup is required",
@@ -1278,7 +1481,10 @@ where
                 let network = self
                     .network
                     .filter(|network| {
-                        resource.intent.as_ref() == Some(&network.request.intent_binding())
+                        resource
+                            .intent
+                            .as_ref()
+                            .is_some_and(|intent| intent.immutable_id == network.request.name)
                     })
                     .ok_or(ReconcileError::OwnershipMismatch)?;
                 let identity = resource.binding.as_ref().map_or_else(
@@ -1330,9 +1536,10 @@ where
                     .containers
                     .iter()
                     .find(|container| {
-                        resource.intent.as_ref().is_some_and(|intent| {
-                            intent == &container.request.intent_binding(self.image_id)
-                        })
+                        resource
+                            .intent
+                            .as_ref()
+                            .is_some_and(|intent| intent.immutable_id == container.request.name)
                     })
                     .ok_or(ReconcileError::OwnershipMismatch)?;
                 let identity = resource.binding.as_ref().map_or_else(
@@ -1390,9 +1597,10 @@ where
             .containers
             .iter()
             .find(|container| {
-                resource.intent.as_ref().is_some_and(|intent| {
-                    intent == &container.request.intent_binding(self.image_id)
-                })
+                resource
+                    .intent
+                    .as_ref()
+                    .is_some_and(|intent| intent.immutable_id == container.request.name)
             })
             .ok_or_else(|| cleanup_ownership_error(resource))?;
         let expected = resource
@@ -1436,7 +1644,12 @@ where
     ) -> Result<(), CleanupError> {
         let _network = self
             .network
-            .filter(|network| resource.intent.as_ref() == Some(&network.request.intent_binding()))
+            .filter(|network| {
+                resource
+                    .intent
+                    .as_ref()
+                    .is_some_and(|intent| intent.immutable_id == network.request.name)
+            })
             .ok_or_else(|| cleanup_ownership_error(resource))?;
         let identity = resource
             .binding
@@ -2360,6 +2573,57 @@ mod tests {
 
         assert!(report.succeeded());
         assert_eq!(context.journal.state, RunState::Removed);
+    }
+
+    #[test]
+    fn dropping_an_incomplete_launch_context_attempts_exact_cleanup() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("fixture");
+        let acknowledgement = temporary.path().join("acknowledgement.json");
+        fs::write(
+            &acknowledgement,
+            r#"{"schema_version":1,"sql_server_eula":{"accepted":true}}"#,
+        )
+        .unwrap();
+        let config = FixtureConfig::new(&root, acknowledgement).unwrap();
+        let store = JournalStore::initialize(&root).unwrap();
+        let lock = acquire_root_lock(&root).unwrap();
+        let mut journal = store.create(run(&root)).unwrap();
+        journal.resources.push(ResourceRecord {
+            kind: ResourceKind::SecretFile,
+            logical_name: "cancelled-before-create".to_owned(),
+            path: Some(root.join("cancelled-before-create")),
+            intent: None,
+            binding: None,
+            state: ResourceState::Intended,
+        });
+        store.save(&journal).unwrap();
+        let runner = BoundedProcessRunner;
+        drop(LaunchContext {
+            config,
+            _lock: lock,
+            store,
+            journal,
+            docker: DockerCli::new(runner),
+            runner,
+            image_id: "unused".to_owned(),
+            deadline: Instant::now() + Duration::from_secs(180),
+            private_files: Vec::new(),
+            credentials: None,
+            tls: None,
+            network: None,
+            containers: Vec::new(),
+        });
+
+        let store = JournalStore::initialize(&root).unwrap();
+        let journal = store.load().unwrap().unwrap();
+        assert_eq!(journal.state, RunState::Removed);
+        assert!(
+            journal
+                .resources
+                .iter()
+                .all(|resource| resource.state == ResourceState::Removed)
+        );
     }
 
     #[test]

@@ -227,6 +227,49 @@ fn fixture_root_must_be_absolute() {
 }
 
 #[test]
+fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .unwrap();
+    let justfile = fs::read_to_string(root.join("justfile")).unwrap();
+    assert!(
+        justfile.contains(
+            "test-live-three-replica acknowledgement root=\"target/mssql-three-replica\":"
+        )
+    );
+    assert!(justfile.contains("cleanup-live-three-replica root=\"target/mssql-three-replica\":"));
+    assert!(justfile.contains("env -u SQLSERVER_TEST_EULA_ACCEPTED"));
+    assert!(
+        justfile.contains(
+            "KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT=\"$(realpath {{quote(acknowledgement)}})\""
+        )
+    );
+    assert!(
+        justfile.contains("KUBERIC_MSSQL_THREE_REPLICA_ROOT=\"$(realpath -m {{quote(root)}})\"")
+    );
+    assert!(justfile.contains(
+        "cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_happy_path -- --ignored --exact --test-threads=1"
+    ));
+    assert!(justfile.contains(
+        "cargo run --locked -p kuberic-mssql-tests --bin mssql-three-replica-fixture -- cleanup --root"
+    ));
+
+    for recipe in [
+        "default: check",
+        "check: fmt-check clippy test test-ci-helpers",
+    ] {
+        let line = justfile.lines().find(|line| *line == recipe).unwrap();
+        assert!(!line.contains("test-live-three-replica"));
+    }
+    let ci = justfile
+        .lines()
+        .find(|line| line.starts_with("ci fixture="))
+        .unwrap();
+    assert!(!ci.contains("test-live-three-replica"));
+}
+
+#[test]
 fn journal_round_trips_without_secret_values() {
     let directory = tempfile::tempdir().unwrap();
     let mut journal = OwnershipJournal::new(sample_run(directory.path()));

@@ -564,8 +564,8 @@ pub struct SqlServerService {
     config: SqlServerServiceConfig,
     source: Arc<dyn SqlServerObservationSource>,
     clock: Arc<dyn ObservationClock>,
-    binding: Option<Arc<HealthyTopologyBinding>>,
-    authority_context: Option<Arc<dyn RuntimeAuthorityContextSource>>,
+    binding: Mutex<Option<Arc<HealthyTopologyBinding>>>,
+    authority_context: Mutex<Option<Arc<dyn RuntimeAuthorityContextSource>>>,
     open_attempt: tokio::sync::Mutex<()>,
     lifecycle: Mutex<ServiceLifecycle>,
 }
@@ -642,11 +642,52 @@ impl SqlServerService {
             config,
             source,
             clock,
-            binding,
-            authority_context,
+            binding: Mutex::new(binding),
+            authority_context: Mutex::new(authority_context),
             open_attempt: tokio::sync::Mutex::new(()),
             lifecycle: Mutex::new(ServiceLifecycle::Created),
         }
+    }
+
+    pub async fn bind_topology(
+        &self,
+        binding: HealthyTopologyBinding,
+        authority_context: Arc<dyn RuntimeAuthorityContextSource>,
+    ) -> Result<(), KubericAdapterError> {
+        let _attempt = self.open_attempt.lock().await;
+        if self.config.resource_uid != binding.resource_uid
+            || self.config.replication_address != binding.local_member().replication_address
+        {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "service resource UID and replication address must match the local topology binding",
+            ));
+        }
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(*lifecycle, ServiceLifecycle::Created) {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "topology binding must be installed before the service is opened",
+            ));
+        }
+        let mut stored_binding = self
+            .binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stored_context = self
+            .authority_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if stored_binding.is_some() || stored_context.is_some() {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "topology binding is already installed",
+            ));
+        }
+        *stored_binding = Some(Arc::new(binding));
+        *stored_context = Some(authority_context);
+        drop(lifecycle);
+        Ok(())
     }
 
     pub fn validate_resource_identity(
@@ -694,7 +735,16 @@ impl StatefulServiceReplica for SqlServerService {
                 self.source.clone(),
                 self.clock.clone(),
             )
-            .with_optional_binding(self.binding.clone(), self.authority_context.clone()),
+            .with_optional_binding(
+                self.binding
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+                self.authority_context
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
         );
         let interfaces = context
             .partition
@@ -1424,14 +1474,37 @@ fn validate_bound_evidence(
     };
     if state.provenance != NativeProvenance::Local
         || state.role.as_ref() != Some(&expected_native_role)
-        || state.operational_state.as_deref() != Some("ONLINE")
-        || state.connected_state.as_deref() != Some("CONNECTED")
-        || state.recovery_health.as_deref() != Some("ONLINE")
-        || state.synchronization_health.as_deref() != Some("HEALTHY")
-        || state.last_connect_error_number != Some(0)
     {
         return Err(KubericAdapterError::TopologyBindingMismatch(
-            "local native replica role or health differs",
+            "local native replica role differs",
+        ));
+    }
+    if state.operational_state.as_deref() != Some("ONLINE") {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "local native replica operational state differs",
+        ));
+    }
+    if state.connected_state.as_deref() != Some("CONNECTED") {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "local native replica connected state differs",
+        ));
+    }
+    if state.recovery_health.as_deref() != Some("ONLINE") {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "local native replica recovery health differs",
+        ));
+    }
+    if state.synchronization_health.as_deref() != Some("HEALTHY") {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "local native replica synchronization health differs",
+        ));
+    }
+    if state
+        .last_connect_error_number
+        .is_some_and(|number| number != 0)
+    {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "local native replica last-connect evidence differs",
         ));
     }
     if group.databases.len() != usize::from(SUPPORTED_DATABASE_COUNT) {

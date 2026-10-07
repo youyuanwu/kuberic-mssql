@@ -28,6 +28,7 @@ tempfile = "3"
 tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "rustls"] }
 tokio = "1"
 tokio-util = "0.7"
+tonic = "0.14"
 zeroize = "1"
 
 [patch.crates-io]

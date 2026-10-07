@@ -1910,6 +1910,20 @@ async fn primary_commit_participation_remains_exact() {
 }
 
 #[tokio::test]
+async fn connected_native_replica_accepts_absent_last_connect_error() {
+    let mut sample = bound_snapshot();
+    if let Observation::Present { value: group, .. } = &mut sample.availability_group {
+        group.replicas[0]
+            .state
+            .as_mut()
+            .unwrap()
+            .last_connect_error_number = None;
+    }
+    let replicator = opened_bound_replicator(vec![Ok(present(sample))], vec![OBSERVED_AT]).await;
+    assert_eq!(replicator.current_progress().await.unwrap(), 42);
+}
+
+#[tokio::test]
 async fn bound_current_configuration_rejects_every_frozen_value_drift() {
     let binding = topology_binding();
     let exact = bound_replica_set(&binding);
