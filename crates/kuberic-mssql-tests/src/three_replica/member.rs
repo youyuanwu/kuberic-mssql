@@ -74,6 +74,14 @@ impl LaunchedMembers {
         &self.context.journal
     }
 
+    pub fn kuberic_convergence_timeout(&self) -> Duration {
+        self.context.config.deadlines().kuberic_convergence
+    }
+
+    pub fn complete_deadline(&self) -> Instant {
+        self.context.deadline
+    }
+
     pub fn cleanup(mut self) -> Result<CleanupEvidence, CombinedFixtureError> {
         self.context.cleanup_exact()
     }

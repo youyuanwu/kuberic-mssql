@@ -66,6 +66,14 @@ test-live-three-replica acknowledgement root="target/mssql-three-replica":
         CARGO_BUILD_JOBS=1 \
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_happy_path -- --ignored --exact --test-threads=1
 
+# Interrupt a real live subprocess during owned launch, recover, retry, and clean up.
+test-live-three-replica-signal acknowledgement root="target/mssql-three-replica-signal":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT="$(realpath {{quote(acknowledgement)}})" \
+        KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_sigterm_during_owned_launch_is_recoverable -- --ignored --exact --test-threads=1 --nocapture
+
 # Recover and remove only the exactly journaled real three-member topology.
 cleanup-live-three-replica root="target/mssql-three-replica":
     env -u SQLSERVER_TEST_EULA_ACCEPTED CARGO_BUILD_JOBS=1 \

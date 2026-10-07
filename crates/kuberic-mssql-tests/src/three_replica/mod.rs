@@ -24,9 +24,9 @@ pub use availability_group::{
     ProvisionedAvailabilityGroup, validate_binding_incarnations, validate_endpoint_evidence,
 };
 pub use cleanup::{
-    CLEANUP_BUDGET, CleanupBackend, CleanupClock, CleanupCompletion, CleanupCoordinator,
-    CleanupError, CleanupReport, HandledCancellationSignal, SystemCleanupClock, cleanup,
-    combine_with_cleanup,
+    CLEANUP_BUDGET, CancellationSignals, CleanupBackend, CleanupClock, CleanupCompletion,
+    CleanupCoordinator, CleanupError, CleanupReport, HandledCancellationSignal, SystemCleanupClock,
+    cleanup, combine_with_cleanup,
 };
 pub use config::{
     ACKNOWLEDGEMENT_SCHEMA_VERSION, AcknowledgementSource, FixtureConfig, FixtureConfigError,

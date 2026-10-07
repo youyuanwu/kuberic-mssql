@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use kuberic_mssql::kuberic::{
     HealthyTopologyBinding, HealthyTopologyMemberBinding, ObservationClock,
-    RuntimeAuthorityContext, RuntimeAuthorityContextSource, SqlServerObservationSource,
-    SqlServerReplicator, SqlServerReplicatorFactory, SqlServerService, SqlServerServiceConfig,
-    SqlServerStartIncarnation,
+    RuntimeAuthorityContext, RuntimeAuthorityContextSource, SqlServerMemberEndpoint,
+    SqlServerObservationSource, SqlServerReplicator, SqlServerReplicatorFactory, SqlServerService,
+    SqlServerServiceConfig, SqlServerStartIncarnation,
 };
 use kuberic_mssql::observation::{
     AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, DatabaseSnapshot, InstanceMetadata,
@@ -480,7 +480,11 @@ fn topology_binding_for(local_index: usize) -> HealthyTopologyBinding {
                     ProcessSessionId::new(format!("session-{}", index + 1)),
                     format!("replica-{}.example:5022", index + 1),
                     sql_identity(index),
-                    ServerName::new(format!("sql-{index}")).unwrap(),
+                    SqlServerMemberEndpoint::new(
+                        ServerName::new(format!("sql-{index}")).unwrap(),
+                        format!("TCP://sql-{index}:5022"),
+                    )
+                    .unwrap(),
                     SqlServerStartIncarnation::new(format!("2026-10-06T12:00:0{index}")).unwrap(),
                     if index == 0 {
                         ReplicaRole::Primary
@@ -2039,6 +2043,12 @@ async fn bound_evidence_rejects_identity_incarnation_lineage_role_and_health_dri
             ReplicaIdentity::observed("logical-0", guid(LOCAL_ID), "other-pod").unwrap();
     }
     cases.push(("container incarnation", changed));
+
+    let mut changed = bound_snapshot();
+    if let Observation::Present { value: group, .. } = &mut changed.availability_group {
+        group.replicas[0].endpoint_url = Some("TCP://replacement:5022".into());
+    }
+    cases.push(("endpoint identity", changed));
 
     let mut changed = bound_snapshot();
     if let Observation::Present { value: group, .. } = &mut changed.availability_group {

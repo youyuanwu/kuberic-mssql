@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::io;
 use std::time::{Duration, Instant};
 
 use super::model::{
@@ -82,6 +83,27 @@ impl CleanupClock for SystemCleanupClock {
 pub enum HandledCancellationSignal {
     Interrupt,
     Terminate,
+}
+
+pub struct CancellationSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl CancellationSignals {
+    pub fn register() -> io::Result<Self> {
+        Ok(Self {
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
+
+    pub async fn recv(&mut self) -> HandledCancellationSignal {
+        tokio::select! {
+            _ = self.interrupt.recv() => HandledCancellationSignal::Interrupt,
+            _ = self.terminate.recv() => HandledCancellationSignal::Terminate,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

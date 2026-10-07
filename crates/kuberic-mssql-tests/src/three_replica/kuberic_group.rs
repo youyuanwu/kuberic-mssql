@@ -1,18 +1,20 @@
 use std::error::Error;
 use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use kuberic_mssql::instance::SqlServerInstanceManager;
 use kuberic_mssql::kuberic::{
     HealthyTopologyBinding, HealthyTopologyMemberBinding, ObservationClock,
-    RuntimeAuthorityContext, RuntimeAuthorityContextSource, SqlServerObservationSource,
-    SqlServerService, SqlServerServiceConfig, SqlServerStartIncarnation, SystemObservationClock,
+    RuntimeAuthorityContext, RuntimeAuthorityContextSource, SqlServerMemberEndpoint,
+    SqlServerObservationSource, SqlServerService, SqlServerServiceConfig,
+    SqlServerStartIncarnation, SystemObservationClock,
 };
 use kuberic_mssql::observation::InstanceSnapshot;
 use kuberic_mssql::runtime_config::ObserverConfig;
@@ -38,12 +40,12 @@ use kuberic_runtime::testing::sqlite_store::SqliteStore;
 use kuberic_runtime::testing::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
 use tonic::Request;
 
+use super::deadline::{BoundedOperationError, complete_before};
 use super::member::ReadyMember;
 use super::model::{NativeTopologyBinding, TopologyRun};
 
 pub const MSSQL_FAILOVER_DELAY_SECONDS: u64 = 30;
 const AGENT_TOKEN: &str = "mssql-three-replica-agent";
-const REPORT_DEADLINE: Duration = Duration::from_secs(30);
 
 type Source = Arc<dyn SqlServerObservationSource>;
 type Clock = Arc<dyn ObservationClock>;
@@ -64,6 +66,70 @@ impl fmt::Display for MssqlGroupError {
 }
 
 impl Error for MssqlGroupError {}
+
+#[derive(Debug, Clone, Copy)]
+struct ConvergenceBudget {
+    deadline: tokio::time::Instant,
+    operation_timeout: Duration,
+    complete_deadline: StdInstant,
+}
+
+impl ConvergenceBudget {
+    fn new(
+        operation_timeout: Duration,
+        complete_deadline: StdInstant,
+    ) -> Result<Self, MssqlGroupError> {
+        let remaining = complete_deadline.saturating_duration_since(StdInstant::now());
+        if operation_timeout.is_zero() || remaining.is_zero() {
+            return Err(MssqlGroupError::new(
+                "Kuberic convergence deadline exceeded",
+            ));
+        }
+        Ok(Self {
+            deadline: tokio::time::Instant::now() + operation_timeout.min(remaining),
+            operation_timeout,
+            complete_deadline,
+        })
+    }
+
+    fn check(self, operation: &'static str) -> Result<(), MssqlGroupError> {
+        if tokio::time::Instant::now() >= self.deadline
+            || StdInstant::now() >= self.complete_deadline
+        {
+            Err(MssqlGroupError::new(format!(
+                "{operation} exceeded the Kuberic convergence deadline"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn run<T, F>(
+        self,
+        operation: &'static str,
+        operation_timeout: Duration,
+        future: F,
+    ) -> Result<T, MssqlGroupError>
+    where
+        F: Future<Output = T>,
+    {
+        self.check(operation)?;
+        complete_before(self.deadline, operation_timeout, future)
+            .await
+            .map_err(|error| match error {
+                BoundedOperationError::Deadline => MssqlGroupError::new(format!(
+                    "{operation} exceeded the Kuberic convergence deadline"
+                )),
+                BoundedOperationError::OperationTimeout => {
+                    MssqlGroupError::new(format!("{operation} timed out"))
+                }
+            })
+    }
+
+    fn shutdown_budget(self) -> Result<Self, MssqlGroupError> {
+        Self::new(self.operation_timeout, self.complete_deadline)
+    }
+}
 
 pub struct MssqlPod {
     pub ordinal: u8,
@@ -86,28 +152,37 @@ pub struct MssqlPod {
 }
 
 impl MssqlPod {
-    async fn effect(&self, action: RuntimeEffectAction) -> Result<(), MssqlGroupError> {
-        let sequence = self
-            .store
-            .load_state()
-            .await
-            .map_err(display_error)?
-            .next_effect_sequence;
-        RuntimeAdapter::new(self.store.clone(), self.runtime.clone())
-            .execute(RuntimeEffect {
-                operation_id: OperationId::new(format!(
-                    "mssql-member-{}-effect-{sequence}",
-                    self.ordinal
-                )),
-                sequence,
-                action,
+    async fn effect(
+        &self,
+        action: RuntimeEffectAction,
+        budget: ConvergenceBudget,
+    ) -> Result<(), MssqlGroupError> {
+        budget
+            .run("RuntimeAdapter effect", budget.operation_timeout, async {
+                let sequence = self
+                    .store
+                    .load_state()
+                    .await
+                    .map_err(display_error)?
+                    .next_effect_sequence;
+                RuntimeAdapter::new(self.store.clone(), self.runtime.clone())
+                    .execute(RuntimeEffect {
+                        operation_id: OperationId::new(format!(
+                            "mssql-member-{}-effect-{sequence}",
+                            self.ordinal
+                        )),
+                        sequence,
+                        action,
+                    })
+                    .await
+                    .map_err(display_error)?;
+                Ok(())
             })
             .await
-            .map_err(display_error)?;
-        Ok(())
+            .and_then(|result| result)
     }
 
-    async fn start_agent(&mut self) -> Result<(), MssqlGroupError> {
+    async fn start_agent(&mut self, budget: ConvergenceBudget) -> Result<(), MssqlGroupError> {
         let (ready, mut ready_rx) = tokio::sync::watch::channel(false);
         let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
         let agent = self.agent.clone();
@@ -117,56 +192,69 @@ impl MssqlPod {
             tokio::spawn(
                 async move { agent.serve(control, replication, ready, shutdown_rx).await },
             );
-        tokio::time::timeout(REPORT_DEADLINE, ready_rx.wait_for(|value| *value))
-            .await
-            .map_err(|_| MssqlGroupError::new("agent service readiness deadline exceeded"))?
-            .map_err(display_error)?;
         self.shutdown = Some(shutdown);
         self.server = Some(server);
+        budget
+            .run(
+                "agent service readiness",
+                budget.operation_timeout,
+                ready_rx.wait_for(|value| *value),
+            )
+            .await?
+            .map_err(display_error)?;
         Ok(())
     }
 
-    pub async fn report(
+    async fn report(
         &self,
         resource_uid: &ResourceUid,
+        budget: ConvergenceBudget,
     ) -> Result<proto::AgentStatusReport, MssqlGroupError> {
-        let mut client = proto::agent_control_client::AgentControlClient::connect(format!(
-            "http://{}",
-            self.control_address
-        ))
-        .await
-        .map_err(display_error)?;
-        let mut request = Request::new(proto::GetAgentStatusRequest {
-            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
-            resource_uid: resource_uid.to_string(),
-            replica_id: self.identity.replica_id.value(),
-            expected_instance_id: self.identity.instance_id.to_string(),
-        });
-        request.metadata_mut().insert(
-            "authorization",
-            format!("Bearer {AGENT_TOKEN}")
-                .parse()
-                .map_err(display_error)?,
-        );
-        tokio::time::timeout(REPORT_DEADLINE, client.get_status(request))
+        budget
+            .run("agent report", budget.operation_timeout, async {
+                let mut client = proto::agent_control_client::AgentControlClient::connect(format!(
+                    "http://{}",
+                    self.control_address
+                ))
+                .await
+                .map_err(display_error)?;
+                let mut request = Request::new(proto::GetAgentStatusRequest {
+                    protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                    resource_uid: resource_uid.to_string(),
+                    replica_id: self.identity.replica_id.value(),
+                    expected_instance_id: self.identity.instance_id.to_string(),
+                });
+                request.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {AGENT_TOKEN}")
+                        .parse()
+                        .map_err(display_error)?,
+                );
+                client
+                    .get_status(request)
+                    .await
+                    .map_err(display_error)
+                    .map(|response| response.into_inner())
+            })
             .await
-            .map_err(|_| MssqlGroupError::new("agent report deadline exceeded"))?
-            .map_err(display_error)
-            .map(|response| response.into_inner())
+            .and_then(|result| result)
     }
 
-    async fn shutdown(&mut self) -> Result<(), MssqlGroupError> {
+    async fn shutdown(&mut self, budget: ConvergenceBudget) -> Result<(), MssqlGroupError> {
         self.runtime.abort();
         if let Some(shutdown) = self.shutdown.take() {
             shutdown.send_replace(true);
         }
         if let Some(server) = self.server.take() {
-            match tokio::time::timeout(REPORT_DEADLINE, server).await {
+            match budget
+                .run("agent shutdown", budget.operation_timeout, server)
+                .await
+            {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(error))) => return Err(display_error(error)),
                 Ok(Err(error)) if error.is_cancelled() => {}
                 Ok(Err(error)) => return Err(display_error(error)),
-                Err(_) => return Err(MssqlGroupError::new("agent shutdown deadline exceeded")),
+                Err(error) => return Err(error),
             }
         }
         Ok(())
@@ -191,6 +279,8 @@ pub struct MssqlGroup {
     pub configuration: ConfigurationDescriptor,
     pub pods: [MssqlPod; 3],
     native_binding: NativeTopologyBinding,
+    topology_bindings: [HealthyTopologyBinding; 3],
+    convergence_budget: ConvergenceBudget,
 }
 
 impl MssqlGroup {
@@ -199,18 +289,26 @@ impl MssqlGroup {
         run: &TopologyRun,
         native_binding: &NativeTopologyBinding,
         members: &[ReadyMember; 3],
+        convergence_timeout: Duration,
+        complete_deadline: StdInstant,
     ) -> Result<Self, MssqlGroupError> {
+        let budget = ConvergenceBudget::new(convergence_timeout, complete_deadline)?;
         let mut sources = Vec::with_capacity(3);
         for member in members {
-            let config = ObserverConfig::read(&member.observer_config)
+            let config = budget
+                .run(
+                    "observer configuration read",
+                    convergence_timeout,
+                    ObserverConfig::read(&member.observer_config),
+                )
                 .await
-                .map_err(display_error)?;
+                .and_then(|result| result.map_err(display_error))?;
             sources.push(Arc::new(SqlServerInstanceManager::new(
                 TdsExecutor::new(config.connection().clone()),
                 config,
             )) as Source);
         }
-        Self::assemble(
+        Self::assemble_with_store_policies(
             root,
             run,
             native_binding,
@@ -218,6 +316,8 @@ impl MssqlGroup {
                 .try_into()
                 .map_err(|_| MssqlGroupError::new("exactly three observation sources required"))?,
             std::array::from_fn(|_| Arc::new(SystemObservationClock) as Clock),
+            std::array::from_fn(|_| exact_policy()),
+            budget,
         )
         .await
     }
@@ -228,7 +328,10 @@ impl MssqlGroup {
         native_binding: &NativeTopologyBinding,
         sources: [Source; 3],
         clocks: [Clock; 3],
+        convergence_timeout: Duration,
+        complete_deadline: StdInstant,
     ) -> Result<Self, MssqlGroupError> {
+        let budget = ConvergenceBudget::new(convergence_timeout, complete_deadline)?;
         Self::assemble_with_store_policies(
             root,
             run,
@@ -236,6 +339,7 @@ impl MssqlGroup {
             sources,
             clocks,
             std::array::from_fn(|_| exact_policy()),
+            budget,
         )
         .await
     }
@@ -247,8 +351,10 @@ impl MssqlGroup {
         sources: [Source; 3],
         clocks: [Clock; 3],
         store_policies: [EffectivePolicy; 3],
+        budget: ConvergenceBudget,
     ) -> Result<Self, MssqlGroupError> {
         validate_run_binding(run, native_binding)?;
+        budget.check("Kuberic topology assembly")?;
         let resource_uid = ResourceUid::new(run.resource_uid.clone());
         let effective_policy = exact_policy();
         let identities: [ReplicaIdentity; 3] =
@@ -354,10 +460,11 @@ impl MssqlGroup {
             .try_into()
             .map_err(|_| MssqlGroupError::new("exactly three Kuberic pods required"))?;
 
-        let initial = observe_sources(&pods).await?;
+        let initial = observe_sources(&pods, budget).await?;
         let members = build_member_bindings(run, native_binding, &pods, &initial, &roles)?;
         let availability_group = availability_group_identity(native_binding)?;
         let database_lineage = database_lineage(native_binding)?;
+        let mut topology_bindings = Vec::with_capacity(3);
         for pod in &pods {
             let binding = HealthyTopologyBinding::new(
                 resource_uid.clone(),
@@ -369,19 +476,28 @@ impl MssqlGroup {
                 members.clone(),
             )
             .map_err(display_error)?;
-            pod.application
-                .bind_topology(
-                    binding,
-                    Arc::new(StoreAuthorityContextSource {
-                        store: pod.store.clone(),
-                    }),
+            topology_bindings.push(binding.clone());
+            budget
+                .run(
+                    "healthy topology binding",
+                    budget.operation_timeout,
+                    pod.application.bind_topology(
+                        binding,
+                        Arc::new(StoreAuthorityContextSource {
+                            store: pod.store.clone(),
+                        }),
+                    ),
                 )
-                .await
+                .await?
                 .map_err(display_error)?;
         }
+        let topology_bindings: [HealthyTopologyBinding; 3] = topology_bindings
+            .try_into()
+            .map_err(|_| MssqlGroupError::new("exactly three topology bindings required"))?;
 
         for pod in &pods {
-            pod.effect(RuntimeEffectAction::Open(OpenMode::New)).await?;
+            pod.effect(RuntimeEffectAction::Open(OpenMode::New), budget)
+                .await?;
         }
         for source_index in 0..3 {
             for target_index in 0..3 {
@@ -390,10 +506,13 @@ impl MssqlGroup {
                 }
                 let target = &pods[target_index];
                 pods[source_index]
-                    .effect(RuntimeEffectAction::RegisterPeerSession {
-                        identity: target.identity.clone(),
-                        session: target.session.clone(),
-                    })
+                    .effect(
+                        RuntimeEffectAction::RegisterPeerSession {
+                            identity: target.identity.clone(),
+                            session: target.session.clone(),
+                        },
+                        budget,
+                    )
                     .await?;
                 let mut description = ReplicaInformation::new(
                     OperationId::default(),
@@ -402,14 +521,22 @@ impl MssqlGroup {
                 );
                 description.process_session_id = target.session.clone();
                 description.role = roles[target_index];
-                kuberic_runtime::testing::describe_peer(&pods[source_index].runtime, description)
-                    .await
+                budget
+                    .run(
+                        "peer description",
+                        budget.operation_timeout,
+                        kuberic_runtime::testing::describe_peer(
+                            &pods[source_index].runtime,
+                            description,
+                        ),
+                    )
+                    .await?
                     .map_err(display_error)?;
             }
         }
         for pod in &pods {
-            pod.effect(RuntimeEffectAction::AdmitAuthority(Box::new(
-                AdmittedAuthority {
+            pod.effect(
+                RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
                     local_identity: pod.identity.clone(),
                     transition_kind: None,
                     previous_configuration: None,
@@ -417,27 +544,32 @@ impl MssqlGroup {
                     switchover_handoff: None,
                     secondary_removal: None,
                     scale_up: None,
-                },
-            )))
+                })),
+                budget,
+            )
             .await?;
         }
-        observe_sources(&pods).await?;
+        observe_sources(&pods, budget).await?;
         for (pod, role) in pods.iter().zip(roles) {
-            pod.effect(RuntimeEffectAction::ChangeRole(role)).await?;
-            pod.effect(RuntimeEffectAction::SetAccessStatus {
-                read: AccessStatus::ReconfigurationPending,
-                write: if role == ReplicaRole::Primary {
-                    AccessStatus::ReconfigurationPending
-                } else {
-                    AccessStatus::NotPrimary
+            pod.effect(RuntimeEffectAction::ChangeRole(role), budget)
+                .await?;
+            pod.effect(
+                RuntimeEffectAction::SetAccessStatus {
+                    read: AccessStatus::ReconfigurationPending,
+                    write: if role == ReplicaRole::Primary {
+                        AccessStatus::ReconfigurationPending
+                    } else {
+                        AccessStatus::NotPrimary
+                    },
                 },
-            })
+                budget,
+            )
             .await?;
-            pod.effect(RuntimeEffectAction::RefreshApplicationProgress)
+            pod.effect(RuntimeEffectAction::RefreshApplicationProgress, budget)
                 .await?;
         }
         for pod in &mut pods {
-            pod.start_agent().await?;
+            pod.start_agent(budget).await?;
         }
 
         let group = Self {
@@ -446,6 +578,8 @@ impl MssqlGroup {
             configuration,
             pods,
             native_binding: native_binding.clone(),
+            topology_bindings,
+            convergence_budget: budget,
         };
         group.validate_durable_state().await?;
         Ok(group)
@@ -454,27 +588,33 @@ impl MssqlGroup {
     pub async fn reports_bracketed(
         &self,
     ) -> Result<[proto::AgentStatusReport; 3], MssqlGroupError> {
-        let before = observe_sources(&self.pods).await?;
+        let before = observe_sources(&self.pods, self.convergence_budget).await?;
         let mut reports = Vec::with_capacity(3);
         for pod in &self.pods {
-            reports.push(pod.report(&self.resource_uid).await?);
+            reports.push(
+                pod.report(&self.resource_uid, self.convergence_budget)
+                    .await?,
+            );
         }
-        let after = observe_sources(&self.pods).await?;
+        let after = observe_sources(&self.pods, self.convergence_budget).await?;
         for index in 0..3 {
-            validate_exact_observation(
+            validate_bound_observation(
                 index,
                 &self.native_binding,
+                &self.topology_bindings[index],
                 &before[index],
                 self.pods[index].source.observer_config(),
             )?;
-            validate_exact_observation(
+            validate_bound_observation(
                 index,
                 &self.native_binding,
+                &self.topology_bindings[index],
                 &after[index],
                 self.pods[index].source.observer_config(),
             )?;
             self.validate_report(index, &reports[index])?;
         }
+        self.convergence_budget.check("report comparison")?;
         reports
             .try_into()
             .map_err(|_| MssqlGroupError::new("exactly three reports required"))
@@ -482,7 +622,15 @@ impl MssqlGroup {
 
     pub async fn validate_durable_state(&self) -> Result<(), MssqlGroupError> {
         for (index, pod) in self.pods.iter().enumerate() {
-            let state = pod.store.load_state().await.map_err(display_error)?;
+            let state = self
+                .convergence_budget
+                .run(
+                    "durable state validation",
+                    self.convergence_budget.operation_timeout,
+                    pod.store.load_state(),
+                )
+                .await?
+                .map_err(display_error)?;
             if state.identity.resource_uid != self.resource_uid
                 || state.identity.local_identity != pod.identity
                 || state.identity.pod_uid != pod.pod_uid
@@ -512,7 +660,14 @@ impl MssqlGroup {
                     index + 1
                 )));
             }
-            let snapshot = pod.runtime.snapshot().await;
+            let snapshot = self
+                .convergence_budget
+                .run(
+                    "runtime state validation",
+                    self.convergence_budget.operation_timeout,
+                    pod.runtime.snapshot(),
+                )
+                .await?;
             if snapshot
                 .authority
                 .as_ref()
@@ -533,8 +688,9 @@ impl MssqlGroup {
 
     pub async fn shutdown(mut self) -> Result<(), MssqlGroupError> {
         let mut errors = Vec::new();
+        let budget = self.convergence_budget.shutdown_budget()?;
         for pod in &mut self.pods {
-            if let Err(error) = pod.shutdown().await {
+            if let Err(error) = pod.shutdown(budget).await {
                 errors.push(error.to_string());
             }
         }
@@ -690,27 +846,39 @@ fn stable_roles(
     Ok(roles)
 }
 
-async fn observe_sources(pods: &[MssqlPod; 3]) -> Result<[InstanceSnapshot; 3], MssqlGroupError> {
+async fn observe_sources(
+    pods: &[MssqlPod; 3],
+    budget: ConvergenceBudget,
+) -> Result<[InstanceSnapshot; 3], MssqlGroupError> {
     let mut snapshots = Vec::with_capacity(3);
     for pod in pods {
-        let observation = pod.source.observe().await.map_err(display_error)?;
-        let snapshot = match observation {
-            Observation::Present { value, .. } => value,
-            Observation::Absent { .. } => {
-                return Err(MssqlGroupError::new("availability group is absent"));
-            }
-            Observation::Failed(failure) => {
-                return Err(MssqlGroupError::new(format!(
-                    "direct observation failed: {:?}",
-                    failure.kind
-                )));
-            }
-        };
-        snapshots.push(snapshot);
+        snapshots.push(observe_source(&pod.source, budget).await?);
     }
     snapshots
         .try_into()
         .map_err(|_| MssqlGroupError::new("exactly three direct observations required"))
+}
+
+async fn observe_source(
+    source: &Source,
+    budget: ConvergenceBudget,
+) -> Result<InstanceSnapshot, MssqlGroupError> {
+    let observation = budget
+        .run(
+            "direct SQL observation",
+            source.observer_config().sample_timeout(),
+            source.observe(),
+        )
+        .await?
+        .map_err(display_error)?;
+    match observation {
+        Observation::Present { value, .. } => Ok(value),
+        Observation::Absent { .. } => Err(MssqlGroupError::new("availability group is absent")),
+        Observation::Failed(failure) => Err(MssqlGroupError::new(format!(
+            "direct observation failed: {:?}",
+            failure.kind
+        ))),
+    }
 }
 
 fn build_member_bindings(
@@ -722,7 +890,7 @@ fn build_member_bindings(
 ) -> Result<Vec<HealthyTopologyMemberBinding>, MssqlGroupError> {
     (0..3)
         .map(|index| {
-            validate_exact_observation(
+            validate_native_observation(
                 index,
                 native_binding,
                 &snapshots[index],
@@ -734,7 +902,12 @@ fn build_member_bindings(
                 pods[index].session.clone(),
                 pods[index].replication_address.to_string(),
                 group.local_replica.identity.clone(),
-                ServerName::new(run.members[index].server_name.clone()).map_err(display_error)?,
+                SqlServerMemberEndpoint::new(
+                    ServerName::new(run.members[index].server_name.clone())
+                        .map_err(display_error)?,
+                    native_binding.members[index].endpoint_url.clone(),
+                )
+                .map_err(display_error)?,
                 SqlServerStartIncarnation::new(
                     snapshots[index].instance.sqlserver_start_time.clone(),
                 )
@@ -777,7 +950,7 @@ fn validate_run_binding(
     Ok(())
 }
 
-fn validate_exact_observation(
+fn validate_native_observation(
     index: usize,
     native_binding: &NativeTopologyBinding,
     snapshot: &InstanceSnapshot,
@@ -860,6 +1033,25 @@ fn validate_exact_observation(
         )));
     }
     Ok(())
+}
+
+fn validate_bound_observation(
+    index: usize,
+    native_binding: &NativeTopologyBinding,
+    binding: &HealthyTopologyBinding,
+    snapshot: &InstanceSnapshot,
+    config: &ObserverConfig,
+) -> Result<(), MssqlGroupError> {
+    validate_native_observation(index, native_binding, snapshot, config)?;
+    let role = binding
+        .members()
+        .iter()
+        .find(|member| member.kuberic_identity() == binding.local_identity())
+        .map(HealthyTopologyMemberBinding::stable_role)
+        .ok_or_else(|| MssqlGroupError::new("local topology binding member is missing"))?;
+    binding
+        .validate_snapshot(config, snapshot, unix_millis()?, true, Some(role))
+        .map_err(display_error)
 }
 
 fn present_group(
@@ -1075,6 +1267,70 @@ mod tests {
         }
     }
 
+    struct DelayedSource {
+        inner: StaticSource,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl SqlServerObservationSource for DelayedSource {
+        fn observer_config(&self) -> &ObserverConfig {
+            self.inner.observer_config()
+        }
+
+        async fn observe(
+            &self,
+        ) -> Result<Observation<InstanceSnapshot>, kuberic_mssql::runtime_error::RuntimeError>
+        {
+            tokio::time::sleep(self.delay).await;
+            self.inner.observe().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_observation_at_remaining_overall_deadline_is_rejected() {
+        let root = PathBuf::from("/phase7-deadline-test");
+        let run = run(&root);
+        let now = unix_millis().unwrap();
+        let source: Source = Arc::new(DelayedSource {
+            inner: source(&run, 0, now),
+            delay: Duration::from_millis(25),
+        });
+        let budget = ConvergenceBudget::new(
+            Duration::from_secs(60),
+            StdInstant::now() + Duration::from_millis(25),
+        )
+        .unwrap();
+        let error = observe_source(&source, budget).await.unwrap_err();
+        assert!(
+            error.to_string().contains("Kuberic convergence deadline"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_observation_before_convergence_deadline_succeeds() {
+        let root = PathBuf::from("/phase7-deadline-success-test");
+        let run = run(&root);
+        let now = unix_millis().unwrap();
+        let source: Source = Arc::new(DelayedSource {
+            inner: source(&run, 0, now),
+            delay: Duration::from_millis(24),
+        });
+        let budget = ConvergenceBudget::new(
+            Duration::from_millis(25),
+            StdInstant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(
+            observe_source(&source, budget)
+                .await
+                .unwrap()
+                .observed_at_unix_millis,
+            now
+        );
+    }
+
     #[test]
     fn three_runtime_assembly_uses_actual_sessions_and_fenced_reports() {
         run_group_test(async {
@@ -1090,6 +1346,8 @@ mod tests {
                 &native,
                 sources.clone().map(|source| source as Source),
                 std::array::from_fn(|_| Arc::new(FixedClock(AtomicU64::new(now))) as Clock),
+                Duration::from_secs(60),
+                StdInstant::now() + Duration::from_secs(120),
             )
             .await
             .unwrap();
@@ -1158,6 +1416,11 @@ mod tests {
                     EffectivePolicy::fixed(3, MSSQL_FAILOVER_DELAY_SECONDS + 1).unwrap(),
                     exact_policy(),
                 ],
+                ConvergenceBudget::new(
+                    Duration::from_secs(60),
+                    StdInstant::now() + Duration::from_secs(120),
+                )
+                .unwrap(),
             )
             .await
             {
@@ -1191,6 +1454,8 @@ mod tests {
                 &native,
                 sources.clone().map(|source| source as Source),
                 std::array::from_fn(|_| Arc::new(FixedClock(AtomicU64::new(now))) as Clock),
+                Duration::from_secs(60),
+                StdInstant::now() + Duration::from_secs(120),
             )
             .await
             .unwrap();
@@ -1201,6 +1466,76 @@ mod tests {
                     .to_string()
                     .contains("injected report observation failure")
             );
+            group.shutdown().await.unwrap();
+            fs::remove_dir_all(&root).unwrap();
+        });
+    }
+
+    #[test]
+    fn direct_report_brackets_reject_start_and_health_drift() {
+        run_group_test(async {
+            let root = test_root("direct-drift");
+            let run = run(&root);
+            let native = native_binding(&run);
+            let now = unix_millis().unwrap();
+            let sources: [Arc<StaticSource>; 3] =
+                std::array::from_fn(|index| Arc::new(source(&run, index, now)));
+            let group = MssqlGroup::assemble(
+                &root,
+                &run,
+                &native,
+                sources.clone().map(|source| source as Source),
+                std::array::from_fn(|_| Arc::new(FixedClock(AtomicU64::new(now))) as Clock),
+                Duration::from_secs(60),
+                StdInstant::now() + Duration::from_secs(120),
+            )
+            .await
+            .unwrap();
+
+            let mut start_drift = sources[0].snapshot.clone();
+            start_drift.instance.sqlserver_start_time = "2026-10-07T01:02:03".into();
+            let error = validate_bound_observation(
+                0,
+                &native,
+                &group.topology_bindings[0],
+                &start_drift,
+                sources[0].observer_config(),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("incarnation evidence"),
+                "{error}"
+            );
+
+            let mut health_drift = sources[0].snapshot.clone();
+            let local = present_group(&health_drift)
+                .unwrap()
+                .replicas
+                .iter()
+                .position(|replica| replica.state.is_some())
+                .unwrap();
+            let group_snapshot = match &mut health_drift.availability_group {
+                Observation::Present { value, .. } => value,
+                _ => unreachable!(),
+            };
+            group_snapshot.replicas[local]
+                .state
+                .as_mut()
+                .unwrap()
+                .synchronization_health = Some("NOT_HEALTHY".into());
+            let error = validate_bound_observation(
+                0,
+                &native,
+                &group.topology_bindings[0],
+                &health_drift,
+                sources[0].observer_config(),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("synchronization health"),
+                "{error}"
+            );
+
             group.shutdown().await.unwrap();
             fs::remove_dir_all(&root).unwrap();
         });

@@ -272,12 +272,40 @@ impl SqlServerStartIncarnation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlServerMemberEndpoint {
+    server_name: ServerName,
+    endpoint_url: String,
+}
+
+impl SqlServerMemberEndpoint {
+    pub fn new(
+        server_name: ServerName,
+        endpoint_url: impl Into<String>,
+    ) -> Result<Self, KubericAdapterError> {
+        let endpoint_url = endpoint_url.into();
+        validate_replication_address(&endpoint_url)?;
+        Ok(Self {
+            server_name,
+            endpoint_url,
+        })
+    }
+
+    pub fn server_name(&self) -> &ServerName {
+        &self.server_name
+    }
+
+    pub fn endpoint_url(&self) -> &str {
+        &self.endpoint_url
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthyTopologyMemberBinding {
     kuberic_identity: KubericReplicaIdentity,
     process_session_id: ProcessSessionId,
     replication_address: String,
     sql_replica_identity: SqlReplicaIdentity,
-    server_name: ServerName,
+    sql_endpoint: SqlServerMemberEndpoint,
     sql_server_start_incarnation: SqlServerStartIncarnation,
     stable_role: ReplicaRole,
 }
@@ -288,7 +316,7 @@ impl HealthyTopologyMemberBinding {
         process_session_id: ProcessSessionId,
         replication_address: impl Into<String>,
         sql_replica_identity: SqlReplicaIdentity,
-        server_name: ServerName,
+        sql_endpoint: SqlServerMemberEndpoint,
         sql_server_start_incarnation: SqlServerStartIncarnation,
         stable_role: ReplicaRole,
     ) -> Result<Self, KubericAdapterError> {
@@ -321,7 +349,7 @@ impl HealthyTopologyMemberBinding {
             process_session_id,
             replication_address,
             sql_replica_identity,
-            server_name,
+            sql_endpoint,
             sql_server_start_incarnation,
             stable_role,
         })
@@ -344,7 +372,11 @@ impl HealthyTopologyMemberBinding {
     }
 
     pub fn server_name(&self) -> &ServerName {
-        &self.server_name
+        self.sql_endpoint.server_name()
+    }
+
+    pub fn sql_endpoint_url(&self) -> &str {
+        self.sql_endpoint.endpoint_url()
     }
 
     pub fn sql_server_start_incarnation(&self) -> &SqlServerStartIncarnation {
@@ -455,13 +487,14 @@ impl HealthyTopologyBinding {
                 other.kuberic_identity == member.kuberic_identity
                     || other.process_session_id == member.process_session_id
                     || other.replication_address == member.replication_address
-                    || other.server_name == member.server_name
+                    || other.sql_endpoint.server_name == member.sql_endpoint.server_name
+                    || other.sql_endpoint.endpoint_url == member.sql_endpoint.endpoint_url
                     || other.sql_replica_identity.native_replica_id()
                         == member.sql_replica_identity.native_replica_id()
             })
         }) {
             return Err(KubericAdapterError::InvalidConfiguration(
-                "bound identities, sessions, addresses, servers, and native replica GUIDs must be unique",
+                "bound identities, sessions, addresses, SQL endpoints, servers, and native replica GUIDs must be unique",
             ));
         }
         for configuration_member in &configuration.members {
@@ -550,6 +583,48 @@ impl HealthyTopologyBinding {
 
     pub fn members(&self) -> &[HealthyTopologyMemberBinding] {
         &self.members
+    }
+
+    pub fn validate_snapshot(
+        &self,
+        config: &ObserverConfig,
+        snapshot: &InstanceSnapshot,
+        now_unix_millis: u64,
+        require_progress_role: bool,
+        requested_role: Option<ReplicaRole>,
+    ) -> Result<(), KubericAdapterError> {
+        let observed_at = snapshot.observed_at_unix_millis;
+        let Some(age) = now_unix_millis.checked_sub(observed_at) else {
+            return Err(KubericAdapterError::ObservationFromFuture);
+        };
+        if age > config.max_age_millis() {
+            return Err(KubericAdapterError::ObservationStale);
+        }
+        let group = match &snapshot.availability_group {
+            Observation::Present {
+                value,
+                observed_at_unix_millis,
+            } if *observed_at_unix_millis == observed_at => value,
+            Observation::Present { .. } => {
+                return Err(KubericAdapterError::ObservationInconsistent(
+                    "availability-group and instance timestamps differ",
+                ));
+            }
+            Observation::Absent { .. } => {
+                return Err(KubericAdapterError::AvailabilityGroupAbsent);
+            }
+            Observation::Failed(failure) => {
+                return Err(KubericAdapterError::ObservationUnavailable(failure.kind));
+            }
+        };
+        validate_eligible_snapshot(config, &snapshot.instance, group, require_progress_role)?;
+        validate_bound_evidence(self, config, &snapshot.instance, group, requested_role)?;
+        if group.configuration_sequence.value() != self.configuration.epoch.configuration_number {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "configuration sequence differs from the frozen configuration",
+            ));
+        }
+        Ok(())
     }
 
     fn local_member(&self) -> &HealthyTopologyMemberBinding {
@@ -1404,8 +1479,8 @@ fn validate_bound_evidence(
     let target = config.target();
     if target.replica.logical_id() != local.sql_replica_identity.logical_id()
         || target.replica.incarnation() != local.sql_replica_identity.incarnation()
-        || instance.server_name != local.server_name
-        || instance.property_server_name != local.server_name
+        || instance.server_name != *local.server_name()
+        || instance.property_server_name != *local.server_name()
         || instance.sqlserver_start_time != local.sql_server_start_incarnation.as_str()
     {
         return Err(KubericAdapterError::TopologyBindingMismatch(
@@ -1447,12 +1522,14 @@ fn validate_bound_evidence(
             .replicas
             .iter()
             .filter(|replica| {
-                &replica.replica_id == native_id && replica.server_name == member.server_name
+                &replica.replica_id == native_id
+                    && replica.server_name == *member.server_name()
+                    && replica.endpoint_url.as_deref() == Some(member.sql_endpoint_url())
             })
             .collect::<Vec<_>>();
         if matching.len() != 1 {
             return Err(KubericAdapterError::TopologyBindingMismatch(
-                "native replica GUID or SQL server membership differs",
+                "native replica GUID, SQL server, or endpoint membership differs",
             ));
         }
     }
@@ -1464,7 +1541,7 @@ fn validate_bound_evidence(
         .replicas
         .iter()
         .find(|replica| {
-            &replica.replica_id == local_native_id && replica.server_name == local.server_name
+            &replica.replica_id == local_native_id && replica.server_name == *local.server_name()
         })
         .expect("native membership was validated");
     let Some(state) = &local_replica.state else {

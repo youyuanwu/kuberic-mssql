@@ -239,6 +239,9 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         )
     );
     assert!(justfile.contains("cleanup-live-three-replica root=\"target/mssql-three-replica\":"));
+    assert!(justfile.contains(
+        "test-live-three-replica-signal acknowledgement root=\"target/mssql-three-replica-signal\":"
+    ));
     assert!(justfile.contains("env -u SQLSERVER_TEST_EULA_ACCEPTED"));
     assert!(
         justfile.contains(
@@ -253,6 +256,9 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
     ));
     assert!(justfile.contains(
         "cargo run --locked -p kuberic-mssql-tests --bin mssql-three-replica-fixture -- cleanup --root"
+    ));
+    assert!(justfile.contains(
+        "three_replica_sigterm_during_owned_launch_is_recoverable -- --ignored --exact --test-threads=1 --nocapture"
     ));
 
     for recipe in [
