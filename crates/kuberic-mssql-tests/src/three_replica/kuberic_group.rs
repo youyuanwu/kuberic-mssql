@@ -1628,6 +1628,8 @@ mod tests {
     use super::*;
     use crate::three_replica::{KubericMember, NativeMemberBinding, SqlMember, TopologyRun};
 
+    static GROUP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     const AG_ID: &str = "11111111-1111-4111-8111-111111111111";
     const DATABASE_ID: &str = "22222222-2222-4222-8222-222222222222";
     const FAMILY_ID: &str = "33333333-3333-4333-8333-333333333333";
@@ -2172,6 +2174,9 @@ mod tests {
     }
 
     fn run_group_test(future: impl Future<Output = ()> + Send + 'static) {
+        let _guard = GROUP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::thread::Builder::new()
             .stack_size(32 * 1024 * 1024)
             .spawn(move || {

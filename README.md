@@ -417,10 +417,12 @@ mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59
 ```
 
 It currently also pins Kuberic Git commit
-`301d7f364744aea4dd2513dcc8179d3588fd7dd7`, associated with the open
-[Kuberic PR #124](https://github.com/youyuanwu/kuberic/pull/124). This is a
-temporary dependency until a suitable upstream merge or release is available;
-it does not promise that the PR will merge.
+`c83588e8625557af1024d023f0daf60454a753a0`, associated with open
+[Kuberic PR #127](https://github.com/youyuanwu/kuberic/pull/127). Its parent is
+the formal authority fix
+`0784b7b8fc18c3f68c34c3bc1e1035412c027de9`; PR #127 adds only the testing
+listener handoff required by this fixture. The Git pin remains temporary until
+that testing API is merged and released.
 
 The test crate constructs an affirmative `SqlServerEulaAcknowledgement` through
 the clearly test-only `FixtureConfig` path and injects exactly

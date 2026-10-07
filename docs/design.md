@@ -340,11 +340,12 @@ write uses its private administrator connection to the directly observed native
 primary and is not a Kuberic client-access decision.
 
 The current implementation temporarily pins Kuberic Git commit
-`301d7f364744aea4dd2513dcc8179d3588fd7dd7` for the authority-validation
-ordering tracked by
-[youyuanwu/kuberic#124](https://github.com/youyuanwu/kuberic/pull/124). This pin
-remains an upstream dependency until an appropriate merge or release is
-available; no merge outcome is assumed.
+`c83588e8625557af1024d023f0daf60454a753a0`. Its parent
+`0784b7b8fc18c3f68c34c3bc1e1035412c027de9` is the merged formal
+authority-validation fix; open
+[youyuanwu/kuberic#127](https://github.com/youyuanwu/kuberic/pull/127) adds the
+testing-only bound-listener handoff required by the three-runtime fixture. The
+pin remains until that API is merged and released.
 
 ## Delivery Sequence
 

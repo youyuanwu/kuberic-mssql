@@ -33,4 +33,4 @@ zeroize = "1"
 
 [patch.crates-io]
 # Custom authority validation must complete before durable authority publication.
-kuberic-runtime = { git = "https://github.com/youyuanwu/kuberic.git", rev = "301d7f364744aea4dd2513dcc8179d3588fd7dd7" }
+kuberic-runtime = { git = "https://github.com/youyuanwu/kuberic.git", rev = "c83588e8625557af1024d023f0daf60454a753a0" }
