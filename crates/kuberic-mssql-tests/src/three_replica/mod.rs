@@ -1,20 +1,16 @@
-mod admin;
 mod availability_group;
-mod cleanup;
-mod config;
 mod data;
-mod deadline;
-mod docker;
 mod evidence;
 mod kuberic_group;
 mod member;
 mod model;
-mod ownership;
-mod preflight;
-mod process;
 mod secrets;
 mod tls;
 
+pub(crate) use crate::fixture::{admin, cleanup, config, docker, ownership, preflight, process};
+
+pub use crate::fixture::secrets::{PrivateFile, SecretError, SecretValue};
+pub use crate::fixture::tls::{MemberTlsAssets, TlsError};
 pub use admin::{
     AdminDeadlines, AdminEndpoint, AdminError, AdminSession, EXPECTED_SQL_SERVER_VERSION,
     LoginFiles, MemberReadinessEvidence, validated_identifier,
@@ -25,8 +21,8 @@ pub use availability_group::{
 };
 pub use cleanup::{
     CLEANUP_BUDGET, CancellationSignals, CleanupBackend, CleanupClock, CleanupCompletion,
-    CleanupCoordinator, CleanupError, CleanupReport, HandledCancellationSignal, SystemCleanupClock,
-    cleanup, combine_with_cleanup,
+    CleanupCoordinator, CleanupError, CleanupJournal, CleanupJournalStore, CleanupReport,
+    HandledCancellationSignal, SystemCleanupClock, cleanup, combine_with_cleanup,
 };
 pub use config::{
     ACKNOWLEDGEMENT_SCHEMA_VERSION, AcknowledgementSource, FixtureConfig, FixtureConfigError,
@@ -58,9 +54,10 @@ pub use model::{
     TopologyRun,
 };
 pub use ownership::{
-    AclController, AclEvidence, CommandAclController, DirectoryBinding, JournalStore, LockError,
-    MemberDirectoryError, OwnershipInspector, ProcessIncarnationError, ReconcileError,
-    ReconcileReport, ResourceObservation, RootLock, acquire_root_lock, current_process_incarnation,
+    AclController, AclEvidence, CommandAclController, DirectoryBinding, JournalDocument,
+    JournalStore, LockError, MemberDirectoryError, NewJournal, OwnershipInspector,
+    ProcessIncarnationError, ProcessOwnedJournal, ReconcileError, ReconcileReport,
+    ResourceObservation, RootLock, acquire_root_lock, current_process_incarnation,
     inspect_member_directory, parse_acl_evidence, parse_process_incarnation,
     prepare_member_directory, prepare_member_directory_with_clock, process_incarnation,
     process_incarnation_is_alive, process_incarnation_matches_stat, reconcile,
@@ -76,5 +73,5 @@ pub use process::{
     BoundedProcessRunner, ChildDisposition, CommandSpec, ProcessError, ProcessErrorKind,
     ProcessResult, ProcessRunner,
 };
-pub use secrets::{CredentialFiles, PrivateFile, SecretError, SecretValue};
-pub use tls::{MemberTlsAssets, TlsAssets, TlsError};
+pub use secrets::CredentialFiles;
+pub use tls::TlsAssets;

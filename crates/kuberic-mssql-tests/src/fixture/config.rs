@@ -58,7 +58,7 @@ impl fmt::Display for FixtureConfigError {
                 formatter.write_str("SQL Server EULA acknowledgement changed during launch")
             }
             Self::InvalidFixtureRoot => {
-                formatter.write_str("three-replica fixture root must be an absolute path")
+                formatter.write_str("SQL Server fixture root must be an absolute path")
             }
         }
     }
@@ -228,6 +228,18 @@ impl FixtureConfig {
 
     pub fn for_test_fixture(root: impl Into<PathBuf>) -> Result<Self, FixtureConfigError> {
         Self::with_authorization(root.into(), LaunchAuthorization::for_test_fixture())
+    }
+
+    pub(crate) fn for_test_fixture_with_policy(
+        root: impl Into<PathBuf>,
+        resources: ResourcePolicy,
+        deadlines: StageDeadlines,
+    ) -> Result<Self, FixtureConfigError> {
+        let mut config =
+            Self::with_authorization(root.into(), LaunchAuthorization::for_test_fixture())?;
+        config.resources = resources;
+        config.deadlines = deadlines;
+        Ok(config)
     }
 
     pub fn root(&self) -> &Path {

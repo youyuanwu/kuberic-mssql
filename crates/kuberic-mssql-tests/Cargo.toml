@@ -18,6 +18,11 @@ name = "mssql-three-replica-fixture"
 path = "src/bin/mssql-three-replica-fixture.rs"
 test = false
 
+[[bin]]
+name = "mssql-one-replica-fixture"
+path = "src/bin/mssql-one-replica-fixture.rs"
+test = false
+
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true

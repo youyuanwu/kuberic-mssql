@@ -1,30 +1,21 @@
 export CARGO_BUILD_JOBS := env_var_or_default("CARGO_BUILD_JOBS", "1")
-export SQLSERVER_TEST_EULA_ACCEPTED := "true"
 export PATH := env_var("HOME") + "/.local/bin:" + env_var("HOME") + "/.cargo/bin:" + env_var("PATH")
 
 # Run all server-free checks without provisioning SQL Server.
 default: check
 
 # Run the complete CI pipeline locally or on the CI runner.
-ci fixture="": setup check (validate-live fixture) test-live-three-replica
+ci: setup check test-live-one-replica test-live-three-replica
 
 # Install only missing/mismatched shared Rust, just and compiler prerequisites.
 setup:
     bash crates/kuberic-mssql-tests/scripts/setup_environment.sh
 
-# Ensure the selected fixture is ready without running tests.
-provision fixture="":
-    python3 -B crates/kuberic-mssql-tests/scripts/sqlserver_fixture.py provision {{quote(fixture)}}
+# Release both Rust-owned fixture families.
+cleanup: cleanup-live-one-replica cleanup-live-three-replica
 
-# Release both owned fixture families; borrowed instances are preserved.
-cleanup fixture="": cleanup-live-three-replica
-    python3 -B crates/kuberic-mssql-tests/scripts/sqlserver_fixture.py cleanup {{quote(fixture)}}
-
-# Ensure readiness, run shared live checks, and release owned resources.
-validate-live fixture="": build
-    python3 -B crates/kuberic-mssql-tests/scripts/sqlserver_fixture.py validate {{quote(fixture)}}
-# Check formatting, strict Clippy, Rust tests, and CI fixture helper tests.
-check: fmt-check clippy test test-ci-helpers
+# Check formatting, strict Clippy, and ordinary Rust tests.
+check: fmt-check clippy test
 
 # Build the observe-only executable.
 build:
@@ -42,21 +33,26 @@ clippy:
 test:
     cargo test --locked --workspace --all-features
 
-# Test the CI helper's guards without installing or starting SQL Server.
-test-ci-helpers:
-    python3 -B -m unittest discover -s crates/kuberic-mssql-tests/scripts -p 'test_*.py'
+# Launch one owned SQL Server member, validate unique observer/CLI behavior, and clean up.
+test-live-one-replica root="target/mssql-one-replica":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        SQLSERVER_ONE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_one_replica \
+        one_replica_mssql_observation_and_cli -- --ignored --exact --test-threads=1 --nocapture
 
-# Run the three non-AG cases against explicitly provisioned fixtures.
-test-live fixture="":
-    python3 -B crates/kuberic-mssql-tests/scripts/sqlserver_fixture.py test {{quote(fixture)}}
+# Recover and remove only the exactly journaled one-member fixture.
+cleanup-live-one-replica root="target/mssql-one-replica":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED CARGO_BUILD_JOBS=1 \
+        cargo run --locked -p kuberic-mssql-tests --bin mssql-one-replica-fixture -- cleanup --root "$(realpath -m {{quote(root)}})"
 
-# Run every direct-observation live case against the fixture-owned EXTERNAL AG.
-test-live-all fixture="":
-    python3 -B crates/kuberic-mssql-tests/scripts/sqlserver_fixture.py test-all {{quote(fixture)}}
-
-# Run the feature-enabled Kuberic happy path against the same ready fixture.
-test-live-kuberic fixture="":
-    python3 -B crates/kuberic-mssql-tests/scripts/sqlserver_fixture.py test-kuberic {{quote(fixture)}}
+# Exercise launch/scenario faults, panic, timeout, explicit error, SIGINT and SIGTERM recovery.
+test-live-one-replica-recovery root="target/mssql-one-replica-recovery":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        SQLSERVER_ONE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_one_replica \
+        one_replica_recovery_ -- --ignored --test-threads=1 --nocapture
 
 # Launch, validate, and clean up the dedicated real three-member topology.
 test-live-three-replica root="target/mssql-three-replica":
@@ -92,17 +88,3 @@ test-live-three-replica-faults root="target/mssql-three-replica-faults":
 cleanup-live-three-replica root="target/mssql-three-replica":
     env -u SQLSERVER_TEST_EULA_ACCEPTED CARGO_BUILD_JOBS=1 \
         cargo run --locked -p kuberic-mssql-tests --bin mssql-three-replica-fixture -- cleanup --root "$(realpath -m {{quote(root)}})"
-
-# Compile once and run direct observation plus Kuberic against one fixture lifetime.
-test-live-shared fixture="":
-    python3 -B crates/kuberic-mssql-tests/scripts/sqlserver_fixture.py test-shared {{quote(fixture)}}
-
-# Build the CLI, emit an observation, and verify it against the container fixture.
-test-live-cli report: build && (verify-live-cli report)
-    target/debug/sqlserver-observer \
-        --config "${SQLSERVER_LIVE_ABSENT_CONFIG:?SQLSERVER_LIVE_ABSENT_CONFIG must reference a provisioned fixture}" \
-        > {{quote(report)}}
-
-# Verify fresh CLI output from the pinned Enterprise Developer container.
-verify-live-cli report:
-    python3 -B crates/kuberic-mssql-tests/scripts/sqlserver_fixture.py verify-cli {{quote(report)}}

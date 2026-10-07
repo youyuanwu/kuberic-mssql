@@ -271,6 +271,12 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         .and_then(Path::parent)
         .unwrap();
     let justfile = fs::read_to_string(root.join("justfile")).unwrap();
+    assert!(justfile.contains("test-live-one-replica root=\"target/mssql-one-replica\":"));
+    assert!(
+        justfile
+            .contains("test-live-one-replica-recovery root=\"target/mssql-one-replica-recovery\":")
+    );
+    assert!(justfile.contains("cleanup-live-one-replica root=\"target/mssql-one-replica\":"));
     assert!(justfile.contains("test-live-three-replica root=\"target/mssql-three-replica\":"));
     assert!(justfile.contains("cleanup-live-three-replica root=\"target/mssql-three-replica\":"));
     assert!(
@@ -289,7 +295,7 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
             .lines()
             .filter(|line| line.contains("env -u SQLSERVER_TEST_EULA_ACCEPTED"))
             .count(),
-        5
+        8
     );
     assert!(!justfile.contains("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT"));
     assert!(!justfile.contains("acknowledgement root="));
@@ -306,25 +312,28 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         "three_replica_sigterm_during_owned_launch_is_recoverable -- --ignored --exact --test-threads=1 --nocapture"
     ));
 
-    for recipe in [
-        "default: check",
-        "check: fmt-check clippy test test-ci-helpers",
-    ] {
+    for recipe in ["default: check", "check: fmt-check clippy test"] {
         let line = justfile.lines().find(|line| *line == recipe).unwrap();
         assert!(!line.contains("test-live-three-replica"));
+        assert!(!line.contains("test-live-one-replica"));
     }
     let ci = justfile
         .lines()
-        .find(|line| line.starts_with("ci fixture="))
+        .find(|line| line.starts_with("ci:"))
         .unwrap();
     assert_eq!(
         ci,
-        "ci fixture=\"\": setup check (validate-live fixture) test-live-three-replica"
+        "ci: setup check test-live-one-replica test-live-three-replica"
     );
     assert!(
-        ci.find("(validate-live fixture)").unwrap() < ci.find("test-live-three-replica").unwrap()
+        ci.find("test-live-one-replica").unwrap() < ci.find("test-live-three-replica").unwrap()
     );
-    assert!(justfile.contains("cleanup fixture=\"\": cleanup-live-three-replica"));
+    assert!(justfile.contains("cleanup: cleanup-live-one-replica cleanup-live-three-replica"));
+    assert!(!justfile.contains("sqlserver_fixture.py"));
+    assert!(!justfile.contains("test-ci-helpers"));
+    assert!(!justfile.contains("validate-live"));
+    assert!(!justfile.contains("test-live-kuberic"));
+    assert!(!justfile.contains("test-live-shared"));
 
     let workflow = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
     assert!(workflow.contains("just cleanup\n"));
@@ -353,6 +362,23 @@ fn journal_round_trips_without_secret_values() {
     assert!(text.contains("sa-password"));
     assert!(!text.contains("\"secret_value\""));
     assert_eq!(OwnershipJournal::from_json(&encoded).unwrap(), journal);
+}
+
+#[test]
+fn schema_seven_serialized_shape_and_previous_schema_migration_remain_stable() {
+    let current_bytes = include_bytes!("../fixtures/ownership-journal-schema-7.json");
+    let current = OwnershipJournal::from_json(current_bytes).unwrap();
+    assert_eq!(current.schema_version, JOURNAL_SCHEMA_VERSION);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&current.to_json().unwrap()).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(current_bytes).unwrap()
+    );
+
+    let previous = OwnershipJournal::from_json(include_bytes!(
+        "../fixtures/ownership-journal-schema-6.json"
+    ))
+    .unwrap();
+    assert_eq!(previous, current);
 }
 
 #[test]

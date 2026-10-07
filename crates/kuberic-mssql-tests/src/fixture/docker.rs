@@ -34,28 +34,47 @@ pub struct OwnedLabels {
     pub run_id: String,
     pub resource_kind: String,
     pub member_ordinal: Option<u8>,
+    #[serde(skip, default = "default_fixture_label")]
+    fixture_label: String,
 }
 
 impl OwnedLabels {
     pub fn network(run_id: impl Into<String>) -> Self {
+        Self::network_for_fixture(FIXTURE_LABEL_VALUE, run_id)
+    }
+
+    pub(crate) fn network_for_fixture(
+        fixture_label: impl Into<String>,
+        run_id: impl Into<String>,
+    ) -> Self {
         Self {
             run_id: run_id.into(),
             resource_kind: "network".to_owned(),
             member_ordinal: None,
+            fixture_label: fixture_label.into(),
         }
     }
 
     pub fn container(run_id: impl Into<String>, member_ordinal: u8) -> Self {
+        Self::container_for_fixture(FIXTURE_LABEL_VALUE, run_id, member_ordinal)
+    }
+
+    pub(crate) fn container_for_fixture(
+        fixture_label: impl Into<String>,
+        run_id: impl Into<String>,
+        member_ordinal: u8,
+    ) -> Self {
         Self {
             run_id: run_id.into(),
             resource_kind: "container".to_owned(),
             member_ordinal: Some(member_ordinal),
+            fixture_label: fixture_label.into(),
         }
     }
 
     pub fn as_map(&self) -> BTreeMap<String, String> {
         let mut labels = BTreeMap::from([
-            (FIXTURE_LABEL.to_owned(), FIXTURE_LABEL_VALUE.to_owned()),
+            (FIXTURE_LABEL.to_owned(), self.fixture_label.clone()),
             (RUN_LABEL.to_owned(), self.run_id.clone()),
             (KIND_LABEL.to_owned(), self.resource_kind.clone()),
         ]);
@@ -81,6 +100,10 @@ impl OwnedLabels {
                 .count()
                 == expected.len()
     }
+}
+
+fn default_fixture_label() -> String {
+    FIXTURE_LABEL_VALUE.to_owned()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +230,14 @@ impl NetworkRequest {
             immutable_id: self.name.clone(),
             attributes_sha256: hex(&Sha256::digest(attributes)),
         }
+    }
+
+    pub(crate) fn resource_binding(
+        &self,
+        inspection: &NetworkInspection,
+    ) -> Result<ResourceBinding, DockerError> {
+        self.verify_inspection(inspection)?;
+        stable_resource_binding(&inspection.id, &self.intent_binding(), &[])
     }
 }
 
@@ -433,6 +464,19 @@ impl ContainerRequest {
             return Err(DockerError::OwnershipMismatch);
         }
         Ok(())
+    }
+
+    pub(crate) fn resource_binding(
+        &self,
+        expected_image_id: &str,
+        inspection: &ContainerInspection,
+    ) -> Result<ResourceBinding, DockerError> {
+        self.verify_inspection(inspection, expected_image_id, inspection.running)?;
+        stable_resource_binding(
+            &inspection.id,
+            &self.intent_binding(expected_image_id),
+            &inspection.ports,
+        )
     }
 
     pub fn intent_binding(&self, expected_image_id: &str) -> ResourceBinding {
@@ -968,6 +1012,22 @@ fn validate_environment(environment: &[EnvironmentVariable]) -> Result<(), Docke
         }
     }
     Ok(())
+}
+
+fn stable_resource_binding(
+    immutable_id: &str,
+    intent: &ResourceBinding,
+    ports: &[ContainerPort],
+) -> Result<ResourceBinding, DockerError> {
+    if immutable_id.is_empty() {
+        return Err(DockerError::MalformedInspection);
+    }
+    let attributes =
+        serde_json::to_vec(&(intent, ports)).map_err(|_| DockerError::MalformedInspection)?;
+    Ok(ResourceBinding {
+        immutable_id: immutable_id.to_owned(),
+        attributes_sha256: hex(&Sha256::digest(attributes)),
+    })
 }
 
 fn hex(bytes: &[u8]) -> String {

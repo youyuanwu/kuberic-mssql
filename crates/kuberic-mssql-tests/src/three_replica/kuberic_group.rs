@@ -42,8 +42,9 @@ use kuberic_runtime::testing::sqlite_store::SqliteStore;
 use kuberic_runtime::testing::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
 use tonic::Request;
 
-use super::cleanup::{CleanupClock, CleanupCoordinator};
-use super::deadline::{BoundedOperationError, complete_before};
+use crate::fixture::cleanup::{CleanupClock, CleanupCoordinator};
+use crate::fixture::deadline::{BoundedOperationError, complete_before};
+
 use super::member::ReadyMember;
 use super::model::{NativeTopologyBinding, TopologyRun};
 
@@ -2154,7 +2155,7 @@ mod tests {
             let sources: [Source; 3] = std::array::from_fn(|index| {
                 Arc::new(YieldingSource {
                     inner: source(&run, index, now),
-                    yields: 100,
+                    yields: 1,
                 }) as Source
             });
             let group = MssqlGroup::assemble(

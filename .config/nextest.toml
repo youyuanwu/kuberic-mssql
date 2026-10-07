@@ -8,4 +8,4 @@ test-threads = 1
 
 [profile.external]
 inherits = "default"
-default-filter = 'binary_id(=kuberic-mssql-tests::live_observation)'
+default-filter = 'binary_id(=kuberic-mssql-tests::live_one_replica)'

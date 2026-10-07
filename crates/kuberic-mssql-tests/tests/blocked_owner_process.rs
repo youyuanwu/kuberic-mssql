@@ -232,7 +232,7 @@ fn wait_for(timeout: Duration, mut predicate: impl FnMut() -> bool) {
 fn load_journal(root: &Path) -> OwnershipJournal {
     JournalStore::initialize(root)
         .unwrap()
-        .load()
+        .load::<OwnershipJournal>()
         .unwrap()
         .unwrap()
 }

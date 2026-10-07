@@ -531,7 +531,7 @@ fn assert_exact_reports(
 fn assert_removed(root: &Path) {
     let store = JournalStore::initialize(root).expect("cleanup journal root");
     let journal = store
-        .load()
+        .load::<kuberic_mssql_tests::three_replica::OwnershipJournal>()
         .expect("cleanup journal")
         .expect("cleanup journal exists");
     assert_eq!(journal.state, RunState::Removed);

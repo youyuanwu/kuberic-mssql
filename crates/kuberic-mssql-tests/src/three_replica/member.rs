@@ -11,38 +11,41 @@ use tokio::time::sleep;
 
 use kuberic_mssql::runtime_config::ObserverConfig;
 
-use super::admin::{
-    AdminDeadlines, AdminEndpoint, AdminError, AdminSession, LoginFiles, MemberReadinessEvidence,
-};
 use super::availability_group::{
     AvailabilityGroupError, FrozenMemberVerifier, ProvisionContext, ProvisionedAvailabilityGroup,
     provision,
 };
-use super::cleanup::{
+use super::data::{DataContext, DataError, MarkerEvidence, prove_replicated_marker};
+use crate::fixture::admin::{
+    AdminDeadlines, AdminEndpoint, AdminError, AdminSession, LoginFiles, MemberReadinessEvidence,
+};
+use crate::fixture::cleanup::{
     CLEANUP_BUDGET, CleanupBackend, CleanupClock, CleanupCoordinator, CleanupError, CleanupReport,
     OperationBudget, SystemCleanupClock, combine_with_cleanup,
 };
-use super::config::{FixtureConfig, PINNED_SQL_SERVER_IMAGE};
-use super::data::{DataContext, DataError, MarkerEvidence, prove_replicated_marker};
-use super::docker::{
+use crate::fixture::config::{FixtureConfig, PINNED_SQL_SERVER_IMAGE};
+use crate::fixture::docker::{
     ContainerInspection, ContainerRequest, DockerApi, DockerCli, DockerError, NetworkRequest,
     OwnedLabels, SQL_SERVER_UID, SqlServerContainerSpec,
 };
-use super::model::{
-    CombinedFixtureError, FailureCategory, FailureStage, KubericMember, OwnershipJournal,
-    ResourceBinding, ResourceKind, ResourceRecord, ResourceState, RunState, SanitizedFailure,
-    SqlMember, SqlMemberIncarnation, TopologyRun,
-};
-use super::ownership::{
+use crate::fixture::ownership::{
     CommandAclController, DirectoryBinding, JournalStore, OwnershipInspector,
     PrivateDirectoryBinding, ReconcileError, ResourceObservation, RootLock, acquire_root_lock,
     create_private_owned_directory, inspect_member_directory, inspect_owned_directory,
     prepare_member_directory, process_incarnation_is_alive,
 };
-use super::preflight::{CommandAclProbe, LocalHostProbe, run_preflight_with_deadline};
-use super::process::{BoundedProcessRunner, CommandSpec, ProcessRunner};
-use super::secrets::{CredentialFiles, PrivateFile, SecretError, SecretValue};
-use super::tls::{TlsAssetRecorder, TlsAssets, TlsError};
+use crate::fixture::preflight::{CommandAclProbe, LocalHostProbe, run_preflight_with_deadline};
+use crate::fixture::process::{BoundedProcessRunner, CommandSpec, ProcessRunner};
+use crate::fixture::secrets::{PrivateFile, SecretError, SecretValue};
+use crate::fixture::tls::{TlsAssetRecorder, TlsError};
+
+use super::model::{
+    CombinedFixtureError, FailureCategory, FailureStage, KubericMember, OwnershipJournal,
+    ResourceBinding, ResourceKind, ResourceRecord, ResourceState, RunState, SanitizedFailure,
+    SqlMember, SqlMemberIncarnation, TopologyRun,
+};
+use super::secrets::CredentialFiles;
+use super::tls::TlsAssets;
 
 const READINESS_RETRY: Duration = Duration::from_secs(2);
 
@@ -248,7 +251,7 @@ pub fn cleanup_three_replica_fixture(root: &Path) -> Result<CleanupEvidence, Com
             Vec::new(),
         )
     })?;
-    let Some(mut journal) = store.load().map_err(|_| {
+    let Some(mut journal) = store.load::<OwnershipJournal>().map_err(|_| {
         CombinedFixtureError::new(
             SanitizedFailure::new(FailureStage::Cleanup, FailureCategory::Journal),
             Vec::new(),
@@ -424,7 +427,7 @@ pub async fn create_blocked_owner_regression_fixture(root: &Path) -> Result<Path
     let store = JournalStore::initialize(root).map_err(|error| error.to_string())?;
     let run = topology_run(store.root()).map_err(|error| error.to_string())?;
     let mut journal = store
-        .create(run.clone())
+        .create::<OwnershipJournal, _>(run.clone())
         .map_err(|error| error.to_string())?;
     let path = store.root().join("owner-process-regression");
     let binding =
@@ -501,7 +504,9 @@ pub fn retry_owner_regression_fixture(root: &Path) -> Result<(), String> {
         let _lock = acquire_root_lock(root).map_err(|error| error.to_string())?;
         let store = JournalStore::initialize(root).map_err(|error| error.to_string())?;
         let mut journal = store
-            .create(topology_run(store.root()).map_err(|error| error.to_string())?)
+            .create::<OwnershipJournal, _>(
+                topology_run(store.root()).map_err(|error| error.to_string())?,
+            )
             .map_err(|error| error.to_string())?;
         let path = store.root().join("owner-process-retry");
         let binding = create_private_owned_directory(store.root(), &path)
@@ -675,7 +680,9 @@ impl LaunchContext {
         let mut lock = acquire_root_lock(config.root()).map_err(|_| NativeLaunchError::RootLock)?;
         let mut store =
             JournalStore::initialize(config.root()).map_err(|_| NativeLaunchError::Journal)?;
-        if let Some(existing) = store.load().map_err(|_| NativeLaunchError::Journal)?
+        if let Some(existing) = store
+            .load::<OwnershipJournal>()
+            .map_err(|_| NativeLaunchError::Journal)?
             && existing.state != RunState::Removed
         {
             drop(store);
@@ -686,7 +693,7 @@ impl LaunchContext {
             store =
                 JournalStore::initialize(config.root()).map_err(|_| NativeLaunchError::Journal)?;
             if store
-                .load()
+                .load::<OwnershipJournal>()
                 .map_err(|_| NativeLaunchError::Journal)?
                 .is_some_and(|journal| journal.state != RunState::Removed)
             {
@@ -705,7 +712,9 @@ impl LaunchContext {
         )
         .map_err(NativeLaunchError::Preflight)?;
         let run = topology_run(store.root())?;
-        let journal = store.create(run).map_err(|_| NativeLaunchError::Journal)?;
+        let journal = store
+            .create::<OwnershipJournal, _>(run)
+            .map_err(|_| NativeLaunchError::Journal)?;
         Ok(Self {
             deadline,
             config,
@@ -2910,7 +2919,7 @@ mod tests {
         let temporary = tempdir().unwrap();
         let root = temporary.path().join("fixture");
         let store = JournalStore::initialize(&root).unwrap();
-        let journal = store.create(run(&root)).unwrap();
+        let journal = store.create::<OwnershipJournal, _>(run(&root)).unwrap();
         let clock = FakeClock::new();
         let docker = SlowRecoveryDocker {
             clock: clock.clone(),
@@ -2996,7 +3005,7 @@ mod tests {
         let temporary = tempdir().unwrap();
         let root = temporary.path().join("fixture");
         let store = JournalStore::initialize(&root).unwrap();
-        let mut journal = store.create(run(&root)).unwrap();
+        let mut journal = store.create::<OwnershipJournal, _>(run(&root)).unwrap();
         let request = NetworkRequest {
             name: "logical-network-name".to_owned(),
             labels: OwnedLabels::network("0123456789ab"),
@@ -3072,7 +3081,7 @@ mod tests {
         let config = FixtureConfig::new(&root, acknowledgement).unwrap();
         let lock = acquire_root_lock(&root).unwrap();
         let store = JournalStore::initialize(&root).unwrap();
-        let mut journal = store.create(run(&root)).unwrap();
+        let mut journal = store.create::<OwnershipJournal, _>(run(&root)).unwrap();
         journal.resources.push(ResourceRecord {
             kind: ResourceKind::SecretFile,
             logical_name: "never-created".to_owned(),
@@ -3119,7 +3128,7 @@ mod tests {
         let config = FixtureConfig::new(&root, acknowledgement).unwrap();
         let store = JournalStore::initialize(&root).unwrap();
         let lock = acquire_root_lock(&root).unwrap();
-        let mut journal = store.create(run(&root)).unwrap();
+        let mut journal = store.create::<OwnershipJournal, _>(run(&root)).unwrap();
         journal.resources.push(ResourceRecord {
             kind: ResourceKind::SecretFile,
             logical_name: "cancelled-before-create".to_owned(),
@@ -3148,7 +3157,7 @@ mod tests {
         });
 
         let store = JournalStore::initialize(&root).unwrap();
-        let journal = store.load().unwrap().unwrap();
+        let journal = store.load::<OwnershipJournal>().unwrap().unwrap();
         assert_eq!(journal.state, RunState::Removed);
         assert!(
             journal
@@ -3171,7 +3180,7 @@ mod tests {
         let config = FixtureConfig::new(&root, acknowledgement).unwrap();
         let lock = acquire_root_lock(&root).unwrap();
         let store = JournalStore::initialize(&root).unwrap();
-        let journal = store.create(run(&root)).unwrap();
+        let journal = store.create::<OwnershipJournal, _>(run(&root)).unwrap();
         let collision = root.join("credentials");
         fs::create_dir(&collision).unwrap();
         fs::set_permissions(&collision, fs::Permissions::from_mode(0o700)).unwrap();
@@ -3210,7 +3219,7 @@ mod tests {
         let temporary = tempdir().unwrap();
         let root = temporary.path().join("fixture");
         let store = JournalStore::initialize(&root).unwrap();
-        let mut journal = store.create(run(&root)).unwrap();
+        let mut journal = store.create::<OwnershipJournal, _>(run(&root)).unwrap();
         let directory = root.join("observer");
         let mut private_files = Vec::new();
         let mut recorder = LaunchAssetRecorder {
@@ -3267,7 +3276,7 @@ mod tests {
         let temporary = tempdir().unwrap();
         let root = temporary.path().join("fixture");
         let store = JournalStore::initialize(&root).unwrap();
-        let mut journal = store.create(run(&root)).unwrap();
+        let mut journal = store.create::<OwnershipJournal, _>(run(&root)).unwrap();
         let request = NetworkRequest {
             name: "km-three-0123456789ab".to_owned(),
             labels: OwnedLabels::network("0123456789ab"),
