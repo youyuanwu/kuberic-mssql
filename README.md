@@ -380,7 +380,7 @@ just test-live-three-replica-faults target/my-mssql-three-replica-faults
 
 Cleanup removes only exactly journaled resources. Foreign, replaced, or
 otherwise unverifiable resources remain untouched and block reuse. The signal
-signal recipe interrupts an owned launch with SIGTERM, recovers it, reruns the
+recipe interrupts an owned launch with SIGTERM, recovers it, reruns the
 complete happy path, and verifies idempotent cleanup. The recovery recipe also
 executes real SIGINT and SIGKILL subprocess cases. The fault recipe injects a
 post-AG failure, an actual panic after agent startup, and a report-stage failure;
@@ -389,14 +389,16 @@ each is followed by a separate exact cleanup process and a final retry.
 Direct test commands remain available:
 
 ```bash
-cargo nextest list --profile external --run-ignored only
-cargo test --locked -p kuberic-mssql-tests --test live_observation -- --ignored
+cargo test --locked -p kuberic-mssql-tests --test live_one_replica \
+  one_replica_mssql_observation_and_cli -- --ignored --exact --test-threads=1
+cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
+  three_replica_mssql_happy_path -- --ignored --exact --test-threads=1
 ```
 
 An explicitly requested live test fails if any of its prerequisites are
-missing; it never silently skips. Rust tests use observation principals and
-issue no setup/mutation SQL. The fixture helper owns its exact test AG metadata
-and cleanup. The dedicated three-replica fixture performs test-only endpoint,
-AG, database, seeding, and marker mutation; production remains observe-only.
+missing; it never silently skips. The one-replica fixture uses observation
+principals and creates no AG, endpoint or database. The three-replica fixture
+performs test-only endpoint, AG, database, seeding, and marker mutation. Both
+lifecycles own and clean their exact resources; production remains observe-only.
 Local three-node failover, lease expiry, old-primary fencing, and fault
 injection remain unsupported and are not claims of this work.
