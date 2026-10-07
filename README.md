@@ -416,13 +416,11 @@ The fixture pins:
 mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726
 ```
 
-It currently also pins Kuberic Git commit
-`c83588e8625557af1024d023f0daf60454a753a0`, associated with open
-[Kuberic PR #127](https://github.com/youyuanwu/kuberic/pull/127). Its parent is
-the formal authority fix
-`0784b7b8fc18c3f68c34c3bc1e1035412c027de9`; PR #127 adds only the testing
-listener handoff required by this fixture. The Git pin remains temporary until
-that testing API is merged and released.
+It currently tracks the Kuberic `main` branch. `Cargo.lock` resolves the exact
+revision used by reproducible builds; the current revision includes formal
+authority fix `0784b7b8fc18c3f68c34c3bc1e1035412c027de9` and merged
+[Kuberic PR #127](https://github.com/youyuanwu/kuberic/pull/127), which supplies
+the testing listener handoff required by this fixture.
 
 The test crate constructs an affirmative `SqlServerEulaAcknowledgement` through
 the clearly test-only `FixtureConfig` path and injects exactly

@@ -219,13 +219,11 @@ configuration sequence `4294967307`, and the same marker visible on all three.
 The final ignored test additionally proves the three fenced Kuberic reports and
 exact cleanup/recovery behavior.
 
-The workspace temporarily pins Kuberic commit
-`c83588e8625557af1024d023f0daf60454a753a0`. The merged parent
-`0784b7b8fc18c3f68c34c3bc1e1035412c027de9` supplies formal custom-authority
-validation and recovery. Open
-[Kuberic PR #127](https://github.com/youyuanwu/kuberic/pull/127) adds only the
-testing listener-adoption API required for exact endpoint ownership. The pin
-remains until that testing API is merged and released.
+The workspace tracks Kuberic `main`, with `Cargo.lock` recording the exact
+revision used by locked builds. The branch includes formal custom-authority fix
+`0784b7b8fc18c3f68c34c3bc1e1035412c027de9` and merged
+[Kuberic PR #127](https://github.com/youyuanwu/kuberic/pull/127), which adds the
+testing listener-adoption API required for exact endpoint ownership.
 
 ## Usage
 

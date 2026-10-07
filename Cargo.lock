@@ -782,7 +782,7 @@ dependencies = [
 [[package]]
 name = "kuberic-runtime"
 version = "0.0.1"
-source = "git+https://github.com/youyuanwu/kuberic.git?rev=c83588e8625557af1024d023f0daf60454a753a0#c83588e8625557af1024d023f0daf60454a753a0"
+source = "git+https://github.com/youyuanwu/kuberic.git?branch=main#b2cbbf266d4791ef15df908a9ae23b79fed33c5c"
 dependencies = [
  "async-trait",
  "bytes",

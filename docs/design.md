@@ -339,13 +339,12 @@ access is never granted. There is no external write lease. The fixture's marker
 write uses its private administrator connection to the directly observed native
 primary and is not a Kuberic client-access decision.
 
-The current implementation temporarily pins Kuberic Git commit
-`c83588e8625557af1024d023f0daf60454a753a0`. Its parent
-`0784b7b8fc18c3f68c34c3bc1e1035412c027de9` is the merged formal
-authority-validation fix; open
-[youyuanwu/kuberic#127](https://github.com/youyuanwu/kuberic/pull/127) adds the
-testing-only bound-listener handoff required by the three-runtime fixture. The
-pin remains until that API is merged and released.
+The current implementation tracks Kuberic `main`; `Cargo.lock` freezes the
+exact revision used by each build. The branch includes formal authority fix
+`0784b7b8fc18c3f68c34c3bc1e1035412c027de9` and merged
+[youyuanwu/kuberic#127](https://github.com/youyuanwu/kuberic/pull/127), which
+adds the testing-only bound-listener handoff required by the three-runtime
+fixture.
 
 ## Delivery Sequence
 
