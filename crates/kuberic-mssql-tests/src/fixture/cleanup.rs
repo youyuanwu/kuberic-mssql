@@ -203,11 +203,26 @@ pub struct CleanupError {
 
 impl CleanupError {
     fn ownership(resource: &ResourceRecord) -> Self {
+        let detail = match resource.kind {
+            ResourceKind::Container => "container identity or immutable attributes changed",
+            ResourceKind::Network => "network identity, attributes, or attachments changed",
+            ResourceKind::DataDirectory | ResourceKind::Directory | ResourceKind::SecretFile => {
+                "path identity or attributes changed"
+            }
+            ResourceKind::AvailabilityGroup | ResourceKind::Database => {
+                "native SQL resource ownership changed"
+            }
+        };
+        Self::ownership_with_detail(resource, detail)
+    }
+
+    fn ownership_with_detail(resource: &ResourceRecord, detail: impl Into<String>) -> Self {
         Self {
             resource: resource.logical_name.clone(),
-            failure: SanitizedFailure::new(
+            failure: SanitizedFailure::with_detail(
                 FailureStage::Cleanup,
                 FailureCategory::OwnershipMismatch,
+                detail,
             ),
         }
     }
@@ -307,7 +322,13 @@ where
                 | ResourceKind::Network
         ) && !containers_proven_absent(journal)
         {
-            block(journal, index, &record, &mut report);
+            block_with_detail(
+                journal,
+                index,
+                &record,
+                &mut report,
+                Some("owned container cleanup is not complete"),
+            );
             let _ = store.save_cleanup_journal(journal);
             continue;
         }
@@ -316,14 +337,26 @@ where
             ResourceKind::DataDirectory | ResourceKind::Directory
         ) && !descendants_proven_removed(journal, &record)
         {
-            block(journal, index, &record, &mut report);
+            block_with_detail(
+                journal,
+                index,
+                &record,
+                &mut report,
+                Some("owned descendant cleanup is not complete"),
+            );
             let _ = store.save_cleanup_journal(journal);
             continue;
         }
         let observation = match backend.inspect_cleanup(&record, coordinator.remaining()) {
             Ok(observation) => observation,
             Err(_) => {
-                block(journal, index, &record, &mut report);
+                block_with_detail(
+                    journal,
+                    index,
+                    &record,
+                    &mut report,
+                    Some("resource inspection could not prove exact ownership"),
+                );
                 continue;
             }
         };
@@ -344,7 +377,13 @@ where
                             | ResourceKind::SecretFile
                     )
                 {
-                    block(journal, index, &record, &mut report);
+                    block_with_detail(
+                        journal,
+                        index,
+                        &record,
+                        &mut report,
+                        Some("create dispatch outcome is ambiguous"),
+                    );
                 } else {
                     journal.resources_mut()[index].state = ResourceState::Removed;
                     report.removed.push(record.logical_name.clone());
@@ -363,7 +402,13 @@ where
                 foreign_attachments,
             } => {
                 if !foreign_attachments.is_empty() {
-                    block(journal, index, &record, &mut report);
+                    block_with_detail(
+                        journal,
+                        index,
+                        &record,
+                        &mut report,
+                        Some("resource has foreign attachments"),
+                    );
                     continue;
                 }
                 binding
@@ -371,7 +416,13 @@ where
         };
         if let Some(expected) = &record.binding {
             if expected != &binding {
-                block(journal, index, &record, &mut report);
+                block_with_detail(
+                    journal,
+                    index,
+                    &record,
+                    &mut report,
+                    Some("journaled immutable binding changed"),
+                );
                 continue;
             }
         } else if matches!(
@@ -380,7 +431,13 @@ where
         ) {
             journal.resources_mut()[index].binding = Some(binding);
         } else {
-            block(journal, index, &record, &mut report);
+            block_with_detail(
+                journal,
+                index,
+                &record,
+                &mut report,
+                Some("resource state lacks a dispatched binding"),
+            );
             continue;
         }
         journal.resources_mut()[index].state = ResourceState::Cleaning;
@@ -413,7 +470,13 @@ where
                 }
             }
             Ok(ResourceObservation::Owned { .. }) | Ok(ResourceObservation::Foreign) | Err(_) => {
-                block(journal, index, &record, &mut report)
+                block_with_detail(
+                    journal,
+                    index,
+                    &record,
+                    &mut report,
+                    Some("resource remained present after removal"),
+                )
             }
         }
     }
@@ -526,11 +589,24 @@ fn block(
     record: &ResourceRecord,
     report: &mut CleanupReport,
 ) {
+    block_with_detail(journal, index, record, report, None);
+}
+
+fn block_with_detail(
+    journal: &mut impl CleanupJournal,
+    index: usize,
+    record: &ResourceRecord,
+    report: &mut CleanupReport,
+    detail: Option<&str>,
+) {
     journal.resources_mut()[index].state = ResourceState::Blocked;
     if !report.unresolved.contains(&record.logical_name) {
         report.unresolved.push(record.logical_name.clone());
     }
-    report.errors.push(CleanupError::ownership(record));
+    report.errors.push(match detail {
+        Some(detail) => CleanupError::ownership_with_detail(record, detail),
+        None => CleanupError::ownership(record),
+    });
 }
 
 impl From<ReconcileError> for CleanupError {

@@ -743,6 +743,9 @@ mod tests {
         assert!(!backend.removed.get());
         assert_eq!(journal.state, RunState::Blocked);
         assert_eq!(journal.resources[0].state, ResourceState::Blocked);
+        let diagnostic = OneReplicaCleanupError::Cleanup(report).to_string();
+        assert!(diagnostic.contains("container-1"));
+        assert!(diagnostic.contains("container identity or immutable attributes changed"));
     }
 
     #[test]
@@ -760,6 +763,11 @@ mod tests {
         assert!(!report.succeeded());
         assert!(!backend.removed.get());
         assert_eq!(journal.resources[0].state, ResourceState::Blocked);
+        assert!(
+            OneReplicaCleanupError::Cleanup(report)
+                .to_string()
+                .contains("stage deadline exceeded")
+        );
     }
 
     #[test]
@@ -798,6 +806,30 @@ mod tests {
         assert!(!report.succeeded());
         assert!(!backend.removed.get());
         assert_eq!(journal.resources[0].state, ResourceState::Blocked);
+        assert!(
+            OneReplicaCleanupError::Cleanup(report)
+                .to_string()
+                .contains("foreign attachments")
+        );
+    }
+
+    #[test]
+    fn path_mismatch_diagnostic_is_distinct_from_container_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut journal) = journal(&root.path().join("fixture"));
+        journal.resources[0].kind = ResourceKind::SecretFile;
+        journal.resources[0].path = Some(store.root().join("secret"));
+        store.save(&journal).unwrap();
+        let backend = FakeBackend {
+            foreign: true,
+            attachments: false,
+            removed: Cell::new(false),
+        };
+        let report = CleanupCoordinator::default().cleanup(&store, &mut journal, &backend);
+        let diagnostic = OneReplicaCleanupError::Cleanup(report).to_string();
+        assert!(diagnostic.contains("container-1"));
+        assert!(diagnostic.contains("path identity or attributes changed"));
+        assert!(!diagnostic.contains("container identity"));
     }
 
     #[test]

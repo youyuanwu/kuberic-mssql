@@ -113,6 +113,22 @@ async fn one_replica_recovery_child() {
                 .await;
             assert!(result.is_err());
         }
+        "kill" => {
+            let mut fixture = launch_one_replica(config).await.unwrap();
+            fixture.block_for_recovery().unwrap();
+            loop {
+                thread::park();
+            }
+        }
+        "retry" => {
+            let fixture = launch_one_replica(config).await.unwrap();
+            fixture
+                .run_with_cleanup(Duration::from_secs(120), |_| async move {
+                    Ok::<(), SanitizedFailure>(())
+                })
+                .await
+                .unwrap();
+        }
         other => panic!("unknown one-replica child mode {other}"),
     }
     let root = PathBuf::from(std::env::var_os(CHILD_ROOT_ENV).unwrap());
@@ -153,6 +169,25 @@ fn one_replica_recovery_sigint_and_sigterm_paths() {
     }
 }
 
+#[test]
+#[ignore = "requires licensed SQL Server container prerequisites"]
+fn one_replica_recovery_sigkill_standalone_cleanup_and_retry() {
+    let root = recovery_root("signal-kill");
+    let mut child = spawn_child("kill", &root, None);
+    wait_for_blocked_owner(&root, child.id(), Duration::from_secs(120));
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+    wait_for_termination(&mut child, Duration::from_secs(30));
+
+    cleanup_one_replica_fixture(&root).unwrap();
+    assert_removed(&root);
+    assert_no_owned_docker_resources();
+
+    let mut retry = spawn_child("retry", &root, None);
+    wait_for_exit(&mut retry, Duration::from_secs(180));
+    assert_removed(&root);
+    assert_no_owned_docker_resources();
+}
+
 fn recovery_root(name: &str) -> PathBuf {
     let base = std::env::var_os("SQLSERVER_ONE_REPLICA_ROOT")
         .map(PathBuf::from)
@@ -185,10 +220,26 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) {
             assert!(status.success(), "child exited with {status}");
             return;
         }
+
         if Instant::now() >= deadline {
             child.kill().unwrap();
             let _ = child.wait();
             panic!("one-replica recovery child exceeded {timeout:?}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_termination(child: &mut Child, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("one-replica recovery child did not terminate");
         }
         thread::sleep(Duration::from_millis(100));
     }
