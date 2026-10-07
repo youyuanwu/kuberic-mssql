@@ -24,7 +24,8 @@ pub use config::{
 pub use error::ContractError;
 #[cfg(feature = "kuberic")]
 pub use kuberic::{
-    HealthyTopologyBinding, HealthyTopologyMemberBinding, SqlServerStartIncarnation,
+    HealthyTopologyBinding, HealthyTopologyMemberBinding, RuntimeAuthorityContext,
+    RuntimeAuthorityContextSource, SqlServerStartIncarnation,
 };
 pub use operation::{
     DestructiveApproval, EffectSignature, FenceReference, InputSignature,

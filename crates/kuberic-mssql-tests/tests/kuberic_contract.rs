@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use kuberic_mssql::kuberic::{
     HealthyTopologyBinding, HealthyTopologyMemberBinding, ObservationClock,
-    SqlServerObservationSource, SqlServerReplicator, SqlServerReplicatorFactory, SqlServerService,
-    SqlServerServiceConfig, SqlServerStartIncarnation,
+    RuntimeAuthorityContext, RuntimeAuthorityContextSource, SqlServerObservationSource,
+    SqlServerReplicator, SqlServerReplicatorFactory, SqlServerService, SqlServerServiceConfig,
+    SqlServerStartIncarnation,
 };
 use kuberic_mssql::observation::{
     AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, DatabaseSnapshot, InstanceMetadata,
@@ -32,9 +33,11 @@ use kuberic_runtime::replicator::{
     PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode,
     Replicator,
 };
+use kuberic_runtime::testing::effects::RuntimeEffectAction;
 use kuberic_runtime::testing::hosting::PodRuntime;
 use kuberic_runtime::testing::sqlite_store::SqliteStore;
 use kuberic_runtime::testing::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
+use tokio::sync::oneshot;
 
 const OBSERVED_AT: u64 = 1_000;
 const MAX_AGE: u64 = 100;
@@ -81,6 +84,102 @@ impl SqlServerObservationSource for CountingSource {
     async fn observe(&self) -> Result<Observation<InstanceSnapshot>, RuntimeError> {
         self.observations.fetch_add(1, Ordering::SeqCst);
         self.inner.observe().await
+    }
+}
+
+struct FixedAuthorityContextSource {
+    context: Mutex<Option<RuntimeAuthorityContext>>,
+}
+
+#[async_trait]
+impl RuntimeAuthorityContextSource for FixedAuthorityContextSource {
+    async fn current_authority_context(
+        &self,
+    ) -> kuberic_runtime::Result<Option<RuntimeAuthorityContext>> {
+        Ok(self.context.lock().unwrap().clone())
+    }
+}
+
+struct StoreAuthorityContextSource {
+    store: Arc<SqliteStore>,
+}
+
+#[async_trait]
+impl RuntimeAuthorityContextSource for StoreAuthorityContextSource {
+    async fn current_authority_context(
+        &self,
+    ) -> kuberic_runtime::Result<Option<RuntimeAuthorityContext>> {
+        let state = self
+            .store
+            .load_state()
+            .await
+            .map_err(|error| KubericRuntimeError::Application(error.to_string()))?;
+        let pending = state.pending_effect.as_ref().and_then(|pending| {
+            if let RuntimeEffectAction::AdmitAuthority(authority) = &pending.effect.action {
+                Some(authority.as_ref())
+            } else {
+                None
+            }
+        });
+        let configuration = pending
+            .map(|authority| authority.current_configuration.clone())
+            .or(state.current_configuration);
+        let Some(configuration) = configuration else {
+            return Ok(None);
+        };
+        let effective_policy = state
+            .admitted_policy
+            .unwrap_or_else(|| state.identity.effective_policy.clone());
+        Ok(Some(RuntimeAuthorityContext::new(
+            state.identity.local_identity,
+            configuration,
+            effective_policy,
+        )))
+    }
+}
+
+struct GatedSource {
+    config: ObserverConfig,
+    samples: Mutex<VecDeque<Result<Observation<InstanceSnapshot>, RuntimeError>>>,
+    observations: AtomicUsize,
+    gate_at: usize,
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+#[async_trait]
+impl SqlServerObservationSource for GatedSource {
+    fn observer_config(&self) -> &ObserverConfig {
+        &self.config
+    }
+
+    async fn observe(&self) -> Result<Observation<InstanceSnapshot>, RuntimeError> {
+        let observation = self.observations.fetch_add(1, Ordering::SeqCst);
+        let sample = self
+            .samples
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("test must provide one observation per request");
+        if observation == self.gate_at {
+            self.entered
+                .lock()
+                .unwrap()
+                .take()
+                .expect("gate must be entered once")
+                .send(())
+                .expect("test must wait for the observation gate");
+            let release = self
+                .release
+                .lock()
+                .unwrap()
+                .take()
+                .expect("gate must be released once");
+            release
+                .await
+                .expect("test must release the observation gate");
+        }
+        sample
     }
 }
 
@@ -262,6 +361,22 @@ fn topology_binding() -> HealthyTopologyBinding {
     topology_binding_for(0)
 }
 
+fn authority_context_for(binding: &HealthyTopologyBinding) -> RuntimeAuthorityContext {
+    RuntimeAuthorityContext::new(
+        binding.local_identity().clone(),
+        binding.configuration().clone(),
+        binding.effective_policy().clone(),
+    )
+}
+
+fn fixed_authority_source(
+    context: Option<RuntimeAuthorityContext>,
+) -> Arc<dyn RuntimeAuthorityContextSource> {
+    Arc::new(FixedAuthorityContextSource {
+        context: Mutex::new(context),
+    })
+}
+
 fn topology_binding_for(local_index: usize) -> HealthyTopologyBinding {
     HealthyTopologyBinding::new(
         ResourceUid::new("resource-a"),
@@ -412,6 +527,7 @@ fn bound_replicator_for(
     samples: Vec<Result<Observation<InstanceSnapshot>, RuntimeError>>,
     times: Vec<u64>,
 ) -> Arc<SqlServerReplicator> {
+    let binding = topology_binding_for(local_index);
     Arc::new(
         SqlServerReplicator::new_bound(
             format!("replica-{}.example:5022", local_index + 1),
@@ -422,10 +538,45 @@ fn bound_replicator_for(
             Arc::new(ScriptedClock {
                 times: Mutex::new(times.into()),
             }),
-            topology_binding_for(local_index),
+            binding.clone(),
+            fixed_authority_source(Some(authority_context_for(&binding))),
         )
         .unwrap(),
     )
+}
+
+fn gated_bound_replicator(
+    samples: Vec<Result<Observation<InstanceSnapshot>, RuntimeError>>,
+    times: Vec<u64>,
+    gate_at: usize,
+) -> (
+    Arc<SqlServerReplicator>,
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+) {
+    let binding = topology_binding();
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let replicator = Arc::new(
+        SqlServerReplicator::new_bound(
+            "replica-1.example:5022".into(),
+            Arc::new(GatedSource {
+                config: observer_config(),
+                samples: Mutex::new(samples.into()),
+                observations: AtomicUsize::new(0),
+                gate_at,
+                entered: Mutex::new(Some(entered_tx)),
+                release: Mutex::new(Some(release_rx)),
+            }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(times.into()),
+            }),
+            binding.clone(),
+            fixed_authority_source(Some(authority_context_for(&binding))),
+        )
+        .unwrap(),
+    );
+    (replicator, entered_rx, release_tx)
 }
 
 async fn opened_bound_replicator(
@@ -799,6 +950,7 @@ fn bound_constructors_reject_resource_address_policy_and_local_mapping_drift() {
             source(),
             clock(),
             topology_binding(),
+            fixed_authority_source(Some(authority_context_for(&topology_binding()))),
         )
         .is_ok()
     );
@@ -809,15 +961,18 @@ fn bound_constructors_reject_resource_address_policy_and_local_mapping_drift() {
             source(),
             clock(),
             topology_binding(),
+            fixed_authority_source(Some(authority_context_for(&topology_binding()))),
         )
         .is_err()
     );
+    let binding = topology_binding();
     assert!(
         SqlServerReplicator::new_bound(
             "wrong.example:5022".into(),
             source(),
             clock(),
-            topology_binding(),
+            binding.clone(),
+            fixed_authority_source(Some(authority_context_for(&binding))),
         )
         .is_err()
     );
@@ -842,6 +997,86 @@ fn bound_constructors_reject_resource_address_policy_and_local_mapping_drift() {
             exact.resource_uid().clone(),
             kuberic_identity(9),
             exact.configuration().clone(),
+            exact.effective_policy().clone(),
+            exact.availability_group().clone(),
+            exact.database_lineage().clone(),
+            exact.members().to_vec(),
+        )
+        .is_err()
+    );
+
+    let mut changed_policy = exact.effective_policy().clone();
+    changed_policy.read_quorum = 1;
+    assert!(
+        HealthyTopologyBinding::new(
+            exact.resource_uid().clone(),
+            exact.local_identity().clone(),
+            exact.configuration().clone(),
+            changed_policy,
+            exact.availability_group().clone(),
+            exact.database_lineage().clone(),
+            exact.members().to_vec(),
+        )
+        .is_err()
+    );
+
+    let duplicate = kuberic_identity(1);
+    let duplicate_descriptor = ConfigurationDescriptor::new(
+        Epoch::new(7, 11),
+        ReplicaId::new(1),
+        vec![
+            ConfigurationMember {
+                identity: duplicate.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: duplicate,
+                role: ReplicaRole::ActiveSecondary,
+            },
+            ConfigurationMember {
+                identity: kuberic_identity(3),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        2,
+    );
+    assert!(
+        HealthyTopologyBinding::new(
+            exact.resource_uid().clone(),
+            exact.local_identity().clone(),
+            duplicate_descriptor,
+            exact.effective_policy().clone(),
+            exact.availability_group().clone(),
+            exact.database_lineage().clone(),
+            exact.members().to_vec(),
+        )
+        .is_err()
+    );
+
+    let descriptor_without_local = ConfigurationDescriptor::new(
+        Epoch::new(7, 11),
+        ReplicaId::new(2),
+        vec![
+            ConfigurationMember {
+                identity: kuberic_identity(2),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: kuberic_identity(3),
+                role: ReplicaRole::ActiveSecondary,
+            },
+            ConfigurationMember {
+                identity: kuberic_identity(4),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        2,
+    );
+    assert!(
+        HealthyTopologyBinding::new(
+            exact.resource_uid().clone(),
+            exact.local_identity().clone(),
+            descriptor_without_local,
             exact.effective_policy().clone(),
             exact.availability_group().clone(),
             exact.database_lineage().clone(),
@@ -876,6 +1111,7 @@ async fn bound_service_open_rejects_a_different_runtime_local_identity() {
                 times: Mutex::new(VecDeque::new()),
             }),
             binding.clone(),
+            fixed_authority_source(Some(authority_context_for(&binding))),
         )
         .unwrap(),
     );
@@ -1060,6 +1296,197 @@ async fn bound_topology_admits_exact_current_replays_and_reports_fresh_capabilit
 }
 
 #[tokio::test]
+async fn bound_admission_requires_the_exact_runtime_effective_policy() {
+    let binding = topology_binding();
+    let current = bound_replica_set(&binding);
+    let mut policies = Vec::new();
+    let mut changed = binding.effective_policy().clone();
+    changed.replica_set_size = 5;
+    policies.push(changed);
+    let mut changed = binding.effective_policy().clone();
+    changed.write_quorum = 1;
+    policies.push(changed);
+    let mut changed = binding.effective_policy().clone();
+    changed.read_quorum = 1;
+    policies.push(changed);
+    let mut changed = binding.effective_policy().clone();
+    changed.failover_delay_seconds += 1;
+    policies.push(changed);
+
+    for policy in policies {
+        let authority = RuntimeAuthorityContext::new(
+            binding.local_identity().clone(),
+            binding.configuration().clone(),
+            policy,
+        );
+        let replicator = Arc::new(
+            SqlServerReplicator::new_bound(
+                "replica-1.example:5022".into(),
+                Arc::new(ScriptedSource {
+                    config: observer_config(),
+                    samples: Mutex::new(vec![Ok(present(bound_snapshot()))].into()),
+                }),
+                Arc::new(ScriptedClock {
+                    times: Mutex::new(vec![OBSERVED_AT].into()),
+                }),
+                binding.clone(),
+                fixed_authority_source(Some(authority)),
+            )
+            .unwrap(),
+        );
+        replicator.open().await.unwrap();
+        let message = application_error(
+            replicator
+                .update_current_replica_set_configuration(current.clone())
+                .await
+                .unwrap_err(),
+        );
+        assert!(message.contains("effective policy"), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn capability_rechecks_the_exact_runtime_effective_policy() {
+    let binding = topology_binding();
+    let current = bound_replica_set(&binding);
+    let authority = Arc::new(FixedAuthorityContextSource {
+        context: Mutex::new(Some(authority_context_for(&binding))),
+    });
+    let replicator = Arc::new(
+        SqlServerReplicator::new_bound(
+            "replica-1.example:5022".into(),
+            Arc::new(ScriptedSource {
+                config: observer_config(),
+                samples: Mutex::new(
+                    vec![
+                        Ok(present(bound_snapshot())),
+                        Ok(present(bound_snapshot())),
+                        Ok(present(bound_snapshot())),
+                    ]
+                    .into(),
+                ),
+            }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT; 3].into()),
+            }),
+            binding.clone(),
+            authority.clone(),
+        )
+        .unwrap(),
+    );
+    replicator.open().await.unwrap();
+    replicator
+        .update_current_replica_set_configuration(current)
+        .await
+        .unwrap();
+    replicator
+        .change_role(binding.configuration().epoch, ReplicaRole::Primary)
+        .await
+        .unwrap();
+
+    let mut wrong_policy = binding.effective_policy().clone();
+    wrong_policy.failover_delay_seconds += 1;
+    *authority.context.lock().unwrap() = Some(RuntimeAuthorityContext::new(
+        binding.local_identity().clone(),
+        binding.configuration().clone(),
+        wrong_policy,
+    ));
+    let message = application_error(replicator.catch_up_capability().await.unwrap_err());
+    assert!(message.contains("effective policy"), "{message}");
+}
+
+#[tokio::test]
+async fn pod_runtime_wrong_policy_cannot_admit_or_report_capability() {
+    let exact = topology_binding();
+    let binding = HealthyTopologyBinding::new(
+        ResourceUid::new("partition-generation-1"),
+        exact.local_identity().clone(),
+        exact.configuration().clone(),
+        exact.effective_policy().clone(),
+        exact.availability_group().clone(),
+        exact.database_lineage().clone(),
+        exact.members().to_vec(),
+    )
+    .unwrap();
+    let current = bound_replica_set(&binding);
+    let directory = tempfile::tempdir().expect("create isolated Kuberic testing directory");
+    let database = SqliteStore::metadata_database_path(directory.path());
+    let wrong_policy = EffectivePolicy::fixed(3, 31).unwrap();
+    let mut state = AgentState::new(StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: binding.resource_uid().clone(),
+        pod_uid: PodUid::new("contract-pod"),
+        pvc_uid: PvcUid::new("contract-pvc"),
+        initialization_id: InitializationId::new("contract-initialization"),
+        local_identity: binding.local_identity().clone(),
+        effective_policy: wrong_policy.clone(),
+    });
+    state.current_configuration = Some(binding.configuration().clone());
+    state.admitted_policy = Some(wrong_policy);
+    drop(SqliteStore::create_authorized(&database, state).unwrap());
+    let store = Arc::new(SqliteStore::open_existing(&database, None).unwrap());
+    let service = Arc::new(
+        SqlServerService::with_observation_source_and_binding(
+            SqlServerServiceConfig::new(binding.resource_uid().clone(), "replica-1.example:5022")
+                .unwrap(),
+            Arc::new(ScriptedSource {
+                config: observer_config(),
+                samples: Mutex::new(
+                    vec![
+                        Ok(present(bound_snapshot())),
+                        Ok(present(bound_snapshot())),
+                        Ok(present(bound_snapshot())),
+                    ]
+                    .into(),
+                ),
+            }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT; 3].into()),
+            }),
+            binding.clone(),
+            Arc::new(StoreAuthorityContextSource {
+                store: store.clone(),
+            }),
+        )
+        .unwrap(),
+    );
+    let runtime = Arc::new(PodRuntime::new(
+        binding.local_identity().clone(),
+        service.clone(),
+        store.clone(),
+    ));
+    runtime
+        .reconstruct(
+            OpenMode::Existing,
+            ReplicaRole::None,
+            AccessStatus::NotPrimary,
+            AccessStatus::NotPrimary,
+            None,
+        )
+        .await
+        .unwrap();
+    let error = runtime
+        .primary_replicator()
+        .await
+        .unwrap()
+        .update_current_replica_set_configuration(current.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        application_error(error).contains("effective policy"),
+        "wrong PodRuntime policy must reject current admission"
+    );
+
+    let replicator = service.replicator().unwrap();
+    let message = application_error(replicator.catch_up_capability().await.unwrap_err());
+    assert!(
+        message.contains("not been admitted") || message.contains("effective policy"),
+        "{message}"
+    );
+    assert_eq!(current.configuration, binding.configuration().clone());
+}
+
+#[tokio::test]
 async fn both_bound_active_secondaries_admit_the_same_frozen_topology() {
     for local_index in [1, 2] {
         let binding = topology_binding_for(local_index);
@@ -1083,6 +1510,33 @@ async fn both_bound_active_secondaries_admit_the_same_frozen_topology() {
             .await
             .unwrap();
         assert_eq!(replicator.catch_up_capability().await.unwrap(), 42);
+    }
+}
+
+#[tokio::test]
+async fn secondary_commit_participation_is_not_required_from_direct_observation() {
+    for commit_participant in [Some(false), None] {
+        let mut sample = bound_snapshot_for(1);
+        if let Observation::Present { value: group, .. } = &mut sample.availability_group {
+            group.databases[0].replicas[0].is_commit_participant = commit_participant;
+        }
+        let replicator = bound_replicator_for(1, vec![Ok(present(sample))], vec![OBSERVED_AT]);
+        replicator.open().await.unwrap();
+        assert_eq!(replicator.current_progress().await.unwrap(), 42);
+    }
+}
+
+#[tokio::test]
+async fn primary_commit_participation_remains_exact() {
+    for commit_participant in [Some(false), None] {
+        let mut sample = bound_snapshot();
+        if let Observation::Present { value: group, .. } = &mut sample.availability_group {
+            group.databases[0].replicas[0].is_commit_participant = commit_participant;
+        }
+        let replicator =
+            opened_bound_replicator(vec![Ok(present(sample))], vec![OBSERVED_AT]).await;
+        let message = application_error(replicator.current_progress().await.unwrap_err());
+        assert!(message.contains("binding mismatch"), "{message}");
     }
 }
 
@@ -1296,6 +1750,98 @@ async fn bound_evidence_rejects_stale_future_failed_closed_and_aborted_calls() {
 }
 
 #[tokio::test]
+async fn close_during_observation_cannot_publish_current_admission() {
+    let binding = topology_binding();
+    let current = bound_replica_set(&binding);
+    let (replicator, entered, release) =
+        gated_bound_replicator(vec![Ok(present(bound_snapshot()))], vec![OBSERVED_AT], 0);
+    replicator.open().await.unwrap();
+    let task = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(current)
+                .await
+        }
+    });
+    entered.await.unwrap();
+    replicator.close().await.unwrap();
+    release.send(()).unwrap();
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    assert!(matches!(
+        replicator.catch_up_capability().await,
+        Err(KubericRuntimeError::Closed)
+    ));
+}
+
+#[tokio::test]
+async fn abort_during_fresh_observation_fences_progress_role_and_epoch_results() {
+    for operation in ["progress", "role", "epoch"] {
+        let binding = topology_binding();
+        let (replicator, entered, release) =
+            gated_bound_replicator(vec![Ok(present(bound_snapshot()))], vec![OBSERVED_AT], 0);
+        replicator.open().await.unwrap();
+        let task = tokio::spawn({
+            let replicator = replicator.clone();
+            let epoch = binding.configuration().epoch;
+            async move {
+                match operation {
+                    "progress" => replicator.current_progress().await.map(|_| ()),
+                    "role" => replicator.change_role(epoch, ReplicaRole::Primary).await,
+                    "epoch" => replicator.update_epoch(epoch).await,
+                    _ => unreachable!(),
+                }
+            }
+        });
+        entered.await.unwrap();
+        replicator.abort();
+        release.send(()).unwrap();
+        assert!(
+            matches!(task.await.unwrap(), Err(KubericRuntimeError::Closed)),
+            "{operation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn abort_during_capability_observation_cannot_return_fresh_progress() {
+    let binding = topology_binding();
+    let current = bound_replica_set(&binding);
+    let (replicator, entered, release) = gated_bound_replicator(
+        vec![
+            Ok(present(bound_snapshot())),
+            Ok(present(bound_snapshot())),
+            Ok(present(bound_snapshot())),
+        ],
+        vec![OBSERVED_AT; 3],
+        2,
+    );
+    replicator.open().await.unwrap();
+    replicator
+        .update_current_replica_set_configuration(current)
+        .await
+        .unwrap();
+    replicator
+        .change_role(binding.configuration().epoch, ReplicaRole::Primary)
+        .await
+        .unwrap();
+    let task = tokio::spawn({
+        let replicator = replicator.clone();
+        async move { replicator.catch_up_capability().await }
+    });
+    entered.await.unwrap();
+    replicator.abort();
+    release.send(()).unwrap();
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+}
+
+#[tokio::test]
 async fn bound_role_and_epoch_callbacks_require_fresh_evidence_and_the_frozen_values() {
     let binding = topology_binding();
     let replicator = opened_bound_replicator(
@@ -1407,6 +1953,7 @@ async fn supported_bound_callbacks_use_one_fresh_observation_and_no_mutation_int
                 times: Mutex::new(vec![OBSERVED_AT; 4].into()),
             }),
             binding.clone(),
+            fixed_authority_source(Some(authority_context_for(&binding))),
         )
         .unwrap(),
     );
