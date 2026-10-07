@@ -64,6 +64,11 @@ impl AddressReservation {
     fn address(&self) -> Result<SocketAddr, MssqlGroupError> {
         self.listener.local_addr().map_err(display_error)
     }
+
+    fn into_tokio(self) -> Result<tokio::net::TcpListener, MssqlGroupError> {
+        self.listener.set_nonblocking(true).map_err(display_error)?;
+        tokio::net::TcpListener::from_std(self.listener).map_err(display_error)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,12 +217,12 @@ impl MssqlPod {
             .replication_reservation
             .take()
             .ok_or_else(|| MssqlGroupError::new("replication address reservation is missing"))?;
-        let control = control_reservation.address()?;
-        let replication = replication_reservation.address()?;
+        let control_listener = control_reservation.into_tokio()?;
+        let replication_listener = replication_reservation.into_tokio()?;
         let server = tokio::spawn(async move {
-            drop(control_reservation);
-            drop(replication_reservation);
-            agent.serve(control, replication, ready, shutdown_rx).await
+            agent
+                .serve_with_listeners(control_listener, replication_listener, ready, shutdown_rx)
+                .await
         });
         self.shutdown = Some(shutdown);
         self.server = Some(server);
