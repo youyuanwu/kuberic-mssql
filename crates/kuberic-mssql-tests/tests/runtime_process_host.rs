@@ -634,6 +634,16 @@ async fn public_hosts_initialize_report_and_restart_with_fresh_sessions_case() {
     assert_initialization_listeners(&mut first_attempts).await;
     let (mut first_replicas, first_sessions) = initialize_attempts(&mut first_attempts).await;
     let first_reports = reports(&first_attempts).await;
+    let expected_identities = identities();
+    for (index, report) in first_reports.iter().enumerate() {
+        assert_eq!(report.resource_uid, "runtime-host-test");
+        assert_eq!(
+            report.identity,
+            Some(expected_identities[index].clone().into())
+        );
+        assert_eq!(report.pod_uid, format!("pod-{}", index + 1));
+        assert_eq!(report.pvc_uid, format!("pvc-{}", index + 1));
+    }
     assert_eq!(first_reports[0].replica_id, 1);
     assert_eq!(first_reports[0].role, wire::ReplicaRole::Primary as i32);
     for (index, report) in first_reports[1..].iter().enumerate() {

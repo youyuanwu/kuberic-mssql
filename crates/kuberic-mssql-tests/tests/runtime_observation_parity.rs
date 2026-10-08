@@ -9,11 +9,13 @@ use kuberic_mssql::monitor::ObservationReport;
 use kuberic_mssql::query::ReadQuery;
 use kuberic_mssql::runtime_config::ObserverConfig;
 use kuberic_mssql::runtime_error::RuntimeError;
+use kuberic_mssql::tds::{testing_classify_driver_error, testing_classify_server_error};
 use kuberic_mssql::{AvailabilityGroupName, Observation, ObservationFailureKind};
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::replicator::Replicator;
 
 const OBSERVED_AT: u64 = 1_000;
+const SENSITIVE_SERVER_MESSAGE: &str = "sensitive-driver-server-message";
 
 #[derive(Clone, Copy)]
 enum FailureCase {
@@ -30,16 +32,10 @@ struct FailureExecutor(FailureCase);
 impl SqlExecutor for FailureExecutor {
     async fn connect(&self) -> Result<Box<dyn SqlSession>, RuntimeError> {
         match self.0 {
-            FailureCase::Authentication => Err(RuntimeError::new(
-                ObservationFailureKind::Authentication,
-                "login",
-                "SQL Server authentication failed",
-            )),
-            FailureCase::Tls => Err(RuntimeError::new(
-                ObservationFailureKind::Tls,
-                "TLS/TDS login",
-                "TLS certificate verification failed",
-            )),
+            FailureCase::Authentication => Err(testing_classify_server_error(18456)),
+            FailureCase::Tls => Err(testing_classify_driver_error(tiberius::error::Error::Tls(
+                SENSITIVE_SERVER_MESSAGE.into(),
+            ))),
             FailureCase::Permission => Ok(Box::new(ScriptedSession::new(vec![Step {
                 query: ReadQuery::Permissions,
                 rows: vec![permissions(false)],
@@ -222,6 +218,8 @@ async fn observer_and_runtime_share_actual_failure_classification() {
         let serialized = serde_json::to_string(&report).unwrap();
         assert!(!serialized.contains("sensitive-observer-secret"));
         assert!(!message.contains("sensitive-observer-secret"));
+        assert!(!serialized.contains(SENSITIVE_SERVER_MESSAGE));
+        assert!(!message.contains(SENSITIVE_SERVER_MESSAGE));
     }
 }
 
