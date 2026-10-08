@@ -98,6 +98,11 @@ descriptions may only be completed once, after which replay is exact. Role and
 progress callbacks still reobserve SQL Server, and no client SQL listener or
 service address is published.
 
+With empty authorized roots, startup initializes Kuberic metadata and writes
+the application binding. Reusing those roots reopens established state only
+when the supplied identities, bound paths, observer target and topology still
+match; the reopened process receives a new session, and mismatches fail closed.
+
 SIGINT and SIGTERM cancel initialization or request bounded runtime shutdown.
 Operational and cleanup failures are retained together instead of being
 converted to success.
