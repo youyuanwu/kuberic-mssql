@@ -1,5 +1,6 @@
 mod binding;
 mod config;
+mod process;
 mod routes;
 
 pub use binding::{
@@ -7,4 +8,5 @@ pub use binding::{
     RuntimeBindingStore,
 };
 pub use config::{ResolverConfig, RuntimeHostArgs, RuntimeHostConfig, RuntimeHostConfigError};
+pub use process::{RuntimeProcessError, run_from_env, run_runtime, run_runtime_with_shutdown};
 pub use routes::{PeerRoute, PeerRoutes, PeerRoutesError};
