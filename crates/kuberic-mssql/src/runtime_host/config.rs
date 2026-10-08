@@ -1,6 +1,8 @@
 use std::fmt;
+use std::fs::OpenOptions;
+use std::io::Read;
 use std::net::SocketAddr;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -167,12 +169,12 @@ impl RuntimeHostConfig {
             }
         }
 
-        validate_regular_file(&args.observer_config).await?;
-        let observer = ObserverConfig::read(&args.observer_config)
-            .await
+        let observer_bytes =
+            read_regular_bounded(&args.observer_config, MAX_TOPOLOGY_BYTES, false)?;
+        let observer = ObserverConfig::from_json(&observer_bytes)
             .map_err(|_| RuntimeHostConfigError::Observer)?;
         let topology_bytes =
-            read_regular_bounded(&args.topology_config, MAX_TOPOLOGY_BYTES).await?;
+            read_regular_bounded(&args.topology_config, MAX_TOPOLOGY_BYTES, false)?;
         let topology = SqlServerTopologyExpectation::from_json(
             &topology_bytes,
             ReplicaId::new(args.replica_id),
@@ -183,8 +185,7 @@ impl RuntimeHostConfig {
             return Err(RuntimeHostConfigError::Topology);
         }
 
-        let bearer_token =
-            Zeroizing::new(read_secret(&args.bearer_token_file, MAX_SECRET_BYTES).await?);
+        let bearer_token = Zeroizing::new(read_secret(&args.bearer_token_file, MAX_SECRET_BYTES)?);
         let resolver = match (args.namespace, args.peer_routes) {
             (Some(namespace), None) if valid_namespace(&namespace) => {
                 ResolverConfig::KubernetesDns { namespace }
@@ -371,56 +372,61 @@ fn valid_identity_component(value: &str) -> bool {
 
 fn valid_namespace(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 253
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
-        })
-        && !value.starts_with('-')
-        && !value.ends_with('-')
+        && value.len() <= 63
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-async fn read_regular_bounded(
+fn read_regular_bounded(
     path: &Path,
     max_bytes: u64,
+    private: bool,
 ) -> Result<Vec<u8>, RuntimeHostConfigError> {
-    let metadata = tokio::fs::symlink_metadata(path)
-        .await
-        .map_err(|_| RuntimeHostConfigError::Io)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > max_bytes {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                RuntimeHostConfigError::InvalidPath
+            } else {
+                RuntimeHostConfigError::Io
+            }
+        })?;
+    let metadata = file.metadata().map_err(|_| RuntimeHostConfigError::Io)?;
+    if !metadata.is_file()
+        || metadata.len() > max_bytes
+        || (private
+            && (metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.permissions().mode() & 0o077 != 0))
+    {
         return Err(RuntimeHostConfigError::InvalidPath);
     }
-    tokio::fs::read(path)
-        .await
-        .map_err(|_| RuntimeHostConfigError::Io)
-}
-
-async fn validate_regular_file(path: &Path) -> Result<(), RuntimeHostConfigError> {
-    let metadata = tokio::fs::symlink_metadata(path)
-        .await
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
         .map_err(|_| RuntimeHostConfigError::Io)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        Err(RuntimeHostConfigError::InvalidPath)
-    } else {
-        Ok(())
+    if bytes.len() as u64 > max_bytes {
+        return Err(RuntimeHostConfigError::InvalidPath);
     }
+    Ok(bytes)
 }
 
-async fn read_secret(path: &Path, max_bytes: u64) -> Result<String, RuntimeHostConfigError> {
-    let metadata = tokio::fs::symlink_metadata(path)
-        .await
-        .map_err(|_| RuntimeHostConfigError::Secret)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() == 0
-        || metadata.len() > max_bytes
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o077 != 0
-    {
+fn read_secret(path: &Path, max_bytes: u64) -> Result<String, RuntimeHostConfigError> {
+    let bytes =
+        read_regular_bounded(path, max_bytes, true).map_err(|_| RuntimeHostConfigError::Secret)?;
+    if bytes.is_empty() {
         return Err(RuntimeHostConfigError::Secret);
     }
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|_| RuntimeHostConfigError::Secret)?;
     let token = String::from_utf8(bytes).map_err(|_| RuntimeHostConfigError::Secret)?;
     if token.is_empty()
         || token.trim() != token

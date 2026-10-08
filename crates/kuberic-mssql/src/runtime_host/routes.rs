@@ -1,4 +1,7 @@
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use kuberic_runtime::protocol::types::{
@@ -38,18 +41,22 @@ pub struct PeerRoutes {
 
 impl PeerRoutes {
     pub async fn read(path: &Path) -> Result<Self, PeerRoutesError> {
-        let metadata = tokio::fs::symlink_metadata(path)
-            .await
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)
             .map_err(|_| PeerRoutesError::Unavailable)?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || metadata.len() > MAX_PEER_ROUTES_BYTES
-        {
+        let metadata = file.metadata().map_err(|_| PeerRoutesError::Unavailable)?;
+        if !metadata.is_file() || metadata.len() > MAX_PEER_ROUTES_BYTES {
             return Err(PeerRoutesError::Invalid);
         }
-        let bytes = tokio::fs::read(path)
-            .await
+        let mut bytes = Vec::new();
+        file.take(MAX_PEER_ROUTES_BYTES + 1)
+            .read_to_end(&mut bytes)
             .map_err(|_| PeerRoutesError::Unavailable)?;
+        if bytes.len() as u64 > MAX_PEER_ROUTES_BYTES {
+            return Err(PeerRoutesError::Invalid);
+        }
         Self::from_json(&bytes)
     }
 
@@ -165,11 +172,22 @@ pub(crate) fn validate_http_endpoint(endpoint: &str) -> Result<(), PeerRoutesErr
     {
         return Err(PeerRoutesError::Invalid);
     }
-    let Some((host, port)) = endpoint[7..].rsplit_once(':') else {
+    let authority = &endpoint[7..];
+    if authority.contains(['/', '?', '#', '@']) {
+        return Err(PeerRoutesError::Invalid);
+    }
+    let Some((host, port)) = authority.rsplit_once(':') else {
         return Err(PeerRoutesError::Invalid);
     };
     if host.is_empty()
         || host.chars().any(char::is_whitespace)
+        || host.contains(':')
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        || host
+            .split('.')
+            .any(|label| label.is_empty() || label.starts_with('-') || label.ends_with('-'))
         || port.parse::<u16>().ok().is_none_or(|port| port == 0)
     {
         return Err(PeerRoutesError::Invalid);

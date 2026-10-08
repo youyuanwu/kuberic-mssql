@@ -1,5 +1,7 @@
+use std::ffi::CString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -101,15 +103,18 @@ impl RuntimeBindingStore {
     }
 
     pub fn storage_state(&self) -> Result<ApplicationStorageState, RuntimeBindingError> {
-        let metadata = match fs::symlink_metadata(&self.root) {
-            Ok(metadata) => metadata,
+        let root = match BoundRoot::open(&self.root) {
+            Ok(root) => root,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(ApplicationStorageState::FreshEmpty);
             }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(RuntimeBindingError::UnsafeState);
+            }
             Err(_) => return Err(RuntimeBindingError::Io),
         };
-        validate_private_directory(&metadata)?;
-        let entries = fs::read_dir(&self.root)
+        root.verify_path()?;
+        let entries = fs::read_dir(format!("/proc/self/fd/{}", root.file.as_raw_fd()))
             .map_err(|_| RuntimeBindingError::Io)?
             .map(|entry| entry.map(|entry| entry.file_name()))
             .collect::<Result<Vec<_>, _>>()
@@ -120,7 +125,8 @@ impl RuntimeBindingStore {
         if entries.len() != 1 || entries[0] != BINDING_FILE {
             return Err(RuntimeBindingError::UnsafeState);
         }
-        let actual = self.load()?;
+        let actual = self.load(&root)?;
+        root.verify_path()?;
         if actual != self.expected {
             return Err(RuntimeBindingError::IdentityMismatch);
         }
@@ -138,17 +144,15 @@ impl RuntimeBindingStore {
                 .create(&self.root)
                 .map_err(|_| RuntimeBindingError::Io)?;
         }
-        let metadata = fs::symlink_metadata(&self.root).map_err(|_| RuntimeBindingError::Io)?;
-        validate_private_directory(&metadata)?;
-        if self
-            .root
-            .canonicalize()
-            .map_err(|_| RuntimeBindingError::Io)?
-            != self.root
-        {
-            return Err(RuntimeBindingError::InvalidPath);
-        }
-        self.save()
+        let root = BoundRoot::open(&self.root).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                RuntimeBindingError::UnsafeState
+            } else {
+                RuntimeBindingError::Io
+            }
+        })?;
+        root.verify_path()?;
+        self.save(&root)
     }
 
     pub fn validate(&self) -> Result<(), RuntimeBindingError> {
@@ -159,17 +163,29 @@ impl RuntimeBindingStore {
         }
     }
 
-    fn load(&self) -> Result<RuntimeBindingIdentity, RuntimeBindingError> {
-        let metadata = fs::symlink_metadata(&self.path).map_err(|_| RuntimeBindingError::Io)?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
+    fn load(&self, root: &BoundRoot) -> Result<RuntimeBindingIdentity, RuntimeBindingError> {
+        let file = root
+            .openat(
+                BINDING_FILE,
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0,
+            )
+            .map_err(|_| RuntimeBindingError::Io)?;
+        let metadata = file.metadata().map_err(|_| RuntimeBindingError::Io)?;
+        if !metadata.is_file()
             || metadata.len() > MAX_BINDING_BYTES
             || metadata.uid() != unsafe { libc::geteuid() }
             || metadata.permissions().mode() & 0o077 != 0
         {
             return Err(RuntimeBindingError::UnsafeState);
         }
-        let bytes = fs::read(&self.path).map_err(|_| RuntimeBindingError::Io)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_BINDING_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| RuntimeBindingError::Io)?;
+        if bytes.len() as u64 > MAX_BINDING_BYTES {
+            return Err(RuntimeBindingError::UnsafeState);
+        }
         let identity: RuntimeBindingIdentity =
             serde_json::from_slice(&bytes).map_err(|_| RuntimeBindingError::Malformed)?;
         if identity.schema_version != RUNTIME_BINDING_SCHEMA_VERSION {
@@ -180,31 +196,117 @@ impl RuntimeBindingStore {
         Ok(identity)
     }
 
-    fn save(&self) -> Result<(), RuntimeBindingError> {
+    fn save(&self, root: &BoundRoot) -> Result<(), RuntimeBindingError> {
         let bytes = serde_json::to_vec_pretty(&self.expected)
             .map_err(|_| RuntimeBindingError::Malformed)?;
-        let temporary = self
-            .root
-            .join(format!(".{BINDING_FILE}.{}.new", std::process::id()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)
+        let temporary = format!(".{BINDING_FILE}.{}.new", std::process::id());
+        let mut file = root
+            .openat(
+                &temporary,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
             .map_err(|_| RuntimeBindingError::Io)?;
         let result = (|| {
             file.write_all(&bytes)
                 .map_err(|_| RuntimeBindingError::Io)?;
             file.sync_all().map_err(|_| RuntimeBindingError::Io)?;
-            fs::rename(&temporary, &self.path).map_err(|_| RuntimeBindingError::Io)?;
-            File::open(&self.root)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|_| RuntimeBindingError::Io)
+            root.verify_path()?;
+            root.renameat(&temporary, BINDING_FILE)?;
+            root.file.sync_all().map_err(|_| RuntimeBindingError::Io)
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&temporary);
+            root.unlinkat(&temporary);
         }
         result
+    }
+}
+
+struct BoundRoot {
+    path: PathBuf,
+    file: File,
+    device: u64,
+    inode: u64,
+}
+
+impl BoundRoot {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            file,
+        })
+    }
+
+    fn verify_path(&self) -> Result<(), RuntimeBindingError> {
+        let metadata = fs::symlink_metadata(&self.path).map_err(|_| RuntimeBindingError::Io)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.dev() != self.device
+            || metadata.ino() != self.inode
+            || self
+                .path
+                .canonicalize()
+                .map_err(|_| RuntimeBindingError::Io)?
+                != self.path
+        {
+            return Err(RuntimeBindingError::UnsafeState);
+        }
+        let bound = self.file.metadata().map_err(|_| RuntimeBindingError::Io)?;
+        if bound.dev() != self.device || bound.ino() != self.inode {
+            return Err(RuntimeBindingError::UnsafeState);
+        }
+        Ok(())
+    }
+
+    fn openat(&self, name: &str, flags: i32, mode: libc::mode_t) -> std::io::Result<File> {
+        let name = CString::new(name)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let descriptor = unsafe { libc::openat(self.file.as_raw_fd(), name.as_ptr(), flags, mode) };
+        if descriptor < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(unsafe { File::from_raw_fd(descriptor) })
+        }
+    }
+
+    fn renameat(&self, from: &str, to: &str) -> Result<(), RuntimeBindingError> {
+        let from = CString::new(from).map_err(|_| RuntimeBindingError::Io)?;
+        let to = CString::new(to).map_err(|_| RuntimeBindingError::Io)?;
+        if unsafe {
+            libc::renameat(
+                self.file.as_raw_fd(),
+                from.as_ptr(),
+                self.file.as_raw_fd(),
+                to.as_ptr(),
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(RuntimeBindingError::Io)
+        }
+    }
+
+    fn unlinkat(&self, name: &str) {
+        let Ok(name) = CString::new(name) else {
+            return;
+        };
+        unsafe {
+            libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0);
+        }
     }
 }
 
@@ -270,18 +372,6 @@ fn canonical_root(path: &Path) -> Result<PathBuf, RuntimeBindingError> {
         .map_err(|_| RuntimeBindingError::InvalidPath)?;
     let name = path.file_name().ok_or(RuntimeBindingError::InvalidPath)?;
     Ok(parent.join(name))
-}
-
-fn validate_private_directory(metadata: &fs::Metadata) -> Result<(), RuntimeBindingError> {
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        Err(RuntimeBindingError::UnsafeState)
-    } else {
-        Ok(())
-    }
 }
 
 fn hex(bytes: &[u8]) -> String {

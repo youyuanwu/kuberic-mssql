@@ -164,6 +164,36 @@ async fn runtime_config_rejects_bad_secret_resolver_endpoint_and_deadline_inputs
     );
 
     let mut invalid = args(&files);
+    invalid.peer_routes = None;
+    assert_eq!(
+        RuntimeHostConfig::load(invalid, temporary.path())
+            .await
+            .unwrap_err(),
+        RuntimeHostConfigError::InvalidResolver
+    );
+
+    let mut dns = args(&files);
+    dns.peer_routes = None;
+    dns.namespace = Some("default".into());
+    assert!(matches!(
+        RuntimeHostConfig::load(dns, temporary.path())
+            .await
+            .unwrap()
+            .resolver(),
+        ResolverConfig::KubernetesDns { namespace } if namespace == "default"
+    ));
+
+    let mut invalid = args(&files);
+    invalid.peer_routes = None;
+    invalid.namespace = Some("bad.namespace".into());
+    assert_eq!(
+        RuntimeHostConfig::load(invalid, temporary.path())
+            .await
+            .unwrap_err(),
+        RuntimeHostConfigError::InvalidResolver
+    );
+
+    let mut invalid = args(&files);
     invalid.control_endpoint = "not-an-endpoint".into();
     assert_eq!(
         RuntimeHostConfig::load(invalid, temporary.path())
@@ -194,6 +224,24 @@ async fn runtime_config_rejects_bad_secret_resolver_endpoint_and_deadline_inputs
     fs::remove_file(&files.observer).unwrap();
     fs::copy(&observer_target, &files.observer).unwrap();
 
+    write_private(&files.token, vec![b'x'; 4_097]);
+    assert_eq!(
+        RuntimeHostConfig::load(args(&files), temporary.path())
+            .await
+            .unwrap_err(),
+        RuntimeHostConfigError::Secret
+    );
+
+    write_private(&files.token, "agent-token-value");
+    fs::set_permissions(&files.token, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        RuntimeHostConfig::load(args(&files), temporary.path())
+            .await
+            .unwrap_err(),
+        RuntimeHostConfigError::Secret
+    );
+    fs::set_permissions(&files.token, fs::Permissions::from_mode(0o600)).unwrap();
+
     write_private(&files.token, "token\n");
     let error = RuntimeHostConfig::load(args(&files), temporary.path())
         .await
@@ -213,8 +261,8 @@ async fn runtime_config_rejects_bad_secret_resolver_endpoint_and_deadline_inputs
     );
 }
 
-#[test]
-fn peer_routes_are_bounded_strict_and_sanitized() {
+#[tokio::test]
+async fn peer_routes_are_bounded_strict_and_sanitized() {
     let valid = br#"{
         "schema_version":1,
         "routes":[{
@@ -245,13 +293,64 @@ fn peer_routes_are_bounded_strict_and_sanitized() {
         PeerRoutes::from_json(duplicate),
         Err(PeerRoutesError::Invalid)
     );
+
+    let path_endpoint = br#"{
+        "schema_version":1,
+        "routes":[{
+            "replica_id":2,
+            "instance_id":"pod-2",
+            "agent_generation":"generation-2",
+            "control_endpoint":"http://host:80/path:81",
+            "replication_endpoint":"http://127.0.0.1:51052"
+        }]
+    }"#;
+    assert_eq!(
+        PeerRoutes::from_json(path_endpoint),
+        Err(PeerRoutesError::Invalid)
+    );
+
+    assert_eq!(
+        PeerRoutes::from_json(&vec![b' '; 65_537]),
+        Err(PeerRoutesError::Invalid)
+    );
+
+    let routes = (1..=33)
+        .map(|replica_id| {
+            serde_json::json!({
+                "replica_id": replica_id,
+                "instance_id": format!("pod-{replica_id}"),
+                "agent_generation": format!("generation-{replica_id}"),
+                "control_endpoint": format!("http://127.0.0.1:{}", 10_000 + replica_id),
+                "replication_endpoint": format!("http://127.0.0.1:{}", 20_000 + replica_id)
+            })
+        })
+        .collect::<Vec<_>>();
+    let too_many = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "routes": routes
+    }))
+    .unwrap();
+    assert_eq!(
+        PeerRoutes::from_json(&too_many),
+        Err(PeerRoutesError::Invalid)
+    );
+
+    let temporary = tempfile::tempdir().unwrap();
+    let target = temporary.path().join("routes-target.json");
+    let link = temporary.path().join("routes-link.json");
+    write_private(&target, valid);
+    symlink(&target, &link).unwrap();
+    assert_eq!(
+        PeerRoutes::read(&link).await,
+        Err(PeerRoutesError::Unavailable)
+    );
 }
 
 #[tokio::test]
 async fn runtime_binding_is_durable_secret_free_and_rejects_identity_drift() {
     let temporary = tempfile::tempdir().unwrap();
-    let config = config(temporary.path()).await;
-    let store = RuntimeBindingStore::new(&config).unwrap();
+    let runtime_config = config(temporary.path()).await;
+    let store = RuntimeBindingStore::new(&runtime_config).unwrap();
     assert_eq!(
         store.storage_state().unwrap(),
         ApplicationStorageState::FreshEmpty
@@ -281,6 +380,31 @@ async fn runtime_binding_is_durable_secret_free_and_rejects_identity_drift() {
     assert_eq!(
         changed_store.storage_state(),
         Err(RuntimeBindingError::IdentityMismatch)
+    );
+
+    let original_digest = store.expected().topology_sha256().to_owned();
+    write_private(
+        &files.topology,
+        br#"{
+            "schema_version": 1,
+            "members": [
+                {"replica_id":3,"server_name":"sql-3","endpoint_url":"TCP://sql-3:5022"},
+                {"replica_id":1,"server_name":"sql-1","endpoint_url":"TCP://sql-1:5022"},
+                {"replica_id":2,"server_name":"sql-2","endpoint_url":"TCP://sql-2:5022"}
+            ]
+        }"#,
+    );
+    let reordered = RuntimeHostConfig::load(args(&files), temporary.path())
+        .await
+        .unwrap();
+    let reordered_store = RuntimeBindingStore::new(&reordered).unwrap();
+    assert_eq!(
+        reordered_store.expected().topology_sha256(),
+        original_digest
+    );
+    assert_eq!(
+        reordered_store.storage_state().unwrap(),
+        ApplicationStorageState::Established
     );
 
     write_private(
@@ -324,9 +448,13 @@ async fn runtime_binding_is_durable_secret_free_and_rejects_identity_drift() {
 #[tokio::test]
 async fn runtime_binding_rejects_extra_malformed_unsupported_and_symlinked_state() {
     let temporary = tempfile::tempdir().unwrap();
-    let config = config(temporary.path()).await;
-    let store = RuntimeBindingStore::new(&config).unwrap();
+    let runtime_config = config(temporary.path()).await;
+    let store = RuntimeBindingStore::new(&runtime_config).unwrap();
     store.initialize().unwrap();
+
+    fs::set_permissions(store.path(), fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(store.storage_state(), Err(RuntimeBindingError::UnsafeState));
+    fs::set_permissions(store.path(), fs::Permissions::from_mode(0o600)).unwrap();
 
     fs::write(store.root().join("foreign"), "foreign").unwrap();
     assert_eq!(store.storage_state(), Err(RuntimeBindingError::UnsafeState));
@@ -356,5 +484,20 @@ async fn runtime_binding_rejects_extra_malformed_unsupported_and_symlinked_state
     assert_eq!(
         RuntimeBindingStore::new(&linked).unwrap_err(),
         RuntimeBindingError::InvalidPath
+    );
+
+    let unsafe_root = tempfile::tempdir().unwrap();
+    let unsafe_config = config(unsafe_root.path()).await;
+    fs::create_dir(unsafe_config.application_root()).unwrap();
+    fs::set_permissions(
+        unsafe_config.application_root(),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    assert_eq!(
+        RuntimeBindingStore::new(&unsafe_config)
+            .unwrap()
+            .storage_state(),
+        Err(RuntimeBindingError::UnsafeState)
     );
 }
