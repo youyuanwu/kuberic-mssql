@@ -428,6 +428,17 @@ async fn runtime_binding_is_durable_secret_free_and_rejects_identity_drift() {
         Err(RuntimeBindingError::IdentityMismatch)
     );
 
+    write_private(
+        &files.topology,
+        br#"{
+            "schema_version": 1,
+            "members": [
+                {"replica_id":1,"server_name":"sql-1","endpoint_url":"TCP://sql-1:5022"},
+                {"replica_id":2,"server_name":"sql-2","endpoint_url":"TCP://sql-2:5022"},
+                {"replica_id":3,"server_name":"sql-3","endpoint_url":"TCP://sql-3:5022"}
+            ]
+        }"#,
+    );
     let moved_root = temporary.path().join("moved-application");
     fs::create_dir(&moved_root).unwrap();
     fs::set_permissions(&moved_root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -441,6 +452,65 @@ async fn runtime_binding_is_durable_secret_free_and_rejects_identity_drift() {
         .unwrap();
     assert_eq!(
         RuntimeBindingStore::new(&moved).unwrap().storage_state(),
+        Err(RuntimeBindingError::IdentityMismatch)
+    );
+
+    let original_observer = fs::read_to_string(&files.observer).unwrap();
+    write_private(
+        &files.observer,
+        original_observer.replace("\"app-ag\"", "\"other-ag\""),
+    );
+    let changed_observer = RuntimeHostConfig::load(args(&files), temporary.path())
+        .await
+        .unwrap();
+    assert_eq!(
+        RuntimeBindingStore::new(&changed_observer)
+            .unwrap()
+            .storage_state(),
+        Err(RuntimeBindingError::IdentityMismatch)
+    );
+
+    write_private(
+        &files.observer,
+        original_observer
+            .replace("sql-1.example", "sql-2.example")
+            .replace("\"sql-1\"", "\"sql-2\"")
+            .replace("\"logical-1\"", "\"logical-2\"")
+            .replace("\"pod-1\"", "\"pod-2\""),
+    );
+    write_private(
+        &files.routes,
+        br#"{
+            "schema_version": 1,
+            "routes": [
+                {
+                    "replica_id": 1,
+                    "instance_id": "pod-1",
+                    "agent_generation": "generation-1",
+                    "control_endpoint": "http://127.0.0.1:50051",
+                    "replication_endpoint": "http://127.0.0.1:50052"
+                },
+                {
+                    "replica_id": 3,
+                    "instance_id": "pod-3",
+                    "agent_generation": "generation-3",
+                    "control_endpoint": "http://127.0.0.1:52051",
+                    "replication_endpoint": "http://127.0.0.1:52052"
+                }
+            ]
+        }"#,
+    );
+    let mut changed_replica_args = args(&files);
+    changed_replica_args.replica_id = 2;
+    changed_replica_args.pod_uid = "pod-2".into();
+    changed_replica_args.pvc_uid = "pvc-2".into();
+    let changed_replica = RuntimeHostConfig::load(changed_replica_args, temporary.path())
+        .await
+        .unwrap();
+    assert_eq!(
+        RuntimeBindingStore::new(&changed_replica)
+            .unwrap()
+            .storage_state(),
         Err(RuntimeBindingError::IdentityMismatch)
     );
 }

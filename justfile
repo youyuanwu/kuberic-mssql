@@ -5,7 +5,7 @@ export PATH := env_var("HOME") + "/.local/bin:" + env_var("HOME") + "/.cargo/bin
 default: check
 
 # Run the complete CI pipeline locally or on the CI runner.
-ci: setup check test-live-one-replica test-live-three-replica
+ci: setup check test-live-one-replica test-live-three-replica test-live-three-replica-restart
 
 # Install only missing/mismatched shared Rust, just and compiler prerequisites.
 setup:
@@ -31,7 +31,7 @@ clippy:
 
 # Run ordinary Rust tests; live fixtures remain ignored.
 test:
-    cargo test --locked --workspace --all-features
+    cargo test --locked --workspace --all-features -- --test-threads=1
 
 # Launch one owned SQL Server member, validate unique observer/CLI behavior, and clean up.
 test-live-one-replica root="target/mssql-one-replica":
@@ -60,6 +60,13 @@ test-live-three-replica root="target/mssql-three-replica":
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_happy_path -- --ignored --exact --test-threads=1
+
+# Validate same-root replacement of all three public Kuberic hosts.
+test-live-three-replica-restart root="target/mssql-three-replica-restart":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_same_root_restart -- --ignored --exact --test-threads=1 --nocapture
 
 # Interrupt a real live subprocess during owned launch, recover, retry, and clean up.
 test-live-three-replica-signal root="target/mssql-three-replica-signal":

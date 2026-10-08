@@ -11,27 +11,39 @@ use std::time::{Duration, Instant};
 use futures::FutureExt;
 use kuberic_mssql_tests::three_replica::{
     CLEANUP_BUDGET, CancellationSignals, CleanupClock, CleanupCoordinator, CombinedFixtureError,
-    FixtureConfig, HandledCancellationSignal, JournalStore, MssqlGroupError, NativeTopologyBinding,
-    OwnershipJournal, PublicMssqlGroup, ReadyMember, ResourceState, RunState, SystemCleanupClock,
-    TopologyRun, cleanup_three_replica_fixture, launch_three_members,
+    FixtureConfig, HandledCancellationSignal, JournalStore, LaunchedMembers, MssqlGroupError,
+    NativeTopologyBinding, OwnershipJournal, PublicMssqlGroup, ReadyMember, ResourceState,
+    RunState, SystemCleanupClock, TopologyRun, cleanup_three_replica_fixture, launch_three_members,
 };
 use kuberic_runtime::control::proto;
 
 type TestError = Box<dyn Error + Send + Sync>;
+const HAPPY_PATH_TEST: &str = "three_replica_mssql_happy_path";
+const SAME_ROOT_RESTART_TEST: &str = "three_replica_mssql_same_root_restart";
 
 #[test]
 #[ignore = "auto-accepts the SQL Server EULA for this test fixture and requires a qualified local Docker host"]
 fn three_replica_mssql_happy_path() {
+    run_three_replica_test(false);
+}
+
+#[test]
+#[ignore = "validates same-root Kuberic host restart with a licensed SQL Server fixture"]
+fn three_replica_mssql_same_root_restart() {
+    run_three_replica_test(true);
+}
+
+fn run_three_replica_test(validate_restart: bool) {
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
-        .spawn(|| {
+        .spawn(move || {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .thread_stack_size(32 * 1024 * 1024)
                 .enable_all()
                 .build()
                 .expect("three-replica Tokio runtime")
-                .block_on(run_three_replica_mssql_happy_path());
+                .block_on(run_three_replica_mssql_happy_path(validate_restart));
         })
         .expect("three-replica test thread")
         .join()
@@ -132,6 +144,7 @@ fn three_replica_post_ag_and_report_fault_checkpoints_recover() {
         "fail-after-ag",
         "panic-after-agent-start",
         "fail-during-report",
+        "fail-after-agent-restart",
     ] {
         let root = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
         cleanup_three_replica_fixture(&root).expect("clean fault-checkpoint baseline");
@@ -146,7 +159,7 @@ fn three_replica_post_ag_and_report_fault_checkpoints_recover() {
         assert_removed(&root);
     }
     let root = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
-    let mut retry = spawn_live_child(&root, None);
+    let mut retry = spawn_restart_child(&root);
     assert!(
         wait_for_child_with_cleanup(&mut retry, Duration::from_secs(1200), &root).success(),
         "retry after fault checkpoints"
@@ -155,7 +168,7 @@ fn three_replica_post_ag_and_report_fault_checkpoints_recover() {
     assert_removed(&root);
 }
 
-async fn run_three_replica_mssql_happy_path() {
+async fn run_three_replica_mssql_happy_path(validate_restart: bool) {
     let mut cancellation =
         CancellationSignals::register().expect("install SIGINT/SIGTERM cleanup handlers");
     write_signal_handler_ready_evidence();
@@ -165,9 +178,14 @@ async fn run_three_replica_mssql_happy_path() {
     );
     let config =
         FixtureConfig::for_test_fixture(&root).expect("validated test-only fixture config");
-    match AssertUnwindSafe(execute_live_lifecycle(&root, config, &mut cancellation))
-        .catch_unwind()
-        .await
+    match AssertUnwindSafe(execute_live_lifecycle(
+        &root,
+        config,
+        &mut cancellation,
+        validate_restart,
+    ))
+    .catch_unwind()
+    .await
     {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -221,6 +239,7 @@ async fn execute_live_lifecycle(
     root: &Path,
     config: FixtureConfig,
     cancellation: &mut CancellationSignals,
+    validate_restart: bool,
 ) -> Result<(), TestError> {
     let mut launched = launch_three_members(config)
         .await
@@ -237,8 +256,7 @@ async fn execute_live_lifecycle(
     if native_binding != topology.binding {
         return Err("journaled native binding changed".into());
     }
-    let cleanup_clock = SystemCleanupClock::default();
-    let cleanup = CleanupCoordinator::new(cleanup_clock, CLEANUP_BUDGET);
+    let startup_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
     let group = match AssertUnwindSafe(start_public_group_with_retry(
         root,
         &launched.run,
@@ -246,7 +264,7 @@ async fn execute_live_lifecycle(
         &launched.members,
         launched.kuberic_convergence_timeout(),
         launched.complete_deadline(),
-        &cleanup,
+        &startup_cleanup,
     ))
     .catch_unwind()
     .await
@@ -263,7 +281,7 @@ async fn execute_live_lifecycle(
                 }
                 return Err(diagnostic.into());
             }
-            let fixture_cleanup = launched.cleanup_with_coordinator(&cleanup);
+            let fixture_cleanup = launched.cleanup_with_coordinator(&startup_cleanup);
             return match fixture_cleanup {
                 Ok(_) => Err(Box::new(error)),
                 Err(cleanup) => Err(format!(
@@ -273,7 +291,7 @@ async fn execute_live_lifecycle(
             };
         }
         Err(panic) => {
-            let fixture_cleanup = launched.cleanup_with_coordinator(&cleanup);
+            let fixture_cleanup = launched.cleanup_with_coordinator(&startup_cleanup);
             if let Err(cleanup) = fixture_cleanup {
                 let primary = panic_message(&panic);
                 panic!(
@@ -283,7 +301,19 @@ async fn execute_live_lifecycle(
             std::panic::resume_unwind(panic);
         }
     };
-    let outcome = {
+    let first_resource_uid = group.resource_uid.clone();
+    let first_effective_policy = group.effective_policy.clone();
+    let first_configuration = group.configuration.clone();
+    let first_pods = group.pods.each_ref().map(|pod| {
+        (
+            pod.identity.clone(),
+            pod.stable_role,
+            pod.pod_uid.clone(),
+            pod.pvc_uid.clone(),
+        )
+    });
+    let first_sessions = group.pods.each_ref().map(|pod| pod.session.clone());
+    let first_outcome = {
         let runtime = AssertUnwindSafe(async {
             if fault_checkpoint("panic-after-agent-start") {
                 panic!("injected panic after agent startup");
@@ -291,8 +321,12 @@ async fn execute_live_lifecycle(
             if fault_checkpoint("fail-during-report") {
                 return Err::<(), TestError>("injected failure during bracketed reporting".into());
             }
-            let reports = group.reports_bracketed().await?;
-            assert_exact_reports(&group, &reports, native_binding.configuration_sequence)?;
+            wait_for_exact_reports(
+                &group,
+                native_binding.configuration_sequence,
+                launched.kuberic_convergence_timeout(),
+            )
+            .await?;
             let marker = launched
                 .commit_replicated_marker(&topology.evidence)
                 .await?;
@@ -310,10 +344,129 @@ async fn execute_live_lifecycle(
             signal = cancellation.recv() => RuntimeOutcome::Interrupted(signal),
         }
     };
-    let shutdown = group.shutdown_with_coordinator(&cleanup).await;
+    let first_shutdown_cleanup =
+        CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let shutdown = group
+        .shutdown_with_coordinator(&first_shutdown_cleanup)
+        .await;
     if let Err(shutdown) = shutdown {
         let diagnostic = format!(
             "{}; Kuberic shutdown failed before fixture cleanup: {shutdown}",
+            first_outcome.description()
+        );
+        if let Err(block) = launched.block_cleanup() {
+            return Err(
+                format!("{diagnostic}; ownership journal blocking also failed: {block}").into(),
+            );
+        }
+        return Err(diagnostic.into());
+    }
+    if !matches!(&first_outcome, RuntimeOutcome::Completed(Ok(Ok(())))) {
+        let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+        return finish_runtime_outcome(root, launched, first_outcome, &cleanup);
+    }
+    if !validate_restart {
+        let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+        return finish_runtime_outcome(root, launched, first_outcome, &cleanup);
+    }
+
+    let restart_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let restarted = match AssertUnwindSafe(start_public_group_with_retry(
+        root,
+        &launched.run,
+        &native_binding,
+        &launched.members,
+        launched.kuberic_convergence_timeout(),
+        launched.complete_deadline(),
+        &restart_cleanup,
+    ))
+    .catch_unwind()
+    .await
+    {
+        Ok(Ok(group)) => group,
+        Ok(Err(error)) => {
+            if error.agent_termination_unconfirmed() {
+                let diagnostic = format!("replacement Kuberic startup failed: {error}");
+                if let Err(block) = launched.block_cleanup() {
+                    return Err(format!(
+                        "{diagnostic}; ownership journal blocking also failed: {block}"
+                    )
+                    .into());
+                }
+                return Err(diagnostic.into());
+            }
+            let fixture_cleanup = launched.cleanup_with_coordinator(&restart_cleanup);
+            return match fixture_cleanup {
+                Ok(_) => Err(format!("replacement Kuberic startup failed: {error}").into()),
+                Err(cleanup) => Err(format!(
+                    "replacement Kuberic startup failed: {error}; cleanup also failed: {cleanup}"
+                )
+                .into()),
+            };
+        }
+        Err(panic) => {
+            let fixture_cleanup = launched.cleanup_with_coordinator(&restart_cleanup);
+            if let Err(cleanup) = fixture_cleanup {
+                let primary = panic_message(&panic);
+                panic!(
+                    "replacement Kuberic startup panicked: {primary}; cleanup also failed: {cleanup}"
+                );
+            }
+            std::panic::resume_unwind(panic);
+        }
+    };
+    let outcome = {
+        let runtime = AssertUnwindSafe(async {
+            if restarted.resource_uid != first_resource_uid
+                || restarted.effective_policy != first_effective_policy
+                || restarted.configuration != first_configuration
+                || restarted.pods.iter().zip(&first_pods).any(
+                    |(pod, (identity, role, pod_uid, pvc_uid))| {
+                        &pod.identity != identity
+                            || pod.stable_role != *role
+                            || &pod.pod_uid != pod_uid
+                            || &pod.pvc_uid != pvc_uid
+                    },
+                )
+            {
+                return Err::<(), TestError>(
+                    "replacement Kuberic hosts changed stable identity or authority".into(),
+                );
+            }
+            restarted
+                .assert_superseded_sessions_rejected(&first_sessions)
+                .await?;
+            if fault_checkpoint("fail-after-agent-restart") {
+                return Err("injected failure after replacement agent startup".into());
+            }
+            wait_for_exact_reports(
+                &restarted,
+                native_binding.configuration_sequence,
+                launched.kuberic_convergence_timeout(),
+            )
+            .await?;
+            let marker = launched
+                .commit_replicated_marker(&topology.evidence)
+                .await?;
+            if marker.primary_ordinal != topology.evidence.primary_ordinal
+                || marker.readable_ordinals != [1, 2, 3]
+            {
+                return Err("post-restart marker was not readable from all exact members".into());
+            }
+            Ok(())
+        })
+        .catch_unwind();
+        tokio::pin!(runtime);
+        tokio::select! {
+            result = &mut runtime => RuntimeOutcome::Completed(result),
+            signal = cancellation.recv() => RuntimeOutcome::Interrupted(signal),
+        }
+    };
+    let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let shutdown = restarted.shutdown_with_coordinator(&cleanup).await;
+    if let Err(shutdown) = shutdown {
+        let diagnostic = format!(
+            "{}; replacement Kuberic shutdown failed before fixture cleanup: {shutdown}",
             outcome.description()
         );
         if let Err(block) = launched.block_cleanup() {
@@ -323,7 +476,16 @@ async fn execute_live_lifecycle(
         }
         return Err(diagnostic.into());
     }
-    let fixture_cleanup = launched.cleanup_with_coordinator(&cleanup);
+    finish_runtime_outcome(root, launched, outcome, &cleanup)
+}
+
+fn finish_runtime_outcome(
+    root: &Path,
+    launched: LaunchedMembers,
+    outcome: RuntimeOutcome,
+    cleanup: &CleanupCoordinator<SystemCleanupClock>,
+) -> Result<(), TestError> {
+    let fixture_cleanup = launched.cleanup_with_coordinator(cleanup);
     match (outcome, fixture_cleanup) {
         (RuntimeOutcome::Completed(Ok(Ok(()))), Ok(cleanup)) => {
             assert_eq!(cleanup.removed_container_ids.len(), 3);
@@ -423,9 +585,22 @@ fn required_path(variable: &str) -> PathBuf {
 }
 
 fn spawn_live_child(root: &Path, ready: Option<&Path>) -> Child {
+    spawn_test_child(root, HAPPY_PATH_TEST, ready, None)
+}
+
+fn spawn_restart_child(root: &Path) -> Child {
+    spawn_test_child(root, SAME_ROOT_RESTART_TEST, None, None)
+}
+
+fn spawn_test_child(
+    root: &Path,
+    test_name: &str,
+    ready: Option<&Path>,
+    checkpoint: Option<&str>,
+) -> Child {
     let mut command = Command::new(std::env::current_exe().expect("current live test executable"));
     command
-        .arg("three_replica_mssql_happy_path")
+        .arg(test_name)
         .arg("--ignored")
         .arg("--exact")
         .arg("--nocapture")
@@ -437,22 +612,19 @@ fn spawn_live_child(root: &Path, ready: Option<&Path>) -> Child {
     if let Some(ready) = ready {
         command.env("KUBERIC_MSSQL_SIGNAL_READY_FILE", ready);
     }
+    if let Some(checkpoint) = checkpoint {
+        command.env("KUBERIC_MSSQL_FAULT_CHECKPOINT", checkpoint);
+    }
     command.spawn().expect("spawn exact live child")
 }
 
 fn spawn_live_child_with_fault(root: &Path, checkpoint: &str) -> Child {
-    let mut child = Command::new(std::env::current_exe().expect("current live test executable"));
-    child
-        .arg("three_replica_mssql_happy_path")
-        .arg("--ignored")
-        .arg("--exact")
-        .arg("--nocapture")
-        .arg("--test-threads=1")
-        .env("KUBERIC_MSSQL_THREE_REPLICA_ROOT", root)
-        .env("KUBERIC_MSSQL_FAULT_CHECKPOINT", checkpoint)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    child.spawn().expect("spawn fault-injected live child")
+    let test_name = if checkpoint == "fail-after-agent-restart" {
+        SAME_ROOT_RESTART_TEST
+    } else {
+        HAPPY_PATH_TEST
+    };
+    spawn_test_child(root, test_name, None, Some(checkpoint))
 }
 
 fn spawn_cleanup_child(root: &Path) -> Child {
@@ -565,7 +737,31 @@ fn assert_exact_reports(
             || report.write_status != expected_write as i32
             || report.role != expected_role as i32
         {
-            return Err("Kuberic report differs from the exact fenced topology".into());
+            return Err(format!(
+                "Kuberic report differs from the exact fenced topology: ordinal={}, \
+                 resource_uid={}, identity={:?}, session={}, replica_id={}, pod_uid={}, \
+                 pvc_uid={}, storage_state={}, fault={}, previous_configuration={}, \
+                 current_configuration={}, progress={}, capability={:?}, healthy={}, \
+                 read_status={}, write_status={}, role={}",
+                pod.ordinal,
+                report.resource_uid,
+                report.identity,
+                report.process_session_id,
+                report.replica_id,
+                report.pod_uid,
+                report.pvc_uid,
+                report.storage_state,
+                report.reported_fault,
+                report.previous_configuration.is_some(),
+                report.current_configuration.is_some(),
+                report.current_progress,
+                report.catch_up_capability,
+                report.healthy,
+                report.read_status,
+                report.write_status,
+                report.role,
+            )
+            .into());
         }
     }
     if reports
@@ -582,6 +778,31 @@ fn assert_exact_reports(
         return Err("Kuberic reports do not expose one primary and two active secondaries".into());
     }
     Ok(())
+}
+
+async fn wait_for_exact_reports(
+    group: &PublicMssqlGroup,
+    configuration_sequence: i64,
+    timeout: Duration,
+) -> Result<[proto::AgentStatusReport; 3], TestError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or("public report convergence exceeded its deadline")?;
+        let reports = tokio::time::timeout(remaining, group.reports_bracketed())
+            .await
+            .map_err(|_| "public bracketed reporting exceeded its deadline")??;
+        match assert_exact_reports(group, &reports, configuration_sequence) {
+            Ok(()) => return Ok(reports),
+            Err(error) => {
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .ok_or(error)?;
+                tokio::time::sleep(remaining.min(Duration::from_millis(20))).await;
+            }
+        }
+    }
 }
 
 fn assert_removed(root: &Path) {

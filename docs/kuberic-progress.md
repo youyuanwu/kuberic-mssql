@@ -214,17 +214,24 @@ Role is not write authority. No SQL external write lease is acquired. The
 replicated marker is written only by the fixture administrator against the
 directly observed native primary.
 
-The pre-implementation feasibility run completed the native path on the same
-pinned image with one primary, two synchronized healthy secondaries, common
-configuration sequence `4294967307`, and the same marker visible on all three.
-The final ignored test additionally proves the three fenced Kuberic reports,
-handled-signal and SIGKILL recovery, fault checkpoints and exact cleanup.
+The licensed same-root restart test stops all three public hosts while retaining
+the SQL Server availability group and durable roots. Replacement hosts receive
+fresh process sessions, commands targeting every superseded session are
+rejected, exact reports reconverge within the bounded publication deadline, and
+the replicated marker remains readable from every native member. SQL Server
+processes are not restarted.
+
+The ignored live tests additionally prove handled-signal and SIGKILL recovery,
+post-AG, post-agent, report-stage and post-restart fault checkpoints, exact
+cleanup, and a successful restart retry.
 
 The workspace tracks Kuberic `main`, with `Cargo.lock` recording the exact
-revision used by locked builds. The branch includes formal custom-authority fix
-`0784b7b8fc18c3f68c34c3bc1e1035412c027de9` and merged
-[Kuberic PR #127](https://github.com/youyuanwu/kuberic/pull/127), which adds the
-testing listener-adoption API required for exact endpoint ownership.
+revision used by locked builds. The current pin
+`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f` is the merge commit of
+[youyuanwu/kuberic#133](https://github.com/youyuanwu/kuberic/pull/133), which
+fixes custom-authority recovery and serializes peer replacement across
+same-root host replacement. It also contains the listener-adoption API from
+[youyuanwu/kuberic#127](https://github.com/youyuanwu/kuberic/pull/127).
 
 ## Usage
 
@@ -302,14 +309,10 @@ This integration does not yet provide:
 
 Those stages require separate design and safety review.
 
-The pinned Kuberic revision can transiently cancel custom-authority
-restoration under real live observation timing. The runtime and server-free
-public-host tests prove durable same-root restart and stale-session rejection;
-licensed same-root restart remains deferred until the restoration-ownership fix
-is available in the pinned dependency. The later unpinned Kuberic commit
-`301d7f364744aea4dd2513dcc8179d3588fd7dd7` includes that ownership fix; this
-workspace deliberately remains pinned to
-`b2cbbf266d4791ef15df908a9ae23b79fed33c5c`.
+The current Kuberic pin validates durable same-root public-host restart under
+real licensed observation timing. That evidence covers Kuberic host replacement
+only; SQL Server process ownership/restart, Kubernetes lifecycle, native member
+replacement, and failover remain deferred above.
 
 ## References
 

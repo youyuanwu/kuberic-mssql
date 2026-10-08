@@ -102,6 +102,9 @@ With empty authorized roots, startup initializes Kuberic metadata and writes
 the application binding. Reusing those roots reopens established state only
 when the supplied identities, bound paths, observer target and topology still
 match; the reopened process receives a new session, and mismatches fail closed.
+The licensed three-replica validation also stops all public hosts, reopens the
+same roots with fresh sessions, rejects commands targeting the superseded
+sessions, and reconverges exact reports without restarting SQL Server.
 
 SIGINT and SIGTERM cancel initialization or request bounded runtime shutdown.
 Operational and cleanup failures are retained together instead of being
@@ -384,10 +387,11 @@ mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59
 ```
 
 It currently tracks the Kuberic `main` branch. `Cargo.lock` resolves the exact
-revision used by reproducible builds; the current revision includes formal
-authority fix `0784b7b8fc18c3f68c34c3bc1e1035412c027de9` and merged
-[Kuberic PR #127](https://github.com/youyuanwu/kuberic/pull/127), which supplies
-the testing listener handoff required by this fixture.
+revision used by reproducible builds; the current revision is the merged
+[Kuberic PR #133](https://github.com/youyuanwu/kuberic/pull/133) commit
+`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f`. It includes
+the custom-authority same-root recovery fix and the earlier testing listener
+handoff from [Kuberic PR #127](https://github.com/youyuanwu/kuberic/pull/127).
 
 The test crate constructs an affirmative `SqlServerEulaAcknowledgement` through
 the clearly test-only `FixtureConfig` path and injects exactly
@@ -399,6 +403,7 @@ Run the exact dedicated command with an optional fixture root:
 
 ```bash
 just test-live-three-replica [root]
+just test-live-three-replica-restart [root]
 ```
 
 For example:
@@ -406,6 +411,7 @@ For example:
 ```bash
 just test-live-three-replica
 just test-live-three-replica target/my-mssql-three-replica
+just test-live-three-replica-restart
 ```
 
 Production and future launchers retain explicit
@@ -437,8 +443,9 @@ otherwise unverifiable resources remain untouched and block reuse. The signal
 recipe interrupts an owned launch with SIGTERM, recovers it, reruns the
 complete happy path, and verifies idempotent cleanup. The recovery recipe also
 executes real SIGINT and SIGKILL subprocess cases. The fault recipe injects a
-post-AG failure, an actual panic after agent startup, and a report-stage failure;
-each is followed by a separate exact cleanup process and a final retry.
+post-AG failure, an actual panic after agent startup, a report-stage failure,
+and a failure after same-root replacement startup; each is followed by a
+separate exact cleanup process and a final same-root restart retry.
 
 Direct test commands remain available:
 
@@ -447,6 +454,8 @@ cargo test --locked -p kuberic-mssql-tests --test live_one_replica \
   one_replica_mssql_observation_and_cli -- --ignored --exact --test-threads=1
 cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
   three_replica_mssql_happy_path -- --ignored --exact --test-threads=1
+cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
+  three_replica_mssql_same_root_restart -- --ignored --exact --test-threads=1
 ```
 
 An explicitly requested live test fails if any of its prerequisites are

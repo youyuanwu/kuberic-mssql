@@ -278,6 +278,11 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
     );
     assert!(justfile.contains("cleanup-live-one-replica root=\"target/mssql-one-replica\":"));
     assert!(justfile.contains("test-live-three-replica root=\"target/mssql-three-replica\":"));
+    assert!(
+        justfile.contains(
+            "test-live-three-replica-restart root=\"target/mssql-three-replica-restart\":"
+        )
+    );
     assert!(justfile.contains("cleanup-live-three-replica root=\"target/mssql-three-replica\":"));
     assert!(
         justfile
@@ -295,7 +300,7 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
             .lines()
             .filter(|line| line.contains("env -u SQLSERVER_TEST_EULA_ACCEPTED"))
             .count(),
-        8
+        9
     );
     assert!(!justfile.contains("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT"));
     assert!(!justfile.contains("acknowledgement root="));
@@ -304,6 +309,9 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
     );
     assert!(justfile.contains(
         "cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_happy_path -- --ignored --exact --test-threads=1"
+    ));
+    assert!(justfile.contains(
+        "cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_same_root_restart -- --ignored --exact --test-threads=1 --nocapture"
     ));
     assert!(justfile.contains(
         "cargo run --locked -p kuberic-mssql-tests --bin mssql-three-replica-fixture -- cleanup --root"
@@ -317,16 +325,23 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         assert!(!line.contains("test-live-three-replica"));
         assert!(!line.contains("test-live-one-replica"));
     }
+    assert!(
+        justfile.contains("cargo test --locked --workspace --all-features -- --test-threads=1")
+    );
     let ci = justfile
         .lines()
         .find(|line| line.starts_with("ci:"))
         .unwrap();
     assert_eq!(
         ci,
-        "ci: setup check test-live-one-replica test-live-three-replica"
+        "ci: setup check test-live-one-replica test-live-three-replica test-live-three-replica-restart"
     );
     assert!(
         ci.find("test-live-one-replica").unwrap() < ci.find("test-live-three-replica").unwrap()
+    );
+    assert!(
+        ci.find("test-live-three-replica").unwrap()
+            < ci.find("test-live-three-replica-restart").unwrap()
     );
     assert!(justfile.contains("cleanup: cleanup-live-one-replica cleanup-live-three-replica"));
     assert!(!justfile.contains("sqlserver_fixture.py"));

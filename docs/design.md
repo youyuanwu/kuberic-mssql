@@ -345,11 +345,13 @@ write uses its private administrator connection to the directly observed native
 primary and is not a Kuberic client-access decision.
 
 The current implementation tracks Kuberic `main`; `Cargo.lock` freezes the
-exact revision used by each build. The branch includes formal authority fix
-`0784b7b8fc18c3f68c34c3bc1e1035412c027de9` and merged
-[youyuanwu/kuberic#127](https://github.com/youyuanwu/kuberic/pull/127), which
-adds the testing-only bound-listener handoff required by the three-runtime
-fixture.
+exact revision used by each build. The current pin
+`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f` is the merge commit of
+[youyuanwu/kuberic#133](https://github.com/youyuanwu/kuberic/pull/133), which
+fixes custom-authority recovery and serializes peer replacement when public
+hosts reopen the same durable roots. It also includes the testing-only
+bound-listener handoff from
+[youyuanwu/kuberic#127](https://github.com/youyuanwu/kuberic/pull/127).
 
 ## Delivery Sequence
 
@@ -406,12 +408,14 @@ is persisted before create dispatch, cleanup revalidates immutable IDs and
 attributes. Both fixture families persist intent before create dispatch, refuse
 foreign or replaced resources, and perform bounded recovery without requiring
 SQL Server availability. `just cleanup` invokes both exact cleanup binaries.
-Three-replica fault, signal and recovery cases remain explicitly invoked.
-This does not
-advance the production delivery sequence. It provides healthy-path evidence
-only: it does not test
-write-lease expiry, old-primary fencing, switchover, failover, replica
-replacement, Kubernetes lifecycle, or client routing.
+The three-runtime validation also performs a host-only same-root restart:
+replacement processes receive fresh sessions, stale-session commands are
+rejected, exact reports reconverge, and native marker continuity is retained.
+Fault, signal and recovery cases remain explicitly invoked, including failure
+after replacement-host startup followed by exact cleanup and retry. This does
+not advance the production delivery sequence: it does not test SQL Server
+process restart, write-lease expiry, old-primary fencing, switchover, failover,
+replica replacement, Kubernetes lifecycle, or client routing.
 
 ## References
 
