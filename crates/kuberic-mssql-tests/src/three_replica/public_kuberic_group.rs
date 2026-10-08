@@ -15,9 +15,10 @@ use kuberic_mssql::runtime_host::{
 };
 use kuberic_mssql::tds::TdsExecutor;
 use kuberic_mssql::{NativeRole, Observation};
+use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::application::StatefulServiceReplica;
 use kuberic_runtime::control::proto::{self as wire, agent_control_client::AgentControlClient};
-use kuberic_runtime::host::{ReplicaHost, RunningReplica};
+use kuberic_runtime::host::{HostError, ReplicaHost, RunningReplica};
 use kuberic_runtime::protocol::types::{
     ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch, PodUid, PvcUid,
     ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
@@ -39,6 +40,8 @@ pub struct PublicMssqlPod {
     pub identity: ReplicaIdentity,
     pub session: kuberic_runtime::protocol::types::ProcessSessionId,
     pub stable_role: ReplicaRole,
+    pub pod_uid: PodUid,
+    pub pvc_uid: PvcUid,
     resource_uid: ResourceUid,
     control_address: SocketAddr,
     running: Option<RunningReplica>,
@@ -58,7 +61,7 @@ pub struct PublicMssqlGroup {
 
 struct HostAttempt {
     shutdown: tokio::sync::watch::Sender<bool>,
-    task: tokio::task::JoinHandle<kuberic_runtime::host::Result<Option<RunningReplica>>>,
+    task: Option<tokio::task::JoinHandle<kuberic_runtime::host::Result<Option<RunningReplica>>>>,
 }
 
 struct RuntimeConfigContext<'a> {
@@ -139,13 +142,15 @@ impl PublicMssqlGroup {
             let (shutdown, receiver) = tokio::sync::watch::channel(false);
             attempts.push(HostAttempt {
                 shutdown,
-                task: tokio::spawn(host.start_with_shutdown(receiver)),
+                task: Some(tokio::spawn(host.start_with_shutdown(receiver))),
             });
             pods.push(PublicMssqlPod {
                 ordinal: index as u8 + 1,
                 identity: identities[index].clone(),
                 session: Default::default(),
                 stable_role: roles[index],
+                pod_uid: PodUid::new(run.kuberic_members[index].pod_uid.clone()),
+                pvc_uid: PvcUid::new(run.kuberic_members[index].pvc_uid.clone()),
                 resource_uid: resource_uid.clone(),
                 control_address: controls[index],
                 running: None,
@@ -160,24 +165,66 @@ impl PublicMssqlGroup {
         let result = async {
             validate_observations(&pods, native_binding, operation_timeout, complete_deadline)
                 .await?;
-            let initialization_sessions = initialization_sessions(&pods, operation_timeout).await?;
-            initialize(
-                &pods,
-                run,
-                &identities,
-                &configuration,
-                &effective_policy,
-                &initialization_sessions,
-                operation_timeout,
-            )
-            .await?;
-            for (index, attempt) in attempts.iter_mut().enumerate() {
-                let joined = timeout(
+            let startup_reports =
+                startup_reports(&mut pods, &mut attempts, operation_timeout).await?;
+            let uninitialized = startup_reports
+                .iter()
+                .filter(|report| {
+                    report.storage_state == wire::AgentStorageState::Uninitialized as i32
+                })
+                .count();
+            let initialized = startup_reports
+                .iter()
+                .filter(|report| {
+                    report.storage_state == wire::AgentStorageState::Initialized as i32
+                })
+                .count();
+            if uninitialized != 0 && initialized != 0 {
+                return Err(MssqlGroupError::new(
+                    "public Kuberic stores have mixed fresh and established state",
+                ));
+            }
+            if uninitialized == pods.len() {
+                let initialization_sessions = startup_reports
+                    .iter()
+                    .map(|report| report.process_session_id.clone())
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .map_err(|_| {
+                        MssqlGroupError::new("exactly three initialization sessions required")
+                    })?;
+                initialize(
+                    &pods,
+                    run,
+                    &identities,
+                    &configuration,
+                    &effective_policy,
+                    &initialization_sessions,
                     operation_timeout,
-                    "public Kuberic readiness",
-                    &mut attempt.task,
                 )
                 .await?;
+            } else if initialized != pods.len() {
+                return Err(MssqlGroupError::new(
+                    "public Kuberic storage state is neither fresh nor established",
+                ));
+            }
+            for (index, attempt) in attempts.iter_mut().enumerate() {
+                if pods[index].running.is_some() {
+                    continue;
+                }
+                let mut task = attempt
+                    .task
+                    .take()
+                    .ok_or_else(|| MssqlGroupError::new("public host task is missing"))?;
+                let joined =
+                    timeout(operation_timeout, "public Kuberic readiness", &mut task).await;
+                let joined = match joined {
+                    Ok(joined) => joined,
+                    Err(error) => {
+                        attempt.task = Some(task);
+                        return Err(error);
+                    }
+                };
                 let started = joined.map_err(display_error)?;
                 let running = started
                     .map_err(display_error)?
@@ -254,13 +301,22 @@ impl PublicMssqlGroup {
                     Ok(Err(error)) => errors.push(error.to_string()),
                     Err(_) => {
                         pod.application.abort();
-                        match running.wait().await {
-                            Ok(()) => errors.push(format!(
+                        match tokio::time::timeout(
+                            cleanup.remaining().min(Duration::from_secs(10)),
+                            running.wait(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => errors.push(format!(
                                 "member {} shutdown exceeded its deadline",
                                 pod.ordinal
                             )),
-                            Err(error) => errors.push(format!(
+                            Ok(Err(error)) => errors.push(format!(
                                 "member {} shutdown timed out and abort failed: {error}",
+                                pod.ordinal
+                            )),
+                            Err(_) => errors.push(format!(
+                                "member {} termination remains unconfirmed after abort",
                                 pod.ordinal
                             )),
                         }
@@ -405,17 +461,54 @@ fn configuration(
     ))
 }
 
-async fn initialization_sessions(
-    pods: &[PublicMssqlPod; 3],
+async fn startup_reports(
+    pods: &mut [PublicMssqlPod; 3],
+    attempts: &mut [HostAttempt],
     timeout_duration: Duration,
-) -> Result<[String; 3], MssqlGroupError> {
-    let mut sessions = Vec::new();
-    for pod in pods {
-        sessions.push(status(pod, timeout_duration).await?.1.process_session_id);
+) -> Result<[wire::AgentStatusReport; 3], MssqlGroupError> {
+    let mut reports = Vec::new();
+    for index in 0..3 {
+        enum StartupOutcome {
+            Report(Box<wire::AgentStatusReport>),
+            Task(
+                Result<
+                    kuberic_runtime::host::Result<Option<RunningReplica>>,
+                    tokio::task::JoinError,
+                >,
+            ),
+        }
+        let outcome = {
+            let task = attempts[index]
+                .task
+                .as_mut()
+                .ok_or_else(|| MssqlGroupError::new("public host task is missing"))?;
+            tokio::select! {
+                report = async {
+                    status(&pods[index], timeout_duration)
+                        .await
+                        .map(|(_, report)| Box::new(report))
+                } => {
+                    StartupOutcome::Report(report?)
+                }
+                result = task => StartupOutcome::Task(result),
+            }
+        };
+        match outcome {
+            StartupOutcome::Report(report) => reports.push(*report),
+            StartupOutcome::Task(result) => {
+                attempts[index].task.take();
+                let running = result
+                    .map_err(display_error)?
+                    .map_err(display_error)?
+                    .ok_or_else(|| MssqlGroupError::new("public host startup was cancelled"))?;
+                pods[index].running = Some(running);
+                reports.push(status(&pods[index], timeout_duration).await?.1);
+            }
+        }
     }
-    sessions
+    reports
         .try_into()
-        .map_err(|_| MssqlGroupError::new("exactly three initialization sessions required"))
+        .map_err(|_| MssqlGroupError::new("exactly three startup reports required"))
 }
 
 async fn initialize(
@@ -489,26 +582,14 @@ async fn ensure_configuration(
             sessions.push(report.process_session_id);
         }
         let results = join_all(clients.into_iter().enumerate().map(|(index, mut client)| {
-            let request = authorized(wire::ExecuteCommandRequest {
-                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
-                resource_uid: resource_uid.to_string(),
-                target: Some(identities[index].clone().into()),
-                expected_process_session_id: sessions[index].clone(),
-                command: Some(wire::execute_command_request::Command::EnsureConfiguration(
-                    Box::new(wire::EnsureConfigurationCommand {
-                        operation_id: format!("bootstrap-configuration-{}", index + 1),
-                        current_configuration: Some(configuration.clone().into()),
-                        current_epoch: Some(configuration.epoch.into()),
-                        effective_policy: Some(policy.clone().into()),
-                        local_replica_id: identities[index].replica_id.value(),
-                        expected_instance_id: identities[index].instance_id.to_string(),
-                        expected_agent_generation: identities[index].agent_generation.to_string(),
-                        transition_kind: wire::TransitionKind::Bootstrap as i32,
-                        primary_write_status: wire::AccessStatus::ReconfigurationPending as i32,
-                        ..Default::default()
-                    }),
-                )),
-            });
+            let request = configuration_request(
+                resource_uid,
+                configuration,
+                policy,
+                &identities[index],
+                &kuberic_runtime::protocol::types::ProcessSessionId::new(sessions[index].clone()),
+                &format!("bootstrap-configuration-{}", index + 1),
+            );
             async move { client.execute(request).await }
         }))
         .await;
@@ -533,6 +614,36 @@ async fn ensure_configuration(
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+fn configuration_request(
+    resource_uid: &ResourceUid,
+    configuration: &ConfigurationDescriptor,
+    policy: &EffectivePolicy,
+    identity: &ReplicaIdentity,
+    session: &kuberic_runtime::protocol::types::ProcessSessionId,
+    operation_id: &str,
+) -> Request<wire::ExecuteCommandRequest> {
+    authorized(wire::ExecuteCommandRequest {
+        protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+        resource_uid: resource_uid.to_string(),
+        target: Some(identity.clone().into()),
+        expected_process_session_id: session.to_string(),
+        command: Some(wire::execute_command_request::Command::EnsureConfiguration(
+            Box::new(wire::EnsureConfigurationCommand {
+                operation_id: operation_id.into(),
+                current_configuration: Some(configuration.clone().into()),
+                current_epoch: Some(configuration.epoch.into()),
+                effective_policy: Some(policy.clone().into()),
+                local_replica_id: identity.replica_id.value(),
+                expected_instance_id: identity.instance_id.to_string(),
+                expected_agent_generation: identity.agent_generation.to_string(),
+                transition_kind: wire::TransitionKind::Bootstrap as i32,
+                primary_write_status: wire::AccessStatus::ReconfigurationPending as i32,
+                ..Default::default()
+            }),
+        )),
+    })
 }
 
 async fn status(
@@ -663,8 +774,11 @@ async fn cancel_attempts(
         attempt.shutdown.send_replace(true);
     }
     for (index, attempt) in attempts.iter_mut().enumerate() {
+        let Some(mut task) = attempt.task.take() else {
+            continue;
+        };
         let deadline = cleanup.remaining().min(Duration::from_secs(10));
-        match tokio::time::timeout(deadline, &mut attempt.task).await {
+        match tokio::time::timeout(deadline, &mut task).await {
             Ok(Ok(Ok(Some(mut running)))) => {
                 running.shutdown();
                 tokio::time::timeout(deadline, running.wait())
@@ -675,10 +789,12 @@ async fn cancel_attempts(
                     .map_err(display_error)?;
             }
             Ok(Ok(Ok(None))) => {}
+            Ok(Ok(Err(HostError::Runtime(KubericRuntimeError::OperationCancelled)))) => {}
             Ok(Ok(Err(error))) => return Err(display_error(error)),
             Ok(Err(error)) => return Err(display_error(error)),
             Err(_) => {
                 pods[index].application.abort();
+                attempt.task = Some(task);
                 return Err(MssqlGroupError::termination_unconfirmed(format!(
                     "member {} startup cancellation timed out",
                     index + 1

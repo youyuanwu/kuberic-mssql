@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use kuberic_mssql_tests::three_replica::{
-    CLEANUP_BUDGET, CancellationSignals, CleanupCoordinator, CombinedFixtureError, FixtureConfig,
-    HandledCancellationSignal, JournalStore, OwnershipJournal, PublicMssqlGroup, ResourceState,
-    RunState, SystemCleanupClock, cleanup_three_replica_fixture, launch_three_members,
+    CLEANUP_BUDGET, CancellationSignals, CleanupClock, CleanupCoordinator, CombinedFixtureError,
+    FixtureConfig, HandledCancellationSignal, JournalStore, MssqlGroupError, NativeTopologyBinding,
+    OwnershipJournal, PublicMssqlGroup, ReadyMember, ResourceState, RunState, SystemCleanupClock,
+    TopologyRun, cleanup_three_replica_fixture, launch_three_members,
 };
 use kuberic_runtime::control::proto;
 
@@ -176,6 +177,46 @@ async fn run_three_replica_mssql_happy_path() {
     }
 }
 
+async fn start_public_group_with_retry<C: CleanupClock>(
+    root: &Path,
+    run: &TopologyRun,
+    native_binding: &NativeTopologyBinding,
+    members: &[ReadyMember; 3],
+    convergence_timeout: Duration,
+    first_deadline: Instant,
+    cleanup: &CleanupCoordinator<C>,
+) -> Result<PublicMssqlGroup, MssqlGroupError> {
+    for attempt in 1..=3 {
+        let deadline = if attempt == 1 {
+            first_deadline
+        } else {
+            Instant::now() + convergence_timeout
+        };
+        match PublicMssqlGroup::from_live_with_coordinator(
+            root,
+            run,
+            native_binding,
+            members,
+            convergence_timeout,
+            deadline,
+            cleanup,
+        )
+        .await
+        {
+            Ok(group) => return Ok(group),
+            Err(error)
+                if !error.agent_termination_unconfirmed()
+                    && error.to_string().contains("operation was cancelled")
+                    && attempt < 3 =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded public Kuberic retry loop always returns")
+}
+
 async fn execute_live_lifecycle(
     root: &Path,
     config: FixtureConfig,
@@ -198,7 +239,7 @@ async fn execute_live_lifecycle(
     }
     let cleanup_clock = SystemCleanupClock::default();
     let cleanup = CleanupCoordinator::new(cleanup_clock, CLEANUP_BUDGET);
-    let group = match AssertUnwindSafe(PublicMssqlGroup::from_live_with_coordinator(
+    let group = match AssertUnwindSafe(start_public_group_with_retry(
         root,
         &launched.run,
         &native_binding,
@@ -493,7 +534,6 @@ fn assert_exact_reports(
     reports: &[proto::AgentStatusReport; 3],
     configuration_sequence: i64,
 ) -> Result<(), TestError> {
-    let configuration_id = group.configuration.configuration_id.as_str();
     for (pod, report) in group.pods.iter().zip(reports) {
         let expected_role = match pod.stable_role {
             kuberic_runtime::protocol::types::ReplicaRole::Primary => proto::ReplicaRole::Primary,
@@ -502,19 +542,26 @@ fn assert_exact_reports(
             }
             _ => return Err("public Kuberic pod has an unstable role".into()),
         };
+        let expected_write =
+            if pod.stable_role == kuberic_runtime::protocol::types::ReplicaRole::Primary {
+                proto::AccessStatus::ReconfigurationPending
+            } else {
+                proto::AccessStatus::NotPrimary
+            };
         if report.resource_uid != group.resource_uid.as_str()
+            || report.identity != Some(pod.identity.clone().into())
             || report.process_session_id != pod.session.as_str()
             || report.replica_id != pod.identity.replica_id.value()
+            || report.pod_uid != pod.pod_uid.as_str()
+            || report.pvc_uid != pod.pvc_uid.as_str()
+            || report.storage_state != proto::AgentStorageState::Initialized as i32
+            || report.reported_fault == proto::FaultType::Permanent as i32
             || report.previous_configuration.is_some()
-            || report
-                .current_configuration
-                .as_ref()
-                .map(|configuration| configuration.configuration_id.as_str())
-                != Some(configuration_id)
+            || report.current_configuration != Some(group.configuration.clone().into())
             || report.current_progress != configuration_sequence
             || report.catch_up_capability != Some(configuration_sequence)
             || !report.healthy
-            || report.write_status == proto::AccessStatus::Granted as i32
+            || report.write_status != expected_write as i32
             || report.role != expected_role as i32
         {
             return Err("Kuberic report differs from the exact fenced topology".into());
