@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 use futures::FutureExt;
 use kuberic_mssql_tests::three_replica::{
     CLEANUP_BUDGET, CancellationSignals, CleanupClock, CleanupCoordinator, CombinedFixtureError,
-    FixtureConfig, HandledCancellationSignal, JournalStore, MssqlGroupError, NativeTopologyBinding,
-    OwnershipJournal, PublicMssqlGroup, ReadyMember, ResourceState, RunState, SystemCleanupClock,
-    TopologyRun, cleanup_three_replica_fixture, launch_three_members,
+    FixtureConfig, HandledCancellationSignal, JournalStore, LaunchedMembers, MssqlGroupError,
+    NativeTopologyBinding, OwnershipJournal, PublicMssqlGroup, ReadyMember, ResourceState,
+    RunState, SystemCleanupClock, TopologyRun, cleanup_three_replica_fixture, launch_three_members,
 };
 use kuberic_runtime::control::proto;
 
@@ -22,16 +22,26 @@ type TestError = Box<dyn Error + Send + Sync>;
 #[test]
 #[ignore = "auto-accepts the SQL Server EULA for this test fixture and requires a qualified local Docker host"]
 fn three_replica_mssql_happy_path() {
+    run_three_replica_test(false);
+}
+
+#[test]
+#[ignore = "reproduces Kuberic same-root replacement startup cancellation with a licensed SQL Server fixture"]
+fn three_replica_mssql_same_root_restart_repro() {
+    run_three_replica_test(true);
+}
+
+fn run_three_replica_test(restart_repro: bool) {
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
-        .spawn(|| {
+        .spawn(move || {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .thread_stack_size(32 * 1024 * 1024)
                 .enable_all()
                 .build()
                 .expect("three-replica Tokio runtime")
-                .block_on(run_three_replica_mssql_happy_path());
+                .block_on(run_three_replica_mssql_happy_path(restart_repro));
         })
         .expect("three-replica test thread")
         .join()
@@ -155,7 +165,7 @@ fn three_replica_post_ag_and_report_fault_checkpoints_recover() {
     assert_removed(&root);
 }
 
-async fn run_three_replica_mssql_happy_path() {
+async fn run_three_replica_mssql_happy_path(restart_repro: bool) {
     let mut cancellation =
         CancellationSignals::register().expect("install SIGINT/SIGTERM cleanup handlers");
     write_signal_handler_ready_evidence();
@@ -165,9 +175,14 @@ async fn run_three_replica_mssql_happy_path() {
     );
     let config =
         FixtureConfig::for_test_fixture(&root).expect("validated test-only fixture config");
-    match AssertUnwindSafe(execute_live_lifecycle(&root, config, &mut cancellation))
-        .catch_unwind()
-        .await
+    match AssertUnwindSafe(execute_live_lifecycle(
+        &root,
+        config,
+        &mut cancellation,
+        restart_repro,
+    ))
+    .catch_unwind()
+    .await
     {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -221,6 +236,7 @@ async fn execute_live_lifecycle(
     root: &Path,
     config: FixtureConfig,
     cancellation: &mut CancellationSignals,
+    restart_repro: bool,
 ) -> Result<(), TestError> {
     let mut launched = launch_three_members(config)
         .await
@@ -237,8 +253,7 @@ async fn execute_live_lifecycle(
     if native_binding != topology.binding {
         return Err("journaled native binding changed".into());
     }
-    let cleanup_clock = SystemCleanupClock::default();
-    let cleanup = CleanupCoordinator::new(cleanup_clock, CLEANUP_BUDGET);
+    let startup_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
     let group = match AssertUnwindSafe(start_public_group_with_retry(
         root,
         &launched.run,
@@ -246,7 +261,7 @@ async fn execute_live_lifecycle(
         &launched.members,
         launched.kuberic_convergence_timeout(),
         launched.complete_deadline(),
-        &cleanup,
+        &startup_cleanup,
     ))
     .catch_unwind()
     .await
@@ -263,7 +278,7 @@ async fn execute_live_lifecycle(
                 }
                 return Err(diagnostic.into());
             }
-            let fixture_cleanup = launched.cleanup_with_coordinator(&cleanup);
+            let fixture_cleanup = launched.cleanup_with_coordinator(&startup_cleanup);
             return match fixture_cleanup {
                 Ok(_) => Err(Box::new(error)),
                 Err(cleanup) => Err(format!(
@@ -273,7 +288,7 @@ async fn execute_live_lifecycle(
             };
         }
         Err(panic) => {
-            let fixture_cleanup = launched.cleanup_with_coordinator(&cleanup);
+            let fixture_cleanup = launched.cleanup_with_coordinator(&startup_cleanup);
             if let Err(cleanup) = fixture_cleanup {
                 let primary = panic_message(&panic);
                 panic!(
@@ -283,7 +298,19 @@ async fn execute_live_lifecycle(
             std::panic::resume_unwind(panic);
         }
     };
-    let outcome = {
+    let first_resource_uid = group.resource_uid.clone();
+    let first_effective_policy = group.effective_policy.clone();
+    let first_configuration = group.configuration.clone();
+    let first_pods = group.pods.each_ref().map(|pod| {
+        (
+            pod.identity.clone(),
+            pod.stable_role,
+            pod.pod_uid.clone(),
+            pod.pvc_uid.clone(),
+        )
+    });
+    let first_sessions = group.pods.each_ref().map(|pod| pod.session.clone());
+    let first_outcome = {
         let runtime = AssertUnwindSafe(async {
             if fault_checkpoint("panic-after-agent-start") {
                 panic!("injected panic after agent startup");
@@ -310,10 +337,125 @@ async fn execute_live_lifecycle(
             signal = cancellation.recv() => RuntimeOutcome::Interrupted(signal),
         }
     };
-    let shutdown = group.shutdown_with_coordinator(&cleanup).await;
+    let first_shutdown_cleanup =
+        CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let shutdown = group
+        .shutdown_with_coordinator(&first_shutdown_cleanup)
+        .await;
     if let Err(shutdown) = shutdown {
         let diagnostic = format!(
             "{}; Kuberic shutdown failed before fixture cleanup: {shutdown}",
+            first_outcome.description()
+        );
+        if let Err(block) = launched.block_cleanup() {
+            return Err(
+                format!("{diagnostic}; ownership journal blocking also failed: {block}").into(),
+            );
+        }
+        return Err(diagnostic.into());
+    }
+    if !matches!(&first_outcome, RuntimeOutcome::Completed(Ok(Ok(())))) {
+        let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+        return finish_runtime_outcome(root, launched, first_outcome, &cleanup);
+    }
+    if !restart_repro {
+        let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+        return finish_runtime_outcome(root, launched, first_outcome, &cleanup);
+    }
+
+    let restart_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let restarted = match AssertUnwindSafe(start_public_group_with_retry(
+        root,
+        &launched.run,
+        &native_binding,
+        &launched.members,
+        launched.kuberic_convergence_timeout(),
+        launched.complete_deadline(),
+        &restart_cleanup,
+    ))
+    .catch_unwind()
+    .await
+    {
+        Ok(Ok(group)) => group,
+        Ok(Err(error)) => {
+            if error.agent_termination_unconfirmed() {
+                let diagnostic = format!("replacement Kuberic startup failed: {error}");
+                if let Err(block) = launched.block_cleanup() {
+                    return Err(format!(
+                        "{diagnostic}; ownership journal blocking also failed: {block}"
+                    )
+                    .into());
+                }
+                return Err(diagnostic.into());
+            }
+            let fixture_cleanup = launched.cleanup_with_coordinator(&restart_cleanup);
+            return match fixture_cleanup {
+                Ok(_) => Err(format!("replacement Kuberic startup failed: {error}").into()),
+                Err(cleanup) => Err(format!(
+                    "replacement Kuberic startup failed: {error}; cleanup also failed: {cleanup}"
+                )
+                .into()),
+            };
+        }
+        Err(panic) => {
+            let fixture_cleanup = launched.cleanup_with_coordinator(&restart_cleanup);
+            if let Err(cleanup) = fixture_cleanup {
+                let primary = panic_message(&panic);
+                panic!(
+                    "replacement Kuberic startup panicked: {primary}; cleanup also failed: {cleanup}"
+                );
+            }
+            std::panic::resume_unwind(panic);
+        }
+    };
+    let outcome = {
+        let runtime = AssertUnwindSafe(async {
+            if restarted.resource_uid != first_resource_uid
+                || restarted.effective_policy != first_effective_policy
+                || restarted.configuration != first_configuration
+                || restarted.pods.iter().zip(&first_pods).any(
+                    |(pod, (identity, role, pod_uid, pvc_uid))| {
+                        &pod.identity != identity
+                            || pod.stable_role != *role
+                            || &pod.pod_uid != pod_uid
+                            || &pod.pvc_uid != pvc_uid
+                    },
+                )
+            {
+                return Err::<(), TestError>(
+                    "replacement Kuberic hosts changed stable identity or authority".into(),
+                );
+            }
+            restarted
+                .assert_superseded_sessions_rejected(&first_sessions)
+                .await?;
+            if fault_checkpoint("fail-after-agent-restart") {
+                return Err("injected failure after replacement agent startup".into());
+            }
+            let reports = restarted.reports_bracketed().await?;
+            assert_exact_reports(&restarted, &reports, native_binding.configuration_sequence)?;
+            let marker = launched
+                .commit_replicated_marker(&topology.evidence)
+                .await?;
+            if marker.primary_ordinal != topology.evidence.primary_ordinal
+                || marker.readable_ordinals != [1, 2, 3]
+            {
+                return Err("post-restart marker was not readable from all exact members".into());
+            }
+            Ok(())
+        })
+        .catch_unwind();
+        tokio::pin!(runtime);
+        tokio::select! {
+            result = &mut runtime => RuntimeOutcome::Completed(result),
+            signal = cancellation.recv() => RuntimeOutcome::Interrupted(signal),
+        }
+    };
+    let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let shutdown = restarted.shutdown_with_coordinator(&cleanup).await;
+    if let Err(shutdown) = shutdown {
+        let diagnostic = format!(
+            "{}; replacement Kuberic shutdown failed before fixture cleanup: {shutdown}",
             outcome.description()
         );
         if let Err(block) = launched.block_cleanup() {
@@ -323,7 +465,16 @@ async fn execute_live_lifecycle(
         }
         return Err(diagnostic.into());
     }
-    let fixture_cleanup = launched.cleanup_with_coordinator(&cleanup);
+    finish_runtime_outcome(root, launched, outcome, &cleanup)
+}
+
+fn finish_runtime_outcome(
+    root: &Path,
+    launched: LaunchedMembers,
+    outcome: RuntimeOutcome,
+    cleanup: &CleanupCoordinator<SystemCleanupClock>,
+) -> Result<(), TestError> {
+    let fixture_cleanup = launched.cleanup_with_coordinator(cleanup);
     match (outcome, fixture_cleanup) {
         (RuntimeOutcome::Completed(Ok(Ok(()))), Ok(cleanup)) => {
             assert_eq!(cleanup.removed_container_ids.len(), 3);

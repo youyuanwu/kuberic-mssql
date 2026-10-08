@@ -283,6 +283,47 @@ impl PublicMssqlGroup {
             .map_err(|_| MssqlGroupError::new("exactly three public Kuberic reports required"))
     }
 
+    pub async fn assert_superseded_sessions_rejected(
+        &self,
+        superseded: &[kuberic_runtime::protocol::types::ProcessSessionId; 3],
+    ) -> Result<(), MssqlGroupError> {
+        for (index, (pod, session)) in self.pods.iter().zip(superseded).enumerate() {
+            if &pod.session == session {
+                return Err(MssqlGroupError::new(format!(
+                    "member {} did not replace its process session",
+                    pod.ordinal
+                )));
+            }
+            let (mut client, _) = status(pod, self.operation_timeout).await?;
+            let error = client
+                .execute(configuration_request(
+                    &self.resource_uid,
+                    &self.configuration,
+                    &self.effective_policy,
+                    &pod.identity,
+                    session,
+                    &format!("stale-restart-configuration-{}", index + 1),
+                ))
+                .await
+                .err()
+                .ok_or_else(|| {
+                    MssqlGroupError::new(format!(
+                        "member {} accepted a superseded process session",
+                        pod.ordinal
+                    ))
+                })?;
+            if error.code() != tonic::Code::FailedPrecondition
+                || !error.message().contains("stale agent process session")
+            {
+                return Err(MssqlGroupError::new(format!(
+                    "member {} returned an unexpected stale-session result: {error}",
+                    pod.ordinal
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn shutdown_with_coordinator(
         mut self,
         cleanup: &CleanupCoordinator<impl CleanupClock>,

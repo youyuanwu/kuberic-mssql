@@ -603,6 +603,8 @@ async fn reports(attempts: &[HostAttempt]) -> Vec<wire::AgentStatusReport> {
                 && report.reported_fault != wire::FaultType::Permanent as i32
                 && report.current_progress == 42
                 && report.catch_up_capability == Some(42)
+                && report.read_status == wire::AccessStatus::Granted as i32
+                && report.write_status != wire::AccessStatus::Granted as i32
         }) {
             return reports;
         }
@@ -615,6 +617,8 @@ async fn reports(attempts: &[HostAttempt]) -> Vec<wire::AgentStatusReport> {
                     report.replica_id,
                     report.healthy,
                     report.role,
+                    report.read_status,
+                    report.write_status,
                     report.current_progress,
                     report.catch_up_capability,
                     report
