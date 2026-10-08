@@ -112,7 +112,20 @@ pub async fn run_runtime_with_shutdown(
         result = &mut startup => (result, None),
         result = &mut shutdown => {
             startup_shutdown.send_replace(true);
-            (startup.await, Some(result))
+            match tokio::time::timeout(shutdown_deadline, &mut startup).await {
+                Ok(started) => (started, Some(result)),
+                Err(_) => {
+                    application.abort();
+                    let trigger = combine(
+                        result,
+                        Err(RuntimeProcessError::new(
+                            "runtime startup cancellation exceeded its deadline",
+                        )),
+                        "startup cancellation",
+                    );
+                    (startup.await, Some(trigger))
+                }
+            }
         }
     };
     let mut replica = match started {
@@ -168,12 +181,22 @@ async fn finish_shutdown(
 ) -> Result<(), RuntimeProcessError> {
     replica.shutdown();
     let completion = match completion {
-        Some(result) => result,
-        None => tokio::time::timeout(deadline, replica.wait())
-            .await
-            .map_err(|_| RuntimeProcessError::new("runtime shutdown acknowledgement timed out"))?,
-    }
-    .map_err(RuntimeProcessError::host);
+        Some(result) => result.map_err(RuntimeProcessError::host),
+        None => match tokio::time::timeout(deadline, replica.wait()).await {
+            Ok(result) => result.map_err(RuntimeProcessError::host),
+            Err(_) => {
+                application.abort();
+                let joined = replica.wait().await.map_err(RuntimeProcessError::host);
+                combine(
+                    Err(RuntimeProcessError::new(
+                        "runtime shutdown acknowledgement timed out",
+                    )),
+                    joined,
+                    "runtime completion after timeout",
+                )
+            }
+        },
+    };
     let result = combine(completion, trigger, "shutdown trigger");
     finish_application(application, result, deadline).await
 }
@@ -340,7 +363,7 @@ pub struct RuntimeProcessError {
 }
 
 impl RuntimeProcessError {
-    fn new(message: impl Into<String>) -> Self {
+    pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }

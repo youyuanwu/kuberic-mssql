@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use kuberic_mssql::runtime_host::{
+    RuntimeHostArgs, RuntimeHostConfig, RuntimeProcessError, run_runtime_with_shutdown,
+};
+
 fn runtime_binary() -> PathBuf {
     std::env::var_os("NEXTEST_BIN_EXE_kuberic_mssql_runtime_test")
         .or_else(|| std::env::var_os("CARGO_BIN_EXE_kuberic-mssql-runtime-test"))
@@ -108,6 +112,29 @@ fn command(root: &Path, files: &RuntimeFiles) -> Command {
     command
 }
 
+fn runtime_args(root: &Path, files: &RuntimeFiles) -> RuntimeHostArgs {
+    RuntimeHostArgs {
+        resource_uid: "resource-a".into(),
+        replica_id: 1,
+        pod_uid: "pod-1".into(),
+        pvc_uid: "pvc-1".into(),
+        data_root: root.join("state"),
+        application_root: None,
+        control_address: free_address().parse().unwrap(),
+        replication_address: free_address().parse().unwrap(),
+        control_endpoint: "http://127.0.0.1:50051".into(),
+        replication_endpoint: "http://127.0.0.1:50052".into(),
+        namespace: None,
+        peer_routes: Some(files.routes.clone()),
+        observer_config: files.observer.clone(),
+        topology_config: files.topology.clone(),
+        bearer_token_file: files.token.clone(),
+        rpc_deadline_ms: 5_000,
+        transport_window_capacity: 256,
+        shutdown_deadline_ms: 10_000,
+    }
+}
+
 #[test]
 fn runtime_help_has_no_inline_secret_mutation_deployment_or_client_surface() {
     let output = Command::new(runtime_binary())
@@ -188,4 +215,26 @@ async fn sigint_and_sigterm_cancel_fresh_startup_without_application_state() {
         assert!(output.stderr.is_empty());
         assert!(!temporary.path().join("state/application").exists());
     }
+}
+
+#[tokio::test]
+async fn startup_shutdown_failure_is_preserved_after_host_cleanup() {
+    let temporary = tempfile::tempdir().unwrap();
+    let files = files(temporary.path());
+    let config = RuntimeHostConfig::load(runtime_args(temporary.path(), &files), temporary.path())
+        .await
+        .unwrap();
+    let error = run_runtime_with_shutdown(config, async {
+        Err(RuntimeProcessError::new(
+            "injected shutdown trigger failure",
+        ))
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected shutdown trigger failure")
+    );
+    assert!(!temporary.path().join("state/application").exists());
 }
