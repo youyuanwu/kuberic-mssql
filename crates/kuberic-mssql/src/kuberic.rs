@@ -1077,7 +1077,8 @@ impl PrimaryReplicator for SqlServerReplicator {
             if (previous_topology.as_ref() != &candidate
                 && !topology_enriches(previous_topology, &candidate))
                 || (previous_configuration != &current
-                    && !configuration_enriches(previous_configuration, &current))
+                    && (configuration_is_complete(previous_configuration)
+                        || !configuration_enriches(previous_configuration, &current)))
             {
                 return Err(KubericAdapterError::TopologyBindingMismatch(
                     "current configuration replay differs from the admitted value",
@@ -1506,6 +1507,14 @@ fn configuration_enriches(
             && (matches!(old.role, ReplicaRole::None) || old.role == new.role)
             && old.current_progress == new.current_progress
             && old.catch_up_capability == new.catch_up_capability
+    })
+}
+
+fn configuration_is_complete(configuration: &ReplicaSetConfiguration) -> bool {
+    configuration.replicas.iter().all(|replica| {
+        !replica.process_session_id.is_empty()
+            && validate_replication_address(&replica.replication_address).is_ok()
+            && !matches!(replica.role, ReplicaRole::None)
     })
 }
 

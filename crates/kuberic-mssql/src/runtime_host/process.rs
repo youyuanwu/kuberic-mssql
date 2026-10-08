@@ -245,10 +245,6 @@ impl RuntimeHostApplication {
             self.binding.root().to_owned(),
         )])
     }
-
-    pub fn service(&self) -> &Arc<SqlServerService> {
-        &self.inner
-    }
 }
 
 #[async_trait]

@@ -1574,7 +1574,14 @@ async fn admitted_current_configuration_allows_only_value_identical_replay() {
     changed_session.replicas[0].process_session_id = ProcessSessionId::new("other-session");
     let mut changed_address = current;
     changed_address.replicas[1].replication_address = "other.example:5022".into();
-    for changed_replay in [changed_progress, changed_session, changed_address] {
+    let mut reordered = bound_replica_set();
+    reordered.replicas.reverse();
+    for changed_replay in [
+        changed_progress,
+        changed_session,
+        changed_address,
+        reordered,
+    ] {
         let message = application_error(
             replicator
                 .update_current_replica_set_configuration(changed_replay)
@@ -1641,12 +1648,13 @@ async fn incomplete_bootstrap_reports_native_capability_and_allows_one_way_peer_
             Ok(present(bound_snapshot())),
             Ok(present(bound_snapshot())),
             Ok(present(bound_snapshot())),
+            Ok(present(bound_snapshot())),
         ],
-        vec![OBSERVED_AT; 5],
+        vec![OBSERVED_AT; 6],
     )
     .await;
     replicator
-        .update_current_replica_set_configuration(incomplete)
+        .update_current_replica_set_configuration(incomplete.clone())
         .await
         .unwrap();
     replicator
@@ -1659,6 +1667,46 @@ async fn incomplete_bootstrap_reports_native_capability_and_allows_one_way_peer_
         .await
         .unwrap();
     assert_eq!(replicator.catch_up_capability().await.unwrap(), 42);
+    assert!(
+        application_error(
+            replicator
+                .update_current_replica_set_configuration(incomplete)
+                .await
+                .unwrap_err()
+        )
+        .contains("replay differs")
+    );
+}
+
+#[tokio::test]
+async fn concurrent_peer_enrichment_allows_exactly_one_completed_session_set() {
+    let mut incomplete = bound_replica_set();
+    for replica in &mut incomplete.replicas[1..] {
+        replica.process_session_id = ProcessSessionId::default();
+        replica.replication_address.clear();
+        replica.role = ReplicaRole::None;
+    }
+    let replicator = opened_bound_replicator(
+        vec![
+            Ok(present(bound_snapshot())),
+            Ok(present(bound_snapshot())),
+            Ok(present(bound_snapshot())),
+        ],
+        vec![OBSERVED_AT; 3],
+    )
+    .await;
+    replicator
+        .update_current_replica_set_configuration(incomplete)
+        .await
+        .unwrap();
+
+    let first = bound_replica_set();
+    let second = replica_set_with_session_prefix("competing-session");
+    let (first, second) = tokio::join!(
+        replicator.update_current_replica_set_configuration(first),
+        replicator.update_current_replica_set_configuration(second)
+    );
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
 }
 
 #[tokio::test]

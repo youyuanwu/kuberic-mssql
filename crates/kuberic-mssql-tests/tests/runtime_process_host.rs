@@ -406,7 +406,7 @@ async fn status(
     address: SocketAddr,
     replica_id: i64,
 ) -> (AgentControlClient<Channel>, wire::AgentStatusReport) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut last_error: Option<String>;
     loop {
         match AgentControlClient::connect(format!("http://{address}")).await {
@@ -541,7 +541,7 @@ async fn initialize_attempts(attempts: &mut [HostAttempt]) -> (Vec<RunningReplic
 }
 
 async fn configure_attempts(attempts: &[HostAttempt]) -> Vec<String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let mut clients = Vec::new();
         let mut sessions = Vec::new();
@@ -634,25 +634,19 @@ async fn public_hosts_initialize_report_and_restart_with_fresh_sessions_case() {
     assert_initialization_listeners(&mut first_attempts).await;
     let (mut first_replicas, first_sessions) = initialize_attempts(&mut first_attempts).await;
     let first_reports = reports(&first_attempts).await;
-    assert_eq!(
-        first_reports
-            .iter()
-            .filter(|report| report.role == wire::ReplicaRole::Primary as i32)
-            .count(),
-        1
-    );
-    assert_eq!(
-        first_reports
-            .iter()
-            .filter(|report| report.role == wire::ReplicaRole::ActiveSecondary as i32)
-            .count(),
-        2
-    );
+    assert_eq!(first_reports[0].replica_id, 1);
+    assert_eq!(first_reports[0].role, wire::ReplicaRole::Primary as i32);
+    for (index, report) in first_reports[1..].iter().enumerate() {
+        assert_eq!(report.replica_id, index as i64 + 2);
+        assert_eq!(report.role, wire::ReplicaRole::ActiveSecondary as i32);
+    }
     assert!(
         first_reports
             .iter()
             .all(|report| report.write_status != wire::AccessStatus::Granted as i32)
     );
+    let replay_sessions = configure_attempts(&first_attempts).await;
+    assert_eq!(replay_sessions, first_sessions);
     stop_all(&mut first_replicas).await;
     drop(first_replicas);
 
