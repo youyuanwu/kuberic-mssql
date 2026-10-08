@@ -501,3 +501,10 @@ async fn runtime_binding_rejects_extra_malformed_unsupported_and_symlinked_state
         Err(RuntimeBindingError::UnsafeState)
     );
 }
+
+#[test]
+fn shipped_peer_routes_example_is_valid() {
+    let routes =
+        PeerRoutes::from_json(include_bytes!("../../../runtime-peer-routes.example.json")).unwrap();
+    assert_eq!(routes.len(), 2);
+}

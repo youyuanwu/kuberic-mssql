@@ -182,3 +182,14 @@ fn topology_errors_do_not_echo_external_values() {
             .unwrap_err();
     assert!(!error.to_string().contains(sensitive));
 }
+
+#[test]
+fn shipped_runtime_topology_example_is_valid() {
+    let topology = SqlServerTopologyExpectation::from_json(
+        include_bytes!("../../../runtime-topology.example.json"),
+        ReplicaId::new(1),
+        "logical-1",
+    )
+    .unwrap();
+    assert_eq!(topology.members().len(), 3);
+}

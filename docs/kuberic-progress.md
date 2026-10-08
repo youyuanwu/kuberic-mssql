@@ -90,19 +90,22 @@ Successful role validation always returns no client service address. The
 configured replication address belongs only to `Replicator::open`; it is not a
 listener, routing endpoint, or application address.
 
-An exactly bound healthy topology enables two additional current-only
-operations. `HealthyTopologyBinding` freezes the shared resource, local and peer
-Kuberic identities, process sessions, replication addresses, stable roles,
-current configuration, effective policy, SQL Server process incarnations,
-native replica GUIDs, AG identity, and database lineage.
+A strict topology expectation associates three stable Kuberic replica numbers
+with expected SQL Server names and AG endpoint URLs. The first current
+configuration callback combines those associations with fresh native evidence
+and the callback's full identities, roles, process sessions and replication
+addresses.
 
-`update_current_replica_set_configuration` accepts only the frozen current
-descriptor and exact peer descriptions; after admission, only value-identical
-replay is accepted. `catch_up_capability` is then reported as a fresh
-configuration sequence equal to current progress. Both paths reobserve SQL
-Server and revalidate the durable runtime authority and effective policy. Any
-identity, session, epoch, role, health, synchronization, lineage, incarnation,
-freshness, or policy drift fails closed.
+Kuberic can deliver the bootstrap callback before remote sessions are known.
+Empty remote descriptions may be completed in one direction; after completion,
+replay is value-identical. SQL Server process incarnation is local evidence:
+each runtime freezes and revalidates its own start identity, while the
+three-member validation proves all members collectively.
+
+`catch_up_capability` is reported as a fresh configuration sequence equal to
+current progress after native topology admission. It does not depend on remote
+transport-session readiness. Identity, completed-session, address, epoch, role,
+health, synchronization, lineage, incarnation or freshness drift fails closed.
 
 This is a conservative current-only capability: the adapter claims no earlier
 retained configuration history. It is not a database LSN and does not imply
@@ -191,11 +194,10 @@ restart, container replacement, AG/database recreation, role drift, stale
 sample, sequence mismatch, suspended database, or unhealthy synchronization
 invalidates the binding.
 
-`MssqlGroup` then creates three isolated SQLite stores, services, replicators,
-runtimes, process sessions, and agent servers for one shared Kuberic resource.
-Every ordered peer pair is registered and described before the exact current
-configuration is admitted. Reports are bracketed by fresh direct observations
-and must show:
+The licensed path then creates three public `ReplicaHost` applications for one
+shared Kuberic resource, initializes them through public control RPCs and
+admits the exact current configuration. Reports are bracketed by fresh direct
+observations and must show:
 
 - one shared resource and current configuration with no previous
   configuration;
@@ -214,8 +216,8 @@ directly observed native primary.
 The pre-implementation feasibility run completed the native path on the same
 pinned image with one primary, two synchronized healthy secondaries, common
 configuration sequence `4294967307`, and the same marker visible on all three.
-The final ignored test additionally proves the three fenced Kuberic reports and
-exact cleanup/recovery behavior.
+The final ignored test additionally proves the three fenced Kuberic reports,
+handled-signal and SIGKILL recovery, fault checkpoints and exact cleanup.
 
 The workspace tracks Kuberic `main`, with `Cargo.lock` recording the exact
 revision used by locked builds. The branch includes formal custom-authority fix
@@ -235,6 +237,8 @@ Build or test the adapter through the feature:
 
 ```bash
 cargo test --locked -p kuberic-mssql-tests --test kuberic_contract
+cargo build --locked -p kuberic-mssql --features kuberic \
+  --bin kuberic-mssql-runtime
 ```
 
 Run the complete server-free and Rust-owned live gates:
@@ -279,7 +283,6 @@ contract, but tests do not require it.
 
 This integration does not yet provide:
 
-- a production executable hosting SQL Server through `ReplicaHost`;
 - SQL Server process ownership or restart containment;
 - production managed-database creation;
 - production endpoint certificate provisioning or rotation;
@@ -297,6 +300,15 @@ This integration does not yet provide:
   write-lease-expiry testing.
 
 Those stages require separate design and safety review.
+
+The pinned Kuberic revision can transiently cancel custom-authority
+restoration under real live observation timing. The runtime and server-free
+public-host tests prove durable same-root restart and stale-session rejection;
+licensed same-root restart remains deferred until the restoration-ownership fix
+is available in the pinned dependency. The later unpinned Kuberic commit
+`301d7f364744aea4dd2513dcc8179d3588fd7dd7` includes that ownership fix; this
+workspace deliberately remains pinned to
+`b2cbbf266d4791ef15df908a9ae23b79fed33c5c`.
 
 ## References
 

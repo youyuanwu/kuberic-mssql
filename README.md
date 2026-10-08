@@ -6,10 +6,11 @@ container, accept an EULA, start or restart `sqlservr`, create an AG, change a
 role, renew a write lease, or execute any mutation command.
 
 The library is compatible with the observation side of the level-triggered
-contract. Its optional Kuberic adapter publishes validated AG configuration
-sequence through the fixed Service Fabric-compatible progress API, but it is
-not wired into the level-triggered controller. This is not a complete
-Kubernetes HA integration or an automatic failover implementation. See the
+contract. Its optional Kuberic runtime publishes validated AG configuration
+sequence through the fixed Service Fabric-compatible progress API and hosts the
+application through Kuberic's public `ReplicaHost`; it is not wired into the
+level-triggered controller. This is not a complete Kubernetes HA integration
+or an automatic failover implementation. See the
 [progress integration guide](docs/kuberic-progress.md); the
 [support and safety design](docs/design.md) remains authoritative.
 Role validation never publishes a client service address; the configured
@@ -20,7 +21,7 @@ replication address is returned only by the custom replicator's open callback.
 The repository is a two-member Cargo workspace:
 
 - `crates/kuberic-mssql` contains the observe-only runtime library and the
-  production `sqlserver-observer` binary.
+  production `sqlserver-observer` and `kuberic-mssql-runtime` binaries.
 - `crates/kuberic-mssql-tests` contains shared test support, integration and
   ignored licensed live tests, and Rust-owned SQL Server fixture lifecycles.
 
@@ -63,6 +64,43 @@ cargo run --locked -p kuberic-mssql --bin sqlserver-observer -- \
 There is no mutation flag, arbitrary SQL input, plaintext connection option, or
 certificate-verification bypass. Unknown JSON configuration fields and modes
 are rejected, including inline passwords and mutation credentials.
+
+## Run the Kuberic application
+
+The non-containerized `kuberic-mssql-runtime` hosts one already provisioned SQL
+Server member through Kuberic's public process boundary. It embeds the same
+observation engine as the CLI; it never spawns or parses `sqlserver-observer`.
+
+Provide the normal Kuberic resource, replica, Pod, PVC, control, replication
+and data-root variables plus three absolute mounted-file paths:
+
+- `KUBERIC_MSSQL_OBSERVER_CONFIG` — the existing observer JSON;
+- `KUBERIC_MSSQL_TOPOLOGY_CONFIG` — the stable replica-to-SQL association,
+  following [runtime-topology.example.json](runtime-topology.example.json);
+- `KUBERIC_AGENT_BEARER_TOKEN_FILE` — a private, bounded token file.
+
+Choose exactly one peer resolver:
+
+- `KUBERIC_NAMESPACE` for Kuberic DNS names; or
+- `KUBERIC_PEER_ROUTES` for an exact route document following
+  [runtime-peer-routes.example.json](runtime-peer-routes.example.json).
+
+```bash
+cargo run --locked -p kuberic-mssql \
+  --features kuberic --bin kuberic-mssql-runtime
+```
+
+Runtime identity and topology files reject unknown, duplicate, ambiguous,
+symlinked or oversized inputs. The application root contains only a private
+schema-versioned binding of non-secret identity and topology digests. Kuberic
+authority can initially arrive before remote peer sessions; missing peer
+descriptions may only be completed once, after which replay is exact. Role and
+progress callbacks still reobserve SQL Server, and no client SQL listener or
+service address is published.
+
+SIGINT and SIGTERM cancel initialization or request bounded runtime shutdown.
+Operational and cleanup failures are retained together instead of being
+converted to success.
 
 TLS is required for the complete TDS session. By default the client uses the
 system trust store. With `ca_certificate_file`, the pinned TDS driver's Rustls
@@ -229,6 +267,11 @@ failure reports. The previous hook still handles unrelated panics, including
 other tasks between polls. Embedders that replace the panic hook after starting
 TDS observation must preserve this delegation.
 
+`runtime_host` owns strict process inputs, peer resolution, non-secret durable
+application binding, public `ReplicaHost` assembly, startup cancellation and
+shutdown/error composition. Kuberic's private SQLite store and runtime-effect
+types are not part of the application API.
+
 Operation-envelope serialization/decoding and the durable result journal
 remain stage 3 work. The existing canonical signatures and approval/fence
 bindings are unchanged. Observation JSON is an output format, not a new
@@ -311,8 +354,8 @@ untouched.
 The dedicated three-replica fixture complements the one-replica observer/CLI
 path above. It starts three real SQL Server processes, creates
 certificate-authenticated endpoints, joins one external AG, automatically
-seeds one database, runs three in-process Kuberic agents, and proves a marker
-is readable from every member.
+seeds one database, runs three public `ReplicaHost` applications through agent
+control RPCs, and proves a marker is readable from every member.
 
 The live path is ignored by default and is not part of `just`, `just check`, or
 direct Cargo test runs. The happy path runs after one-replica validation in
