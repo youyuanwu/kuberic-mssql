@@ -34,7 +34,6 @@ use kuberic_runtime::replicator::{
     Replicator,
 };
 use kuberic_runtime::testing::authority::AdmittedAuthority;
-use kuberic_runtime::testing::describe_peer;
 use kuberic_runtime::testing::effects::{RuntimeEffect, RuntimeEffectAction};
 use kuberic_runtime::testing::hosting::PodRuntime;
 use kuberic_runtime::testing::runtime_adapter::RuntimeAdapter;
@@ -1273,8 +1272,9 @@ async fn bound_topology_admits_exact_current_replays_and_reports_fresh_capabilit
             Ok(present(bound_snapshot())),
             Ok(present(bound_snapshot())),
             Ok(present(bound_snapshot())),
+            Ok(present(bound_snapshot())),
         ],
-        vec![OBSERVED_AT; 4],
+        vec![OBSERVED_AT; 5],
     )
     .await;
 
@@ -1365,7 +1365,7 @@ async fn first_admission_rejects_duplicate_and_wrong_local_native_replica_ids() 
 }
 
 #[test]
-fn runtime_adapter_contains_missing_peer_authority_failure_before_persistence() {
+fn runtime_adapter_admits_authority_before_peer_session_enrichment() {
     run_runtime_effect_test(async {
         let expectation = topology_expectation();
         let source = Arc::new(CountingSource {
@@ -1386,37 +1386,25 @@ fn runtime_adapter_contains_missing_peer_authority_failure_before_persistence() 
         )
         .await;
 
-        let error = adapter
+        adapter
             .execute(runtime_effect(
                 "exact-admission",
                 2,
                 RuntimeEffectAction::AdmitAuthority(Box::new(admitted_authority(0))),
             ))
             .await
-            .unwrap_err();
+            .unwrap();
+        assert!(runtime.snapshot().await.authority.is_some());
+        let admitted = store.load_state().await.unwrap();
+        assert_eq!(admitted.current_configuration, Some(configuration()));
+        assert!(admitted.admitted_policy.is_some());
+        assert!(admitted.pending_effect.is_none());
         assert!(
-            error.to_string().contains("session, address, or role"),
-            "{error}"
+            _service
+                .replicator()
+                .and_then(|replicator| replicator.admitted_topology())
+                .is_some()
         );
-        assert!(runtime.snapshot().await.authority.is_none());
-        let failed = store.load_state().await.unwrap();
-        assert!(failed.current_configuration.is_none());
-        assert!(failed.admitted_policy.is_none());
-
-        assert!(
-            describe_peer(
-                &runtime,
-                ReplicaInformation::new(
-                    OperationId::new("post-failure-peer-description"),
-                    kuberic_identity(2),
-                    "replica-2.example:5022".into(),
-                ),
-            )
-            .await
-            .is_err(),
-            "contained authority failure must close the runtime before later peer mutation"
-        );
-        assert!(failed.pending_effect.is_some());
         assert_eq!(source.observations.load(Ordering::SeqCst), 2);
     });
 }
@@ -1537,12 +1525,8 @@ async fn bound_current_configuration_rejects_every_frozen_value_drift() {
     cases.push(("empty generation identity", changed));
 
     let mut changed = exact.clone();
-    changed.replicas[0].process_session_id = ProcessSessionId::default();
-    cases.push(("empty session", changed));
-
-    let mut changed = exact.clone();
-    changed.replicas[0].replication_address.clear();
-    cases.push(("empty address", changed));
+    changed.replicas[0].replication_address = "not-an-address".into();
+    cases.push(("invalid address", changed));
 
     let mut changed = exact.clone();
     changed.replicas[1].process_session_id = changed.replicas[0].process_session_id.clone();
@@ -1574,8 +1558,9 @@ async fn admitted_current_configuration_allows_only_value_identical_replay() {
             Ok(present(bound_snapshot())),
             Ok(present(bound_snapshot())),
             Ok(present(bound_snapshot())),
+            Ok(present(bound_snapshot())),
         ],
-        vec![OBSERVED_AT; 4],
+        vec![OBSERVED_AT; 5],
     )
     .await;
     replicator
@@ -1638,6 +1623,42 @@ async fn a_new_process_admits_fresh_sessions_for_the_same_stable_topology() {
         .await
         .unwrap_err();
     assert!(application_error(error).contains("replay differs"));
+}
+
+#[tokio::test]
+async fn incomplete_bootstrap_reports_native_capability_and_allows_one_way_peer_enrichment() {
+    let complete = bound_replica_set();
+    let mut incomplete = complete.clone();
+    for replica in &mut incomplete.replicas[1..] {
+        replica.process_session_id = ProcessSessionId::default();
+        replica.replication_address.clear();
+        replica.role = ReplicaRole::None;
+    }
+    let replicator = opened_bound_replicator(
+        vec![
+            Ok(present(bound_snapshot())),
+            Ok(present(bound_snapshot())),
+            Ok(present(bound_snapshot())),
+            Ok(present(bound_snapshot())),
+            Ok(present(bound_snapshot())),
+        ],
+        vec![OBSERVED_AT; 5],
+    )
+    .await;
+    replicator
+        .update_current_replica_set_configuration(incomplete)
+        .await
+        .unwrap();
+    replicator
+        .change_role(configuration().epoch, ReplicaRole::Primary)
+        .await
+        .unwrap();
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), 42);
+    replicator
+        .update_current_replica_set_configuration(complete)
+        .await
+        .unwrap();
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), 42);
 }
 
 #[tokio::test]

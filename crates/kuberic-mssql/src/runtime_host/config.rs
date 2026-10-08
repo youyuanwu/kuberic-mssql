@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
+use kuberic_runtime::host::ReplicaProcessConfig;
 use kuberic_runtime::protocol::types::{PodUid, PvcUid, ReplicaId, ResourceUid};
 use zeroize::Zeroizing;
 
@@ -300,6 +301,21 @@ impl RuntimeHostConfig {
 
     pub fn shutdown_deadline(&self) -> Duration {
         self.shutdown_deadline
+    }
+
+    pub fn replica_process_config(&self) -> ReplicaProcessConfig {
+        ReplicaProcessConfig {
+            resource_uid: self.resource_uid.clone(),
+            replica_id: self.replica_id,
+            pod_uid: self.pod_uid.clone(),
+            pvc_uid: self.pvc_uid.clone(),
+            data_root: self.data_root.clone(),
+            control_address: self.control_address,
+            replication_address: self.replication_address,
+            bearer_token: self.bearer_token.to_string(),
+            rpc_deadline: self.rpc_deadline,
+            transport_window_capacity: self.transport_window_capacity,
+        }
     }
 }
 

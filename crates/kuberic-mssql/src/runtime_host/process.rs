@@ -12,7 +12,7 @@ use clap::Parser;
 use kuberic_runtime::application::{OpenContext, OpenMode, RoleChange, StatefulServiceReplica};
 use kuberic_runtime::host::{
     ApplicationStorageState, KubernetesDnsResolver, ReplicaEndpointResolver, ReplicaHost,
-    ReplicaProcessConfig, RunningReplica,
+    RunningReplica,
 };
 use kuberic_runtime::protocol::types::{
     ReplicaIdentity, derive_agent_generation, derive_initialization_id,
@@ -20,7 +20,10 @@ use kuberic_runtime::protocol::types::{
 use kuberic_runtime::{Replicator, Result as KubericResult, RuntimeError as KubericRuntimeError};
 
 use crate::instance::SqlServerInstanceManager;
-use crate::kuberic::{SqlServerService, SqlServerServiceConfig};
+use crate::kuberic::{
+    ObservationClock, SqlServerObservationSource, SqlServerService, SqlServerServiceConfig,
+    SystemObservationClock,
+};
 use crate::tds::TdsExecutor;
 
 use super::binding::{RuntimeBindingError, RuntimeBindingStore};
@@ -57,52 +60,22 @@ pub async fn run_runtime_with_shutdown(
     shutdown: impl Future<Output = Result<(), RuntimeProcessError>> + Send + 'static,
 ) -> Result<(), RuntimeProcessError> {
     prepare_data_root(config.data_root())?;
-    let binding = RuntimeBindingStore::new(&config).map_err(RuntimeProcessError::binding)?;
-    let storage = binding
-        .storage_state()
-        .map_err(RuntimeProcessError::binding)?;
     let executor = TdsExecutor::new(config.observer().connection().clone());
     let manager = SqlServerInstanceManager::new(executor, config.observer().clone());
-    let service = Arc::new(
-        SqlServerService::new_with_topology(
-            SqlServerServiceConfig::new(
-                config.resource_uid().clone(),
-                config.replication_endpoint(),
-            )
-            .map_err(RuntimeProcessError::application)?,
-            manager,
-            config.topology().clone(),
-        )
-        .map_err(RuntimeProcessError::application)?,
-    );
-    let application = Arc::new(BoundSqlServerService {
-        inner: service,
-        binding,
-    });
+    let application = Arc::new(RuntimeHostApplication::with_observation_source(
+        &config,
+        Arc::new(manager),
+        Arc::new(SystemObservationClock),
+    )?);
+    let storage = application.storage_state()?;
     let resolver = Arc::new(RuntimeEndpointResolver::new(&config)?);
-    let mut storage_paths = BTreeMap::new();
-    storage_paths.insert(
-        APPLICATION_STORAGE_NAME.to_owned(),
-        config.application_root().to_owned(),
-    );
     let host = ReplicaHost::new(
-        ReplicaProcessConfig {
-            resource_uid: config.resource_uid().clone(),
-            replica_id: config.replica_id(),
-            pod_uid: config.pod_uid().clone(),
-            pvc_uid: config.pvc_uid().clone(),
-            data_root: config.data_root().to_owned(),
-            control_address: config.control_address(),
-            replication_address: config.replication_address(),
-            bearer_token: config.bearer_token().to_owned(),
-            rpc_deadline: config.rpc_deadline(),
-            transport_window_capacity: config.transport_window_capacity(),
-        },
+        config.replica_process_config(),
         application.clone(),
         storage,
         resolver,
-    )
-    .with_application_storage_paths(storage_paths);
+    );
+    let host = host.with_application_storage_paths(application.storage_paths());
 
     let shutdown_deadline = config.shutdown_deadline();
     tokio::pin!(shutdown);
@@ -174,7 +147,7 @@ pub async fn run_runtime_with_shutdown(
 
 async fn finish_shutdown(
     mut replica: RunningReplica,
-    application: &BoundSqlServerService,
+    application: &RuntimeHostApplication,
     completion: Option<kuberic_runtime::host::Result<()>>,
     trigger: Result<(), RuntimeProcessError>,
     deadline: std::time::Duration,
@@ -202,7 +175,7 @@ async fn finish_shutdown(
 }
 
 async fn finish_application(
-    application: &BoundSqlServerService,
+    application: &RuntimeHostApplication,
     result: Result<(), RuntimeProcessError>,
     deadline: std::time::Duration,
 ) -> Result<(), RuntimeProcessError> {
@@ -232,13 +205,54 @@ fn combine(
     }
 }
 
-struct BoundSqlServerService {
+pub struct RuntimeHostApplication {
     inner: Arc<SqlServerService>,
     binding: RuntimeBindingStore,
 }
 
+impl RuntimeHostApplication {
+    pub fn with_observation_source(
+        config: &RuntimeHostConfig,
+        source: Arc<dyn SqlServerObservationSource>,
+        clock: Arc<dyn ObservationClock>,
+    ) -> Result<Self, RuntimeProcessError> {
+        let binding = RuntimeBindingStore::new(config).map_err(RuntimeProcessError::binding)?;
+        let inner = Arc::new(
+            SqlServerService::with_observation_source_and_topology(
+                SqlServerServiceConfig::new(
+                    config.resource_uid().clone(),
+                    config.replication_endpoint(),
+                )
+                .map_err(RuntimeProcessError::application)?,
+                source,
+                clock,
+                config.topology().clone(),
+            )
+            .map_err(RuntimeProcessError::application)?,
+        );
+        Ok(Self { inner, binding })
+    }
+
+    pub fn storage_state(&self) -> Result<ApplicationStorageState, RuntimeProcessError> {
+        self.binding
+            .storage_state()
+            .map_err(RuntimeProcessError::binding)
+    }
+
+    pub fn storage_paths(&self) -> BTreeMap<String, std::path::PathBuf> {
+        BTreeMap::from([(
+            APPLICATION_STORAGE_NAME.to_owned(),
+            self.binding.root().to_owned(),
+        )])
+    }
+
+    pub fn service(&self) -> &Arc<SqlServerService> {
+        &self.inner
+    }
+}
+
 #[async_trait]
-impl StatefulServiceReplica for BoundSqlServerService {
+impl StatefulServiceReplica for RuntimeHostApplication {
     async fn open(self: Arc<Self>, context: OpenContext) -> KubericResult<Arc<dyn Replicator>> {
         match context.mode {
             OpenMode::New => match self.binding.storage_state().map_err(binding_error)? {
@@ -274,7 +288,7 @@ fn binding_error(error: RuntimeBindingError) -> KubericRuntimeError {
     KubericRuntimeError::Application(error.to_string())
 }
 
-enum RuntimeEndpointResolver {
+pub enum RuntimeEndpointResolver {
     KubernetesDns(KubernetesDnsResolver),
     PeerRoutes {
         local_identity: ReplicaIdentity,
@@ -285,7 +299,7 @@ enum RuntimeEndpointResolver {
 }
 
 impl RuntimeEndpointResolver {
-    fn new(config: &RuntimeHostConfig) -> Result<Self, RuntimeProcessError> {
+    pub fn new(config: &RuntimeHostConfig) -> Result<Self, RuntimeProcessError> {
         let initialization = derive_initialization_id(
             config.resource_uid(),
             config.replica_id(),

@@ -978,6 +978,7 @@ impl Replicator for SqlServerReplicator {
             }
             return self.unsupported(ObserveOnlyOperation::CatchUpCapability);
         };
+
         {
             let _lifecycle = self.finish_operation(generation)?;
             if *self
@@ -1073,13 +1074,19 @@ impl PrimaryReplicator for SqlServerReplicator {
         if let (Some(previous_topology), Some(previous_configuration)) =
             (&*admitted_topology, &*admitted_configuration)
         {
-            if previous_topology.as_ref() != &candidate || previous_configuration != &current {
+            if (previous_topology.as_ref() != &candidate
+                && !topology_enriches(previous_topology, &candidate))
+                || (previous_configuration != &current
+                    && !configuration_enriches(previous_configuration, &current))
+            {
                 return Err(KubericAdapterError::TopologyBindingMismatch(
                     "current configuration replay differs from the admitted value",
                 )
                 .into());
             }
             self.ensure_observation_fresh(observed_at)?;
+            *admitted_topology = Some(Arc::new(candidate));
+            *admitted_configuration = Some(current);
         } else {
             self.ensure_observation_fresh(observed_at)?;
             *admitted_topology = Some(Arc::new(candidate));
@@ -1377,13 +1384,23 @@ fn validate_configuration_shape(
             .iter()
             .filter(|replica| replica.identity == configuration_member.identity)
             .collect::<Vec<_>>();
-        if descriptions.len() != 1
-            || descriptions[0].process_session_id.is_empty()
-            || validate_replication_address(&descriptions[0].replication_address).is_err()
-            || descriptions[0].role != configuration_member.role
+        if descriptions.len() != 1 {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "current replica identity differs from the descriptor",
+            ));
+        }
+        if !descriptions[0].replication_address.is_empty()
+            && validate_replication_address(&descriptions[0].replication_address).is_err()
         {
             return Err(KubericAdapterError::TopologyBindingMismatch(
-                "current replica session, address, or role differs from the descriptor",
+                "current replica address is invalid",
+            ));
+        }
+        if !matches!(descriptions[0].role, ReplicaRole::None)
+            && descriptions[0].role != configuration_member.role
+        {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "current replica role differs from the descriptor",
             ));
         }
         if configuration_member.identity == *runtime_identity
@@ -1397,8 +1414,10 @@ fn validate_configuration_shape(
     if current.replicas.iter().enumerate().any(|(index, replica)| {
         current.replicas[..index].iter().any(|other| {
             other.identity == replica.identity
-                || other.process_session_id == replica.process_session_id
-                || other.replication_address == replica.replication_address
+                || (!replica.process_session_id.is_empty()
+                    && other.process_session_id == replica.process_session_id)
+                || (!replica.replication_address.is_empty()
+                    && other.replication_address == replica.replication_address)
         })
     }) {
         return Err(KubericAdapterError::TopologyBindingMismatch(
@@ -1451,7 +1470,7 @@ fn validate_current_configuration(
         let replica = matching[0];
         if replica.process_session_id != member.process_session_id
             || replica.replication_address != member.replication_address
-            || replica.role != member.stable_role
+            || (!matches!(replica.role, ReplicaRole::None) && replica.role != member.stable_role)
         {
             return Err(KubericAdapterError::TopologyBindingMismatch(
                 "current replica session, address, or role differs from the frozen member",
@@ -1459,6 +1478,66 @@ fn validate_current_configuration(
         }
     }
     Ok(())
+}
+
+fn configuration_enriches(
+    previous: &ReplicaSetConfiguration,
+    current: &ReplicaSetConfiguration,
+) -> bool {
+    if previous.configuration != current.configuration
+        || previous.replicas.len() != current.replicas.len()
+    {
+        return false;
+    }
+
+    previous.replicas.iter().all(|old| {
+        let matching = current
+            .replicas
+            .iter()
+            .filter(|new| new.identity == old.identity)
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return false;
+        }
+        let new = matching[0];
+        (old.process_session_id.is_empty() || old.process_session_id == new.process_session_id)
+            && (old.replication_address.is_empty()
+                || old.replication_address == new.replication_address)
+            && (matches!(old.role, ReplicaRole::None) || old.role == new.role)
+            && old.current_progress == new.current_progress
+            && old.catch_up_capability == new.catch_up_capability
+    })
+}
+
+fn topology_enriches(previous: &HealthyTopologyBinding, current: &HealthyTopologyBinding) -> bool {
+    if previous.local_identity != current.local_identity
+        || previous.configuration != current.configuration
+        || previous.availability_group != current.availability_group
+        || previous.database_lineage != current.database_lineage
+        || previous.local_sql_replica_identity != current.local_sql_replica_identity
+        || previous.local_sql_server_start_incarnation != current.local_sql_server_start_incarnation
+        || previous.members.len() != current.members.len()
+    {
+        return false;
+    }
+    previous.members.iter().all(|old| {
+        let matching = current
+            .members
+            .iter()
+            .filter(|new| new.kuberic_identity == old.kuberic_identity)
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return false;
+        }
+        let new = matching[0];
+        old.native_replica_id == new.native_replica_id
+            && old.sql_endpoint == new.sql_endpoint
+            && old.stable_role == new.stable_role
+            && (old.process_session_id.is_empty()
+                || old.process_session_id == new.process_session_id)
+            && (old.replication_address.is_empty()
+                || old.replication_address == new.replication_address)
+    })
 }
 
 fn validate_bound_evidence(
