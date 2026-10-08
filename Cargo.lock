@@ -749,6 +749,7 @@ dependencies = [
  "clap",
  "futures",
  "kuberic-runtime",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

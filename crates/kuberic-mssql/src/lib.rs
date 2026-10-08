@@ -12,6 +12,8 @@ mod output;
 pub mod query;
 pub mod runtime_config;
 pub mod runtime_error;
+#[cfg(feature = "kuberic")]
+pub mod runtime_host;
 pub mod tds;
 #[cfg(feature = "kuberic")]
 pub mod topology_config;
