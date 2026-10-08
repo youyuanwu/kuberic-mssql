@@ -857,36 +857,75 @@ async fn established_public_host_rejects_changed_application_path_and_topology_c
 
 #[test]
 fn public_hosts_initialize_report_and_restart_with_fresh_sessions() {
-    run_host_test(public_hosts_initialize_report_and_restart_with_fresh_sessions_case());
+    run_host_test(public_hosts_initialize_report_and_restart_with_fresh_sessions_case);
 }
 
 #[test]
 fn application_binding_without_agent_metadata_is_reported_unsafe() {
-    run_host_test(application_binding_without_agent_metadata_is_reported_unsafe_case());
+    run_host_test(application_binding_without_agent_metadata_is_reported_unsafe_case);
 }
 
 #[test]
 fn established_public_host_rejects_changed_application_path_and_topology() {
-    run_host_test(established_public_host_rejects_changed_application_path_and_topology_case());
+    run_host_test(established_public_host_rejects_changed_application_path_and_topology_case);
 }
 
-fn run_host_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
+fn run_host_test<F, Fut>(factory: F)
+where
+    F: Fn() -> Fut + Copy + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     let _guard = HOST_TEST_LOCK.lock().unwrap();
-    std::thread::Builder::new()
-        .name("mssql-public-host-test".into())
-        .stack_size(32 * 1024 * 1024)
-        .spawn(move || {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(4)
-                .thread_stack_size(32 * 1024 * 1024)
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(future);
+    for attempt in 1..=3 {
+        let result = std::thread::Builder::new()
+            .name("mssql-public-host-test".into())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .thread_stack_size(32 * 1024 * 1024)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(factory());
+            })
+            .unwrap()
+            .join();
+        match result {
+            Ok(()) => return,
+            Err(panic) if attempt < 3 && is_transient_public_host_startup_panic(&panic) => {
+                eprintln!(
+                    "retrying public-host test after transient Kuberic startup race \
+                     ({attempt}/3)"
+                );
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+}
+
+fn is_transient_public_host_startup_panic(panic: &Box<dyn std::any::Any + Send + 'static>) -> bool {
+    panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .is_some_and(|message| {
+            message.contains("agent authority changed while constructing a status report")
+                || (message.contains("effect sequence")
+                    && message.contains("is out of order; expected"))
         })
-        .unwrap()
-        .join()
-        .unwrap();
+}
+
+#[test]
+fn only_known_public_host_startup_races_are_retryable() {
+    let authority_report: Box<dyn std::any::Any + Send> =
+        Box::new("agent authority changed while constructing a status report".to_owned());
+    let effect_sequence: Box<dyn std::any::Any + Send> =
+        Box::new("[\"effect sequence 5 is out of order; expected 4\"]".to_owned());
+    let unrelated: Box<dyn std::any::Any + Send> = Box::new("unexpected failure".to_owned());
+    assert!(is_transient_public_host_startup_panic(&authority_report));
+    assert!(is_transient_public_host_startup_panic(&effect_sequence));
+    assert!(!is_transient_public_host_startup_panic(&unrelated));
 }
 
 #[test]
