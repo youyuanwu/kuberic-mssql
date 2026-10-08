@@ -13,6 +13,8 @@ pub mod query;
 pub mod runtime_config;
 pub mod runtime_error;
 pub mod tds;
+#[cfg(feature = "kuberic")]
+pub mod topology_config;
 pub mod types;
 
 pub use config::{
@@ -30,6 +32,10 @@ pub use operation::{
     DestructiveApproval, EffectSignature, FenceReference, InputSignature,
     OPERATION_CONTRACT_VERSION, OperationEnvelope, OperationPayload, OperationRecord,
     OperationRequest, ReplayDisposition,
+};
+#[cfg(feature = "kuberic")]
+pub use topology_config::{
+    SqlServerTopologyExpectation, SqlServerTopologyMemberExpectation, TopologyConfigError,
 };
 pub use types::{
     AvailabilityGroupIdentity, AvailabilityGroupName, ConfigurationSequence, DatabaseIdentity,
