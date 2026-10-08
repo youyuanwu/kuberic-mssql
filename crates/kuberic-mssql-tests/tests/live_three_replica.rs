@@ -561,6 +561,7 @@ fn assert_exact_reports(
             || report.current_progress != configuration_sequence
             || report.catch_up_capability != Some(configuration_sequence)
             || !report.healthy
+            || report.read_status != proto::AccessStatus::Granted as i32
             || report.write_status != expected_write as i32
             || report.role != expected_role as i32
         {

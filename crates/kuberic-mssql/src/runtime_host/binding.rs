@@ -114,11 +114,42 @@ impl RuntimeBindingStore {
             Err(_) => return Err(RuntimeBindingError::Io),
         };
         root.verify_path()?;
-        let entries = fs::read_dir(format!("/proc/self/fd/{}", root.file.as_raw_fd()))
-            .map_err(|_| RuntimeBindingError::Io)?
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| RuntimeBindingError::Io)?;
+        let mut entries = root.entries()?;
+        let mut recovered = false;
+        for entry in &entries {
+            if entry == BINDING_FILE {
+                continue;
+            }
+            let Some(name) = entry.to_str() else {
+                return Err(RuntimeBindingError::UnsafeState);
+            };
+            let Some(pid) = temporary_binding_pid(name) else {
+                return Err(RuntimeBindingError::UnsafeState);
+            };
+            if !process_is_gone(pid)? {
+                return Err(RuntimeBindingError::UnsafeState);
+            }
+            let temporary = root
+                .openat(name, libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0)
+                .map_err(|_| RuntimeBindingError::UnsafeState)?;
+            let metadata = temporary
+                .metadata()
+                .map_err(|_| RuntimeBindingError::UnsafeState)?;
+            if !metadata.is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err(RuntimeBindingError::UnsafeState);
+            }
+            drop(temporary);
+            root.unlinkat(name)?;
+            recovered = true;
+        }
+        if recovered {
+            root.file.sync_all().map_err(|_| RuntimeBindingError::Io)?;
+            root.verify_path()?;
+            entries = root.entries()?;
+        }
         if entries.is_empty() {
             return Ok(ApplicationStorageState::FreshEmpty);
         }
@@ -216,7 +247,7 @@ impl RuntimeBindingStore {
             root.file.sync_all().map_err(|_| RuntimeBindingError::Io)
         })();
         if result.is_err() {
-            root.unlinkat(&temporary);
+            let _ = root.unlinkat(&temporary);
         }
         result
     }
@@ -282,6 +313,14 @@ impl BoundRoot {
         }
     }
 
+    fn entries(&self) -> Result<Vec<std::ffi::OsString>, RuntimeBindingError> {
+        fs::read_dir(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+            .map_err(|_| RuntimeBindingError::Io)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| RuntimeBindingError::Io)
+    }
+
     fn renameat(&self, from: &str, to: &str) -> Result<(), RuntimeBindingError> {
         let from = CString::new(from).map_err(|_| RuntimeBindingError::Io)?;
         let to = CString::new(to).map_err(|_| RuntimeBindingError::Io)?;
@@ -300,13 +339,33 @@ impl BoundRoot {
         }
     }
 
-    fn unlinkat(&self, name: &str) {
-        let Ok(name) = CString::new(name) else {
-            return;
-        };
-        unsafe {
-            libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0);
+    fn unlinkat(&self, name: &str) -> Result<(), RuntimeBindingError> {
+        let name = CString::new(name).map_err(|_| RuntimeBindingError::Io)?;
+        if unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+            Ok(())
+        } else {
+            Err(RuntimeBindingError::Io)
         }
+    }
+}
+
+fn temporary_binding_pid(name: &str) -> Option<libc::pid_t> {
+    let prefix = format!(".{BINDING_FILE}.");
+    name.strip_prefix(&prefix)?
+        .strip_suffix(".new")?
+        .parse::<libc::pid_t>()
+        .ok()
+        .filter(|pid| *pid > 0)
+}
+
+fn process_is_gone(pid: libc::pid_t) -> Result<bool, RuntimeBindingError> {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(false);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Ok(true),
+        Some(libc::EPERM) => Ok(false),
+        _ => Err(RuntimeBindingError::Io),
     }
 }
 

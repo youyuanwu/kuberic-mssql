@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,6 +38,15 @@ const NATIVE_IDS: [&str; 3] = [
     "22222222-2222-4222-8222-222222222222",
     "33333333-3333-4333-8333-333333333333",
 ];
+const TOPOLOGY_JSON: &[u8] = br#"{
+    "schema_version":1,
+    "members":[
+        {"replica_id":1,"server_name":"sql-1","endpoint_url":"TCP://sql-1:5022"},
+        {"replica_id":2,"server_name":"sql-2","endpoint_url":"TCP://sql-2:5022"},
+        {"replica_id":3,"server_name":"sql-3","endpoint_url":"TCP://sql-3:5022"}
+    ]
+}"#;
+static HOST_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct RepeatingSource {
     config: kuberic_mssql::runtime_config::ObserverConfig,
@@ -234,11 +243,15 @@ fn snapshot(local_index: usize) -> InstanceSnapshot {
     }
 }
 
-fn free_address() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+fn free_host_addresses() -> ([SocketAddr; 3], [SocketAddr; 3]) {
+    let listeners = std::array::from_fn::<_, 6, _>(|_| TcpListener::bind("127.0.0.1:0").unwrap());
+    let addresses = listeners
+        .each_ref()
+        .map(|listener| listener.local_addr().unwrap());
+    (
+        std::array::from_fn(|index| addresses[index]),
+        std::array::from_fn(|index| addresses[index + 3]),
+    )
 }
 
 fn write_private(path: &Path, value: impl AsRef<[u8]>) {
@@ -251,6 +264,17 @@ async fn host_config(
     index: usize,
     controls: &[SocketAddr; 3],
     replications: &[SocketAddr; 3],
+) -> RuntimeHostConfig {
+    host_config_with(root, index, controls, replications, None, TOPOLOGY_JSON).await
+}
+
+async fn host_config_with(
+    root: &Path,
+    index: usize,
+    controls: &[SocketAddr; 3],
+    replications: &[SocketAddr; 3],
+    application_root: Option<PathBuf>,
+    topology_json: &[u8],
 ) -> RuntimeHostConfig {
     let username = root.join("observer-username");
     let password = root.join("observer-password");
@@ -281,17 +305,7 @@ async fn host_config(
         ),
     );
     let topology = root.join("topology.json");
-    write_private(
-        &topology,
-        br#"{
-            "schema_version":1,
-            "members":[
-                {"replica_id":1,"server_name":"sql-1","endpoint_url":"TCP://sql-1:5022"},
-                {"replica_id":2,"server_name":"sql-2","endpoint_url":"TCP://sql-2:5022"},
-                {"replica_id":3,"server_name":"sql-3","endpoint_url":"TCP://sql-3:5022"}
-            ]
-        }"#,
-    );
+    write_private(&topology, topology_json);
     let all_identities = identities();
     let routes = root.join("routes.json");
     let route_values = (0..3)
@@ -326,7 +340,7 @@ async fn host_config(
             pod_uid: format!("pod-{}", index + 1),
             pvc_uid: format!("pvc-{}", index + 1),
             data_root,
-            application_root: None,
+            application_root,
             control_address: controls[index],
             replication_address: replications[index],
             control_endpoint: format!("http://{}", controls[index]),
@@ -347,8 +361,7 @@ async fn host_config(
 }
 
 async fn start_attempts(root: &Path) -> Vec<HostAttempt> {
-    let controls = std::array::from_fn(|_| free_address());
-    let replications = std::array::from_fn(|_| free_address());
+    let (controls, replications) = free_host_addresses();
     let mut attempts = Vec::new();
     for index in 0..3 {
         let member_root = root.join(format!("member-{}", index + 1));
@@ -653,6 +666,11 @@ async fn public_hosts_initialize_report_and_restart_with_fresh_sessions_case() {
     assert!(
         first_reports
             .iter()
+            .all(|report| report.read_status == wire::AccessStatus::Granted as i32)
+    );
+    assert!(
+        first_reports
+            .iter()
             .all(|report| report.write_status != wire::AccessStatus::Granted as i32)
     );
     let replay_sessions = configure_attempts(&first_attempts).await;
@@ -695,8 +713,7 @@ async fn public_hosts_initialize_report_and_restart_with_fresh_sessions_case() {
 
 async fn application_binding_without_agent_metadata_is_reported_unsafe_case() {
     let temporary = tempfile::tempdir().unwrap();
-    let controls = std::array::from_fn(|_| free_address());
-    let replications = std::array::from_fn(|_| free_address());
+    let (controls, replications) = free_host_addresses();
     let root = temporary.path().join("member-1");
     std::fs::create_dir(&root).unwrap();
     let config = host_config(&root, 0, &controls, &replications).await;
@@ -748,6 +765,92 @@ async fn application_binding_without_agent_metadata_is_reported_unsafe_case() {
     );
 }
 
+async fn established_public_host_rejects_changed_application_path_and_topology_case() {
+    let temporary = tempfile::tempdir().unwrap();
+    let mut first_attempts = start_attempts(temporary.path()).await;
+    assert_initialization_listeners(&mut first_attempts).await;
+    let (mut first_replicas, _) = initialize_attempts(&mut first_attempts).await;
+    stop_all(&mut first_replicas).await;
+
+    let (controls, replications) = free_host_addresses();
+    let root = temporary.path().join("member-1");
+    let moved_application = root.join("moved-application");
+    let moved_config = host_config_with(
+        &root,
+        0,
+        &controls,
+        &replications,
+        Some(moved_application),
+        TOPOLOGY_JSON,
+    )
+    .await;
+    let moved_source = Arc::new(RepeatingSource {
+        config: moved_config.observer().clone(),
+        samples: Mutex::new(VecDeque::new()),
+        fallback: snapshot(0),
+    });
+    let moved_application = Arc::new(
+        RuntimeHostApplication::with_observation_source(
+            &moved_config,
+            moved_source,
+            Arc::new(FixedClock),
+        )
+        .unwrap(),
+    );
+    let moved_host = ReplicaHost::new(
+        moved_config.replica_process_config(),
+        moved_application.clone(),
+        moved_application.storage_state().unwrap(),
+        Arc::new(RuntimeEndpointResolver::new(&moved_config).unwrap()),
+    )
+    .with_application_storage_paths(moved_application.storage_paths());
+    let (_shutdown, receiver) = tokio::sync::watch::channel(false);
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        moved_host.start_with_shutdown(receiver),
+    )
+    .await
+    .expect("changed application path is rejected promptly");
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("changed application path unexpectedly started"),
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("application storage paths differ")
+    );
+
+    let changed_topology = br#"{
+        "schema_version":1,
+        "members":[
+            {"replica_id":1,"server_name":"sql-1","endpoint_url":"TCP://sql-1:5022"},
+            {"replica_id":2,"server_name":"sql-2","endpoint_url":"TCP://sql-2:5022"},
+            {"replica_id":3,"server_name":"sql-3","endpoint_url":"TCP://sql-3-new:5022"}
+        ]
+    }"#;
+    let changed_config =
+        host_config_with(&root, 0, &controls, &replications, None, changed_topology).await;
+    let changed_source = Arc::new(RepeatingSource {
+        config: changed_config.observer().clone(),
+        samples: Mutex::new(VecDeque::new()),
+        fallback: snapshot(0),
+    });
+    let changed_application = RuntimeHostApplication::with_observation_source(
+        &changed_config,
+        changed_source,
+        Arc::new(FixedClock),
+    )
+    .unwrap();
+    assert!(
+        changed_application
+            .storage_state()
+            .unwrap_err()
+            .to_string()
+            .contains("binding identity differs")
+    );
+}
+
 #[test]
 fn public_hosts_initialize_report_and_restart_with_fresh_sessions() {
     run_host_test(public_hosts_initialize_report_and_restart_with_fresh_sessions_case());
@@ -758,7 +861,13 @@ fn application_binding_without_agent_metadata_is_reported_unsafe() {
     run_host_test(application_binding_without_agent_metadata_is_reported_unsafe_case());
 }
 
+#[test]
+fn established_public_host_rejects_changed_application_path_and_topology() {
+    run_host_test(established_public_host_rejects_changed_application_path_and_topology_case());
+}
+
 fn run_host_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
+    let _guard = HOST_TEST_LOCK.lock().unwrap();
     std::thread::Builder::new()
         .name("mssql-public-host-test".into())
         .stack_size(32 * 1024 * 1024)

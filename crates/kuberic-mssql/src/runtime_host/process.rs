@@ -68,14 +68,45 @@ pub async fn run_runtime_with_shutdown(
         Arc::new(SystemObservationClock),
     )?);
     let storage = application.storage_state()?;
+    let storage_paths = application.storage_paths();
+    run_host_with_shutdown(config, application, storage, Some(storage_paths), shutdown).await
+}
+
+#[cfg(feature = "kuberic-testing")]
+pub async fn testing_run_host_with_shutdown<A>(
+    config: RuntimeHostConfig,
+    application: Arc<A>,
+    storage: ApplicationStorageState,
+    storage_paths: Option<BTreeMap<String, std::path::PathBuf>>,
+    shutdown: impl Future<Output = Result<(), RuntimeProcessError>> + Send + 'static,
+) -> Result<(), RuntimeProcessError>
+where
+    A: StatefulServiceReplica + 'static,
+{
+    prepare_data_root(config.data_root())?;
+    run_host_with_shutdown(config, application, storage, storage_paths, shutdown).await
+}
+
+async fn run_host_with_shutdown<A>(
+    config: RuntimeHostConfig,
+    application: Arc<A>,
+    storage: ApplicationStorageState,
+    storage_paths: Option<BTreeMap<String, std::path::PathBuf>>,
+    shutdown: impl Future<Output = Result<(), RuntimeProcessError>> + Send + 'static,
+) -> Result<(), RuntimeProcessError>
+where
+    A: StatefulServiceReplica + 'static,
+{
     let resolver = Arc::new(RuntimeEndpointResolver::new(&config)?);
-    let host = ReplicaHost::new(
+    let mut host = ReplicaHost::new(
         config.replica_process_config(),
         application.clone(),
         storage,
         resolver,
     );
-    let host = host.with_application_storage_paths(application.storage_paths());
+    if let Some(storage_paths) = storage_paths {
+        host = host.with_application_storage_paths(storage_paths);
+    }
 
     let shutdown_deadline = config.shutdown_deadline();
     tokio::pin!(shutdown);
@@ -96,7 +127,10 @@ pub async fn run_runtime_with_shutdown(
                         )),
                         "startup cancellation",
                     );
-                    (startup.await, Some(trigger))
+                    let termination = abort_startup_task(&mut startup, shutdown_deadline).await;
+                    let result = combine(trigger, termination, "startup task termination");
+                    return finish_application(application.as_ref(), result, shutdown_deadline)
+                        .await;
                 }
             }
         }
@@ -147,7 +181,7 @@ pub async fn run_runtime_with_shutdown(
 
 async fn finish_shutdown(
     mut replica: RunningReplica,
-    application: &RuntimeHostApplication,
+    application: &impl StatefulServiceReplica,
     completion: Option<kuberic_runtime::host::Result<()>>,
     trigger: Result<(), RuntimeProcessError>,
     deadline: std::time::Duration,
@@ -159,7 +193,12 @@ async fn finish_shutdown(
             Ok(result) => result.map_err(RuntimeProcessError::host),
             Err(_) => {
                 application.abort();
-                let joined = replica.wait().await.map_err(RuntimeProcessError::host);
+                let joined = match tokio::time::timeout(deadline, replica.wait()).await {
+                    Ok(result) => result.map_err(RuntimeProcessError::host),
+                    Err(_) => Err(RuntimeProcessError::new(
+                        "runtime completion after abort timed out",
+                    )),
+                };
                 combine(
                     Err(RuntimeProcessError::new(
                         "runtime shutdown acknowledgement timed out",
@@ -174,8 +213,33 @@ async fn finish_shutdown(
     finish_application(application, result, deadline).await
 }
 
+async fn abort_startup_task(
+    startup: &mut tokio::task::JoinHandle<kuberic_runtime::host::Result<Option<RunningReplica>>>,
+    deadline: std::time::Duration,
+) -> Result<(), RuntimeProcessError> {
+    startup.abort();
+    match tokio::time::timeout(deadline, startup).await {
+        Ok(Err(error)) if error.is_cancelled() => Ok(()),
+        Ok(Err(error)) => Err(RuntimeProcessError::task(error)),
+        Ok(Ok(Err(error))) => Err(RuntimeProcessError::host(error)),
+        Ok(Ok(Ok(None))) => Ok(()),
+        Ok(Ok(Ok(Some(mut replica)))) => {
+            replica.shutdown();
+            match tokio::time::timeout(deadline, replica.wait()).await {
+                Ok(result) => result.map_err(RuntimeProcessError::host),
+                Err(_) => Err(RuntimeProcessError::new(
+                    "runtime startup task completion after abort timed out",
+                )),
+            }
+        }
+        Err(_) => Err(RuntimeProcessError::new(
+            "runtime startup task abort timed out",
+        )),
+    }
+}
+
 async fn finish_application(
-    application: &RuntimeHostApplication,
+    application: &impl StatefulServiceReplica,
     result: Result<(), RuntimeProcessError>,
     deadline: std::time::Duration,
 ) -> Result<(), RuntimeProcessError> {
@@ -438,6 +502,8 @@ async fn shutdown_signal() -> Result<(), RuntimeProcessError> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::pending;
+
     use super::*;
 
     #[test]
@@ -472,5 +538,19 @@ mod tests {
             .to_string(),
             "cleanup failed"
         );
+    }
+
+    #[tokio::test]
+    async fn startup_task_abort_is_bounded() {
+        let mut startup = tokio::spawn(pending::<
+            kuberic_runtime::host::Result<Option<RunningReplica>>,
+        >());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            abort_startup_task(&mut startup, std::time::Duration::from_millis(100)),
+        )
+        .await
+        .expect("startup task abort remains bounded")
+        .unwrap();
     }
 }

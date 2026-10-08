@@ -206,8 +206,9 @@ observations and must show:
 - current progress and catch-up capability equal to the corresponding fresh
   native configuration sequence;
 - healthy initialized durable state; and
-- fenced access: read remains reconfiguration-pending and write is never
-  granted.
+- fenced write access: stable primary and active-secondary roles may report
+  read access as granted, but write is never granted and no client service
+  address is published.
 
 Role is not write authority. No SQL external write lease is acquired. The
 replicated marker is written only by the fixture administrator against the

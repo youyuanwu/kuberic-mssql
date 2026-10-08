@@ -219,15 +219,51 @@ fn validate_endpoint_url(endpoint_url: &str) -> Result<(), TopologyConfigError> 
     if !scheme.eq_ignore_ascii_case("tcp://") {
         return Err(TopologyConfigError::Invalid);
     }
-    let Some((host, port)) = endpoint_url[6..].rsplit_once(':') else {
-        return Err(TopologyConfigError::Invalid);
-    };
-    if host.is_empty()
-        || host.trim() != host
-        || host.chars().any(char::is_whitespace)
-        || port.parse::<u16>().ok().is_none_or(|port| port == 0)
+    let authority = &endpoint_url[6..];
+    if authority
+        .chars()
+        .any(|character| matches!(character, '/' | '?' | '#' | '@'))
     {
         return Err(TopologyConfigError::Invalid);
     }
+    let (host, port) = if let Some(address) = authority.strip_prefix('[') {
+        let Some((host, port)) = address.split_once("]:") else {
+            return Err(TopologyConfigError::Invalid);
+        };
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(TopologyConfigError::Invalid);
+        }
+        (host, port)
+    } else {
+        let Some((host, port)) = authority.rsplit_once(':') else {
+            return Err(TopologyConfigError::Invalid);
+        };
+        if host.contains(':') || !valid_endpoint_host(host) {
+            return Err(TopologyConfigError::Invalid);
+        }
+        (host, port)
+    };
+    if host.is_empty() || port.parse::<u16>().ok().is_none_or(|port| port == 0) {
+        return Err(TopologyConfigError::Invalid);
+    }
     Ok(())
+}
+
+fn valid_endpoint_host(host: &str) -> bool {
+    host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
 }

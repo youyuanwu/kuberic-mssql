@@ -502,6 +502,32 @@ async fn runtime_binding_rejects_extra_malformed_unsupported_and_symlinked_state
     );
 }
 
+#[tokio::test]
+async fn runtime_binding_recovers_only_stale_private_initialization_files() {
+    let temporary = tempfile::tempdir().unwrap();
+    let runtime_config = config(temporary.path()).await;
+    let store = RuntimeBindingStore::new(&runtime_config).unwrap();
+    fs::create_dir(store.root()).unwrap();
+    fs::set_permissions(store.root(), fs::Permissions::from_mode(0o700)).unwrap();
+
+    let stale = store.root().join(".runtime-binding.json.2147483647.new");
+    write_private(&stale, "incomplete");
+    assert_eq!(
+        store.storage_state().unwrap(),
+        ApplicationStorageState::FreshEmpty
+    );
+    assert!(!stale.exists());
+    store.initialize().unwrap();
+
+    fs::remove_file(store.path()).unwrap();
+    let active = store
+        .root()
+        .join(format!(".runtime-binding.json.{}.new", std::process::id()));
+    write_private(&active, "incomplete");
+    assert_eq!(store.storage_state(), Err(RuntimeBindingError::UnsafeState));
+    assert!(active.exists());
+}
+
 #[test]
 fn shipped_peer_routes_example_is_valid() {
     let routes =

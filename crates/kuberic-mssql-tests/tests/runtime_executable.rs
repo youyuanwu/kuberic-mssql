@@ -1,12 +1,58 @@
+use std::collections::BTreeMap;
+use std::future::pending;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use kuberic_mssql::runtime_host::{
     RuntimeHostArgs, RuntimeHostConfig, RuntimeProcessError, run_runtime_with_shutdown,
+    testing_run_host_with_shutdown,
 };
+use kuberic_runtime::application::{OpenContext, RoleChange, StatefulServiceReplica};
+use kuberic_runtime::host::ApplicationStorageState;
+use kuberic_runtime::{Replicator, Result as KubericResult, RuntimeError as KubericRuntimeError};
+
+enum CloseBehavior {
+    Error,
+    Pending,
+}
+
+struct CleanupApplication {
+    close_behavior: CloseBehavior,
+}
+
+#[async_trait]
+impl StatefulServiceReplica for CleanupApplication {
+    async fn open(self: Arc<Self>, _context: OpenContext) -> KubericResult<Arc<dyn Replicator>> {
+        Err(KubericRuntimeError::Application(
+            "cleanup test application must not open".into(),
+        ))
+    }
+
+    async fn change_role(
+        &self,
+        _role: kuberic_runtime::protocol::types::ReplicaRole,
+    ) -> KubericResult<RoleChange> {
+        Err(KubericRuntimeError::Application(
+            "cleanup test application has no role".into(),
+        ))
+    }
+
+    async fn close(&self) -> KubericResult<()> {
+        match self.close_behavior {
+            CloseBehavior::Error => Err(KubericRuntimeError::Application(
+                "injected application cleanup failure".into(),
+            )),
+            CloseBehavior::Pending => pending().await,
+        }
+    }
+
+    fn abort(&self) {}
+}
 
 fn runtime_binary() -> PathBuf {
     std::env::var_os("NEXTEST_BIN_EXE_kuberic_mssql_runtime_test")
@@ -84,16 +130,18 @@ fn files(root: &Path) -> RuntimeFiles {
     }
 }
 
-fn free_address() -> String {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .to_string()
+fn free_address_pair() -> (String, String) {
+    let control = TcpListener::bind("127.0.0.1:0").unwrap();
+    let replication = TcpListener::bind("127.0.0.1:0").unwrap();
+    (
+        control.local_addr().unwrap().to_string(),
+        replication.local_addr().unwrap().to_string(),
+    )
 }
 
 fn command(root: &Path, files: &RuntimeFiles) -> Command {
-    command_with_addresses(root, files, &free_address(), &free_address())
+    let (control, replication) = free_address_pair();
+    command_with_addresses(root, files, &control, &replication)
 }
 
 fn command_with_addresses(
@@ -122,6 +170,7 @@ fn command_with_addresses(
 }
 
 fn runtime_args(root: &Path, files: &RuntimeFiles) -> RuntimeHostArgs {
+    let (control_address, replication_address) = free_address_pair();
     RuntimeHostArgs {
         resource_uid: "resource-a".into(),
         replica_id: 1,
@@ -129,8 +178,8 @@ fn runtime_args(root: &Path, files: &RuntimeFiles) -> RuntimeHostArgs {
         pvc_uid: "pvc-1".into(),
         data_root: root.join("state"),
         application_root: None,
-        control_address: free_address().parse().unwrap(),
-        replication_address: free_address().parse().unwrap(),
+        control_address: control_address.parse().unwrap(),
+        replication_address: replication_address.parse().unwrap(),
         control_endpoint: "http://127.0.0.1:50051".into(),
         replication_endpoint: "http://127.0.0.1:50052".into(),
         namespace: None,
@@ -199,8 +248,7 @@ async fn sigint_and_sigterm_cancel_fresh_startup_without_application_state() {
     for signal in ["-INT", "-TERM"] {
         let temporary = tempfile::tempdir().unwrap();
         let files = files(temporary.path());
-        let control_address = free_address();
-        let replication_address = free_address();
+        let (control_address, replication_address) = free_address_pair();
         let child = tokio::process::Command::from(command_with_addresses(
             temporary.path(),
             &files,
@@ -265,4 +313,62 @@ async fn startup_shutdown_failure_is_preserved_after_host_cleanup() {
             .contains("injected shutdown trigger failure")
     );
     assert!(!temporary.path().join("state/application").exists());
+}
+
+#[tokio::test]
+async fn runner_preserves_trigger_and_application_cleanup_failures() {
+    let temporary = tempfile::tempdir().unwrap();
+    let files = files(temporary.path());
+    let config = RuntimeHostConfig::load(runtime_args(temporary.path(), &files), temporary.path())
+        .await
+        .unwrap();
+    let error = testing_run_host_with_shutdown(
+        config,
+        Arc::new(CleanupApplication {
+            close_behavior: CloseBehavior::Error,
+        }),
+        ApplicationStorageState::FreshEmpty,
+        None,
+        async {
+            Err(RuntimeProcessError::new(
+                "injected shutdown trigger failure",
+            ))
+        },
+    )
+    .await
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("injected shutdown trigger failure"));
+    assert!(message.contains("injected application cleanup failure"));
+}
+
+#[tokio::test]
+async fn runner_bounds_application_cleanup_after_shutdown() {
+    let temporary = tempfile::tempdir().unwrap();
+    let files = files(temporary.path());
+    let mut args = runtime_args(temporary.path(), &files);
+    args.shutdown_deadline_ms = 20;
+    let config = RuntimeHostConfig::load(args, temporary.path())
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        testing_run_host_with_shutdown(
+            config,
+            Arc::new(CleanupApplication {
+                close_behavior: CloseBehavior::Pending,
+            }),
+            ApplicationStorageState::FreshEmpty,
+            Some(BTreeMap::new()),
+            async { Ok(()) },
+        ),
+    )
+    .await
+    .expect("runtime cleanup remains bounded")
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("runtime application shutdown timed out")
+    );
 }
