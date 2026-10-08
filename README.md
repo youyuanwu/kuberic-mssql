@@ -387,9 +387,9 @@ mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59
 ```
 
 It currently tracks the Kuberic `main` branch. `Cargo.lock` resolves the exact
-revision used by reproducible builds; the current revision is
-`0124cca382c58cf911eda1c31609c602c52f19b9` from
-[Kuberic PR #133](https://github.com/youyuanwu/kuberic/pull/133). It includes
+revision used by reproducible builds; the current revision is the merged
+[Kuberic PR #133](https://github.com/youyuanwu/kuberic/pull/133) commit
+`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f`. It includes
 the custom-authority same-root recovery fix and the earlier testing listener
 handoff from [Kuberic PR #127](https://github.com/youyuanwu/kuberic/pull/127).
 

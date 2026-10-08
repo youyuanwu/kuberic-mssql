@@ -227,10 +227,10 @@ cleanup, and a successful restart retry.
 
 The workspace tracks Kuberic `main`, with `Cargo.lock` recording the exact
 revision used by locked builds. The current pin
-`0124cca382c58cf911eda1c31609c602c52f19b9` is the head of
+`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f` is the merge commit of
 [youyuanwu/kuberic#133](https://github.com/youyuanwu/kuberic/pull/133), which
-fixes custom-authority recovery across same-root host replacement. It also
-contains the listener-adoption API from
+fixes custom-authority recovery and serializes peer replacement across
+same-root host replacement. It also contains the listener-adoption API from
 [youyuanwu/kuberic#127](https://github.com/youyuanwu/kuberic/pull/127).
 
 ## Usage

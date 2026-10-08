@@ -575,16 +575,22 @@ async fn initialize(
     sessions: &[String; 3],
     timeout_duration: Duration,
 ) -> Result<(), MssqlGroupError> {
+    let deadline = tokio::time::Instant::now() + timeout_duration;
     let results = join_all((0..3).map(|index| async move {
-        let (mut client, _) = status(&pods[index], timeout_duration).await?;
+        let (mut client, _) = status(
+            &pods[index],
+            rpc_remaining(deadline, "public initialization status")?,
+        )
+        .await?;
         let initialization = derive_initialization_id(
             &ResourceUid::new(run.resource_uid.clone()),
             identities[index].replica_id,
             &PodUid::new(run.kuberic_members[index].pod_uid.clone()),
             &PvcUid::new(run.kuberic_members[index].pvc_uid.clone()),
         );
-        client
-            .execute(authorized(wire::ExecuteCommandRequest {
+        tokio::time::timeout(
+            rpc_remaining(deadline, "public initialization execution")?,
+            client.execute(authorized(wire::ExecuteCommandRequest {
                 protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
                 resource_uid: run.resource_uid.clone(),
                 target: Some(identities[index].clone().into()),
@@ -607,9 +613,11 @@ async fn initialize(
                         },
                     ),
                 ),
-            }))
-            .await
-            .map_err(display_error)?;
+            })),
+        )
+        .await
+        .map_err(|_| MssqlGroupError::new("public initialization exceeded its deadline"))?
+        .map_err(display_error)?;
         Ok::<(), MssqlGroupError>(())
     }))
     .await;
@@ -632,10 +640,12 @@ async fn ensure_configuration(
         let mut clients = Vec::new();
         let mut sessions = Vec::new();
         for pod in pods {
-            let (client, report) = status(pod, timeout_duration).await?;
+            let (client, report) =
+                status(pod, rpc_remaining(deadline, "public configuration status")?).await?;
             clients.push(client);
             sessions.push(report.process_session_id);
         }
+        let execution_timeout = rpc_remaining(deadline, "public configuration execution")?;
         let results = join_all(clients.into_iter().enumerate().map(|(index, mut client)| {
             let request = configuration_request(
                 resource_uid,
@@ -645,7 +655,15 @@ async fn ensure_configuration(
                 &kuberic_runtime::protocol::types::ProcessSessionId::new(sessions[index].clone()),
                 &format!("bootstrap-configuration-{}", index + 1),
             );
-            async move { client.execute(request).await }
+            async move {
+                tokio::time::timeout(execution_timeout, client.execute(request))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(tonic::Status::deadline_exceeded(
+                            "public configuration execution exceeded its deadline",
+                        ))
+                    })
+            }
         }))
         .await;
         if results.iter().all(Result::is_ok) {
@@ -662,12 +680,15 @@ async fn ensure_configuration(
             .filter(|error| error.code() != tonic::Code::Cancelled)
             .map(ToString::to_string)
             .collect::<Vec<_>>();
-        if !fatal.is_empty() || tokio::time::Instant::now() >= deadline {
+        if !fatal.is_empty() {
             return Err(MssqlGroupError::new(format!(
                 "public current configuration failed: {fatal:?}"
             )));
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(
+            rpc_remaining(deadline, "public configuration retry")?.min(Duration::from_millis(20)),
+        )
+        .await;
     }
 }
 
@@ -705,32 +726,71 @@ async fn status(
     pod: &PublicMssqlPod,
     timeout_duration: Duration,
 ) -> Result<(AgentControlClient<Channel>, wire::AgentStatusReport), MssqlGroupError> {
+    status_at(
+        pod.control_address,
+        &pod.resource_uid,
+        &pod.identity,
+        timeout_duration,
+    )
+    .await
+}
+
+async fn status_at(
+    control_address: SocketAddr,
+    resource_uid: &ResourceUid,
+    identity: &ReplicaIdentity,
+    timeout_duration: Duration,
+) -> Result<(AgentControlClient<Channel>, wire::AgentStatusReport), MssqlGroupError> {
     let deadline = tokio::time::Instant::now() + timeout_duration;
-    let mut last: Option<String>;
     loop {
-        match AgentControlClient::connect(format!("http://{}", pod.control_address)).await {
-            Ok(mut client) => match client
-                .get_status(authorized(wire::GetAgentStatusRequest {
+        let remaining = rpc_remaining(deadline, "public agent connection")?;
+        match tokio::time::timeout(
+            remaining,
+            AgentControlClient::connect(format!("http://{control_address}")),
+        )
+        .await
+        {
+            Ok(Ok(mut client)) => {
+                let request = authorized(wire::GetAgentStatusRequest {
                     protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
-                    resource_uid: pod.resource_uid.to_string(),
-                    replica_id: pod.identity.replica_id.value(),
-                    expected_instance_id: pod.identity.instance_id.to_string(),
-                }))
+                    resource_uid: resource_uid.to_string(),
+                    replica_id: identity.replica_id.value(),
+                    expected_instance_id: identity.instance_id.to_string(),
+                });
+                match tokio::time::timeout(
+                    rpc_remaining(deadline, "public agent status")?,
+                    client.get_status(request),
+                )
                 .await
-            {
-                Ok(report) => return Ok((client, report.into_inner())),
-                Err(error) => last = Some(error.to_string()),
-            },
-            Err(error) => last = Some(error.to_string()),
+                {
+                    Ok(Ok(report)) => return Ok((client, report.into_inner())),
+                    Ok(Err(_)) => {}
+                    Err(_) => {
+                        return Err(MssqlGroupError::new(
+                            "public agent status exceeded its deadline",
+                        ));
+                    }
+                }
+            }
+            Ok(Err(_)) => {}
+            Err(_) => {
+                return Err(MssqlGroupError::new(
+                    "public agent connection exceeded its deadline",
+                ));
+            }
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(MssqlGroupError::new(format!(
-                "public agent status unavailable: {last}",
-                last = last.as_deref().unwrap_or("no response")
-            )));
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(
+            rpc_remaining(deadline, "public agent status retry")?.min(Duration::from_millis(20)),
+        )
+        .await;
     }
+}
+
+fn rpc_remaining(deadline: tokio::time::Instant, stage: &str) -> Result<Duration, MssqlGroupError> {
+    deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| MssqlGroupError::new(format!("{stage} exceeded its deadline")))
 }
 
 fn authorized<T>(message: T) -> Request<T> {
@@ -906,6 +966,37 @@ fn display_error(error: impl std::fmt::Display) -> MssqlGroupError {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stalled_public_control_connection_is_deadline_bounded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stalled = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let identity = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("pod-1"),
+            agent_generation: kuberic_runtime::protocol::types::AgentGeneration::new(
+                "generation-1",
+            ),
+        };
+        let started = tokio::time::Instant::now();
+        let error = status_at(
+            address,
+            &ResourceUid::new("resource"),
+            &identity,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        stalled.abort();
+    }
+
     #[test]
     fn public_live_group_uses_no_kuberic_testing_or_private_host_api() {
         let source = include_str!("public_kuberic_group.rs");

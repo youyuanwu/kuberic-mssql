@@ -346,10 +346,11 @@ primary and is not a Kuberic client-access decision.
 
 The current implementation tracks Kuberic `main`; `Cargo.lock` freezes the
 exact revision used by each build. The current pin
-`0124cca382c58cf911eda1c31609c602c52f19b9` comes from
+`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f` is the merge commit of
 [youyuanwu/kuberic#133](https://github.com/youyuanwu/kuberic/pull/133), which
-fixes custom-authority recovery when public hosts reopen the same durable roots.
-It also includes the testing-only bound-listener handoff from
+fixes custom-authority recovery and serializes peer replacement when public
+hosts reopen the same durable roots. It also includes the testing-only
+bound-listener handoff from
 [youyuanwu/kuberic#127](https://github.com/youyuanwu/kuberic/pull/127).
 
 ## Delivery Sequence
