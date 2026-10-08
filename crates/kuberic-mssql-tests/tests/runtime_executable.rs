@@ -93,6 +93,15 @@ fn free_address() -> String {
 }
 
 fn command(root: &Path, files: &RuntimeFiles) -> Command {
+    command_with_addresses(root, files, &free_address(), &free_address())
+}
+
+fn command_with_addresses(
+    root: &Path,
+    files: &RuntimeFiles,
+    control_address: &str,
+    replication_address: &str,
+) -> Command {
     let mut command = Command::new(runtime_binary());
     command
         .current_dir(root)
@@ -101,8 +110,8 @@ fn command(root: &Path, files: &RuntimeFiles) -> Command {
         .env("KUBERIC_POD_UID", "pod-1")
         .env("KUBERIC_PVC_UID", "pvc-1")
         .env("KUBERIC_DATA_ROOT", root.join("state"))
-        .env("KUBERIC_CONTROL_ADDRESS", free_address())
-        .env("KUBERIC_REPLICATION_ADDRESS", free_address())
+        .env("KUBERIC_CONTROL_ADDRESS", control_address)
+        .env("KUBERIC_REPLICATION_ADDRESS", replication_address)
         .env("KUBERIC_CONTROL_ENDPOINT", "http://127.0.0.1:50051")
         .env("KUBERIC_REPLICATION_ENDPOINT", "http://127.0.0.1:50052")
         .env("KUBERIC_PEER_ROUTES", &files.routes)
@@ -190,13 +199,32 @@ async fn sigint_and_sigterm_cancel_fresh_startup_without_application_state() {
     for signal in ["-INT", "-TERM"] {
         let temporary = tempfile::tempdir().unwrap();
         let files = files(temporary.path());
-        let child = tokio::process::Command::from(command(temporary.path(), &files))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        let control_address = free_address();
+        let replication_address = free_address();
+        let child = tokio::process::Command::from(command_with_addresses(
+            temporary.path(),
+            &files,
+            &control_address,
+            &replication_address,
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if tokio::net::TcpStream::connect(&control_address)
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("runtime control listener becomes reachable");
         let pid = child.id().unwrap().to_string();
         assert!(
             tokio::process::Command::new("kill")

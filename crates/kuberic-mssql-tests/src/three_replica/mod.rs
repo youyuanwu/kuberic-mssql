@@ -4,6 +4,7 @@ mod evidence;
 mod kuberic_group;
 mod member;
 mod model;
+mod public_kuberic_group;
 mod secrets;
 mod tls;
 
@@ -73,5 +74,6 @@ pub use process::{
     BoundedProcessRunner, ChildDisposition, CommandSpec, ProcessError, ProcessErrorKind,
     ProcessResult, ProcessRunner,
 };
+pub use public_kuberic_group::{PublicMssqlGroup, PublicMssqlPod};
 pub use secrets::CredentialFiles;
 pub use tls::TlsAssets;

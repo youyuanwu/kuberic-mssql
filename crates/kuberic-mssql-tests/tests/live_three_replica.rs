@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use futures::FutureExt;
 use kuberic_mssql_tests::three_replica::{
     CLEANUP_BUDGET, CancellationSignals, CleanupCoordinator, CombinedFixtureError, FixtureConfig,
-    HandledCancellationSignal, JournalStore, MssqlGroup, OwnershipJournal, ResourceState, RunState,
-    SystemCleanupClock, cleanup_three_replica_fixture, launch_three_members,
+    HandledCancellationSignal, JournalStore, OwnershipJournal, PublicMssqlGroup, ResourceState,
+    RunState, SystemCleanupClock, cleanup_three_replica_fixture, launch_three_members,
 };
 use kuberic_runtime::control::proto;
 
@@ -198,7 +198,7 @@ async fn execute_live_lifecycle(
     }
     let cleanup_clock = SystemCleanupClock::default();
     let cleanup = CleanupCoordinator::new(cleanup_clock, CLEANUP_BUDGET);
-    let group = match AssertUnwindSafe(MssqlGroup::from_live_with_coordinator(
+    let group = match AssertUnwindSafe(PublicMssqlGroup::from_live_with_coordinator(
         root,
         &launched.run,
         &native_binding,
@@ -489,12 +489,19 @@ fn load_journal_if_present(root: &Path) -> Option<OwnershipJournal> {
 }
 
 fn assert_exact_reports(
-    group: &MssqlGroup,
+    group: &PublicMssqlGroup,
     reports: &[proto::AgentStatusReport; 3],
     configuration_sequence: i64,
 ) -> Result<(), TestError> {
     let configuration_id = group.configuration.configuration_id.as_str();
     for (pod, report) in group.pods.iter().zip(reports) {
+        let expected_role = match pod.stable_role {
+            kuberic_runtime::protocol::types::ReplicaRole::Primary => proto::ReplicaRole::Primary,
+            kuberic_runtime::protocol::types::ReplicaRole::ActiveSecondary => {
+                proto::ReplicaRole::ActiveSecondary
+            }
+            _ => return Err("public Kuberic pod has an unstable role".into()),
+        };
         if report.resource_uid != group.resource_uid.as_str()
             || report.process_session_id != pod.session.as_str()
             || report.replica_id != pod.identity.replica_id.value()
@@ -508,6 +515,7 @@ fn assert_exact_reports(
             || report.catch_up_capability != Some(configuration_sequence)
             || !report.healthy
             || report.write_status == proto::AccessStatus::Granted as i32
+            || report.role != expected_role as i32
         {
             return Err("Kuberic report differs from the exact fenced topology".into());
         }

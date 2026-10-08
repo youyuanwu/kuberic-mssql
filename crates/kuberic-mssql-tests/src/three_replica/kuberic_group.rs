@@ -97,14 +97,14 @@ pub struct MssqlGroupError {
 }
 
 impl MssqlGroupError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             termination_unconfirmed: false,
         }
     }
 
-    fn termination_unconfirmed(message: impl Into<String>) -> Self {
+    pub(crate) fn termination_unconfirmed(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             termination_unconfirmed: true,
