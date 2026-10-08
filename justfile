@@ -5,7 +5,7 @@ export PATH := env_var("HOME") + "/.local/bin:" + env_var("HOME") + "/.cargo/bin
 default: check
 
 # Run the complete CI pipeline locally or on the CI runner.
-ci: setup check test-live-one-replica test-live-three-replica
+ci: setup check test-live-one-replica test-live-three-replica test-live-three-replica-restart
 
 # Install only missing/mismatched shared Rust, just and compiler prerequisites.
 setup:

@@ -331,10 +331,14 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         .unwrap();
     assert_eq!(
         ci,
-        "ci: setup check test-live-one-replica test-live-three-replica"
+        "ci: setup check test-live-one-replica test-live-three-replica test-live-three-replica-restart"
     );
     assert!(
         ci.find("test-live-one-replica").unwrap() < ci.find("test-live-three-replica").unwrap()
+    );
+    assert!(
+        ci.find("test-live-three-replica").unwrap()
+            < ci.find("test-live-three-replica-restart").unwrap()
     );
     assert!(justfile.contains("cleanup: cleanup-live-one-replica cleanup-live-three-replica"));
     assert!(!justfile.contains("sqlserver_fixture.py"));
