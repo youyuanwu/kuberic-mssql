@@ -438,15 +438,7 @@ impl SqlServerService {
         clock: Arc<dyn ObservationClock>,
         expectation: SqlServerTopologyExpectation,
     ) -> Result<Self, KubericAdapterError> {
-        if source.observer_config().target().expected_server_name
-            != *expectation.local_member().server_name()
-            || source.observer_config().target().replica.logical_id()
-                != expectation.local_logical_replica_id()
-        {
-            return Err(KubericAdapterError::InvalidConfiguration(
-                "observer target must match the local SQL topology member and logical replica",
-            ));
-        }
+        validate_observer_expectation(source.observer_config(), &expectation)?;
         Ok(Self::with_optional_topology(
             config,
             source,
@@ -682,6 +674,7 @@ impl SqlServerReplicator {
                 "runtime identity must match the local topology replica",
             ));
         }
+        validate_observer_expectation(source.observer_config(), &expectation)?;
         Ok(Self::with_parts(
             replication_address,
             source,
@@ -1372,6 +1365,13 @@ fn validate_configuration_shape(
     }
 
     for configuration_member in &configuration.members {
+        if configuration_member.identity.instance_id.is_empty()
+            || configuration_member.identity.agent_generation.is_empty()
+        {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "current member identities must be complete",
+            ));
+        }
         let descriptions = current
             .replicas
             .iter()
@@ -1406,6 +1406,21 @@ fn validate_configuration_shape(
         ));
     }
     Ok(())
+}
+
+fn validate_observer_expectation(
+    config: &ObserverConfig,
+    expectation: &SqlServerTopologyExpectation,
+) -> Result<(), KubericAdapterError> {
+    if config.target().expected_server_name != *expectation.local_member().server_name()
+        || config.target().replica.logical_id() != expectation.local_logical_replica_id()
+    {
+        Err(KubericAdapterError::InvalidConfiguration(
+            "observer target must match the local SQL topology member and logical replica",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_current_configuration(

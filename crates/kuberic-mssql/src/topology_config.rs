@@ -211,8 +211,23 @@ fn validate_endpoint_url(endpoint_url: &str) -> Result<(), TopologyConfigError> 
         || endpoint_url.chars().any(char::is_control)
         || endpoint_url.trim() != endpoint_url
     {
-        Err(TopologyConfigError::Invalid)
-    } else {
-        Ok(())
+        return Err(TopologyConfigError::Invalid);
     }
+    let Some(scheme) = endpoint_url.get(..6) else {
+        return Err(TopologyConfigError::Invalid);
+    };
+    if !scheme.eq_ignore_ascii_case("tcp://") {
+        return Err(TopologyConfigError::Invalid);
+    }
+    let Some((host, port)) = endpoint_url[6..].rsplit_once(':') else {
+        return Err(TopologyConfigError::Invalid);
+    };
+    if host.is_empty()
+        || host.trim() != host
+        || host.chars().any(char::is_whitespace)
+        || port.parse::<u16>().ok().is_none_or(|port| port == 0)
+    {
+        return Err(TopologyConfigError::Invalid);
+    }
+    Ok(())
 }

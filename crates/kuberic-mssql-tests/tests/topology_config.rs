@@ -153,6 +153,22 @@ fn topology_rejects_duplicate_missing_local_and_invalid_member_anchors() {
         ),
         Err(TopologyConfigError::Invalid)
     );
+    assert_eq!(
+        SqlServerTopologyMemberExpectation::new(
+            ReplicaId::new(1),
+            ServerName::new("sql-1").unwrap(),
+            "not-an-endpoint",
+        ),
+        Err(TopologyConfigError::Invalid)
+    );
+    assert_eq!(
+        SqlServerTopologyMemberExpectation::new(
+            ReplicaId::new(1),
+            ServerName::new("sql-1").unwrap(),
+            "TCP://sql-1:0",
+        ),
+        Err(TopologyConfigError::Invalid)
+    );
 }
 
 #[test]

@@ -1090,6 +1090,19 @@ fn topology_constructors_reject_local_observer_and_runtime_identity_drift() {
         )
         .is_err()
     );
+    assert!(
+        SqlServerReplicator::new_with_topology(
+            "replica-1.example:5022".into(),
+            Arc::new(ScriptedSource {
+                config: observer_config_for(1),
+                samples: Mutex::new(VecDeque::new()),
+            }),
+            clock(),
+            kuberic_identity(1),
+            topology_expectation(),
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -1512,6 +1525,16 @@ async fn bound_current_configuration_rejects_every_frozen_value_drift() {
     let mut changed = exact.clone();
     changed.replicas[0].identity = kuberic_identity(9);
     cases.push(("replica identity", changed));
+
+    let mut changed = exact.clone();
+    changed.configuration.members[0].identity.instance_id = ReplicaInstanceId::new("");
+    changed.replicas[0].identity = changed.configuration.members[0].identity.clone();
+    cases.push(("empty instance identity", changed));
+
+    let mut changed = exact.clone();
+    changed.configuration.members[0].identity.agent_generation = AgentGeneration::new("");
+    changed.replicas[0].identity = changed.configuration.members[0].identity.clone();
+    cases.push(("empty generation identity", changed));
 
     let mut changed = exact.clone();
     changed.replicas[0].process_session_id = ProcessSessionId::default();
