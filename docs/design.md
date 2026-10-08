@@ -318,24 +318,29 @@ operations still require:
 - a pure planner that emits at most one authority-changing command; and
 - separate persistence and dispatch reconciliation cycles.
 
-The current SQL Server code remains an independently testable adapter library
-and laboratory tool. It does not claim automatic Kubernetes failover.
+The SQL Server code now includes an independently runnable public
+`ReplicaHost` application, but it is not a controller and does not claim
+automatic Kubernetes failover.
 
-The three-member laboratory path freezes one `HealthyTopologyBinding` per
-member. The binding correlates exact Kuberic resource/replica identities,
-process sessions, addresses, current descriptor, effective policy and stable
-roles with SQL Server names, process-start incarnations, native replica GUIDs,
-AG identity and database lineage. `update_current_replica_set_configuration`
-accepts only that current descriptor and value-identical replay.
-`catch_up_capability` is available only after exact current admission and role
-publication; both callbacks reobserve SQL Server and revalidate durable runtime
-authority. Previous/current transitions, catch-up quorum, build, removal, data
-loss, recovery, failover and lease behavior remain explicit observe-only
-errors.
+Each runtime receives a strict stable mapping from three Kuberic replica
+numbers to SQL Server names and AG endpoint URLs. The current-configuration
+callback supplies dynamic full identities, roles, sessions and addresses.
+Fresh SQL evidence freezes native replica GUIDs, AG/database lineage and the
+local SQL process start. Bootstrap callbacks may omit remote transport
+descriptions; those fields permit only one-way completion, followed by exact
+replay.
+
+The application persists only a schema-versioned non-secret digest binding
+under its authorized application root. Kuberic's private authority store
+remains behind the public host boundary. `catch_up_capability` is available
+after native current admission and role publication; callbacks continue to
+reobserve SQL Server. Previous/current transitions, catch-up quorum, build,
+removal, data loss, recovery, failover and lease behavior remain explicit
+observe-only errors.
 
 Role is not write authority. The healthy reports expose one primary and two
-active secondaries, but read access remains reconfiguration-pending and write
-access is never granted. There is no external write lease. The fixture's marker
+active secondaries, but write access is never granted. No client SQL service
+address is published and there is no external write lease. The fixture's marker
 write uses its private administrator connection to the directly observed native
 primary and is not a Kuberic client-access decision.
 

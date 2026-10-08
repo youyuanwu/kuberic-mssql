@@ -12,7 +12,11 @@ mod output;
 pub mod query;
 pub mod runtime_config;
 pub mod runtime_error;
+#[cfg(feature = "kuberic")]
+pub mod runtime_host;
 pub mod tds;
+#[cfg(feature = "kuberic")]
+pub mod topology_config;
 pub mod types;
 
 pub use config::{
@@ -24,13 +28,16 @@ pub use config::{
 pub use error::ContractError;
 #[cfg(feature = "kuberic")]
 pub use kuberic::{
-    HealthyTopologyBinding, HealthyTopologyMemberBinding, RuntimeAuthorityContext,
-    RuntimeAuthorityContextSource, SqlServerStartIncarnation,
+    HealthyTopologyBinding, HealthyTopologyMemberBinding, SqlServerStartIncarnation,
 };
 pub use operation::{
     DestructiveApproval, EffectSignature, FenceReference, InputSignature,
     OPERATION_CONTRACT_VERSION, OperationEnvelope, OperationPayload, OperationRecord,
     OperationRequest, ReplayDisposition,
+};
+#[cfg(feature = "kuberic")]
+pub use topology_config::{
+    SqlServerTopologyExpectation, SqlServerTopologyMemberExpectation, TopologyConfigError,
 };
 pub use types::{
     AvailabilityGroupIdentity, AvailabilityGroupName, ConfigurationSequence, DatabaseIdentity,

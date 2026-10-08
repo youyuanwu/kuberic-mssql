@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "routes": [
+    {
+      "replica_id": 2,
+      "instance_id": "pod-uid-2",
+      "agent_generation": "derived-generation-2",
+      "control_endpoint": "http://replica-2.example:50051",
+      "replication_endpoint": "http://replica-2.example:50052"
+    },
+    {
+      "replica_id": 3,
+      "instance_id": "pod-uid-3",
+      "agent_generation": "derived-generation-3",
+      "control_endpoint": "http://replica-3.example:50051",
+      "replication_endpoint": "http://replica-3.example:50052"
+    }
+  ]
+}

@@ -17,11 +17,17 @@ kuberic-testing = ["kuberic", "kuberic-runtime/testing"]
 name = "sqlserver-observer"
 path = "src/main.rs"
 
+[[bin]]
+name = "kuberic-mssql-runtime"
+path = "src/bin/kuberic-mssql-runtime.rs"
+required-features = ["kuberic"]
+
 [dependencies]
 async-trait.workspace = true
 clap.workspace = true
 futures.workspace = true
 kuberic-runtime = { workspace = true, optional = true }
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

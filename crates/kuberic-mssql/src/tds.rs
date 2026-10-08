@@ -284,6 +284,21 @@ fn malformed(stage: &'static str, message: &'static str) -> RuntimeError {
     RuntimeError::new(ObservationFailureKind::Malformed, stage, message)
 }
 
+#[cfg(feature = "kuberic-testing")]
+#[doc(hidden)]
+pub fn testing_classify_server_error(code: u32) -> RuntimeError {
+    let (kind, message) = server_error(Some(code));
+    let mut error = RuntimeError::new(kind, "SQL Server", message);
+    error.server_code = Some(code);
+    error
+}
+
+#[cfg(feature = "kuberic-testing")]
+#[doc(hidden)]
+pub fn testing_classify_driver_error(error: tiberius::error::Error) -> RuntimeError {
+    driver_error("TLS/TDS login", error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "members": [
+    {
+      "replica_id": 1,
+      "server_name": "sql-1",
+      "endpoint_url": "TCP://sql-1:5022"
+    },
+    {
+      "replica_id": 2,
+      "server_name": "sql-2",
+      "endpoint_url": "TCP://sql-2:5022"
+    },
+    {
+      "replica_id": 3,
+      "server_name": "sql-3",
+      "endpoint_url": "TCP://sql-3:5022"
+    }
+  ]
+}

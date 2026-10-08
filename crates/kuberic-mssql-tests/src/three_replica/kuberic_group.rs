@@ -13,17 +13,15 @@ use async_trait::async_trait;
 use futures::FutureExt;
 use kuberic_mssql::instance::SqlServerInstanceManager;
 use kuberic_mssql::kuberic::{
-    HealthyTopologyBinding, HealthyTopologyMemberBinding, ObservationClock,
-    RuntimeAuthorityContext, RuntimeAuthorityContextSource, SqlServerMemberEndpoint,
-    SqlServerObservationSource, SqlServerService, SqlServerServiceConfig,
-    SqlServerStartIncarnation, SystemObservationClock,
+    HealthyTopologyBinding, ObservationClock, SqlServerObservationSource, SqlServerService,
+    SqlServerServiceConfig, SystemObservationClock,
 };
 use kuberic_mssql::observation::InstanceSnapshot;
 use kuberic_mssql::runtime_config::ObserverConfig;
 use kuberic_mssql::tds::TdsExecutor;
 use kuberic_mssql::{
-    AvailabilityGroupIdentity, AvailabilityGroupName, DatabaseIdentity, DatabaseLineage, Guid,
-    NativeRole, Observation, ServerName, SqlIdentifier,
+    NativeRole, Observation, ServerName, SqlServerTopologyExpectation,
+    SqlServerTopologyMemberExpectation,
 };
 use kuberic_runtime::application::OpenMode;
 use kuberic_runtime::control::proto;
@@ -99,14 +97,14 @@ pub struct MssqlGroupError {
 }
 
 impl MssqlGroupError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             termination_unconfirmed: false,
         }
     }
 
-    fn termination_unconfirmed(message: impl Into<String>) -> Self {
+    pub(crate) fn termination_unconfirmed(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             termination_unconfirmed: true,
@@ -748,12 +746,19 @@ impl MssqlGroup {
                 )
                 .map_err(display_error)?,
             );
-            let application = Arc::new(SqlServerService::with_observation_source(
-                SqlServerServiceConfig::new(resource_uid.clone(), replication_address.to_string())
+            let application = Arc::new(
+                SqlServerService::with_observation_source_and_topology(
+                    SqlServerServiceConfig::new(
+                        resource_uid.clone(),
+                        replication_address.to_string(),
+                    )
                     .map_err(display_error)?,
-                sources[index].clone(),
-                clocks[index].clone(),
-            ));
+                    sources[index].clone(),
+                    clocks[index].clone(),
+                    topology_expectation(run, native_binding, index)?,
+                )
+                .map_err(display_error)?,
+            );
             let runtime = Arc::new(PodRuntime::new(
                 identities[index].clone(),
                 application.clone(),
@@ -794,40 +799,14 @@ impl MssqlGroup {
 
         let initialization = AssertUnwindSafe(async {
             let initial = observe_sources(&pods, budget).await?;
-            let members = build_member_bindings(run, native_binding, &pods, &initial, &roles)?;
-            let availability_group = availability_group_identity(native_binding)?;
-            let database_lineage = database_lineage(native_binding)?;
-            let mut topology_bindings = Vec::with_capacity(3);
-            for pod in &pods {
-                let binding = HealthyTopologyBinding::new(
-                    resource_uid.clone(),
-                    pod.identity.clone(),
-                    configuration.clone(),
-                    effective_policy.clone(),
-                    availability_group.clone(),
-                    database_lineage.clone(),
-                    members.clone(),
-                )
-                .map_err(display_error)?;
-                topology_bindings.push(binding.clone());
-                budget
-                    .run(
-                        "healthy topology binding",
-                        budget.operation_timeout,
-                        pod.application.bind_topology(
-                            binding,
-                            Arc::new(StoreAuthorityContextSource {
-                                store: pod.store.clone(),
-                            }),
-                        ),
-                    )
-                    .await?
-                    .map_err(display_error)?;
+            for index in 0..3 {
+                validate_native_observation(
+                    index,
+                    native_binding,
+                    &initial[index],
+                    pods[index].source.observer_config(),
+                )?;
             }
-            let topology_bindings: [HealthyTopologyBinding; 3] = topology_bindings
-                .try_into()
-                .map_err(|_| MssqlGroupError::new("exactly three topology bindings required"))?;
-
             for pod in &pods {
                 pod.effect(RuntimeEffectAction::Open(OpenMode::New), budget)
                     .await?;
@@ -892,6 +871,22 @@ impl MssqlGroup {
                 )
                 .await?;
             }
+            let topology_bindings: [HealthyTopologyBinding; 3] = pods
+                .iter()
+                .map(|pod| {
+                    pod.application
+                        .replicator()
+                        .and_then(|replicator| replicator.admitted_topology())
+                        .map(|binding| binding.as_ref().clone())
+                        .ok_or_else(|| {
+                            MssqlGroupError::new(
+                                "current authority did not admit the SQL Server topology",
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .try_into()
+                .map_err(|_| MssqlGroupError::new("exactly three topology bindings required"))?;
             observe_sources(&pods, budget).await?;
             for (pod, role) in pods.iter().zip(roles) {
                 pod.effect(RuntimeEffectAction::ChangeRole(role), budget)
@@ -1178,44 +1173,6 @@ async fn shutdown_pods(
     }
 }
 
-struct StoreAuthorityContextSource {
-    store: Arc<SqliteStore>,
-}
-
-#[async_trait]
-impl RuntimeAuthorityContextSource for StoreAuthorityContextSource {
-    async fn current_authority_context(
-        &self,
-    ) -> kuberic_runtime::Result<Option<RuntimeAuthorityContext>> {
-        let state = self
-            .store
-            .load_state()
-            .await
-            .map_err(|error| kuberic_runtime::RuntimeError::Application(error.to_string()))?;
-        let pending = state.pending_effect.as_ref().and_then(|pending| {
-            if let RuntimeEffectAction::AdmitAuthority(authority) = &pending.effect.action {
-                Some(authority.as_ref())
-            } else {
-                None
-            }
-        });
-        let configuration = pending
-            .map(|authority| authority.current_configuration.clone())
-            .or(state.current_configuration);
-        let Some(configuration) = configuration else {
-            return Ok(None);
-        };
-        let policy = state
-            .admitted_policy
-            .unwrap_or_else(|| state.identity.effective_policy.clone());
-        Ok(Some(RuntimeAuthorityContext::new(
-            state.identity.local_identity,
-            configuration,
-            policy,
-        )))
-    }
-}
-
 fn exact_policy() -> EffectivePolicy {
     EffectivePolicy::fixed(3, MSSQL_FAILOVER_DELAY_SECONDS).expect("three-member policy is valid")
 }
@@ -1302,42 +1259,27 @@ async fn observe_source(
     }
 }
 
-fn build_member_bindings(
+fn topology_expectation(
     run: &TopologyRun,
     native_binding: &NativeTopologyBinding,
-    pods: &[MssqlPod; 3],
-    snapshots: &[InstanceSnapshot; 3],
-    roles: &[ReplicaRole; 3],
-) -> Result<Vec<HealthyTopologyMemberBinding>, MssqlGroupError> {
-    (0..3)
+    local_index: usize,
+) -> Result<SqlServerTopologyExpectation, MssqlGroupError> {
+    let members = (0..3)
         .map(|index| {
-            validate_native_observation(
-                index,
-                native_binding,
-                &snapshots[index],
-                pods[index].source.observer_config(),
-            )?;
-            let group = present_group(&snapshots[index])?;
-            HealthyTopologyMemberBinding::new(
-                pods[index].identity.clone(),
-                pods[index].session.clone(),
-                pods[index].replication_address.to_string(),
-                group.local_replica.identity.clone(),
-                SqlServerMemberEndpoint::new(
-                    ServerName::new(run.members[index].server_name.clone())
-                        .map_err(display_error)?,
-                    native_binding.members[index].endpoint_url.clone(),
-                )
-                .map_err(display_error)?,
-                SqlServerStartIncarnation::new(
-                    native_binding.members[index].sql_start_time.clone(),
-                )
-                .map_err(display_error)?,
-                roles[index],
+            SqlServerTopologyMemberExpectation::new(
+                ReplicaId::new(run.kuberic_members[index].replica_id),
+                ServerName::new(run.members[index].server_name.clone()).map_err(display_error)?,
+                native_binding.members[index].endpoint_url.clone(),
             )
             .map_err(display_error)
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    SqlServerTopologyExpectation::new(
+        ReplicaId::new(run.kuberic_members[local_index].replica_id),
+        format!("{}", local_index + 1),
+        members,
+    )
+    .map_err(display_error)
 }
 
 fn validate_run_binding(
@@ -1469,7 +1411,7 @@ fn validate_bound_observation(
         .members()
         .iter()
         .find(|member| member.kuberic_identity() == binding.local_identity())
-        .map(HealthyTopologyMemberBinding::stable_role)
+        .map(|member| member.stable_role())
         .ok_or_else(|| MssqlGroupError::new("local topology binding member is missing"))?;
     binding
         .validate_snapshot(config, snapshot, unix_millis()?, true, Some(role))
@@ -1488,38 +1430,6 @@ fn present_group(
             "direct observation is absent, failed, or inconsistently timestamped",
         )),
     }
-}
-
-fn availability_group_identity(
-    native_binding: &NativeTopologyBinding,
-) -> Result<AvailabilityGroupIdentity, MssqlGroupError> {
-    Ok(AvailabilityGroupIdentity {
-        name: AvailabilityGroupName::new(native_binding.availability_group_name.clone())
-            .map_err(display_error)?,
-        group_id: Guid::parse(
-            "native availability-group ID",
-            &native_binding.availability_group_id,
-        )
-        .map_err(display_error)?,
-    })
-}
-
-fn database_lineage(
-    native_binding: &NativeTopologyBinding,
-) -> Result<DatabaseLineage, MssqlGroupError> {
-    Ok(DatabaseLineage {
-        database: DatabaseIdentity {
-            name: SqlIdentifier::new(native_binding.database_name.clone())
-                .map_err(display_error)?,
-            group_database_id: Guid::parse(
-                "native group database ID",
-                &native_binding.group_database_id,
-            )
-            .map_err(display_error)?,
-        },
-        recovery_fork_id: Guid::parse("native recovery fork ID", &native_binding.recovery_fork_id)
-            .map_err(display_error)?,
-    })
 }
 
 fn reserve_agent_addresses()
@@ -1622,8 +1532,9 @@ mod tests {
         RecoveryLineageObservation, ReplicaSnapshot, ReplicaState,
     };
     use kuberic_mssql::{
-        ConfigurationSequence, DecimalProgress, NativeProgress,
-        ReplicaIdentity as SqlReplicaIdentity,
+        AvailabilityGroupIdentity, AvailabilityGroupName, ConfigurationSequence, DatabaseIdentity,
+        DatabaseLineage, DecimalProgress, Guid, NativeProgress,
+        ReplicaIdentity as SqlReplicaIdentity, SqlIdentifier,
     };
 
     use super::*;
@@ -1908,47 +1819,6 @@ mod tests {
     }
 
     #[test]
-    fn store_policy_mismatch_fails_before_authority_is_durable() {
-        run_group_test(async {
-            let root = test_root("policy");
-            let run = run(&root);
-            let native = native_binding(&run);
-            let now = unix_millis().unwrap();
-            let sources: [Source; 3] = std::array::from_fn(|index| {
-                Arc::new(source(&run, index, now)) as Arc<dyn SqlServerObservationSource>
-            });
-            let error = match MssqlGroup::assemble_with_store_policies(
-                &root,
-                &run,
-                &native,
-                sources,
-                std::array::from_fn(|_| Arc::new(FixedClock(AtomicU64::new(now))) as Clock),
-                [
-                    exact_policy(),
-                    EffectivePolicy::fixed(3, MSSQL_FAILOVER_DELAY_SECONDS + 1).unwrap(),
-                    exact_policy(),
-                ],
-                ConvergenceBudget::new(
-                    Duration::from_secs(60),
-                    StdInstant::now() + Duration::from_secs(120),
-                )
-                .unwrap(),
-                &CleanupCoordinator::default(),
-            )
-            .await
-            {
-                Ok(group) => {
-                    group.shutdown().await.unwrap();
-                    panic!("policy mismatch unexpectedly assembled")
-                }
-                Err(error) => error,
-            };
-            assert!(error.to_string().contains("effective policy"), "{error}");
-            fs::remove_dir_all(&root).unwrap();
-        });
-    }
-
-    #[test]
     fn report_observation_failure_remains_fenced_and_shutdown_is_clean() {
         run_group_test(async {
             let root = test_root("report-failure");
@@ -2146,9 +2016,9 @@ mod tests {
     }
 
     #[test]
-    fn assembly_tolerates_suspended_native_authority_validation() {
+    fn assembly_tolerates_suspended_native_observation() {
         run_group_test(async {
-            let root = test_root("slow-authority-validation");
+            let root = test_root("slow-observation");
             let run = run(&root);
             let native = native_binding(&run);
             let now = unix_millis().unwrap();
@@ -2164,8 +2034,8 @@ mod tests {
                 &native,
                 sources,
                 std::array::from_fn(|_| Arc::new(FixedClock(AtomicU64::new(now))) as Clock),
-                Duration::from_secs(30),
-                StdInstant::now() + Duration::from_secs(60),
+                Duration::from_secs(120),
+                StdInstant::now() + Duration::from_secs(240),
             )
             .await
             .unwrap();

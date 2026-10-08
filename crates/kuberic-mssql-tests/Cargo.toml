@@ -23,6 +23,11 @@ name = "mssql-one-replica-fixture"
 path = "src/bin/mssql-one-replica-fixture.rs"
 test = false
 
+[[bin]]
+name = "kuberic-mssql-runtime-test"
+path = "src/bin/kuberic-mssql-runtime.rs"
+test = false
+
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true
