@@ -31,7 +31,7 @@ clippy:
 
 # Run ordinary Rust tests; live fixtures remain ignored.
 test:
-    cargo test --locked --workspace --all-features
+    cargo test --locked --workspace --all-features -- --test-threads=1
 
 # Launch one owned SQL Server member, validate unique observer/CLI behavior, and clean up.
 test-live-one-replica root="target/mssql-one-replica":

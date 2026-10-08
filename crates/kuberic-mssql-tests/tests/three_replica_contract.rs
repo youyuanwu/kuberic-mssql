@@ -325,6 +325,9 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         assert!(!line.contains("test-live-three-replica"));
         assert!(!line.contains("test-live-one-replica"));
     }
+    assert!(
+        justfile.contains("cargo test --locked --workspace --all-features -- --test-threads=1")
+    );
     let ci = justfile
         .lines()
         .find(|line| line.starts_with("ci:"))
