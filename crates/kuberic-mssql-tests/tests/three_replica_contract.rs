@@ -278,9 +278,11 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
     );
     assert!(justfile.contains("cleanup-live-one-replica root=\"target/mssql-one-replica\":"));
     assert!(justfile.contains("test-live-three-replica root=\"target/mssql-three-replica\":"));
-    assert!(justfile.contains(
-        "test-live-three-replica-restart-repro root=\"target/mssql-three-replica-restart-repro\":"
-    ));
+    assert!(
+        justfile.contains(
+            "test-live-three-replica-restart root=\"target/mssql-three-replica-restart\":"
+        )
+    );
     assert!(justfile.contains("cleanup-live-three-replica root=\"target/mssql-three-replica\":"));
     assert!(
         justfile
@@ -309,7 +311,7 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         "cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_happy_path -- --ignored --exact --test-threads=1"
     ));
     assert!(justfile.contains(
-        "cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_same_root_restart_repro -- --ignored --exact --test-threads=1 --nocapture"
+        "cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_same_root_restart -- --ignored --exact --test-threads=1 --nocapture"
     ));
     assert!(justfile.contains(
         "cargo run --locked -p kuberic-mssql-tests --bin mssql-three-replica-fixture -- cleanup --root"

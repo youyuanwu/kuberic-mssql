@@ -18,6 +18,8 @@ use kuberic_mssql_tests::three_replica::{
 use kuberic_runtime::control::proto;
 
 type TestError = Box<dyn Error + Send + Sync>;
+const HAPPY_PATH_TEST: &str = "three_replica_mssql_happy_path";
+const SAME_ROOT_RESTART_TEST: &str = "three_replica_mssql_same_root_restart";
 
 #[test]
 #[ignore = "auto-accepts the SQL Server EULA for this test fixture and requires a qualified local Docker host"]
@@ -26,12 +28,12 @@ fn three_replica_mssql_happy_path() {
 }
 
 #[test]
-#[ignore = "reproduces Kuberic same-root replacement startup cancellation with a licensed SQL Server fixture"]
-fn three_replica_mssql_same_root_restart_repro() {
+#[ignore = "validates same-root Kuberic host restart with a licensed SQL Server fixture"]
+fn three_replica_mssql_same_root_restart() {
     run_three_replica_test(true);
 }
 
-fn run_three_replica_test(restart_repro: bool) {
+fn run_three_replica_test(validate_restart: bool) {
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
         .spawn(move || {
@@ -41,7 +43,7 @@ fn run_three_replica_test(restart_repro: bool) {
                 .enable_all()
                 .build()
                 .expect("three-replica Tokio runtime")
-                .block_on(run_three_replica_mssql_happy_path(restart_repro));
+                .block_on(run_three_replica_mssql_happy_path(validate_restart));
         })
         .expect("three-replica test thread")
         .join()
@@ -142,6 +144,7 @@ fn three_replica_post_ag_and_report_fault_checkpoints_recover() {
         "fail-after-ag",
         "panic-after-agent-start",
         "fail-during-report",
+        "fail-after-agent-restart",
     ] {
         let root = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
         cleanup_three_replica_fixture(&root).expect("clean fault-checkpoint baseline");
@@ -156,7 +159,7 @@ fn three_replica_post_ag_and_report_fault_checkpoints_recover() {
         assert_removed(&root);
     }
     let root = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
-    let mut retry = spawn_live_child(&root, None);
+    let mut retry = spawn_restart_child(&root);
     assert!(
         wait_for_child_with_cleanup(&mut retry, Duration::from_secs(1200), &root).success(),
         "retry after fault checkpoints"
@@ -165,7 +168,7 @@ fn three_replica_post_ag_and_report_fault_checkpoints_recover() {
     assert_removed(&root);
 }
 
-async fn run_three_replica_mssql_happy_path(restart_repro: bool) {
+async fn run_three_replica_mssql_happy_path(validate_restart: bool) {
     let mut cancellation =
         CancellationSignals::register().expect("install SIGINT/SIGTERM cleanup handlers");
     write_signal_handler_ready_evidence();
@@ -179,7 +182,7 @@ async fn run_three_replica_mssql_happy_path(restart_repro: bool) {
         &root,
         config,
         &mut cancellation,
-        restart_repro,
+        validate_restart,
     ))
     .catch_unwind()
     .await
@@ -236,7 +239,7 @@ async fn execute_live_lifecycle(
     root: &Path,
     config: FixtureConfig,
     cancellation: &mut CancellationSignals,
-    restart_repro: bool,
+    validate_restart: bool,
 ) -> Result<(), TestError> {
     let mut launched = launch_three_members(config)
         .await
@@ -318,8 +321,12 @@ async fn execute_live_lifecycle(
             if fault_checkpoint("fail-during-report") {
                 return Err::<(), TestError>("injected failure during bracketed reporting".into());
             }
-            let reports = group.reports_bracketed().await?;
-            assert_exact_reports(&group, &reports, native_binding.configuration_sequence)?;
+            wait_for_exact_reports(
+                &group,
+                native_binding.configuration_sequence,
+                launched.kuberic_convergence_timeout(),
+            )
+            .await?;
             let marker = launched
                 .commit_replicated_marker(&topology.evidence)
                 .await?;
@@ -358,7 +365,7 @@ async fn execute_live_lifecycle(
         let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
         return finish_runtime_outcome(root, launched, first_outcome, &cleanup);
     }
-    if !restart_repro {
+    if !validate_restart {
         let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
         return finish_runtime_outcome(root, launched, first_outcome, &cleanup);
     }
@@ -432,8 +439,12 @@ async fn execute_live_lifecycle(
             if fault_checkpoint("fail-after-agent-restart") {
                 return Err("injected failure after replacement agent startup".into());
             }
-            let reports = restarted.reports_bracketed().await?;
-            assert_exact_reports(&restarted, &reports, native_binding.configuration_sequence)?;
+            wait_for_exact_reports(
+                &restarted,
+                native_binding.configuration_sequence,
+                launched.kuberic_convergence_timeout(),
+            )
+            .await?;
             let marker = launched
                 .commit_replicated_marker(&topology.evidence)
                 .await?;
@@ -574,9 +585,22 @@ fn required_path(variable: &str) -> PathBuf {
 }
 
 fn spawn_live_child(root: &Path, ready: Option<&Path>) -> Child {
+    spawn_test_child(root, HAPPY_PATH_TEST, ready, None)
+}
+
+fn spawn_restart_child(root: &Path) -> Child {
+    spawn_test_child(root, SAME_ROOT_RESTART_TEST, None, None)
+}
+
+fn spawn_test_child(
+    root: &Path,
+    test_name: &str,
+    ready: Option<&Path>,
+    checkpoint: Option<&str>,
+) -> Child {
     let mut command = Command::new(std::env::current_exe().expect("current live test executable"));
     command
-        .arg("three_replica_mssql_happy_path")
+        .arg(test_name)
         .arg("--ignored")
         .arg("--exact")
         .arg("--nocapture")
@@ -588,22 +612,19 @@ fn spawn_live_child(root: &Path, ready: Option<&Path>) -> Child {
     if let Some(ready) = ready {
         command.env("KUBERIC_MSSQL_SIGNAL_READY_FILE", ready);
     }
+    if let Some(checkpoint) = checkpoint {
+        command.env("KUBERIC_MSSQL_FAULT_CHECKPOINT", checkpoint);
+    }
     command.spawn().expect("spawn exact live child")
 }
 
 fn spawn_live_child_with_fault(root: &Path, checkpoint: &str) -> Child {
-    let mut child = Command::new(std::env::current_exe().expect("current live test executable"));
-    child
-        .arg("three_replica_mssql_happy_path")
-        .arg("--ignored")
-        .arg("--exact")
-        .arg("--nocapture")
-        .arg("--test-threads=1")
-        .env("KUBERIC_MSSQL_THREE_REPLICA_ROOT", root)
-        .env("KUBERIC_MSSQL_FAULT_CHECKPOINT", checkpoint)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    child.spawn().expect("spawn fault-injected live child")
+    let test_name = if checkpoint == "fail-after-agent-restart" {
+        SAME_ROOT_RESTART_TEST
+    } else {
+        HAPPY_PATH_TEST
+    };
+    spawn_test_child(root, test_name, None, Some(checkpoint))
 }
 
 fn spawn_cleanup_child(root: &Path) -> Child {
@@ -716,7 +737,31 @@ fn assert_exact_reports(
             || report.write_status != expected_write as i32
             || report.role != expected_role as i32
         {
-            return Err("Kuberic report differs from the exact fenced topology".into());
+            return Err(format!(
+                "Kuberic report differs from the exact fenced topology: ordinal={}, \
+                 resource_uid={}, identity={:?}, session={}, replica_id={}, pod_uid={}, \
+                 pvc_uid={}, storage_state={}, fault={}, previous_configuration={}, \
+                 current_configuration={}, progress={}, capability={:?}, healthy={}, \
+                 read_status={}, write_status={}, role={}",
+                pod.ordinal,
+                report.resource_uid,
+                report.identity,
+                report.process_session_id,
+                report.replica_id,
+                report.pod_uid,
+                report.pvc_uid,
+                report.storage_state,
+                report.reported_fault,
+                report.previous_configuration.is_some(),
+                report.current_configuration.is_some(),
+                report.current_progress,
+                report.catch_up_capability,
+                report.healthy,
+                report.read_status,
+                report.write_status,
+                report.role,
+            )
+            .into());
         }
     }
     if reports
@@ -733,6 +778,24 @@ fn assert_exact_reports(
         return Err("Kuberic reports do not expose one primary and two active secondaries".into());
     }
     Ok(())
+}
+
+async fn wait_for_exact_reports(
+    group: &PublicMssqlGroup,
+    configuration_sequence: i64,
+    timeout: Duration,
+) -> Result<[proto::AgentStatusReport; 3], TestError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let reports = group.reports_bracketed().await?;
+        match assert_exact_reports(group, &reports, configuration_sequence) {
+            Ok(()) => return Ok(reports),
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn assert_removed(root: &Path) {
