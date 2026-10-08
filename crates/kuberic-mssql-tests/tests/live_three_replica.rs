@@ -787,13 +787,20 @@ async fn wait_for_exact_reports(
 ) -> Result<[proto::AgentStatusReport; 3], TestError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let reports = group.reports_bracketed().await?;
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or("public report convergence exceeded its deadline")?;
+        let reports = tokio::time::timeout(remaining, group.reports_bracketed())
+            .await
+            .map_err(|_| "public bracketed reporting exceeded its deadline")??;
         match assert_exact_reports(group, &reports, configuration_sequence) {
             Ok(()) => return Ok(reports),
-            Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            Err(error) => {
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .ok_or(error)?;
+                tokio::time::sleep(remaining.min(Duration::from_millis(20))).await;
             }
-            Err(error) => return Err(error),
         }
     }
 }

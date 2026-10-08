@@ -287,6 +287,7 @@ impl PublicMssqlGroup {
         &self,
         superseded: &[kuberic_runtime::protocol::types::ProcessSessionId; 3],
     ) -> Result<(), MssqlGroupError> {
+        let deadline = tokio::time::Instant::now() + self.operation_timeout;
         for (index, (pod, session)) in self.pods.iter().zip(superseded).enumerate() {
             if &pod.session == session {
                 return Err(MssqlGroupError::new(format!(
@@ -294,24 +295,37 @@ impl PublicMssqlGroup {
                     pod.ordinal
                 )));
             }
-            let (mut client, _) = status(pod, self.operation_timeout).await?;
-            let error = client
-                .execute(configuration_request(
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .ok_or_else(|| {
+                    MssqlGroupError::new("stale-session validation exceeded its deadline")
+                })?;
+            let (mut client, _) = status(pod, remaining).await?;
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .ok_or_else(|| {
+                    MssqlGroupError::new("stale-session validation exceeded its deadline")
+                })?;
+            let error = tokio::time::timeout(
+                remaining,
+                client.execute(configuration_request(
                     &self.resource_uid,
                     &self.configuration,
                     &self.effective_policy,
                     &pod.identity,
                     session,
                     &format!("stale-restart-configuration-{}", index + 1),
+                )),
+            )
+            .await
+            .map_err(|_| MssqlGroupError::new("stale-session execution exceeded its deadline"))?
+            .err()
+            .ok_or_else(|| {
+                MssqlGroupError::new(format!(
+                    "member {} accepted a superseded process session",
+                    pod.ordinal
                 ))
-                .await
-                .err()
-                .ok_or_else(|| {
-                    MssqlGroupError::new(format!(
-                        "member {} accepted a superseded process session",
-                        pod.ordinal
-                    ))
-                })?;
+            })?;
             if error.code() != tonic::Code::FailedPrecondition
                 || !error.message().contains("stale agent process session")
             {
