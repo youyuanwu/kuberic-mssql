@@ -25,20 +25,32 @@ pub enum SeedDispatchPhase {
 #[serde(deny_unknown_fields)]
 pub struct SeedDispatchTarget {
     replica_id: String,
-    incarnation: String,
+    instance_id: String,
+    agent_generation: String,
+    process_session_id: String,
+    native_replica_id: String,
 }
 
 impl SeedDispatchTarget {
     pub fn new(
         replica_id: impl Into<String>,
-        incarnation: impl Into<String>,
+        instance_id: impl Into<String>,
+        agent_generation: impl Into<String>,
+        process_session_id: impl Into<String>,
+        native_replica_id: impl Into<String>,
     ) -> Result<Self, SeedStateError> {
         let value = Self {
             replica_id: replica_id.into(),
-            incarnation: incarnation.into(),
+            instance_id: instance_id.into(),
+            agent_generation: agent_generation.into(),
+            process_session_id: process_session_id.into(),
+            native_replica_id: native_replica_id.into(),
         };
         validate_id(&value.replica_id)?;
-        validate_id(&value.incarnation)?;
+        validate_id(&value.instance_id)?;
+        validate_id(&value.agent_generation)?;
+        validate_id(&value.process_session_id)?;
+        validate_guid(&value.native_replica_id)?;
         Ok(value)
     }
 
@@ -46,8 +58,20 @@ impl SeedDispatchTarget {
         &self.replica_id
     }
 
-    pub fn incarnation(&self) -> &str {
-        &self.incarnation
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub fn agent_generation(&self) -> &str {
+        &self.agent_generation
+    }
+
+    pub fn process_session_id(&self) -> &str {
+        &self.process_session_id
+    }
+
+    pub fn native_replica_id(&self) -> &str {
+        &self.native_replica_id
     }
 }
 
@@ -64,8 +88,7 @@ pub struct SeedDispatchRecord {
     database_guid: String,
     family_guid: String,
     recovery_fork_guid: String,
-    source_replica_id: String,
-    source_incarnation: String,
+    source: SeedDispatchTarget,
     targets: [SeedDispatchTarget; 2],
     winning_target_replica_id: String,
     winning_build_id: String,
@@ -85,8 +108,7 @@ impl SeedDispatchRecord {
         database_guid: impl Into<String>,
         family_guid: impl Into<String>,
         recovery_fork_guid: impl Into<String>,
-        source_replica_id: impl Into<String>,
-        source_incarnation: impl Into<String>,
+        source: SeedDispatchTarget,
         targets: [SeedDispatchTarget; 2],
         winning_target_replica_id: impl Into<String>,
         winning_build_id: impl Into<String>,
@@ -103,8 +125,7 @@ impl SeedDispatchRecord {
             database_guid: database_guid.into(),
             family_guid: family_guid.into(),
             recovery_fork_guid: recovery_fork_guid.into(),
-            source_replica_id: source_replica_id.into(),
-            source_incarnation: source_incarnation.into(),
+            source,
             targets,
             winning_target_replica_id: winning_target_replica_id.into(),
             winning_build_id: winning_build_id.into(),
@@ -126,6 +147,14 @@ impl SeedDispatchRecord {
 
     pub fn winning_build_id(&self) -> &str {
         &self.winning_build_id
+    }
+
+    pub fn winning_target_replica_id(&self) -> &str {
+        &self.winning_target_replica_id
+    }
+
+    pub fn source(&self) -> &SeedDispatchTarget {
+        &self.source
     }
 
     pub fn targets(&self) -> &[SeedDispatchTarget; 2] {
@@ -181,8 +210,6 @@ impl SeedDispatchRecord {
             &self.configuration_id,
             &self.availability_group_name,
             &self.database_name,
-            &self.source_replica_id,
-            &self.source_incarnation,
             &self.winning_target_replica_id,
             &self.winning_build_id,
             &self.sqlserver_start_time,
@@ -200,15 +227,18 @@ impl SeedDispatchRecord {
         if let Some(group_database_id) = &self.group_database_id {
             validate_guid(group_database_id)?;
         }
-        for target in &self.targets {
-            validate_id(&target.replica_id)?;
-            validate_id(&target.incarnation)?;
+        for member in std::iter::once(&self.source).chain(self.targets.iter()) {
+            validate_id(&member.replica_id)?;
+            validate_id(&member.instance_id)?;
+            validate_id(&member.agent_generation)?;
+            validate_id(&member.process_session_id)?;
+            validate_guid(&member.native_replica_id)?;
         }
         if self.targets[0].replica_id == self.targets[1].replica_id
             || self
                 .targets
                 .iter()
-                .any(|target| target.replica_id == self.source_replica_id)
+                .any(|target| target.replica_id == self.source.replica_id)
             || !self
                 .targets
                 .iter()
@@ -229,11 +259,25 @@ impl SeedDispatchRecord {
             && self.database_guid == other.database_guid
             && self.family_guid == other.family_guid
             && self.recovery_fork_guid == other.recovery_fork_guid
-            && self.source_replica_id == other.source_replica_id
-            && self.source_incarnation == other.source_incarnation
+            && self.source == other.source
             && self.targets == other.targets
             && self.winning_target_replica_id == other.winning_target_replica_id
             && self.winning_build_id == other.winning_build_id
+            && self.sqlserver_start_time == other.sqlserver_start_time
+    }
+
+    pub fn same_dispatch_context(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.resource_uid == other.resource_uid
+            && self.configuration_id == other.configuration_id
+            && self.availability_group_name == other.availability_group_name
+            && self.availability_group_id == other.availability_group_id
+            && self.database_name == other.database_name
+            && self.database_guid == other.database_guid
+            && self.family_guid == other.family_guid
+            && self.recovery_fork_guid == other.recovery_fork_guid
+            && self.source == other.source
+            && self.targets == other.targets
             && self.sqlserver_start_time == other.sqlserver_start_time
     }
 
@@ -388,6 +432,24 @@ impl SeedDispatchStore {
             return Err(SeedStateError::RevisionMismatch);
         }
         if current.phase != SeedDispatchPhase::Dispatched || current.group_database_id.is_none() {
+            return Err(SeedStateError::InvalidTransition);
+        }
+        self.root
+            .unlinkat(SEED_STATE_FILE)
+            .map_err(SeedStateError::from)?;
+        self.root.file().sync_all().map_err(|_| SeedStateError::Io)
+    }
+
+    pub fn remove_intent(&self, expected_revision: u64) -> Result<(), SeedStateError> {
+        let _transaction = self
+            .transaction
+            .lock()
+            .map_err(|_| SeedStateError::UnsafeState)?;
+        let current = self.load_unlocked()?.ok_or(SeedStateError::Missing)?;
+        if current.revision != expected_revision {
+            return Err(SeedStateError::RevisionMismatch);
+        }
+        if current.phase != SeedDispatchPhase::Intent || current.group_database_id.is_some() {
             return Err(SeedStateError::InvalidTransition);
         }
         self.root

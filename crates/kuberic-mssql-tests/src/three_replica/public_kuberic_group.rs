@@ -26,6 +26,7 @@ use kuberic_runtime::protocol::types::{
     EffectivePolicy, Epoch, OperationId, PodUid, PvcUid, ReplicaId, ReplicaIdentity,
     ReplicaInstanceId, ReplicaRole, ResourceUid, derive_agent_generation, derive_initialization_id,
 };
+use kuberic_runtime::replicator::{PrimaryReplicator, ReplicaInformation};
 use tonic::{Request, transport::Channel};
 
 use super::availability_group::PreparedAvailabilityGroup;
@@ -337,6 +338,9 @@ impl PublicMssqlGroup {
             for (pod, session) in pods.iter_mut().zip(sessions) {
                 pod.session = session;
             }
+            if prepared.is_some() {
+                admit_bootstrap_replicators(&pods, &configuration, &replications).await?;
+            }
             Ok::<(), MssqlGroupError>(())
         }
         .await;
@@ -393,7 +397,15 @@ impl PublicMssqlGroup {
         let snapshots =
             observe_sources(&self.pods, self.operation_timeout, self.complete_deadline).await?;
         validate_bootstrap_snapshots(&snapshots)?;
-        Ok(self.configuration.epoch.configuration_number)
+        let group = match &snapshots[0].availability_group {
+            Observation::Present { value, .. } => value,
+            _ => unreachable!("bootstrap validation requires a present availability group"),
+        };
+        if group.databases.is_empty() {
+            Ok(self.configuration.epoch.configuration_number)
+        } else {
+            Ok(group.configuration_sequence.value())
+        }
     }
 
     pub async fn assert_superseded_sessions_rejected(
@@ -462,9 +474,16 @@ impl PublicMssqlGroup {
                 "public bootstrap builds target secondary indexes 1 or 2",
             ));
         }
+        let operation_id = OperationId::new(operation_id.into());
+        let build_id = OperationId::new(build_id.into());
+        if operation_id != build_id {
+            return Err(MssqlGroupError::new(
+                "public target build operation ID must equal its durable build ID",
+            ));
+        }
         Ok(PublicBuildCommand {
-            operation_id: OperationId::new(operation_id.into()),
-            build_id: OperationId::new(build_id.into()),
+            operation_id,
+            build_id,
             target: self.pods[target_index].identity.clone(),
             retire: false,
         })
@@ -507,7 +526,21 @@ impl PublicMssqlGroup {
     ) -> Vec<Result<(), tonic::Status>> {
         let mut outcomes = Vec::with_capacity(commands.len());
         for command in commands {
-            outcomes.push(self.execute_build_command(command).await);
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                let result = self.execute_build_command(command).await;
+                if result
+                    .as_ref()
+                    .is_err_and(|error| error.code() == tonic::Code::Cancelled)
+                    && attempts < 3
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                outcomes.push(result);
+                break;
+            }
         }
         outcomes
     }
@@ -524,6 +557,15 @@ impl PublicMssqlGroup {
         .await
     }
 
+    pub async fn execute_build_withheld_after_native_completion(
+        &self,
+        command: &PublicBuildCommand,
+    ) -> Result<(), tonic::Status> {
+        self.execute_build_command(command).await?;
+        std::future::pending::<()>().await;
+        unreachable!("withheld build reply never completes")
+    }
+
     async fn execute_build_command(
         &self,
         command: &PublicBuildCommand,
@@ -533,17 +575,50 @@ impl PublicMssqlGroup {
             remaining(self.complete_deadline, "public target build")
                 .map_err(|error| tonic::Status::deadline_exceeded(error.to_string()))?,
         );
+        if !command.retire {
+            let target = self
+                .pods
+                .iter()
+                .find(|pod| pod.identity == command.target)
+                .ok_or_else(|| tonic::Status::failed_precondition("target pod is unavailable"))?;
+            let (mut target_client, target_report) = status(target, timeout_duration)
+                .await
+                .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+            let authority = BuildAuthority {
+                build_id: command.build_id.clone(),
+                kind: BuildAuthorityKind::Failover,
+                source: source.identity.clone(),
+                target: command.target.clone(),
+                current_configuration: self.configuration.clone(),
+                replication_boundary_lsn: 0,
+            };
+            let target_request = authorized(wire::ExecuteCommandRequest {
+                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                resource_uid: self.resource_uid.to_string(),
+                target: Some(command.target.clone().into()),
+                expected_process_session_id: target_report.process_session_id,
+                command: Some(wire::execute_command_request::Command::EnsureReplicaBuild(
+                    wire::EnsureReplicaBuildCommand {
+                        operation_id: command.operation_id.to_string(),
+                        local_replica_id: command.target.replica_id.value(),
+                        expected_instance_id: command.target.instance_id.to_string(),
+                        expected_agent_generation: command.target.agent_generation.to_string(),
+                        target: Some(command.target.clone().into()),
+                        authority: Some(authority.into()),
+                        source_session_id: source.session.to_string(),
+                        retire: false,
+                    },
+                )),
+            });
+            tokio::time::timeout(timeout_duration, target_client.execute(target_request))
+                .await
+                .map_err(|_| {
+                    tonic::Status::deadline_exceeded("public target admission timed out")
+                })??;
+        }
         let (mut client, report) = status(source, timeout_duration)
             .await
             .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
-        let authority = BuildAuthority {
-            build_id: command.build_id.clone(),
-            kind: BuildAuthorityKind::Bootstrap,
-            source: source.identity.clone(),
-            target: command.target.clone(),
-            current_configuration: self.configuration.clone(),
-            replication_boundary_lsn: 0,
-        };
         let request = authorized(wire::ExecuteCommandRequest {
             protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
             resource_uid: self.resource_uid.to_string(),
@@ -556,8 +631,8 @@ impl PublicMssqlGroup {
                     expected_instance_id: source.identity.instance_id.to_string(),
                     expected_agent_generation: source.identity.agent_generation.to_string(),
                     target: Some(command.target.clone().into()),
-                    authority: Some(authority.into()),
-                    source_session_id: source.session.to_string(),
+                    authority: None,
+                    source_session_id: String::new(),
                     retire: command.retire,
                 },
             )),
@@ -565,7 +640,33 @@ impl PublicMssqlGroup {
         tokio::time::timeout(timeout_duration, client.execute(request))
             .await
             .map_err(|_| tonic::Status::deadline_exceeded("public target build timed out"))?
-            .map(|_| ())
+            .map(|_| ())?;
+        if command.retire {
+            return Ok(());
+        }
+        let replicator = source.application.testing_replicator().ok_or_else(|| {
+            tonic::Status::failed_precondition("bootstrap source replicator is unavailable")
+        })?;
+        let topology = replicator.admitted_topology().ok_or_else(|| {
+            tonic::Status::failed_precondition("bootstrap source topology is not admitted")
+        })?;
+        let target = topology
+            .members()
+            .iter()
+            .find(|member| member.kuberic_identity() == &command.target)
+            .ok_or_else(|| {
+                tonic::Status::failed_precondition("bootstrap build target is not admitted")
+            })?;
+        let mut build = ReplicaInformation::new(
+            command.build_id.clone(),
+            command.target.clone(),
+            target.replication_address().to_owned(),
+        );
+        build.process_session_id = target.process_session_id().clone();
+        tokio::time::timeout(timeout_duration, replicator.build_replica(build))
+            .await
+            .map_err(|_| tonic::Status::deadline_exceeded("bootstrap seed callback timed out"))?
+            .map_err(|error| tonic::Status::internal(error.to_string()))
     }
 
     pub async fn shutdown_with_coordinator(
@@ -617,6 +718,52 @@ impl PublicMssqlGroup {
             )))
         }
     }
+}
+
+async fn admit_bootstrap_replicators(
+    pods: &[PublicMssqlPod; 3],
+    configuration: &ConfigurationDescriptor,
+    replications: &[SocketAddr; 3],
+) -> Result<(), MssqlGroupError> {
+    for pod in pods {
+        let replicator = pod
+            .application
+            .testing_replicator()
+            .ok_or_else(|| MssqlGroupError::new("bootstrap replicator is unavailable"))?;
+        let replicas = pods
+            .iter()
+            .enumerate()
+            .map(|(index, member)| {
+                let mut replica = ReplicaInformation::new(
+                    OperationId::default(),
+                    member.identity.clone(),
+                    format!("http://{}", replications[index]),
+                );
+                replica.process_session_id = member.session.clone();
+                replica.role = member.stable_role;
+                replica
+            })
+            .collect();
+        let current = kuberic_runtime::replicator::ReplicaSetConfiguration {
+            configuration: configuration.clone(),
+            replicas,
+        };
+        for attempt in 1..=3 {
+            match replicator
+                .update_current_replica_set_configuration(current.clone())
+                .await
+            {
+                Ok(()) => break,
+                Err(error)
+                    if error.to_string().contains("operation was cancelled") && attempt < 3 =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => return Err(MssqlGroupError::new(error.to_string())),
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn runtime_config(
@@ -1139,7 +1286,7 @@ fn validate_bootstrap_snapshots(snapshots: &[InstanceSnapshot; 3]) -> Result<(),
             }
         };
         if group.replicas.len() != 3
-            || !group.databases.is_empty()
+            || group.databases.len() > 1
             || !group.cluster_type.eq_ignore_ascii_case("EXTERNAL")
             || group.required_synchronized_secondaries_to_commit != 1
             || group.basic_features

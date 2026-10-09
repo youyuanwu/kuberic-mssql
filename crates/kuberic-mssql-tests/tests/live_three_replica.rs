@@ -287,6 +287,9 @@ async fn execute_live_lifecycle(
     if !validate_restart {
         return execute_phase2_bootstrap_lifecycle(root, launched, cancellation).await;
     }
+    if std::env::var_os("KUBERIC_MSSQL_LEGACY_PROVISIONED_RESTART").is_none() {
+        return execute_phase3_bootstrap_restart_lifecycle(root, launched, cancellation).await;
+    }
     let topology = launched.provision_availability_group().await?;
     if fault_checkpoint("fail-after-ag") {
         return Err("injected failure after AG provisioning".into());
@@ -585,6 +588,33 @@ async fn execute_phase2_bootstrap_lifecycle(
             let sequence = group.bootstrap_configuration_sequence().await?;
             wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout())
                 .await?;
+            let builds = [
+                group.target_build_command(1, "seed-build-target-2", "seed-build-target-2")?,
+                group.target_build_command(2, "seed-build-target-3", "seed-build-target-3")?,
+            ];
+            let outcomes = group.execute_build_commands_sequential(&builds[..1]).await;
+            if let Some(error) = outcomes.into_iter().find_map(Result::err) {
+                return Err::<(), TestError>(format!("public target build failed: {error}").into());
+            }
+            let topology = launched
+                .finalize_prepared_availability_group(&prepared)
+                .await?;
+            let marker = launched
+                .commit_replicated_marker(&topology.evidence)
+                .await?;
+            if marker.primary_ordinal != topology.evidence.primary_ordinal
+                || marker.readable_ordinals != [1, 2, 3]
+            {
+                return Err(
+                    "build-owned seeding marker was not readable from all exact members".into(),
+                );
+            }
+            let outcomes = group.execute_build_commands_sequential(&builds[1..]).await;
+            if let Some(error) = outcomes.into_iter().find_map(Result::err) {
+                return Err::<(), TestError>(
+                    format!("native-only peer target build failed: {error}").into(),
+                );
+            }
             Ok(())
         })
         .catch_unwind();
@@ -608,6 +638,191 @@ async fn execute_phase2_bootstrap_lifecycle(
         return Err(diagnostic.into());
     }
     finish_runtime_outcome(root, launched, outcome, &cleanup)
+}
+
+async fn execute_phase3_bootstrap_restart_lifecycle(
+    root: &Path,
+    mut launched: kuberic_mssql_tests::three_replica::LaunchedMembers,
+    _cancellation: &mut CancellationSignals,
+) -> Result<(), TestError> {
+    let prepared = launched.prepare_availability_group().await?;
+    let convergence = launched.kuberic_convergence_timeout();
+
+    let first_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let first = match start_prepared_public_group_with_retry(
+        root,
+        &launched.run,
+        &prepared,
+        &launched.members,
+        convergence,
+        launched.complete_deadline(),
+        &first_cleanup,
+    )
+    .await
+    {
+        Ok(group) => group,
+        Err(error) => {
+            let cleanup = launched.cleanup_with_coordinator(&first_cleanup);
+            return match cleanup {
+                Ok(_) => Err(Box::new(error)),
+                Err(cleanup) => Err(format!(
+                    "pre-association bootstrap startup failed: {error}; cleanup also failed: {cleanup}"
+                )
+                .into()),
+            };
+        }
+    };
+    let stable_resource = first.resource_uid.clone();
+    let stable_policy = first.effective_policy.clone();
+    let stable_configuration = first.configuration.clone();
+    let stable_pods = first.pods.each_ref().map(|pod| {
+        (
+            pod.identity.clone(),
+            pod.stable_role,
+            pod.pod_uid.clone(),
+            pod.pvc_uid.clone(),
+        )
+    });
+    let first_sessions = first.pods.each_ref().map(|pod| pod.session.clone());
+    let first_sequence = first.bootstrap_configuration_sequence().await?;
+    wait_for_exact_reports(&first, first_sequence, convergence).await?;
+    first.shutdown_with_coordinator(&first_cleanup).await?;
+
+    let seed_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let seeded = match start_prepared_public_group_with_retry(
+        root,
+        &launched.run,
+        &prepared,
+        &launched.members,
+        convergence,
+        Instant::now() + convergence,
+        &seed_cleanup,
+    )
+    .await
+    {
+        Ok(group) => group,
+        Err(error) => {
+            let cleanup = launched.cleanup_with_coordinator(&seed_cleanup);
+            return match cleanup {
+                Ok(_) => Err(Box::new(error)),
+                Err(cleanup) => Err(format!(
+                    "pre-association replacement startup failed: {error}; cleanup also failed: {cleanup}"
+                )
+                .into()),
+            };
+        }
+    };
+    seeded
+        .assert_superseded_sessions_rejected(&first_sessions)
+        .await?;
+    if seeded.resource_uid != stable_resource
+        || seeded.effective_policy != stable_policy
+        || seeded.configuration != stable_configuration
+        || seeded
+            .pods
+            .iter()
+            .zip(&stable_pods)
+            .any(|(pod, (identity, role, pod_uid, pvc_uid))| {
+                &pod.identity != identity
+                    || pod.stable_role != *role
+                    || &pod.pod_uid != pod_uid
+                    || &pod.pvc_uid != pvc_uid
+            })
+    {
+        return Err("pre-association replacement changed stable authority".into());
+    }
+    let builds = [
+        seeded.target_build_command(1, "restart-seed-build-2", "restart-seed-build-2")?,
+        seeded.target_build_command(2, "restart-seed-build-3", "restart-seed-build-3")?,
+    ];
+    let topology = {
+        let withheld = seeded.execute_build_withheld_after_native_completion(&builds[0]);
+        let finalized = launched.finalize_prepared_availability_group(&prepared);
+        tokio::pin!(withheld);
+        tokio::pin!(finalized);
+        tokio::select! {
+            result = &mut finalized => result?,
+            result = &mut withheld => {
+                return Err(match result {
+                    Ok(()) => "withheld native-complete build reply returned unexpectedly".into(),
+                    Err(error) => format!("replacement target build failed: {error}").into(),
+                });
+            }
+        }
+    };
+    let first_marker = launched
+        .commit_replicated_marker(&topology.evidence)
+        .await?;
+    if first_marker.primary_ordinal != topology.evidence.primary_ordinal
+        || first_marker.readable_ordinals != [1, 2, 3]
+    {
+        return Err("replacement seed marker was not readable from all exact members".into());
+    }
+    let seeded_sessions = seeded.pods.each_ref().map(|pod| pod.session.clone());
+    seeded.shutdown_with_coordinator(&seed_cleanup).await?;
+
+    let completed_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let completed = match start_prepared_public_group_with_retry(
+        root,
+        &launched.run,
+        &prepared,
+        &launched.members,
+        convergence,
+        Instant::now() + convergence,
+        &completed_cleanup,
+    )
+    .await
+    {
+        Ok(group) => group,
+        Err(error) => {
+            let cleanup = launched.cleanup_with_coordinator(&completed_cleanup);
+            return match cleanup {
+                Ok(_) => Err(Box::new(error)),
+                Err(cleanup) => Err(format!(
+                    "native-complete replacement startup failed: {error}; cleanup also failed: {cleanup}"
+                )
+                .into()),
+            };
+        }
+    };
+    completed
+        .assert_superseded_sessions_rejected(&seeded_sessions)
+        .await?;
+    let native_only = [
+        completed.target_build_command(
+            1,
+            "native-only-build-target-2",
+            "native-only-build-target-2",
+        )?,
+        completed.target_build_command(
+            2,
+            "native-only-build-target-3",
+            "native-only-build-target-3",
+        )?,
+    ];
+    let outcomes = completed
+        .execute_build_commands_sequential(&native_only)
+        .await;
+    if let Some(error) = outcomes.into_iter().find_map(Result::err) {
+        return Err(format!("native-only replacement build failed: {error}").into());
+    }
+    let continued_marker = launched
+        .commit_replicated_marker(&topology.evidence)
+        .await?;
+    if continued_marker.primary_ordinal != first_marker.primary_ordinal
+        || continued_marker.readable_ordinals != first_marker.readable_ordinals
+    {
+        return Err("marker continuity changed after native-complete replacement".into());
+    }
+    completed
+        .shutdown_with_coordinator(&completed_cleanup)
+        .await?;
+    finish_runtime_outcome(
+        root,
+        launched,
+        RuntimeOutcome::Completed(Ok(Ok(()))),
+        &completed_cleanup,
+    )
 }
 
 fn finish_runtime_outcome(

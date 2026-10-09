@@ -201,7 +201,7 @@ impl Default for StageDeadlines {
             sql_batch: Duration::from_secs(30),
             member_readiness: Duration::from_secs(180),
             availability_group: Duration::from_secs(300),
-            kuberic_convergence: Duration::from_secs(60),
+            kuberic_convergence: Duration::from_secs(180),
             marker_convergence: Duration::from_secs(60),
             complete_run: Duration::from_secs(1200),
             cleanup: Duration::from_secs(180),

@@ -13,7 +13,7 @@ use kuberic_mssql::runtime_config::ObserverConfig;
 
 use super::availability_group::{
     AvailabilityGroupError, FrozenMemberVerifier, PreparedAvailabilityGroup, ProvisionContext,
-    ProvisionedAvailabilityGroup, prepare, provision,
+    ProvisionedAvailabilityGroup, finalize_prepared, prepare, provision,
 };
 use super::data::{DataContext, DataError, MarkerEvidence, prove_replicated_marker};
 use crate::fixture::admin::{
@@ -182,6 +182,44 @@ impl LaunchedMembers {
             runner: &self.context.runner,
             frozen_member_verifier: &frozen_member_verifier,
         })
+        .await
+        .map_err(NativePhaseError::AvailabilityGroup)
+    }
+
+    pub async fn finalize_prepared_availability_group(
+        &mut self,
+        prepared: &PreparedAvailabilityGroup,
+    ) -> Result<ProvisionedAvailabilityGroup, NativePhaseError> {
+        let credentials = self
+            .context
+            .credentials
+            .as_ref()
+            .ok_or(NativePhaseError::Unavailable)?;
+        let tls = self
+            .context
+            .tls
+            .as_ref()
+            .ok_or(NativePhaseError::Unavailable)?;
+        let frozen_member_verifier = LaunchFrozenMemberVerifier {
+            docker: &self.context.docker,
+            containers: &self.context.containers,
+            image_id: &self.context.image_id,
+        };
+        finalize_prepared(
+            ProvisionContext {
+                run: &self.run,
+                members: &self.members,
+                credentials,
+                tls,
+                deadlines: self.context.config.deadlines(),
+                complete_deadline: self.context.deadline,
+                store: &self.context.store,
+                journal: &mut self.context.journal,
+                runner: &self.context.runner,
+                frozen_member_verifier: &frozen_member_verifier,
+            },
+            prepared,
+        )
         .await
         .map_err(NativePhaseError::AvailabilityGroup)
     }

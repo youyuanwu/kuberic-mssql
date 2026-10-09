@@ -182,6 +182,43 @@ pub(crate) async fn provision<R: ProcessRunner>(
     )
     .await
     .map_err(AvailabilityGroupError::Data)?;
+    finalize_topology(context, endpoint_evidence, formation_deadline).await
+}
+
+pub(crate) async fn finalize_prepared<R: ProcessRunner>(
+    context: ProvisionContext<'_, R>,
+    prepared: &PreparedAvailabilityGroup,
+) -> Result<ProvisionedAvailabilityGroup, AvailabilityGroupError> {
+    let formation_deadline = earlier(
+        Instant::from_std(context.complete_deadline),
+        Instant::now() + context.deadlines.availability_group,
+    );
+    verify_direct_read_connectivity(
+        &DataContext {
+            run: context.run,
+            members: context.members,
+            credentials: context.credentials,
+            tls: context.tls,
+            deadlines: context.deadlines,
+            complete_deadline: context.complete_deadline,
+        },
+        formation_deadline,
+    )
+    .await
+    .map_err(AvailabilityGroupError::Data)?;
+    finalize_topology(
+        context,
+        prepared.endpoint_evidence.clone(),
+        formation_deadline,
+    )
+    .await
+}
+
+async fn finalize_topology<R: ProcessRunner>(
+    context: ProvisionContext<'_, R>,
+    endpoint_evidence: [EndpointEvidence; 3],
+    formation_deadline: Instant,
+) -> Result<ProvisionedAvailabilityGroup, AvailabilityGroupError> {
     let evidence = loop {
         let observations = observe_direct_members(
             context.run,

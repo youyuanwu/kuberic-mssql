@@ -22,6 +22,8 @@ use kuberic_runtime::{Replicator, Result as KubericResult, RuntimeError as Kuber
 use crate::instance::SqlServerInstanceManager;
 #[cfg(feature = "kuberic-testing")]
 use crate::kuberic::SqlServerBootstrapConfig;
+#[cfg(feature = "kuberic-testing")]
+use crate::kuberic::SqlServerReplicator;
 use crate::kuberic::{
     ObservationClock, SqlServerObservationSource, SqlServerService, SqlServerServiceConfig,
     SystemObservationClock,
@@ -323,6 +325,7 @@ impl RuntimeHostApplication {
                 config.topology().clone(),
                 bootstrap,
                 mutation,
+                binding.root().to_owned(),
             )
             .map_err(RuntimeProcessError::application)?,
         );
@@ -340,6 +343,12 @@ impl RuntimeHostApplication {
             APPLICATION_STORAGE_NAME.to_owned(),
             self.binding.root().to_owned(),
         )])
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_replicator(&self) -> Option<Arc<SqlServerReplicator>> {
+        self.inner.replicator()
     }
 }
 

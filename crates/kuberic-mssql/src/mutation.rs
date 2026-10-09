@@ -153,7 +153,10 @@ impl MutationEffect {
         Self(MutationKind::JoinAvailabilityGroup { availability_group })
     }
 
-    fn add_database(availability_group: AvailabilityGroupName, database: SqlIdentifier) -> Self {
+    pub(crate) fn add_database(
+        availability_group: AvailabilityGroupName,
+        database: SqlIdentifier,
+    ) -> Self {
         Self(MutationKind::AddDatabase {
             availability_group,
             database,

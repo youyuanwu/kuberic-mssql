@@ -614,11 +614,31 @@ fn seed_record() -> SeedDispatchRecord {
         seed_guid(20),
         seed_guid(21),
         seed_guid(22),
-        "replica-1",
-        "pod-1",
+        SeedDispatchTarget::new(
+            "replica-1",
+            "pod-1",
+            "generation-1",
+            "session-1",
+            seed_guid(31),
+        )
+        .unwrap(),
         [
-            SeedDispatchTarget::new("replica-2", "pod-2").unwrap(),
-            SeedDispatchTarget::new("replica-3", "pod-3").unwrap(),
+            SeedDispatchTarget::new(
+                "replica-2",
+                "pod-2",
+                "generation-2",
+                "session-2",
+                seed_guid(32),
+            )
+            .unwrap(),
+            SeedDispatchTarget::new(
+                "replica-3",
+                "pod-3",
+                "generation-3",
+                "session-3",
+                seed_guid(33),
+            )
+            .unwrap(),
         ],
         "replica-2",
         "build-2",
@@ -753,6 +773,30 @@ async fn seed_dispatch_store_serializes_concurrent_record_creation() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn intent_only_claim_can_be_released_but_dispatched_claim_cannot_regress() {
+    let temporary = tempfile::tempdir().unwrap();
+    let runtime_config = config(temporary.path()).await;
+    let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
+    binding.initialize().unwrap();
+    let store = SeedDispatchStore::open(binding.root()).unwrap();
+
+    let record = seed_record();
+    store.create(&record).unwrap();
+    store.remove_intent(record.revision()).unwrap();
+    assert_eq!(store.load().unwrap(), None);
+
+    store.create(&record).unwrap();
+    let mut dispatched = record.clone();
+    dispatched.mark_dispatched().unwrap();
+    let dispatched = store.replace(record.revision(), dispatched).unwrap();
+    assert_eq!(
+        store.remove_intent(dispatched.revision()),
+        Err(SeedStateError::InvalidTransition)
+    );
+    assert_eq!(store.load().unwrap(), Some(dispatched));
 }
 
 #[tokio::test]

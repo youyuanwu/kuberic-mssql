@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
@@ -18,9 +19,9 @@ use kuberic_runtime::replicator::{
 use kuberic_runtime::{Result as KubericResult, RuntimeError as KubericRuntimeError};
 
 use crate::bootstrap::{
-    BootstrapOwnership, NativeConvergenceState, StandaloneDatabaseOwnership,
-    classify_availability_group, classify_bootstrap_ownership, classify_replica_join,
-    classify_standalone_database,
+    BootstrapOwnership, NativeConvergenceState, StandaloneDatabaseIdentity,
+    StandaloneDatabaseOwnership, classify_availability_group, classify_bootstrap_ownership,
+    classify_replica_join, classify_standalone_database,
 };
 use crate::executor::SqlExecutor;
 use crate::instance::{SqlServerInstanceManager, unix_millis};
@@ -31,12 +32,15 @@ use crate::observation::{
 };
 use crate::runtime_config::ObserverConfig;
 use crate::runtime_error::RuntimeError;
+use crate::runtime_host::{
+    SeedDispatchPhase, SeedDispatchRecord, SeedDispatchStore, SeedDispatchTarget, SeedStateError,
+};
 use crate::topology_config::SqlServerTopologyExpectation;
 use crate::{
-    AvailabilityGroupIdentity, ConfigurationSequence, DatabaseLineage, Endpoint, Guid, NativeRole,
-    Observation, ObservationFailureKind, ReplicaDescriptor, ReplicaIdentity as SqlReplicaIdentity,
-    SUPPORTED_DATABASE_COUNT, SUPPORTED_ENGINE_MAJOR, SUPPORTED_REPLICA_COUNT,
-    SUPPORTED_REQUIRED_SECONDARIES, ServerName, SqlIdentifier,
+    AvailabilityGroupIdentity, ConfigurationSequence, DatabaseIdentity, DatabaseLineage, Endpoint,
+    Guid, NativeRole, Observation, ObservationFailureKind, ReplicaDescriptor,
+    ReplicaIdentity as SqlReplicaIdentity, SUPPORTED_DATABASE_COUNT, SUPPORTED_ENGINE_MAJOR,
+    SUPPORTED_REPLICA_COUNT, SUPPORTED_REQUIRED_SECONDARIES, ServerName, SqlIdentifier,
 };
 
 const CREATED: u8 = 0;
@@ -93,6 +97,7 @@ pub enum KubericAdapterError {
         kind: ObservationFailureKind,
         server_code: Option<u32>,
     },
+    SeedState(SeedStateError),
     UnsupportedOperation(ObserveOnlyOperation),
     NotOpen,
     Closed,
@@ -165,6 +170,7 @@ impl fmt::Display for KubericAdapterError {
                 }
                 Ok(())
             }
+            Self::SeedState(error) => write!(formatter, "seed dispatch state failed: {error}"),
             Self::UnsupportedOperation(operation) => write!(
                 formatter,
                 "{operation} is disabled by the observe-only SQL Server adapter"
@@ -363,6 +369,8 @@ pub struct HealthyTopologyBinding {
     native_configuration_sequence: ConfigurationSequence,
     availability_group: AvailabilityGroupIdentity,
     database_lineage: Option<DatabaseLineage>,
+    bootstrap_database_name: Option<SqlIdentifier>,
+    bootstrap_database: Option<StandaloneDatabaseIdentity>,
     local_sql_replica_identity: SqlReplicaIdentity,
     local_sql_server_start_incarnation: SqlServerStartIncarnation,
     members: Vec<HealthyTopologyMemberBinding>,
@@ -456,6 +464,7 @@ pub struct SqlServerService {
 struct BootstrapCapability {
     config: SqlServerBootstrapConfig,
     executor: Arc<dyn SqlMutationExecutor>,
+    seed_root: PathBuf,
 }
 
 enum ServiceLifecycle {
@@ -517,6 +526,7 @@ impl SqlServerService {
         expectation: SqlServerTopologyExpectation,
         bootstrap: SqlServerBootstrapConfig,
         executor: Arc<dyn SqlMutationExecutor>,
+        seed_root: PathBuf,
     ) -> Result<Self, KubericAdapterError> {
         validate_observer_expectation(source.observer_config(), &expectation)?;
         Ok(Self::with_optional_topology(
@@ -527,6 +537,7 @@ impl SqlServerService {
             Some(BootstrapCapability {
                 config: bootstrap,
                 executor,
+                seed_root,
             }),
         ))
     }
@@ -598,6 +609,7 @@ impl StatefulServiceReplica for SqlServerService {
                     expectation.as_ref().clone(),
                     bootstrap.config.clone(),
                     bootstrap.executor.clone(),
+                    bootstrap.seed_root.clone(),
                 )
                 .map_err(KubericRuntimeError::from)?
             } else {
@@ -742,6 +754,7 @@ pub struct SqlServerReplicator {
     expectation: Option<Arc<SqlServerTopologyExpectation>>,
     admitted_topology: Mutex<Option<Arc<HealthyTopologyBinding>>>,
     admitted_configuration: Mutex<Option<ReplicaSetConfiguration>>,
+    admitted_bootstrap_database: Mutex<Option<StandaloneDatabaseIdentity>>,
     lifecycle: RwLock<ReplicatorLifecycle>,
     role: Mutex<Option<ReplicaRole>>,
     epoch: Mutex<Option<Epoch>>,
@@ -752,12 +765,56 @@ struct ReplicatorBootstrapCapability {
     resource_uid: ResourceUid,
     config: SqlServerBootstrapConfig,
     executor: Arc<dyn SqlMutationExecutor>,
+    seed: Arc<SeedCoordinator>,
+}
+
+struct SeedCoordinator {
+    root: PathBuf,
+    store: Mutex<Option<Arc<SeedDispatchStore>>>,
+    arbiter: tokio::sync::Mutex<()>,
+}
+
+impl SeedCoordinator {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            store: Mutex::new(None),
+            arbiter: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    fn store(&self) -> Result<Arc<SeedDispatchStore>, KubericAdapterError> {
+        let mut slot = self
+            .store
+            .lock()
+            .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?;
+        if let Some(store) = slot.as_ref() {
+            return Ok(store.clone());
+        }
+        let store =
+            Arc::new(SeedDispatchStore::open(&self.root).map_err(KubericAdapterError::SeedState)?);
+        *slot = Some(store.clone());
+        Ok(store)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct ReplicatorLifecycle {
     state: u8,
     generation: u64,
+}
+
+struct SeedBuildContext {
+    binding: Arc<HealthyTopologyBinding>,
+    database: StandaloneDatabaseIdentity,
+    record: SeedDispatchRecord,
+    target_native_replica_id: Guid,
+}
+
+enum SourceAssociation {
+    Absent,
+    Incomplete,
+    Exact(DatabaseIdentity),
 }
 
 impl SqlServerReplicator {
@@ -792,6 +849,7 @@ impl SqlServerReplicator {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_bootstrap_with_topology(
         service_config: SqlServerServiceConfig,
         source: Arc<dyn SqlServerObservationSource>,
@@ -800,6 +858,7 @@ impl SqlServerReplicator {
         expectation: SqlServerTopologyExpectation,
         bootstrap: SqlServerBootstrapConfig,
         executor: Arc<dyn SqlMutationExecutor>,
+        seed_root: PathBuf,
     ) -> Result<Self, KubericAdapterError> {
         if runtime_identity.replica_id != expectation.local_replica_id() {
             return Err(KubericAdapterError::InvalidConfiguration(
@@ -817,6 +876,7 @@ impl SqlServerReplicator {
                 resource_uid: service_config.resource_uid,
                 config: bootstrap,
                 executor,
+                seed: Arc::new(SeedCoordinator::new(seed_root)),
             }),
         ))
     }
@@ -838,6 +898,7 @@ impl SqlServerReplicator {
             expectation,
             admitted_topology: Mutex::new(None),
             admitted_configuration: Mutex::new(None),
+            admitted_bootstrap_database: Mutex::new(None),
             lifecycle: RwLock::new(ReplicatorLifecycle {
                 state: CREATED,
                 generation: 0,
@@ -949,7 +1010,7 @@ impl SqlServerReplicator {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                 {
-                    if role != binding.local_member().stable_role {
+                    if !published_role_matches(binding, role) {
                         return Err(KubericAdapterError::TopologyBindingMismatch(
                             "published local role differs from the frozen stable role",
                         ));
@@ -1360,6 +1421,343 @@ impl SqlServerReplicator {
         Ok(())
     }
 
+    fn seed_build_context(
+        &self,
+        replica: &ReplicaInformation,
+    ) -> Result<SeedBuildContext, KubericAdapterError> {
+        let bootstrap =
+            self.bootstrap
+                .as_ref()
+                .ok_or(KubericAdapterError::UnsupportedOperation(
+                    ObserveOnlyOperation::BuildReplica,
+                ))?;
+        if replica.build_id.is_empty() {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "target build identity is empty",
+            ));
+        }
+        let binding = self
+            .admitted_topology()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
+        let admitted_configuration = self
+            .admitted_configuration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
+        if admitted_configuration.configuration != binding.configuration {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "admitted build configuration differs from the topology binding",
+            ));
+        }
+        let database = self
+            .admitted_bootstrap_database
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
+        let source = binding.local_member();
+        if source.kuberic_identity.replica_id != binding.configuration.primary_id
+            || source.stable_role != ReplicaRole::Primary
+            || *self
+                .role
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                != Some(ReplicaRole::Primary)
+        {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "build-owned seeding requires the exact configured primary",
+            ));
+        }
+        let target = binding
+            .members
+            .iter()
+            .find(|member| member.kuberic_identity == replica.identity)
+            .ok_or(KubericAdapterError::TopologyBindingMismatch(
+                "target build identity is not admitted",
+            ))?;
+        if target.stable_role != ReplicaRole::ActiveSecondary
+            || target.process_session_id.is_empty()
+            || replica.process_session_id != target.process_session_id
+            || replica.replication_address != target.replication_address
+            || !matches!(
+                replica.role,
+                ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+            )
+        {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "target build session, address, or role differs from the admitted configuration",
+            ));
+        }
+        let source_record = seed_member(source)?;
+        let targets: [SeedDispatchTarget; 2] = binding
+            .members
+            .iter()
+            .filter(|member| member.stable_role == ReplicaRole::ActiveSecondary)
+            .map(seed_member)
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| {
+                KubericAdapterError::TopologyBindingMismatch(
+                    "seed dispatch requires exactly two configured targets",
+                )
+            })?;
+        if targets
+            .iter()
+            .any(|target| target.process_session_id().is_empty())
+        {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "both configured target sessions must be current before seed dispatch",
+            ));
+        }
+        let target_native_replica_id = target.native_replica_id.clone();
+        let record = SeedDispatchRecord::new(
+            bootstrap.resource_uid.to_string(),
+            binding.configuration.configuration_id.to_string(),
+            binding.availability_group.name.as_str(),
+            binding.availability_group.group_id.as_str(),
+            database.name.as_str(),
+            database.database_guid.as_str(),
+            database.family_guid.as_str(),
+            database.recovery_fork_guid.as_str(),
+            source_record,
+            targets,
+            replica.identity.replica_id.to_string(),
+            replica.build_id.to_string(),
+            binding.local_sql_server_start_incarnation.as_str(),
+        )
+        .map_err(KubericAdapterError::SeedState)?;
+        Ok(SeedBuildContext {
+            binding,
+            database,
+            record,
+            target_native_replica_id,
+        })
+    }
+
+    async fn observe_seed_group(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+        context: &SeedBuildContext,
+    ) -> Result<AvailabilityGroupSnapshot, KubericAdapterError> {
+        let (instance, group, _) = self.bootstrap_observation(generation, deadline).await?;
+        let group = group.ok_or(KubericAdapterError::AvailabilityGroupAbsent)?;
+        validate_eligible_snapshot(self.source.observer_config(), &instance, &group, false)?;
+        validate_seed_binding_evidence(&context.binding, &instance, &group)?;
+        Ok(group)
+    }
+
+    fn validate_seed_record(
+        &self,
+        actual: &SeedDispatchRecord,
+        expected: &SeedDispatchRecord,
+    ) -> Result<(), KubericAdapterError> {
+        if actual.same_dispatch_context(expected) {
+            Ok(())
+        } else {
+            Err(KubericAdapterError::SeedState(
+                SeedStateError::IdentityMismatch,
+            ))
+        }
+    }
+
+    fn compact_seed_record(
+        &self,
+        store: &SeedDispatchStore,
+        mut record: SeedDispatchRecord,
+        database: &DatabaseIdentity,
+    ) -> Result<(), KubericAdapterError> {
+        if record.phase() != SeedDispatchPhase::Dispatched {
+            return Err(KubericAdapterError::SeedState(
+                SeedStateError::InvalidTransition,
+            ));
+        }
+        if record.group_database_id() != Some(database.group_database_id.as_str()) {
+            record
+                .associate_group_database(database.group_database_id.as_str())
+                .map_err(KubericAdapterError::SeedState)?;
+            record = store
+                .replace(record.revision(), record)
+                .map_err(KubericAdapterError::SeedState)?;
+        }
+        store
+            .remove(record.revision())
+            .map_err(KubericAdapterError::SeedState)
+    }
+
+    async fn arbitrate_seed_dispatch(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+        context: &SeedBuildContext,
+    ) -> Result<Option<tokio::task::JoinHandle<Result<(), RuntimeError>>>, KubericAdapterError>
+    {
+        let bootstrap = self
+            .bootstrap
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
+        let _arbiter = bootstrap.seed.arbiter.lock().await;
+        drop(self.finish_operation(generation)?);
+        let group = self
+            .observe_seed_group(generation, deadline, context)
+            .await?;
+        if !matches!(
+            source_association(&group, &context.database)?,
+            SourceAssociation::Absent
+        ) {
+            return Ok(None);
+        }
+        let store = bootstrap.seed.store()?;
+        let existing = store.load().map_err(KubericAdapterError::SeedState)?;
+        let mut record = match existing {
+            Some(record) => {
+                self.validate_seed_record(&record, &context.record)?;
+                match record.phase() {
+                    SeedDispatchPhase::Dispatched => return Ok(None),
+                    SeedDispatchPhase::Intent
+                        if record.winning_target_replica_id()
+                            != context.record.winning_target_replica_id() =>
+                    {
+                        return Ok(None);
+                    }
+                    SeedDispatchPhase::Intent
+                        if record.winning_build_id() != context.record.winning_build_id() =>
+                    {
+                        return Err(KubericAdapterError::SeedState(
+                            SeedStateError::IdentityMismatch,
+                        ));
+                    }
+                    SeedDispatchPhase::Intent => record,
+                }
+            }
+            None => {
+                store
+                    .create(&context.record)
+                    .map_err(KubericAdapterError::SeedState)?;
+                context.record.clone()
+            }
+        };
+        record
+            .mark_dispatched()
+            .map_err(KubericAdapterError::SeedState)?;
+        store
+            .replace(record.revision(), record)
+            .map_err(KubericAdapterError::SeedState)?;
+        let executor = bootstrap.executor.clone();
+        let effect = MutationEffect::add_database(
+            self.source
+                .observer_config()
+                .target()
+                .availability_group
+                .clone(),
+            bootstrap.config.database.clone(),
+        );
+        Ok(Some(tokio::spawn(async move {
+            executor.execute(&effect).await
+        })))
+    }
+
+    async fn converge_seed_build(
+        &self,
+        generation: u64,
+        replica: &ReplicaInformation,
+    ) -> Result<(), KubericAdapterError> {
+        let context = self.seed_build_context(replica)?;
+        let bootstrap = self
+            .bootstrap
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
+        let deadline = tokio::time::Instant::now() + self.source.observer_config().sample_timeout();
+        let mut dispatch_checked = false;
+        loop {
+            drop(self.finish_operation(generation)?);
+            bootstrap_remaining(deadline)?;
+            let group = match self
+                .observe_seed_group(generation, deadline, &context)
+                .await
+            {
+                Ok(group) => group,
+                Err(error) if is_retryable_bootstrap_observation(&error) => {
+                    self.wait_for_bootstrap_retry(generation, deadline).await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let association = source_association(&group, &context.database)?;
+            let store = bootstrap.seed.store()?;
+            let record = store.load().map_err(KubericAdapterError::SeedState)?;
+            if let Some(record) = record.as_ref() {
+                self.validate_seed_record(record, &context.record)?;
+            }
+            match association {
+                SourceAssociation::Exact(database) => {
+                    if let Some(record) = record {
+                        self.compact_seed_record(store.as_ref(), record, &database)?;
+                    }
+                    match classify_source_seed_completion(
+                        &group,
+                        &database,
+                        &context.database,
+                        &context.target_native_replica_id,
+                    ) {
+                        NativeConvergenceState::Complete => {
+                            drop(self.finish_operation(generation)?);
+                            return Ok(());
+                        }
+                        NativeConvergenceState::Conflicting => {
+                            return Err(KubericAdapterError::NativeConvergenceConflict(
+                                "target replica seed",
+                            ));
+                        }
+                        NativeConvergenceState::Unsafe => {
+                            return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                                "target replica seed",
+                            ));
+                        }
+                        NativeConvergenceState::Absent | NativeConvergenceState::Incomplete => {}
+                    }
+                }
+                SourceAssociation::Incomplete => {}
+                SourceAssociation::Absent if !dispatch_checked => {
+                    dispatch_checked = true;
+                    let dispatch = match self
+                        .arbitrate_seed_dispatch(generation, deadline, &context)
+                        .await
+                    {
+                        Ok(dispatch) => dispatch,
+                        Err(error) if is_retryable_bootstrap_observation(&error) => {
+                            dispatch_checked = false;
+                            self.wait_for_bootstrap_retry(generation, deadline).await?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if let Some(mut dispatch) = dispatch {
+                        let result =
+                            tokio::time::timeout(bootstrap_remaining(deadline)?, &mut dispatch)
+                                .await
+                                .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)?
+                                .map_err(|_| {
+                                    KubericAdapterError::NativeConvergenceUnsafe(
+                                        "seed dispatch task terminated",
+                                    )
+                                })?;
+                        drop(self.finish_operation(generation)?);
+                        result.map_err(|error| KubericAdapterError::NativeMutationFailed {
+                            effect: "add database to availability group",
+                            kind: error.kind,
+                            server_code: error.server_code,
+                        })?;
+                    }
+                    continue;
+                }
+                SourceAssociation::Absent => {}
+            }
+            self.wait_for_bootstrap_retry(generation, deadline).await?;
+        }
+    }
+
     async fn validate_and_set_role(&self, role: ReplicaRole) -> KubericResult<()> {
         let generation = self.begin_operation()?;
         if self.bootstrap.is_some() && self.admitted_topology().is_none() {
@@ -1523,11 +1921,11 @@ impl Replicator for SqlServerReplicator {
 
         {
             let _lifecycle = self.finish_operation(generation)?;
-            if *self
+            if self
                 .role
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                != Some(binding.local_member().stable_role)
+                .is_none_or(|role| !published_role_matches(&binding, role))
             {
                 return Err(KubericAdapterError::TopologyBindingMismatch(
                     "capability requires the frozen stable local role to be published",
@@ -1543,11 +1941,11 @@ impl Replicator for SqlServerReplicator {
         };
         self.ensure_observation_fresh(observed_at)?;
         let _lifecycle = self.finish_operation(generation)?;
-        if *self
+        if self
             .role
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            != Some(binding.local_member().stable_role)
+            .is_none_or(|role| !published_role_matches(&binding, role))
         {
             return Err(KubericAdapterError::TopologyBindingMismatch(
                 "capability requires the frozen stable local role to be published",
@@ -1588,7 +1986,54 @@ impl PrimaryReplicator for SqlServerReplicator {
             .runtime_identity
             .as_ref()
             .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
+        let current = if self.bootstrap.is_some() {
+            normalize_bootstrap_configuration(current)?
+        } else {
+            current
+        };
         let generation = self.begin_operation()?;
+        if self.bootstrap.is_some() && current.replicas.len() < usize::from(SUPPORTED_REPLICA_COUNT)
+        {
+            let mut normalized = current.clone();
+            for member in &current.configuration.members {
+                if normalized
+                    .replicas
+                    .iter()
+                    .any(|replica| replica.identity == member.identity)
+                {
+                    continue;
+                }
+                let mut replica = ReplicaInformation::new(
+                    kuberic_runtime::protocol::types::OperationId::default(),
+                    member.identity.clone(),
+                    if member.identity == *runtime_identity {
+                        self.replication_address.clone()
+                    } else {
+                        String::new()
+                    },
+                );
+                replica.role = member.role;
+                normalized.replicas.push(replica);
+            }
+            validate_configuration_shape(
+                runtime_identity,
+                expectation,
+                &self.replication_address,
+                &normalized,
+            )?;
+            drop(self.finish_operation(generation)?);
+            return Ok(());
+        }
+        if self.bootstrap.is_some()
+            && let Some(binding) = self.admitted_topology()
+            && build_enriched_configuration(&binding, &current)?
+        {
+            let (_, observed_at) = self.observed_group(generation, false, None).await?;
+            drop(self.finish_operation(generation)?);
+            self.ensure_observation_fresh(observed_at)?;
+            return Ok(());
+        }
+
         let (instance, group, observed_at, bootstrap_database, bootstrap_deadline) =
             if self.bootstrap.is_some() {
                 self.converge_bootstrap_configuration(generation, &current)
@@ -1638,6 +2083,10 @@ impl PrimaryReplicator for SqlServerReplicator {
             .admitted_configuration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut admitted_bootstrap_database = self
+            .admitted_bootstrap_database
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.bootstrap.is_some() {
             bootstrap_remaining(bootstrap_deadline)?;
         }
@@ -1649,6 +2098,10 @@ impl PrimaryReplicator for SqlServerReplicator {
                 || (previous_configuration != &current
                     && (configuration_is_complete(previous_configuration)
                         || !configuration_enriches(previous_configuration, &current)))
+                || admitted_bootstrap_database
+                    .as_ref()
+                    .zip(bootstrap_database.as_ref())
+                    .is_some_and(|(previous, current)| previous != current)
             {
                 return Err(KubericAdapterError::TopologyBindingMismatch(
                     "current configuration replay differs from the admitted value",
@@ -1658,20 +2111,184 @@ impl PrimaryReplicator for SqlServerReplicator {
             self.ensure_observation_fresh(observed_at)?;
             *admitted_topology = Some(Arc::new(candidate));
             *admitted_configuration = Some(current);
+            if bootstrap_database.is_some() {
+                *admitted_bootstrap_database = bootstrap_database;
+            }
         } else {
             self.ensure_observation_fresh(observed_at)?;
             *admitted_topology = Some(Arc::new(candidate));
             *admitted_configuration = Some(current);
+            *admitted_bootstrap_database = bootstrap_database;
         }
         Ok(())
     }
 
-    async fn build_replica(&self, _replica: ReplicaInformation) -> KubericResult<()> {
-        self.unsupported(ObserveOnlyOperation::BuildReplica)
+    async fn build_replica(&self, replica: ReplicaInformation) -> KubericResult<()> {
+        if self.bootstrap.is_none() {
+            return self.unsupported(ObserveOnlyOperation::BuildReplica);
+        }
+        let generation = self.begin_operation()?;
+        self.converge_seed_build(generation, &replica)
+            .await
+            .map_err(KubericRuntimeError::from)
     }
 
     async fn remove_replica(&self, _replica_id: ReplicaId) -> KubericResult<()> {
         self.unsupported(ObserveOnlyOperation::RemoveReplica)
+    }
+}
+
+fn seed_member(
+    member: &HealthyTopologyMemberBinding,
+) -> Result<SeedDispatchTarget, KubericAdapterError> {
+    SeedDispatchTarget::new(
+        member.kuberic_identity.replica_id.to_string(),
+        member.kuberic_identity.instance_id.to_string(),
+        member.kuberic_identity.agent_generation.to_string(),
+        member.process_session_id.to_string(),
+        member.native_replica_id.as_str(),
+    )
+    .map_err(KubericAdapterError::SeedState)
+}
+
+fn validate_seed_binding_evidence(
+    binding: &HealthyTopologyBinding,
+    instance: &crate::observation::InstanceMetadata,
+    group: &AvailabilityGroupSnapshot,
+) -> Result<(), KubericAdapterError> {
+    let local = binding.local_member();
+    if local.stable_role != ReplicaRole::Primary
+        || instance.server_name != *local.server_name()
+        || instance.property_server_name != *local.server_name()
+        || instance.sqlserver_start_time != binding.local_sql_server_start_incarnation.as_str()
+        || group.identity != binding.availability_group
+        || group.local_replica.identity != binding.local_sql_replica_identity
+        || group.local_replica.role != Some(NativeRole::Primary)
+        || group.replicas.len() != binding.members.len()
+    {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "seed build native source, availability group, or SQL incarnation differs",
+        ));
+    }
+    for member in &binding.members {
+        let matches = group
+            .replicas
+            .iter()
+            .filter(|replica| {
+                replica.replica_id == member.native_replica_id
+                    && replica.server_name == *member.server_name()
+                    && replica.endpoint_url.as_deref() == Some(member.sql_endpoint_url())
+            })
+            .count();
+        if matches != 1 {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "seed build native replica membership differs",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn source_association(
+    group: &AvailabilityGroupSnapshot,
+    expected: &StandaloneDatabaseIdentity,
+) -> Result<SourceAssociation, KubericAdapterError> {
+    let Some(database) = group.databases.first() else {
+        return Ok(SourceAssociation::Absent);
+    };
+    if group.databases.len() != 1 || database.identity.name != expected.name {
+        return Err(KubericAdapterError::NativeConvergenceConflict(
+            "source database association",
+        ));
+    }
+    let Some(local) = database.local.as_ref() else {
+        return Ok(SourceAssociation::Incomplete);
+    };
+    let Some(recovery) = local.recovery.as_ref() else {
+        return Ok(SourceAssociation::Incomplete);
+    };
+    if recovery.database_guid.as_ref() != Some(&expected.database_guid)
+        || recovery.family_guid.as_ref() != Some(&expected.family_guid)
+        || recovery.recovery_fork_guid.as_ref() != Some(&expected.recovery_fork_guid)
+    {
+        return Err(KubericAdapterError::NativeConvergenceConflict(
+            "source database association",
+        ));
+    }
+    if local.state.as_deref() != Some("ONLINE") || local.recovery_model.as_deref() != Some("FULL") {
+        return Ok(SourceAssociation::Incomplete);
+    }
+    Ok(SourceAssociation::Exact(database.identity.clone()))
+}
+
+fn classify_source_seed_completion(
+    group: &AvailabilityGroupSnapshot,
+    database: &DatabaseIdentity,
+    source: &StandaloneDatabaseIdentity,
+    target_replica_id: &Guid,
+) -> NativeConvergenceState {
+    if group.automatic_seeding.iter().any(|seed| {
+        seed.group_database_id == database.group_database_id
+            && seed.remote_replica_id == *target_replica_id
+            && (seed.current_state.as_deref() == Some("FAILED")
+                || seed.performed_seeding == Some(false)
+                || seed.failure_state.is_some_and(|value| value != 0)
+                || seed.error_code.is_some_and(|value| value != 0))
+    }) {
+        return NativeConvergenceState::Unsafe;
+    }
+    let Some(snapshot) = group
+        .databases
+        .iter()
+        .find(|candidate| candidate.identity == *database)
+    else {
+        return NativeConvergenceState::Incomplete;
+    };
+    let Some(target) = snapshot
+        .replicas
+        .iter()
+        .find(|replica| &replica.replica_id == target_replica_id)
+    else {
+        return NativeConvergenceState::Incomplete;
+    };
+    match &target.lineage {
+        RecoveryLineageObservation::Local { value }
+            if value.database != *database
+                || value.recovery_fork_id != source.recovery_fork_guid =>
+        {
+            return NativeConvergenceState::Conflicting;
+        }
+        RecoveryLineageObservation::Local { .. }
+        | RecoveryLineageObservation::RemoteUnavailable => {}
+        RecoveryLineageObservation::LocalUnavailable => {
+            return NativeConvergenceState::Incomplete;
+        }
+    }
+    let successful_dispatch = group.automatic_seeding.iter().any(|seed| {
+        seed.group_database_id == database.group_database_id
+            && seed.remote_replica_id == *target_replica_id
+            && seed.current_state.as_deref() == Some("COMPLETED")
+            && seed.performed_seeding == Some(true)
+            && seed.failure_state.is_none_or(|value| value == 0)
+            && seed.error_code.is_none_or(|value| value == 0)
+    });
+    let database_state_matches = match target.provenance {
+        NativeProvenance::Local => target.database_state.as_deref() == Some("ONLINE"),
+        NativeProvenance::PrimaryRemote => target
+            .database_state
+            .as_deref()
+            .is_none_or(|state| state == "ONLINE"),
+    };
+    if !successful_dispatch
+        || !database_state_matches
+        || target.synchronization_state.as_deref() != Some("SYNCHRONIZED")
+        || target.synchronization_health.as_deref() != Some("HEALTHY")
+        || target.is_suspended != Some(false)
+        || target.suspend_reason.is_some()
+    {
+        NativeConvergenceState::Incomplete
+    } else {
+        NativeConvergenceState::Complete
     }
 }
 
@@ -1914,6 +2531,8 @@ fn admit_topology(
         native_configuration_sequence: group.configuration_sequence,
         availability_group: group.identity.clone(),
         database_lineage,
+        bootstrap_database_name: options.bootstrap_database_name.cloned(),
+        bootstrap_database: options.bootstrap_database.cloned(),
         local_sql_replica_identity: group.local_replica.identity.clone(),
         local_sql_server_start_incarnation: SqlServerStartIncarnation::new(
             instance.sqlserver_start_time.clone(),
@@ -2254,6 +2873,142 @@ fn validate_current_configuration(
     Ok(())
 }
 
+fn normalize_bootstrap_configuration(
+    current: ReplicaSetConfiguration,
+) -> Result<ReplicaSetConfiguration, KubericAdapterError> {
+    if current.replicas.len() <= usize::from(SUPPORTED_REPLICA_COUNT) {
+        return Ok(current);
+    }
+    let mut base = Vec::with_capacity(current.configuration.members.len());
+    let mut described = 0;
+    for member in &current.configuration.members {
+        let matches = current
+            .replicas
+            .iter()
+            .filter(|replica| replica.identity == member.identity)
+            .collect::<Vec<_>>();
+        described += matches.len();
+        let base_descriptions = matches
+            .iter()
+            .filter(|replica| replica.build_id.is_empty())
+            .collect::<Vec<_>>();
+        if base_descriptions.len() != 1
+            || matches.iter().any(|replica| {
+                !replica.build_id.is_empty()
+                    && (member.role != ReplicaRole::ActiveSecondary
+                        || !matches!(
+                            replica.role,
+                            ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+                        ))
+            })
+        {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "bootstrap build-enriched configuration is ambiguous",
+            ));
+        }
+        base.push((**base_descriptions.first().expect("one base description")).clone());
+    }
+    if described != current.replicas.len()
+        || current.replicas.len() > current.configuration.members.len() + 2
+    {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "bootstrap build-enriched configuration has unknown descriptions",
+        ));
+    }
+    Ok(ReplicaSetConfiguration {
+        configuration: current.configuration,
+        replicas: base,
+    })
+}
+
+fn build_enriched_configuration(
+    binding: &HealthyTopologyBinding,
+    current: &ReplicaSetConfiguration,
+) -> Result<bool, KubericAdapterError> {
+    if current.configuration != binding.configuration {
+        return Ok(false);
+    }
+    if current.replicas.len() <= binding.members.len() {
+        return Ok(false);
+    }
+    if current.replicas.len() > binding.members.len() + 2 {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "build-enriched current configuration has an invalid description count",
+        ));
+    }
+    let mut base = Vec::with_capacity(binding.members.len());
+    let mut builds = Vec::new();
+    for member in &binding.members {
+        let matches = current
+            .replicas
+            .iter()
+            .filter(|replica| replica.identity == member.kuberic_identity)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [only] => base.push((*only).clone()),
+            [first, second] => {
+                let (base_replica, build) =
+                    match (first.build_id.is_empty(), second.build_id.is_empty()) {
+                        (true, false) => (*first, *second),
+                        (false, true) => (*second, *first),
+                        _ => {
+                            return Err(KubericAdapterError::TopologyBindingMismatch(
+                                "build-enriched target descriptions are ambiguous",
+                            ));
+                        }
+                    };
+                base.push(base_replica.clone());
+                builds.push(build.clone());
+            }
+            _ => {
+                return Err(KubericAdapterError::TopologyBindingMismatch(
+                    "build-enriched current configuration has invalid member descriptions",
+                ));
+            }
+        }
+    }
+    if builds.is_empty() {
+        return Ok(false);
+    }
+    if base.len() + builds.len() != current.replicas.len() {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "build-enriched current configuration contains an unknown replica",
+        ));
+    }
+    validate_current_configuration(
+        binding,
+        &ReplicaSetConfiguration {
+            configuration: current.configuration.clone(),
+            replicas: base,
+        },
+    )?;
+    for build in builds {
+        let target = binding
+            .members
+            .iter()
+            .find(|member| member.kuberic_identity == build.identity)
+            .ok_or(KubericAdapterError::TopologyBindingMismatch(
+                "build-enriched current configuration has an unknown target",
+            ))?;
+        if target.stable_role != ReplicaRole::ActiveSecondary
+            || build.process_session_id != target.process_session_id
+            || (!build.replication_address.is_empty()
+                && build.replication_address != target.replication_address)
+            || !matches!(
+                build.role,
+                ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+            )
+            || build.current_progress < 0
+            || build.catch_up_capability < 0
+        {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "build-enriched current configuration differs from the admitted target",
+            ));
+        }
+    }
+    Ok(true)
+}
+
 fn configuration_enriches(
     previous: &ReplicaSetConfiguration,
     current: &ReplicaSetConfiguration,
@@ -2297,7 +3052,15 @@ fn topology_enriches(previous: &HealthyTopologyBinding, current: &HealthyTopolog
         || (previous.database_lineage.is_some()
             && previous.native_configuration_sequence != current.native_configuration_sequence)
         || previous.availability_group != current.availability_group
-        || previous.database_lineage != current.database_lineage
+        || previous
+            .database_lineage
+            .as_ref()
+            .is_some_and(|lineage| current.database_lineage.as_ref() != Some(lineage))
+        || previous.bootstrap_database_name != current.bootstrap_database_name
+        || previous
+            .bootstrap_database
+            .as_ref()
+            .is_some_and(|database| current.bootstrap_database.as_ref() != Some(database))
         || previous.local_sql_replica_identity != current.local_sql_replica_identity
         || previous.local_sql_server_start_incarnation != current.local_sql_server_start_incarnation
         || previous.members.len() != current.members.len()
@@ -2360,7 +3123,7 @@ fn validate_bound_evidence(
             "local SQL replica identity differs",
         ));
     }
-    if requested_role.is_some_and(|role| role != local.stable_role) {
+    if requested_role.is_some_and(|role| !published_role_matches(binding, role)) {
         return Err(KubericAdapterError::TopologyBindingMismatch(
             "requested role differs from the frozen stable role",
         ));
@@ -2449,9 +3212,37 @@ fn validate_bound_evidence(
         if group.databases.is_empty() {
             return Ok(());
         }
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "managed database appeared before build-owned association was admitted",
-        ));
+        let expected_name = binding.bootstrap_database_name.as_ref().ok_or(
+            KubericAdapterError::TopologyBindingMismatch(
+                "build-owned database identity is unavailable",
+            ),
+        )?;
+        if group.databases.len() != 1 || group.databases[0].identity.name != *expected_name {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "build-owned database association differs",
+            ));
+        }
+        if let Some(local_database) = group.databases[0].local.as_ref() {
+            let recovery = local_database.recovery.as_ref().ok_or(
+                KubericAdapterError::TopologyBindingMismatch(
+                    "build-owned local database recovery identity is unavailable",
+                ),
+            )?;
+            if local_database.state.as_deref() != Some("ONLINE")
+                || local_database.recovery_model.as_deref() != Some("FULL")
+                || binding.bootstrap_database.as_ref().is_some_and(|expected| {
+                    recovery.database_guid.as_ref() != Some(&expected.database_guid)
+                        || recovery.family_guid.as_ref() != Some(&expected.family_guid)
+                        || recovery.recovery_fork_guid.as_ref()
+                            != Some(&expected.recovery_fork_guid)
+                })
+            {
+                return Err(KubericAdapterError::TopologyBindingMismatch(
+                    "build-owned local database identity or lineage differs",
+                ));
+            }
+        }
+        return Ok(());
     };
     if group.databases.len() != usize::from(SUPPORTED_DATABASE_COUNT) {
         return Err(KubericAdapterError::TopologyBindingMismatch(
@@ -2533,6 +3324,13 @@ fn native_role_for(role: ReplicaRole) -> NativeRole {
             unreachable!("binding constructor rejects unstable roles")
         }
     }
+}
+
+fn published_role_matches(binding: &HealthyTopologyBinding, role: ReplicaRole) -> bool {
+    role == binding.local_member().stable_role
+        || (binding.bootstrap_database_name.is_some()
+            && binding.local_member().stable_role == ReplicaRole::ActiveSecondary
+            && role == ReplicaRole::IdleSecondary)
 }
 
 fn validate_eligible_snapshot(
