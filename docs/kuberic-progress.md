@@ -151,10 +151,14 @@ authorized target build wins a group-level seed dispatch.
 Kuberic's command/effect/build receipts and exact SQL Server postconditions
 remain the primary durable evidence. The application persists only the
 pre-association Intent/Dispatched ambiguity under its existing application
-root; exact source association removes that record. This follows PostgreSQL
-v2's separation of Kuberic authority, application-native evidence and database
-state without copying PostgreSQL recovery mechanics or creating a generic
-operation ledger.
+root; exact source association removes that record. The owned source database
+also retains a narrow AG creation handshake: resource/configuration/name intent
+is written before creation, then SQL Server's generated AG GUID is frozen in
+the same metadata. Replay, join, and seed reject missing or mismatched markers,
+including an exact-profile foreign same-name AG or a later same-name AG with a
+new GUID. This follows PostgreSQL v2's separation of Kuberic authority,
+application-native evidence and database state without copying PostgreSQL
+recovery mechanics or creating a generic operation ledger.
 
 No new TLS certificate provisioning, production mutation configuration or
 plaintext bypass was added. Licensed validation reuses fixture-owned endpoint

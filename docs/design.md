@@ -91,6 +91,8 @@ validation:
   from validated callback/operation data;
 - operation-specific absent, incomplete, complete, conflicting and unsafe
   native classifiers; and
+- a source-database-owned AG handshake that retains resource/configuration/name
+  intent before creation and then freezes SQL Server's generated AG GUID; and
 - bounded seed-dispatch evidence for the pre-association ambiguity only.
 
 The production crate connects to already provisioned SQL Server instances. It
@@ -356,6 +358,12 @@ The application persists a schema-versioned non-secret runtime binding and,
 only while native SQL cannot prove whether group seeding was dispatched, one
 bounded `seed-dispatch-v1.json` record under the same authorized application
 root. Kuberic's private authority store remains behind the public host boundary.
+The already-owned source database separately retains narrow SQL extended
+properties for AG creation intent and the exact SQL-generated AG GUID. Current
+configuration replay, secondary join, and seed build require that native marker
+to match the resource, accepted configuration, AG name, and observed GUID; an
+unmarked same-name AG or a same-name replacement with another GUID is a
+terminal conflict rather than an adoption candidate.
 The seed record binds exact authority and native identities, uses exclusive
 ownership and monotonic atomic transitions, and is removed as soon as exact
 source database-to-AG association proves dispatch. Previous/current
@@ -373,9 +381,11 @@ exact SQL Server postcondition can be reobserved after restart. The PostgreSQL
 v2 precedent uses three distinct owners: Kuberic agent SQLite metadata,
 application-owned checksummed metadata, and PGDATA. MSSQL applies the same
 ownership discipline with Kuberic authority, native SQL state, the immutable
-runtime binding, and one bounded seed-dispatch record under the existing
-application root. The record exists only for the demonstrated pre-association
-ambiguity; no general second operation database or result ledger was added.
+runtime binding, the AG identity marker in the owned source database, and one
+bounded seed-dispatch record under the existing application root. The record
+exists only for the demonstrated pre-association ambiguity; the AG marker only
+binds creation ownership and native identity. No general second operation
+database or result ledger was added.
 
 The current implementation tracks Kuberic `main`; `Cargo.lock` freezes the
 exact revision used by each build. The current pin

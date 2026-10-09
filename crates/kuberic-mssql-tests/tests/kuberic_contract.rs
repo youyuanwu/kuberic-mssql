@@ -22,14 +22,15 @@ use kuberic_mssql::runtime_host::{
     SeedDispatchPhase, SeedDispatchRecord, SeedDispatchStore, SeedDispatchTarget,
 };
 use kuberic_mssql::{
-    AvailabilityGroupIdentity, AvailabilityGroupName, BootstrapOwnership, BootstrapOwnershipError,
-    ConfigurationSequence, DatabaseIdentity, DatabaseLineage, DecimalProgress, Endpoint, Guid,
-    MutationEffect, NativeConvergenceState, NativeProgress, NativeRole, Observation,
-    ObservationFailure, ObservationFailureKind, ReplicaDescriptor, ReplicaIdentity, ServerName,
-    SqlIdentifier, SqlMutationExecutor, SqlServerTopologyExpectation,
-    SqlServerTopologyMemberExpectation, StandaloneDatabaseIdentity, StandaloneDatabaseOwnership,
-    StandaloneDatabaseSnapshot, classify_availability_group, classify_bootstrap_ownership,
-    classify_replica_join, classify_replica_seed,
+    AvailabilityGroupIdentity, AvailabilityGroupName, AvailabilityGroupOwnership,
+    BootstrapOwnership, BootstrapOwnershipError, ConfigurationSequence, DatabaseIdentity,
+    DatabaseLineage, DecimalProgress, Endpoint, Guid, MutationEffect, NativeConvergenceState,
+    NativeProgress, NativeRole, Observation, ObservationFailure, ObservationFailureKind,
+    ReplicaDescriptor, ReplicaIdentity, ServerName, SqlIdentifier, SqlMutationExecutor,
+    SqlServerTopologyExpectation, SqlServerTopologyMemberExpectation, StandaloneDatabaseIdentity,
+    StandaloneDatabaseOwnership, StandaloneDatabaseSnapshot, classify_availability_group,
+    classify_bootstrap_ownership, classify_owned_availability_group, classify_replica_join,
+    classify_replica_seed,
 };
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::application::{OpenMode, StatefulServiceReplica};
@@ -1117,10 +1118,110 @@ fn owned_standalone_database() -> StandaloneDatabaseSnapshot {
             resource_id: "resource-a".into(),
             configuration_id: configuration().configuration_id.to_string(),
         }),
+        availability_group_ownership: Some(AvailabilityGroupOwnership {
+            resource_id: "resource-a".into(),
+            configuration_id: configuration().configuration_id.to_string(),
+            name: AvailabilityGroupName::new("test-ag").unwrap(),
+            group_id: Some(guid(AG_ID)),
+        }),
         state: "ONLINE".into(),
         recovery_model: "FULL".into(),
         accessible: true,
     }
+}
+
+fn owned_standalone_database_without_group_intent() -> StandaloneDatabaseSnapshot {
+    let mut snapshot = owned_standalone_database();
+    snapshot.availability_group_ownership = None;
+    snapshot
+}
+
+fn owned_standalone_database_with_group_intent() -> StandaloneDatabaseSnapshot {
+    let mut snapshot = owned_standalone_database();
+    snapshot
+        .availability_group_ownership
+        .as_mut()
+        .unwrap()
+        .group_id = None;
+    snapshot
+}
+
+#[test]
+fn availability_group_ownership_classifier_rejects_unmarked_recreated_and_secondary_forks() {
+    let descriptors = desired_descriptors();
+    let database_name = SqlIdentifier::new("app-db").unwrap();
+    let database_identity = owned_standalone_database().identity.unwrap();
+    let expected_group_ownership = AvailabilityGroupOwnership {
+        resource_id: "resource-a".into(),
+        configuration_id: configuration().configuration_id.to_string(),
+        name: AvailabilityGroupName::new("test-ag").unwrap(),
+        group_id: None,
+    };
+    let complete = bound_snapshot();
+    let complete_group = match &complete.availability_group {
+        Observation::Present { value, .. } => value,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        classify_owned_availability_group(
+            Some(complete_group),
+            None,
+            &expected_group_ownership,
+            &descriptors,
+            &database_name,
+            Some(&database_identity),
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+
+    let intent = AvailabilityGroupOwnership {
+        resource_id: "resource-a".into(),
+        configuration_id: configuration().configuration_id.to_string(),
+        name: AvailabilityGroupName::new("test-ag").unwrap(),
+        group_id: None,
+    };
+    assert_eq!(
+        classify_owned_availability_group(
+            Some(complete_group),
+            Some(&intent),
+            &expected_group_ownership,
+            &descriptors,
+            &database_name,
+            Some(&database_identity),
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+
+    let frozen = owned_standalone_database()
+        .availability_group_ownership
+        .unwrap();
+    let mut recreated = complete_group.clone();
+    recreated.identity.group_id = guid("99999999-9999-4999-8999-999999999999");
+    assert_eq!(
+        classify_owned_availability_group(
+            Some(&recreated),
+            Some(&frozen),
+            &expected_group_ownership,
+            &descriptors,
+            &database_name,
+            Some(&database_identity),
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+    assert_eq!(
+        classify_replica_join(
+            Some(&recreated),
+            &complete_group.identity,
+            &recreated.local_replica.identity,
+            &recreated.replicas[0].server_name,
+            recreated.replicas[0].endpoint_url.as_deref().unwrap(),
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
 }
 
 #[tokio::test]
@@ -1128,6 +1229,7 @@ async fn explicit_bootstrap_path_assigns_exact_effect_ownership_and_replays_from
     let (primary, primary_mutation) = bootstrap_replicator_for(
         0,
         vec![
+            Ok(present(bootstrap_absent_snapshot(0))),
             Ok(present(bootstrap_absent_snapshot(0))),
             Ok(present(bootstrap_membership_snapshot(0))),
             Ok(present(bootstrap_membership_snapshot_with_sequence(
@@ -1139,6 +1241,8 @@ async fn explicit_bootstrap_path_assigns_exact_effect_ownership_and_replays_from
         ],
         vec![
             Ok(None),
+            Ok(Some(owned_standalone_database_without_group_intent())),
+            Ok(Some(owned_standalone_database_with_group_intent())),
             Ok(Some(owned_standalone_database())),
             Ok(Some(owned_standalone_database())),
             Ok(Some(owned_standalone_database())),
@@ -1155,7 +1259,11 @@ async fn explicit_bootstrap_path_assigns_exact_effect_ownership_and_replays_from
         .unwrap();
     assert_eq!(
         *primary_mutation.effects.lock().unwrap(),
-        vec!["create source database", "create availability group"]
+        vec![
+            "create source database",
+            "retain availability group intent",
+            "create availability group"
+        ]
     );
     assert!(
         primary
@@ -1175,7 +1283,15 @@ async fn explicit_bootstrap_path_assigns_exact_effect_ownership_and_replays_from
                 Ok(present(bootstrap_membership_snapshot(local_index))),
                 Ok(present(bootstrap_membership_snapshot(local_index))),
             ],
-            vec![Ok(None), Ok(None), Ok(None), Ok(None)],
+            vec![
+                Ok(None),
+                Ok(Some(owned_standalone_database())),
+                Ok(None),
+                Ok(Some(owned_standalone_database())),
+                Ok(None),
+                Ok(Some(owned_standalone_database())),
+                Ok(Some(owned_standalone_database())),
+            ],
         );
         secondary.open().await.unwrap();
         secondary
@@ -1212,6 +1328,136 @@ async fn bootstrap_path_fails_closed_on_foreign_standalone_database() {
     assert!(replicator.admitted_topology().is_none());
 }
 
+#[tokio::test]
+async fn bootstrap_restart_requires_the_frozen_availability_group_marker() {
+    let mut unmarked = owned_standalone_database();
+    unmarked.availability_group_ownership = None;
+    let (replicator, mutation) = bootstrap_replicator_for(
+        0,
+        vec![
+            Ok(present(bootstrap_membership_snapshot(0))),
+            Ok(present(bootstrap_membership_snapshot(0))),
+        ],
+        vec![Ok(Some(unmarked))],
+    );
+    replicator.open().await.unwrap();
+    let error = replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("conflicts"));
+    assert!(mutation.effects.lock().unwrap().is_empty());
+
+    let mut recreated = bootstrap_membership_snapshot(0);
+    if let Observation::Present { value: group, .. } = &mut recreated.availability_group {
+        group.identity.group_id = guid("99999999-9999-4999-8999-999999999999");
+    }
+    let (replicator, mutation) = bootstrap_replicator_for(
+        0,
+        vec![Ok(present(recreated))],
+        vec![Ok(Some(owned_standalone_database()))],
+    );
+    replicator.open().await.unwrap();
+    let error = replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("conflicts"));
+    assert!(mutation.effects.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn secondary_restart_rejects_a_local_same_name_group_with_a_different_primary_guid() {
+    let mut fork = bootstrap_membership_snapshot(1);
+    if let Observation::Present { value: group, .. } = &mut fork.availability_group {
+        group.identity.group_id = guid("99999999-9999-4999-8999-999999999999");
+    }
+    let (replicator, mutation) = bootstrap_replicator_for(
+        1,
+        vec![Ok(present(fork))],
+        vec![Ok(None), Ok(Some(owned_standalone_database()))],
+    );
+    replicator.open().await.unwrap();
+    let error = replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("conflicts"));
+    assert!(mutation.effects.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn current_configuration_replay_revalidates_availability_group_ownership() {
+    let mut unmarked = owned_standalone_database();
+    unmarked.availability_group_ownership = None;
+    let (replicator, mutation) = bootstrap_replicator_for(
+        0,
+        vec![
+            Ok(present(bootstrap_membership_snapshot(0))),
+            Ok(present(bootstrap_membership_snapshot(0))),
+        ],
+        vec![Ok(Some(owned_standalone_database())), Ok(Some(unmarked))],
+    );
+    replicator.open().await.unwrap();
+    replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap();
+    let error = replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("conflicts"));
+    assert!(mutation.effects.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn seed_build_revalidates_the_exact_availability_group_guid_marker() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut unmarked = owned_standalone_database();
+    unmarked.availability_group_ownership = None;
+    let executor = Arc::new(ScriptedMutationExecutor {
+        databases: Mutex::new(
+            vec![Ok(Some(owned_standalone_database())), Ok(Some(unmarked))].into(),
+        ),
+        effects: Mutex::new(Vec::new()),
+        executions: Mutex::new(VecDeque::new()),
+    });
+    let replicator = Arc::new(
+        SqlServerReplicator::new_bootstrap_with_topology(
+            SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-1.example:5022")
+                .unwrap(),
+            Arc::new(ScriptedSource {
+                config: observer_config(),
+                samples: Mutex::new(
+                    vec![
+                        Ok(present(bootstrap_membership_snapshot(0))),
+                        Ok(present(bootstrap_membership_snapshot(0))),
+                    ]
+                    .into(),
+                ),
+            }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+            kuberic_identity(1),
+            topology_expectation(),
+            SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+            executor.clone(),
+            root.path().to_owned(),
+        )
+        .unwrap(),
+    );
+    admit_seed_replicator(&replicator).await;
+    let error = replicator
+        .build_replica(target_build(1, "unmarked-seed-build"))
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("ownership marker"));
+    assert!(executor.effects.lock().unwrap().is_empty());
+}
+
 fn mutation_error(code: u32) -> RuntimeError {
     let mut error = RuntimeError::new(
         ObservationFailureKind::Unsupported,
@@ -1243,7 +1489,17 @@ fn pending_secondary_join_snapshot(local_index: usize) -> InstanceSnapshot {
 #[tokio::test]
 async fn secondary_waits_for_primary_group_and_retries_only_expected_join_propagation() {
     let executor = Arc::new(ScriptedMutationExecutor {
-        databases: Mutex::new(vec![Ok(None), Ok(None), Ok(None)].into()),
+        databases: Mutex::new(
+            vec![
+                Ok(None),
+                Ok(Some(owned_standalone_database())),
+                Ok(None),
+                Ok(Some(owned_standalone_database())),
+                Ok(None),
+                Ok(Some(owned_standalone_database())),
+            ]
+            .into(),
+        ),
         effects: Mutex::new(Vec::new()),
         executions: Mutex::new(vec![Err(mutation_error(35250))].into()),
     });
@@ -1288,7 +1544,13 @@ async fn secondary_waits_for_primary_group_and_retries_only_expected_join_propag
 #[tokio::test]
 async fn secondary_join_does_not_retry_arbitrary_sql_errors() {
     let executor = Arc::new(ScriptedMutationExecutor {
-        databases: Mutex::new(vec![Ok(None)].into()),
+        databases: Mutex::new(
+            vec![
+                Ok(Some(owned_standalone_database())),
+                Ok(Some(owned_standalone_database())),
+            ]
+            .into(),
+        ),
         effects: Mutex::new(Vec::new()),
         executions: Mutex::new(vec![Err(mutation_error(50000))].into()),
     });
@@ -1491,7 +1753,13 @@ async fn bootstrap_admission_accepts_only_exact_owned_database_association() {
 #[tokio::test]
 async fn callback_deadline_cancels_gated_observation_before_it_can_publish() {
     let executor = Arc::new(ScriptedMutationExecutor {
-        databases: Mutex::new(vec![Ok(Some(owned_standalone_database()))].into()),
+        databases: Mutex::new(
+            vec![
+                Ok(Some(owned_standalone_database())),
+                Ok(Some(owned_standalone_database())),
+            ]
+            .into(),
+        ),
         effects: Mutex::new(Vec::new()),
         executions: Mutex::new(VecDeque::new()),
     });
@@ -3763,7 +4031,13 @@ async fn later_incomplete_target_with_no_record_waits_without_redispatch() {
     }
     let associated = Arc::new(AtomicBool::new(false));
     let executor = Arc::new(ScriptedMutationExecutor {
-        databases: Mutex::new(vec![Ok(Some(owned_standalone_database()))].into()),
+        databases: Mutex::new(
+            vec![
+                Ok(Some(owned_standalone_database())),
+                Ok(Some(owned_standalone_database())),
+            ]
+            .into(),
+        ),
         effects: Mutex::new(Vec::new()),
         executions: Mutex::new(VecDeque::new()),
     });
@@ -3897,7 +4171,13 @@ async fn build_rejects_changed_sql_incarnation_and_conflicting_source_associatio
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let executor = Arc::new(ScriptedMutationExecutor {
-            databases: Mutex::new(vec![Ok(Some(owned_standalone_database()))].into()),
+            databases: Mutex::new(
+                vec![
+                    Ok(Some(owned_standalone_database())),
+                    Ok(Some(owned_standalone_database())),
+                ]
+                .into(),
+            ),
             effects: Mutex::new(Vec::new()),
             executions: Mutex::new(VecDeque::new()),
         });

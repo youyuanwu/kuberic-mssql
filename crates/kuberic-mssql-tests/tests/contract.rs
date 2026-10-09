@@ -159,6 +159,7 @@ fn standalone_database_preflight_refuses_unowned_same_name_state() {
             resource_id: "default/example".into(),
             configuration_id: "configuration-1".into(),
         }),
+        availability_group_ownership: None,
         state: "ONLINE".into(),
         recovery_model: "FULL".into(),
         accessible: true,
@@ -218,7 +219,7 @@ fn mutation_surface_is_typed_and_contains_only_approved_stage_three_effects() {
         },
     );
     let plan = BootstrapMutationPlan::from_operation(&bootstrap).unwrap();
-    assert_eq!(plan.effects().len(), 2);
+    assert_eq!(plan.effects().len(), 3);
     let create_database = &plan.effects()[0];
     assert_eq!(create_database.label(), "create source database");
     let database_sql = create_database.statement();
@@ -236,11 +237,29 @@ fn mutation_surface_is_typed_and_contains_only_approved_stage_three_effects() {
     assert!(database_sql.contains("N''default/example''"));
     assert!(!database_sql.contains("ADD DATABASE"));
 
-    let create_group = &plan.effects()[1];
+    let retain_intent = &plan.effects()[1];
+    let intent_sql = retain_intent.statement();
+    assert_eq!(retain_intent.label(), "retain availability group intent");
+    assert!(intent_sql.contains("kuberic_ag_resource_id"));
+    assert!(intent_sql.contains("kuberic_ag_configuration_id"));
+    assert!(intent_sql.contains("kuberic_ag_name"));
+    assert!(!intent_sql.contains("CREATE AVAILABILITY GROUP"));
+
+    let create_group = &plan.effects()[2];
     let group_sql = create_group.statement();
     assert!(group_sql.contains("CREATE AVAILABILITY GROUP [kuberic-ag]"));
     assert_eq!(group_sql.matches("SEEDING_MODE = AUTOMATIC").count(), 3);
     assert!(group_sql.contains("REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 1"));
+    assert!(group_sql.contains("kuberic_ag_id"));
+    assert!(group_sql.contains("sys.availability_groups"));
+    let create_offset = group_sql.find("CREATE AVAILABILITY GROUP").unwrap();
+    let generated_id_offset = group_sql.find("DECLARE @kuberic_ag_id").unwrap();
+    let bind_offset = group_sql
+        .find("@name=N'kuberic_ag_id', @value=@kuberic_ag_id")
+        .unwrap();
+    assert!(create_offset < generated_id_offset);
+    assert!(generated_id_offset < bind_offset);
+    assert!(!group_sql.contains("IF NOT EXISTS (SELECT 1 FROM sys.availability_groups"));
     assert!(!group_sql.contains("ADD DATABASE"));
 
     let join_request = request(
@@ -283,7 +302,10 @@ fn mutation_surface_rejects_wrong_shape_and_native_bootstrap_identity() {
     let availability_group = AvailabilityGroupName::new("kuberic-ag").unwrap();
     assert_eq!(
         MutationEffect::create_availability_group(
+            SqlIdentifier::new("application").unwrap(),
             availability_group.clone(),
+            "default/example",
+            "configuration-1",
             vec![descriptor(1), descriptor(2)]
         ),
         Err(MutationContractError::ReplicaCount)
@@ -292,7 +314,13 @@ fn mutation_surface_rejects_wrong_shape_and_native_bootstrap_identity() {
     let mut replicas = vec![descriptor(1), descriptor(2), descriptor(3)];
     replicas[1].identity = replica(2);
     assert_eq!(
-        MutationEffect::create_availability_group(availability_group, replicas),
+        MutationEffect::create_availability_group(
+            SqlIdentifier::new("application").unwrap(),
+            availability_group,
+            "default/example",
+            "configuration-1",
+            replicas
+        ),
         Err(MutationContractError::NativeBootstrapIdentity)
     );
 
@@ -300,7 +328,13 @@ fn mutation_surface_rejects_wrong_shape_and_native_bootstrap_identity() {
     let mut replicas = vec![descriptor(1), descriptor(2), descriptor(3)];
     replicas[2].server_name = replicas[1].server_name.clone();
     assert_eq!(
-        MutationEffect::create_availability_group(availability_group, replicas),
+        MutationEffect::create_availability_group(
+            SqlIdentifier::new("application").unwrap(),
+            availability_group,
+            "default/example",
+            "configuration-1",
+            replicas
+        ),
         Err(MutationContractError::DuplicateReplica)
     );
 }
@@ -374,7 +408,11 @@ async fn mutation_executor_accepts_only_typed_effects_derived_from_validated_ope
     }
     assert_eq!(
         *executor.labels.lock().unwrap(),
-        vec!["create source database", "create availability group"]
+        vec![
+            "create source database",
+            "retain availability group intent",
+            "create availability group"
+        ]
     );
 
     let reseed = request(

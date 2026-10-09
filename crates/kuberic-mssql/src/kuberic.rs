@@ -19,9 +19,9 @@ use kuberic_runtime::replicator::{
 use kuberic_runtime::{Result as KubericResult, RuntimeError as KubericRuntimeError};
 
 use crate::bootstrap::{
-    BootstrapOwnership, NativeConvergenceState, StandaloneDatabaseIdentity,
-    StandaloneDatabaseOwnership, classify_availability_group, classify_bootstrap_ownership,
-    classify_replica_join, classify_standalone_database,
+    AvailabilityGroupOwnership, BootstrapOwnership, NativeConvergenceState,
+    StandaloneDatabaseIdentity, StandaloneDatabaseOwnership, classify_bootstrap_ownership,
+    classify_owned_availability_group, classify_replica_join, classify_standalone_database,
 };
 use crate::executor::SqlExecutor;
 use crate::instance::{SqlServerInstanceManager, unix_millis};
@@ -1383,6 +1383,87 @@ impl SqlServerReplicator {
             .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))
     }
 
+    async fn observe_availability_group_ownership(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+        executor: &dyn SqlMutationExecutor,
+        database: &SqlIdentifier,
+    ) -> Result<Option<crate::bootstrap::StandaloneDatabaseSnapshot>, KubericAdapterError> {
+        let remaining = bootstrap_remaining(deadline)?;
+        let result = tokio::time::timeout(
+            remaining,
+            executor.observe_availability_group_ownership(database),
+        )
+        .await;
+        drop(self.finish_operation(generation)?);
+        result
+            .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)?
+            .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))
+    }
+
+    async fn require_availability_group_ownership(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+        configuration_id: &str,
+        expected_database: Option<&StandaloneDatabaseIdentity>,
+        expected_group: &AvailabilityGroupIdentity,
+    ) -> Result<(), KubericAdapterError> {
+        let bootstrap = self
+            .bootstrap
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
+        let expected_database_ownership = StandaloneDatabaseOwnership {
+            resource_id: bootstrap.resource_uid.to_string(),
+            configuration_id: configuration_id.to_owned(),
+        };
+        let snapshot = self
+            .observe_availability_group_ownership(
+                generation,
+                deadline,
+                bootstrap.executor.as_ref(),
+                bootstrap.config.database(),
+            )
+            .await?;
+        match classify_standalone_database(
+            snapshot.as_ref(),
+            expected_database,
+            &expected_database_ownership,
+            false,
+        ) {
+            NativeConvergenceState::Complete => {}
+            NativeConvergenceState::Unsafe => {
+                return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                    "availability-group ownership database",
+                ));
+            }
+            NativeConvergenceState::Absent
+            | NativeConvergenceState::Incomplete
+            | NativeConvergenceState::Conflicting => {
+                return Err(KubericAdapterError::NativeConvergenceConflict(
+                    "availability-group ownership database",
+                ));
+            }
+        }
+        let expected_marker = AvailabilityGroupOwnership {
+            resource_id: expected_database_ownership.resource_id,
+            configuration_id: expected_database_ownership.configuration_id,
+            name: expected_group.name.clone(),
+            group_id: Some(expected_group.group_id.clone()),
+        };
+        if snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.availability_group_ownership.as_ref())
+            != Some(&expected_marker)
+        {
+            return Err(KubericAdapterError::NativeConvergenceConflict(
+                "availability-group ownership marker",
+            ));
+        }
+        Ok(())
+    }
+
     async fn converge_bootstrap_configuration(
         &self,
         generation: u64,
@@ -1425,6 +1506,17 @@ impl SqlServerReplicator {
             resource_id: bootstrap.resource_uid.to_string(),
             configuration_id: current.configuration.configuration_id.to_string(),
         };
+        let expected_group_ownership = AvailabilityGroupOwnership {
+            resource_id: expected_ownership.resource_id.clone(),
+            configuration_id: expected_ownership.configuration_id.clone(),
+            name: self
+                .source
+                .observer_config()
+                .target()
+                .availability_group
+                .clone(),
+            group_id: None,
+        };
         let create_database = MutationEffect::create_source_database(
             bootstrap.config.database.clone(),
             &expected_ownership.resource_id,
@@ -1435,12 +1527,30 @@ impl SqlServerReplicator {
                 "bootstrap database ownership markers are invalid",
             )
         })?;
-        let create_group = MutationEffect::create_availability_group(
+        let retain_group_intent = MutationEffect::retain_availability_group_intent(
+            bootstrap.config.database.clone(),
             self.source
                 .observer_config()
                 .target()
                 .availability_group
                 .clone(),
+            &expected_ownership.resource_id,
+            &expected_ownership.configuration_id,
+        )
+        .map_err(|_| {
+            KubericAdapterError::InvalidConfiguration(
+                "availability-group ownership intent is invalid",
+            )
+        })?;
+        let create_group = MutationEffect::create_availability_group(
+            bootstrap.config.database.clone(),
+            self.source
+                .observer_config()
+                .target()
+                .availability_group
+                .clone(),
+            &expected_ownership.resource_id,
+            &expected_ownership.configuration_id,
             descriptors.clone(),
         )
         .map_err(|_| {
@@ -1468,9 +1578,24 @@ impl SqlServerReplicator {
                 .await?;
             let database_state =
                 classify_standalone_database(database.as_ref(), None, &expected_ownership, false);
+            let ownership_database = match ownership {
+                BootstrapOwnership::PrimaryTopology => database.clone(),
+                BootstrapOwnership::LocalJoin => {
+                    self.observe_availability_group_ownership(
+                        generation,
+                        deadline,
+                        bootstrap.executor.as_ref(),
+                        bootstrap.config.database(),
+                    )
+                    .await?
+                }
+            };
             let database_identity = database
                 .as_ref()
                 .and_then(|database| database.identity.clone());
+            let availability_group_ownership = ownership_database
+                .as_ref()
+                .and_then(|database| database.availability_group_ownership.as_ref());
             match ownership {
                 BootstrapOwnership::PrimaryTopology => {
                     match database_state {
@@ -1505,39 +1630,63 @@ impl SqlServerReplicator {
                             }
                             Err(error) => return Err(error),
                         };
-                    let Some(group) = group else {
-                        self.execute_bootstrap_effect(
-                            generation,
-                            deadline,
-                            bootstrap.executor.as_ref(),
-                            &create_group,
-                        )
-                        .await?;
-                        continue;
-                    };
-                    match classify_availability_group(
-                        Some(&group),
-                        &self.source.observer_config().target().availability_group,
-                        None,
+                    match classify_owned_availability_group(
+                        group.as_ref(),
+                        availability_group_ownership,
+                        &expected_group_ownership,
                         &descriptors,
                         bootstrap.config.database(),
                         database_identity.as_ref(),
                         false,
                     ) {
                         NativeConvergenceState::Complete
-                            if bootstrap_membership_ready(&group, ownership, &descriptors) =>
+                            if group.as_ref().is_some_and(|group| {
+                                bootstrap_membership_ready(group, ownership, &descriptors)
+                            }) =>
                         {
+                            let group = group.expect("complete classifier requires a group");
                             drop(self.finish_operation(generation)?);
                             bootstrap_remaining(deadline)?;
                             return Ok((instance, group, observed_at, database_identity, deadline));
                         }
-                        NativeConvergenceState::Absent
-                        | NativeConvergenceState::Incomplete
-                        | NativeConvergenceState::Complete => {}
+                        NativeConvergenceState::Absent => {
+                            self.execute_bootstrap_effect(
+                                generation,
+                                deadline,
+                                bootstrap.executor.as_ref(),
+                                &retain_group_intent,
+                            )
+                            .await?;
+                            continue;
+                        }
+                        NativeConvergenceState::Incomplete if group.is_none() => {
+                            self.execute_bootstrap_effect(
+                                generation,
+                                deadline,
+                                bootstrap.executor.as_ref(),
+                                &create_group,
+                            )
+                            .await?;
+                            continue;
+                        }
+                        NativeConvergenceState::Incomplete | NativeConvergenceState::Complete => {}
                         NativeConvergenceState::Conflicting => {
-                            return Err(KubericAdapterError::NativeConvergenceConflict(
-                                "availability group",
-                            ));
+                            let label = if group.as_ref().is_some_and(|group| {
+                                availability_group_ownership
+                                    != Some(&AvailabilityGroupOwnership {
+                                        resource_id: expected_group_ownership.resource_id.clone(),
+                                        configuration_id: expected_group_ownership
+                                            .configuration_id
+                                            .clone(),
+                                        name: expected_group_ownership.name.clone(),
+                                        group_id: Some(group.identity.group_id.clone()),
+                                    })
+                            }) {
+                                "availability-group ownership marker"
+                            } else {
+                                "availability group"
+                            };
+                            return Err(KubericAdapterError::NativeConvergenceConflict(label));
                         }
                         NativeConvergenceState::Unsafe => {
                             return Err(KubericAdapterError::NativeConvergenceUnsafe(
@@ -1571,6 +1720,32 @@ impl SqlServerReplicator {
                             }
                             Err(error) => return Err(error),
                         };
+                    let expected_group = match availability_group_ownership {
+                        Some(AvailabilityGroupOwnership {
+                            resource_id,
+                            configuration_id,
+                            name,
+                            group_id: Some(group_id),
+                        }) if resource_id == &expected_ownership.resource_id
+                            && configuration_id == &expected_ownership.configuration_id
+                            && name
+                                == &self.source.observer_config().target().availability_group =>
+                        {
+                            AvailabilityGroupIdentity {
+                                name: name.clone(),
+                                group_id: group_id.clone(),
+                            }
+                        }
+                        Some(AvailabilityGroupOwnership { group_id: None, .. }) | None => {
+                            self.wait_for_bootstrap_retry(generation, deadline).await?;
+                            continue;
+                        }
+                        Some(_) => {
+                            return Err(KubericAdapterError::NativeConvergenceConflict(
+                                "availability-group ownership",
+                            ));
+                        }
+                    };
                     let Some(group) = group else {
                         if join_absence_observed {
                             let dispatched = self
@@ -1590,19 +1765,30 @@ impl SqlServerReplicator {
                         self.wait_for_bootstrap_retry(generation, deadline).await?;
                         continue;
                     };
-                    match classify_availability_group(
+                    match classify_owned_availability_group(
                         Some(&group),
-                        &self.source.observer_config().target().availability_group,
-                        None,
+                        availability_group_ownership,
+                        &expected_group_ownership,
                         &descriptors,
                         bootstrap.config.database(),
                         database_identity.as_ref(),
                         false,
                     ) {
                         NativeConvergenceState::Conflicting => {
-                            return Err(KubericAdapterError::NativeConvergenceConflict(
-                                "availability group",
-                            ));
+                            let label = if availability_group_ownership
+                                != Some(&AvailabilityGroupOwnership {
+                                    resource_id: expected_group_ownership.resource_id.clone(),
+                                    configuration_id: expected_group_ownership
+                                        .configuration_id
+                                        .clone(),
+                                    name: expected_group_ownership.name.clone(),
+                                    group_id: Some(group.identity.group_id.clone()),
+                                }) {
+                                "availability-group ownership marker"
+                            } else {
+                                "availability group"
+                            };
+                            return Err(KubericAdapterError::NativeConvergenceConflict(label));
                         }
                         NativeConvergenceState::Unsafe => {
                             return Err(KubericAdapterError::NativeConvergenceUnsafe(
@@ -1616,7 +1802,7 @@ impl SqlServerReplicator {
                     let local = expectation.local_member();
                     match classify_replica_join(
                         Some(&group),
-                        &group.identity,
+                        &expected_group,
                         &group.local_replica.identity,
                         local.server_name(),
                         local.endpoint_url(),
@@ -1941,6 +2127,14 @@ impl SqlServerReplicator {
             .as_ref()
             .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
         let deadline = tokio::time::Instant::now() + self.source.observer_config().sample_timeout();
+        self.require_availability_group_ownership(
+            generation,
+            deadline,
+            &context.binding.configuration.configuration_id.to_string(),
+            Some(&context.database),
+            &context.binding.availability_group,
+        )
+        .await?;
         let mut dispatch_checked = false;
         loop {
             drop(self.finish_operation(generation)?);
@@ -2311,12 +2505,39 @@ impl PrimaryReplicator for SqlServerReplicator {
         }
         if self.bootstrap.is_some()
             && let Some(binding) = self.admitted_topology()
-            && build_enriched_configuration(&binding, &current)?
         {
-            let (_, observed_at) = self.observed_group(generation, false, None).await?;
-            drop(self.finish_operation(generation)?);
-            self.ensure_observation_fresh(observed_at)?;
-            return Ok(());
+            let accepted_replay = if build_enriched_configuration(&binding, &current)? {
+                true
+            } else {
+                let admitted = self
+                    .admitted_configuration
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if admitted.as_ref().is_some_and(configuration_is_complete) {
+                    validate_current_configuration(&binding, &current)?;
+                    true
+                } else {
+                    false
+                }
+            };
+            if !accepted_replay {
+                drop(binding);
+            } else {
+                let ownership_deadline =
+                    tokio::time::Instant::now() + self.source.observer_config().sample_timeout();
+                self.require_availability_group_ownership(
+                    generation,
+                    ownership_deadline,
+                    &binding.configuration.configuration_id.to_string(),
+                    None,
+                    &binding.availability_group,
+                )
+                .await?;
+                let (_, observed_at) = self.observed_group(generation, false, None).await?;
+                drop(self.finish_operation(generation)?);
+                self.ensure_observation_fresh(observed_at)?;
+                return Ok(());
+            }
         }
 
         let (instance, group, observed_at, bootstrap_database, bootstrap_deadline) =

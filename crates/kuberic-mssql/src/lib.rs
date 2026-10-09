@@ -22,13 +22,14 @@ pub mod topology_config;
 pub mod types;
 
 #[cfg(feature = "kuberic-testing")]
-pub use bootstrap::{BootstrapOwnership, BootstrapOwnershipError, classify_bootstrap_ownership};
-#[cfg(feature = "kuberic-testing")]
 pub use bootstrap::{
-    NativeConvergenceState, StandaloneDatabaseIdentity, StandaloneDatabaseOwnership,
-    StandaloneDatabaseSnapshot, classify_availability_group, classify_replica_join,
-    classify_replica_seed, classify_standalone_database,
+    AvailabilityGroupOwnership, NativeConvergenceState, StandaloneDatabaseIdentity,
+    StandaloneDatabaseOwnership, StandaloneDatabaseSnapshot, classify_availability_group,
+    classify_owned_availability_group, classify_replica_join, classify_replica_seed,
+    classify_standalone_database,
 };
+#[cfg(feature = "kuberic-testing")]
+pub use bootstrap::{BootstrapOwnership, BootstrapOwnershipError, classify_bootstrap_ownership};
 pub use config::{
     AvailabilityMode, ClusterType, Edition, FailoverMode, MutationMode, SUPPORTED_DATABASE_COUNT,
     SUPPORTED_ENGINE_MAJOR, SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT,

@@ -35,9 +35,20 @@ pub struct StandaloneDatabaseOwnership {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailabilityGroupOwnership {
+    pub resource_id: String,
+    pub configuration_id: String,
+    pub name: AvailabilityGroupName,
+    /// `None` is the durable pre-create intent. A bound marker always freezes
+    /// the SQL-generated availability-group identity.
+    pub group_id: Option<Guid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandaloneDatabaseSnapshot {
     pub identity: Option<StandaloneDatabaseIdentity>,
     pub ownership: Option<StandaloneDatabaseOwnership>,
+    pub availability_group_ownership: Option<AvailabilityGroupOwnership>,
     pub state: String,
     pub recovery_model: String,
     pub accessible: bool,
@@ -72,6 +83,49 @@ pub fn classify_standalone_database(
     } else {
         NativeConvergenceState::Incomplete
     }
+}
+
+pub fn classify_owned_availability_group(
+    group: Option<&AvailabilityGroupSnapshot>,
+    ownership: Option<&AvailabilityGroupOwnership>,
+    expected_ownership: &AvailabilityGroupOwnership,
+    expected_replicas: &[ReplicaDescriptor],
+    expected_database_name: &SqlIdentifier,
+    expected_database: Option<&StandaloneDatabaseIdentity>,
+    unsafe_state: bool,
+) -> NativeConvergenceState {
+    if unsafe_state {
+        return NativeConvergenceState::Unsafe;
+    }
+    let Some(group) = group else {
+        return match ownership {
+            None => NativeConvergenceState::Absent,
+            Some(actual) if actual == expected_ownership => NativeConvergenceState::Incomplete,
+            Some(_) => NativeConvergenceState::Conflicting,
+        };
+    };
+    let Some(ownership) = ownership else {
+        return NativeConvergenceState::Conflicting;
+    };
+    let Some(owned_group_id) = ownership.group_id.as_ref() else {
+        return NativeConvergenceState::Conflicting;
+    };
+    if ownership.resource_id != expected_ownership.resource_id
+        || ownership.configuration_id != expected_ownership.configuration_id
+        || ownership.name != expected_ownership.name
+        || expected_ownership.group_id.is_some()
+    {
+        return NativeConvergenceState::Conflicting;
+    }
+    classify_availability_group(
+        Some(group),
+        &expected_ownership.name,
+        Some(owned_group_id),
+        expected_replicas,
+        expected_database_name,
+        expected_database,
+        false,
+    )
 }
 
 pub fn classify_availability_group(

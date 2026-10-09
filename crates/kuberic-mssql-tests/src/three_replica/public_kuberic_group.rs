@@ -103,7 +103,8 @@ struct HostAttempt {
 }
 
 struct PublicMutationExecutor {
-    inner: TdsMutationExecutor,
+    mutation: TdsMutationExecutor,
+    ownership: TdsMutationExecutor,
     ordinal: u8,
     seed_dispatches: AtomicUsize,
     faults: PublicFaultInjection,
@@ -112,13 +113,15 @@ struct PublicMutationExecutor {
 
 impl PublicMutationExecutor {
     fn new(
-        inner: TdsMutationExecutor,
+        mutation: TdsMutationExecutor,
+        ownership: TdsMutationExecutor,
         ordinal: u8,
         faults: PublicFaultInjection,
         conflicts: PublicConflictInjection,
     ) -> Self {
         Self {
-            inner,
+            mutation,
+            ownership,
             ordinal,
             seed_dispatches: AtomicUsize::new(0),
             faults,
@@ -273,7 +276,14 @@ impl SqlMutationExecutor for PublicMutationExecutor {
         &self,
         database: &SqlIdentifier,
     ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
-        let mut observation = self.inner.observe_standalone_database(database).await?;
+        self.mutation.observe_standalone_database(database).await
+    }
+
+    async fn observe_availability_group_ownership(
+        &self,
+        database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        let mut observation = self.ownership.observe_standalone_database(database).await?;
         if self.ordinal == 1
             && self.conflicts.scenario()
                 == Some(LicensedConflictScenario::StandaloneDatabaseIdentityOrRecovery)
@@ -296,7 +306,7 @@ impl SqlMutationExecutor for PublicMutationExecutor {
         if is_seed_dispatch {
             self.seed_dispatches.fetch_add(1, Ordering::SeqCst);
         }
-        self.inner.execute(effect).await?;
+        self.mutation.execute(effect).await?;
         if self.faults.take_if(self.ordinal, effect, false) {
             return Err(injected_fault());
         }
@@ -469,6 +479,17 @@ impl PublicMssqlGroup {
 
         let mut attempts = Vec::new();
         let mut pods = Vec::new();
+        let primary_mutation_settings = if native_binding.is_none() {
+            let observer = ObserverConfig::read(&members[0].observer_config)
+                .await
+                .map_err(display_error)?;
+            Some(observer.connection().testing_with_secret_files(
+                members[0].admin_username.clone(),
+                members[0].admin_password.clone(),
+            ))
+        } else {
+            None
+        };
         let config_context = RuntimeConfigContext {
             root,
             run,
@@ -495,6 +516,11 @@ impl PublicMssqlGroup {
             let mutation = mutation_settings.map(|settings| {
                 Arc::new(PublicMutationExecutor::new(
                     TdsMutationExecutor::testing_new(settings),
+                    TdsMutationExecutor::testing_new(
+                        primary_mutation_settings
+                            .clone()
+                            .expect("bootstrap construction requires primary ownership settings"),
+                    ),
                     index as u8 + 1,
                     faults.clone(),
                     conflict_injection.clone(),

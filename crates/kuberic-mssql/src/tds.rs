@@ -12,7 +12,8 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use zeroize::Zeroizing;
 
 use crate::bootstrap::{
-    StandaloneDatabaseIdentity, StandaloneDatabaseOwnership, StandaloneDatabaseSnapshot,
+    AvailabilityGroupOwnership, StandaloneDatabaseIdentity, StandaloneDatabaseOwnership,
+    StandaloneDatabaseSnapshot,
 };
 use crate::executor::{QueryRow, SqlExecutor, SqlSession};
 use crate::mutation::{
@@ -140,6 +141,7 @@ impl SqlMutationExecutor for TdsMutationExecutor {
                         result = Some(StandaloneDatabaseSnapshot {
                             identity,
                             ownership: None,
+                            availability_group_ownership: None,
                             state,
                             recovery_model,
                             accessible: false,
@@ -169,7 +171,7 @@ impl SqlMutationExecutor for TdsMutationExecutor {
             Ok(client) => client,
             Err(error) => return existing_database_connect_error(snapshot, error).map(Some),
         };
-        snapshot.ownership = timeout(
+        let ownership = timeout(
             self.settings.query_timeout,
             panic_boundary::contain(STAGE, async move {
                 let mut stream = database_client
@@ -190,7 +192,7 @@ impl SqlMutationExecutor for TdsMutationExecutor {
                             ));
                         }
 
-                        ownership = match (
+                        let database_ownership = match (
                             optional_text(&row, "kuberic_resource_id", STAGE)?,
                             optional_text(&row, "kuberic_configuration_id", STAGE)?,
                         ) {
@@ -208,6 +210,34 @@ impl SqlMutationExecutor for TdsMutationExecutor {
                                 ));
                             }
                         };
+                        let availability_group_ownership = match (
+                            optional_text(&row, "kuberic_ag_resource_id", STAGE)?,
+                            optional_text(&row, "kuberic_ag_configuration_id", STAGE)?,
+                            optional_text(&row, "kuberic_ag_name", STAGE)?,
+                            optional_guid(&row, "kuberic_ag_id", STAGE)?,
+                        ) {
+                            (None, None, None, None) => None,
+                            (Some(resource_id), Some(configuration_id), Some(name), group_id) => {
+                                Some(AvailabilityGroupOwnership {
+                                    resource_id,
+                                    configuration_id,
+                                    name: AvailabilityGroupName::new(name).map_err(|_| {
+                                        malformed(
+                                            STAGE,
+                                            "availability-group ownership marker has an invalid name",
+                                        )
+                                    })?,
+                                    group_id,
+                                })
+                            }
+                            _ => {
+                                return Err(malformed(
+                                    STAGE,
+                                    "availability-group ownership marker is partial",
+                                ));
+                            }
+                        };
+                        ownership = Some((database_ownership, availability_group_ownership));
                     }
                 }
                 Ok(ownership)
@@ -215,6 +245,10 @@ impl SqlMutationExecutor for TdsMutationExecutor {
         )
         .await
         .map_err(|_| timed_out(STAGE))??;
+        if let Some((database_ownership, availability_group_ownership)) = ownership {
+            snapshot.ownership = database_ownership;
+            snapshot.availability_group_ownership = availability_group_ownership;
+        }
         snapshot.accessible = true;
         Ok(Some(snapshot))
     }
@@ -625,6 +659,7 @@ mod tests {
         let snapshot = StandaloneDatabaseSnapshot {
             identity: None,
             ownership: None,
+            availability_group_ownership: None,
             state: "RESTORING".into(),
             recovery_model: "FULL".into(),
             accessible: false,
@@ -650,6 +685,7 @@ mod tests {
                 StandaloneDatabaseSnapshot {
                     identity: None,
                     ownership: None,
+                    availability_group_ownership: None,
                     state: "ONLINE".into(),
                     recovery_model: "FULL".into(),
                     accessible: false,

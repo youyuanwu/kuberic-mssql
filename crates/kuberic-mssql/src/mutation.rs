@@ -27,14 +27,30 @@ WHERE d.name = @P1;"#;
 pub(crate) const DATABASE_OWNERSHIP_QUERY: &str = r#"
 SELECT
     CONVERT(nvarchar(512), ep_resource.value) AS kuberic_resource_id,
-    CONVERT(nvarchar(512), ep_configuration.value) AS kuberic_configuration_id
+    CONVERT(nvarchar(512), ep_configuration.value) AS kuberic_configuration_id,
+    CONVERT(nvarchar(512), ep_ag_resource.value) AS kuberic_ag_resource_id,
+    CONVERT(nvarchar(512), ep_ag_configuration.value) AS kuberic_ag_configuration_id,
+    CONVERT(nvarchar(128), ep_ag_name.value) AS kuberic_ag_name,
+    CONVERT(nvarchar(36), ep_ag_id.value) AS kuberic_ag_id
 FROM (VALUES (1)) AS singleton(value)
 OUTER APPLY sys.fn_listextendedproperty(
     N'kuberic_resource_id', DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT
 ) AS ep_resource
 OUTER APPLY sys.fn_listextendedproperty(
     N'kuberic_configuration_id', DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT
-) AS ep_configuration;"#;
+) AS ep_configuration
+OUTER APPLY sys.fn_listextendedproperty(
+    N'kuberic_ag_resource_id', DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT
+) AS ep_ag_resource
+OUTER APPLY sys.fn_listextendedproperty(
+    N'kuberic_ag_configuration_id', DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT
+) AS ep_ag_configuration
+OUTER APPLY sys.fn_listextendedproperty(
+    N'kuberic_ag_name', DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT
+) AS ep_ag_name
+OUTER APPLY sys.fn_listextendedproperty(
+    N'kuberic_ag_id', DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT
+) AS ep_ag_id;"#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutationEffect(MutationKind);
@@ -46,8 +62,17 @@ enum MutationKind {
         resource_id: String,
         configuration_id: String,
     },
-    CreateAvailabilityGroup {
+    RetainAvailabilityGroupIntent {
+        database: SqlIdentifier,
         availability_group: AvailabilityGroupName,
+        resource_id: String,
+        configuration_id: String,
+    },
+    CreateAvailabilityGroup {
+        database: SqlIdentifier,
+        availability_group: AvailabilityGroupName,
+        resource_id: String,
+        configuration_id: String,
         replicas: Vec<ReplicaDescriptor>,
     },
     JoinAvailabilityGroup {
@@ -78,7 +103,19 @@ impl BootstrapMutationPlan {
                     request.resource_id(),
                     request.source_configuration_id(),
                 )?,
-                MutationEffect::create_availability_group(name.clone(), replicas.clone())?,
+                MutationEffect::retain_availability_group_intent(
+                    database_name.clone(),
+                    name.clone(),
+                    request.resource_id(),
+                    request.source_configuration_id(),
+                )?,
+                MutationEffect::create_availability_group(
+                    database_name.clone(),
+                    name.clone(),
+                    request.resource_id(),
+                    request.source_configuration_id(),
+                    replicas.clone(),
+                )?,
             ],
             OperationPayload::EnsureReplicaJoined {
                 availability_group, ..
@@ -119,9 +156,14 @@ impl MutationEffect {
     }
 
     pub fn create_availability_group(
+        database: SqlIdentifier,
         availability_group: AvailabilityGroupName,
+        resource_id: &str,
+        configuration_id: &str,
         replicas: Vec<ReplicaDescriptor>,
     ) -> Result<Self, MutationContractError> {
+        validate_marker_value(resource_id)?;
+        validate_marker_value(configuration_id)?;
         if replicas.len() != usize::from(SUPPORTED_REPLICA_COUNT) {
             return Err(MutationContractError::ReplicaCount);
         }
@@ -146,8 +188,27 @@ impl MutationEffect {
             }
         }
         Ok(Self(MutationKind::CreateAvailabilityGroup {
+            database,
             availability_group,
+            resource_id: resource_id.to_owned(),
+            configuration_id: configuration_id.to_owned(),
             replicas,
+        }))
+    }
+
+    pub fn retain_availability_group_intent(
+        database: SqlIdentifier,
+        availability_group: AvailabilityGroupName,
+        resource_id: &str,
+        configuration_id: &str,
+    ) -> Result<Self, MutationContractError> {
+        validate_marker_value(resource_id)?;
+        validate_marker_value(configuration_id)?;
+        Ok(Self(MutationKind::RetainAvailabilityGroupIntent {
+            database,
+            availability_group,
+            resource_id: resource_id.to_owned(),
+            configuration_id: configuration_id.to_owned(),
         }))
     }
 
@@ -168,6 +229,9 @@ impl MutationEffect {
     pub const fn label(&self) -> &'static str {
         match &self.0 {
             MutationKind::CreateSourceDatabase { .. } => "create source database",
+            MutationKind::RetainAvailabilityGroupIntent { .. } => {
+                "retain availability group intent"
+            }
             MutationKind::CreateAvailabilityGroup { .. } => "create availability group",
             MutationKind::JoinAvailabilityGroup { .. } => "join availability group",
             MutationKind::AddDatabase { .. } => "add database to availability group",
@@ -221,8 +285,41 @@ impl MutationEffect {
                      RESTORE VERIFYONLY FROM DISK = N'{backup_literal}' WITH CHECKSUM;"
                 )
             }
-            MutationKind::CreateAvailabilityGroup {
+            MutationKind::RetainAvailabilityGroupIntent {
+                database,
                 availability_group,
+                resource_id,
+                configuration_id,
+            } => {
+                let database = database.quoted();
+                let resource_id = sql_literal(resource_id);
+                let configuration_id = sql_literal(configuration_id);
+                let availability_group = sql_literal(availability_group.as_str());
+                format!(
+                    "IF NOT EXISTS (SELECT 1 FROM {database}.sys.extended_properties \
+                     WHERE class = 0 AND name = N'kuberic_resource_id' \
+                     AND CONVERT(nvarchar(512), value) = N'{resource_id}') \
+                     OR NOT EXISTS (SELECT 1 FROM {database}.sys.extended_properties \
+                     WHERE class = 0 AND name = N'kuberic_configuration_id' \
+                     AND CONVERT(nvarchar(512), value) = N'{configuration_id}') \
+                     THROW 51000, N'source database ownership is not exact', 1;\n\
+                     IF EXISTS (SELECT 1 FROM {database}.sys.extended_properties \
+                     WHERE class = 0 AND name IN (N'kuberic_ag_resource_id', \
+                     N'kuberic_ag_configuration_id', N'kuberic_ag_name', N'kuberic_ag_id')) \
+                     THROW 51000, N'availability-group ownership marker already exists', 1;\n\
+                     EXEC {database}.sys.sp_addextendedproperty \
+                     @name=N'kuberic_ag_resource_id', @value=N'{resource_id}';\n\
+                     EXEC {database}.sys.sp_addextendedproperty \
+                     @name=N'kuberic_ag_configuration_id', @value=N'{configuration_id}';\n\
+                     EXEC {database}.sys.sp_addextendedproperty \
+                     @name=N'kuberic_ag_name', @value=N'{availability_group}';"
+                )
+            }
+            MutationKind::CreateAvailabilityGroup {
+                database,
+                availability_group,
+                resource_id,
+                configuration_id,
                 replicas,
             } => {
                 let replicas = replicas
@@ -245,13 +342,43 @@ impl MutationEffect {
                     })
                     .collect::<Vec<_>>()
                     .join(",\n");
+                let database = database.quoted();
+                let availability_group_name = sql_literal(availability_group.as_str());
                 let availability_group = availability_group.quoted();
+                let resource_id = sql_literal(resource_id);
+                let configuration_id = sql_literal(configuration_id);
                 format!(
-                    "CREATE AVAILABILITY GROUP {availability_group}\n\
-                     WITH (CLUSTER_TYPE = EXTERNAL, \
-                     REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 1)\n\
-                     FOR REPLICA ON {replicas};\n\
-                     ALTER AVAILABILITY GROUP {availability_group} GRANT CREATE ANY DATABASE;"
+                    "IF NOT EXISTS (SELECT 1 FROM {database}.sys.extended_properties \
+                    WHERE class = 0 AND name = N'kuberic_resource_id' \
+                    AND CONVERT(nvarchar(512), value) = N'{resource_id}') \
+                    OR NOT EXISTS (SELECT 1 FROM {database}.sys.extended_properties \
+                    WHERE class = 0 AND name = N'kuberic_configuration_id' \
+                    AND CONVERT(nvarchar(512), value) = N'{configuration_id}') \
+                    THROW 51000, N'source database ownership is not exact', 1;\n\
+                    IF NOT EXISTS (SELECT 1 FROM {database}.sys.extended_properties \
+                    WHERE class = 0 AND name = N'kuberic_ag_resource_id' \
+                    AND CONVERT(nvarchar(512), value) = N'{resource_id}') \
+                    OR NOT EXISTS (SELECT 1 FROM {database}.sys.extended_properties \
+                    WHERE class = 0 AND name = N'kuberic_ag_configuration_id' \
+                    AND CONVERT(nvarchar(512), value) = N'{configuration_id}') \
+                    OR NOT EXISTS (SELECT 1 FROM {database}.sys.extended_properties \
+                    WHERE class = 0 AND name = N'kuberic_ag_name' \
+                    AND CONVERT(nvarchar(128), value) = N'{availability_group_name}') \
+                    OR EXISTS (SELECT 1 FROM {database}.sys.extended_properties \
+                    WHERE class = 0 AND name = N'kuberic_ag_id') \
+                    THROW 51000, N'availability-group ownership intent is not exact', 1;\n\
+                    CREATE AVAILABILITY GROUP {availability_group}\n\
+                    WITH (CLUSTER_TYPE = EXTERNAL, \
+                    REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 1)\n\
+                    FOR REPLICA ON {replicas};\n\
+                    DECLARE @kuberic_ag_id nvarchar(36) = (\
+                    SELECT CONVERT(nvarchar(36), group_id) FROM sys.availability_groups \
+                    WHERE name = N'{availability_group_name}');\n\
+                    IF @kuberic_ag_id IS NULL \
+                    THROW 51000, N'created availability-group identity is unavailable', 1;\n\
+                    EXEC {database}.sys.sp_addextendedproperty \
+                    @name=N'kuberic_ag_id', @value=@kuberic_ag_id;\n\
+                    ALTER AVAILABILITY GROUP {availability_group} GRANT CREATE ANY DATABASE;"
                 )
             }
             MutationKind::JoinAvailabilityGroup { availability_group } => {
@@ -280,6 +407,13 @@ pub trait SqlMutationExecutor: Send + Sync {
         &self,
         database: &SqlIdentifier,
     ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError>;
+
+    async fn observe_availability_group_ownership(
+        &self,
+        database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        self.observe_standalone_database(database).await
+    }
 
     async fn execute(&self, effect: &MutationEffect) -> Result<(), RuntimeError>;
 }
