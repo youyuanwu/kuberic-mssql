@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "kuberic-testing"), allow(dead_code))]
+
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};

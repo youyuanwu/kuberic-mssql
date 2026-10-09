@@ -32,7 +32,7 @@ use crate::observation::{
 };
 use crate::runtime_config::ObserverConfig;
 use crate::runtime_error::RuntimeError;
-use crate::runtime_host::{
+use crate::runtime_host::seed_state::{
     SeedDispatchPhase, SeedDispatchRecord, SeedDispatchStore, SeedDispatchTarget, SeedStateError,
 };
 use crate::topology_config::SqlServerTopologyExpectation;
@@ -1805,6 +1805,7 @@ impl SqlServerReplicator {
         context: &SeedBuildContext,
     ) -> Result<AvailabilityGroupSnapshot, KubericAdapterError> {
         let (instance, group, _) = self.bootstrap_observation(generation, deadline).await?;
+        #[allow(unused_mut)]
         let mut group = group.ok_or(KubericAdapterError::AvailabilityGroupAbsent)?;
         #[cfg(feature = "kuberic-testing")]
         self.inject_testing_observation(&mut group).await?;

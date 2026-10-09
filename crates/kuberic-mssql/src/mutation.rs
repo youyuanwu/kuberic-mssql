@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "kuberic-testing"), allow(dead_code))]
+
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;

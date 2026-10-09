@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "kuberic-testing"), allow(dead_code))]
+
 use crate::observation::{AvailabilityGroupSnapshot, NativeProvenance, RecoveryLineageObservation};
 use crate::{
     AvailabilityGroupIdentity, AvailabilityGroupName, DatabaseIdentity, DatabaseLineage, Guid,

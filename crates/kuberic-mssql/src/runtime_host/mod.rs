@@ -2,7 +2,7 @@ mod binding;
 mod config;
 mod process;
 mod routes;
-mod seed_state;
+pub(crate) mod seed_state;
 
 pub use binding::{
     RUNTIME_BINDING_SCHEMA_VERSION, RuntimeBindingError, RuntimeBindingIdentity,
