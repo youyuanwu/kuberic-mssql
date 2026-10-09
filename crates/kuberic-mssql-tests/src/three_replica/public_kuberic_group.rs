@@ -195,12 +195,82 @@ impl PublicConflictInjection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicMutationFault {
-    SourceDatabaseIntent,
+    SourceDatabaseCreationIntentCompletion,
     SourceDatabaseCompletion,
+    SourceDatabaseCreationIntentRemovalCompletion,
+    SourceRecoveryCompletion,
+    SourceOwnershipCompletion,
+    SourceMarkerTableCompletion,
+    SourceFullBackupCompletion,
+    SourceLogBackupCompletion,
+    SourceBackupVerificationCompletion,
+    AvailabilityGroupIntentCompletion,
+    AvailabilityGroupCreationIntentCompletion,
     AvailabilityGroupCompletion,
+    AvailabilityGroupBindingCompletion,
+    AvailabilityGroupCreationIntentRemovalCompletion,
+    PrimarySeedingGrantCompletion,
+    PrimarySeedingGrantEvidenceCompletion,
     FirstSecondaryJoinCompletion,
+    FirstSecondarySeedingGrantCompletion,
+    FirstSecondarySeedingGrantEvidenceCompletion,
     SecondSecondaryJoinCompletion,
+    SecondSecondarySeedingGrantCompletion,
+    SecondSecondarySeedingGrantEvidenceCompletion,
     SeedDispatchCompletion,
+}
+
+impl PublicMutationFault {
+    pub const fn effect_label(self) -> &'static str {
+        match self {
+            Self::SourceDatabaseCreationIntentCompletion => {
+                "retain source database creation intent"
+            }
+            Self::SourceDatabaseCompletion => "create source database",
+            Self::SourceDatabaseCreationIntentRemovalCompletion => {
+                "remove source database creation intent"
+            }
+            Self::SourceRecoveryCompletion => "configure source database recovery",
+            Self::SourceOwnershipCompletion => "retain source database ownership",
+            Self::SourceMarkerTableCompletion => "create source marker table",
+            Self::SourceFullBackupCompletion => "backup source database",
+            Self::SourceLogBackupCompletion => "backup source log",
+            Self::SourceBackupVerificationCompletion => "verify source backup",
+            Self::AvailabilityGroupIntentCompletion => "retain availability group intent",
+            Self::AvailabilityGroupCreationIntentCompletion => {
+                "retain availability group creation intent"
+            }
+            Self::AvailabilityGroupCompletion => "create availability group",
+            Self::AvailabilityGroupBindingCompletion => "bind availability group ownership",
+            Self::AvailabilityGroupCreationIntentRemovalCompletion => {
+                "remove availability group creation intent"
+            }
+            Self::PrimarySeedingGrantCompletion
+            | Self::FirstSecondarySeedingGrantCompletion
+            | Self::SecondSecondarySeedingGrantCompletion => "grant create any database",
+            Self::PrimarySeedingGrantEvidenceCompletion
+            | Self::FirstSecondarySeedingGrantEvidenceCompletion
+            | Self::SecondSecondarySeedingGrantEvidenceCompletion => {
+                "retain create any database evidence"
+            }
+            Self::FirstSecondaryJoinCompletion | Self::SecondSecondaryJoinCompletion => {
+                "join availability group"
+            }
+            Self::SeedDispatchCompletion => "add database to availability group",
+        }
+    }
+
+    const fn ordinal(self) -> u8 {
+        match self {
+            Self::FirstSecondaryJoinCompletion
+            | Self::FirstSecondarySeedingGrantCompletion
+            | Self::FirstSecondarySeedingGrantEvidenceCompletion => 2,
+            Self::SecondSecondaryJoinCompletion
+            | Self::SecondSecondarySeedingGrantCompletion
+            | Self::SecondSecondarySeedingGrantEvidenceCompletion => 3,
+            _ => 1,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -242,26 +312,8 @@ impl PublicFaultInjection {
         let Some(fault) = *armed else {
             return false;
         };
-        let matches = match fault {
-            PublicMutationFault::SourceDatabaseIntent => {
-                before && ordinal == 1 && effect.label() == "create source database"
-            }
-            PublicMutationFault::SourceDatabaseCompletion => {
-                !before && ordinal == 1 && effect.label() == "create source database"
-            }
-            PublicMutationFault::AvailabilityGroupCompletion => {
-                !before && ordinal == 1 && effect.label() == "create availability group"
-            }
-            PublicMutationFault::FirstSecondaryJoinCompletion => {
-                !before && ordinal == 2 && effect.label() == "join availability group"
-            }
-            PublicMutationFault::SecondSecondaryJoinCompletion => {
-                !before && ordinal == 3 && effect.label() == "join availability group"
-            }
-            PublicMutationFault::SeedDispatchCompletion => {
-                !before && ordinal == 1 && effect.label() == "add database to availability group"
-            }
-        };
+        let matches =
+            !before && ordinal == fault.ordinal() && effect.label() == fault.effect_label();
         if matches {
             *armed = None;
             self.state.hits.fetch_add(1, Ordering::SeqCst);
@@ -296,6 +348,13 @@ impl SqlMutationExecutor for PublicMutationExecutor {
             self.conflicts.pause_once().await?;
         }
         Ok(observation)
+    }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        self.mutation.observe_effect_completion(effect).await
     }
 
     async fn execute(&self, effect: &MutationEffect) -> Result<(), RuntimeError> {

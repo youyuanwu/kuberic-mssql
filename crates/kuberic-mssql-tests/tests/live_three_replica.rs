@@ -1201,24 +1201,92 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
 async fn execute_phase4_fault_boundaries(base_root: &Path) -> Result<(), TestError> {
     for (fault, label) in [
         (
-            PublicMutationFault::SourceDatabaseIntent,
-            "source-database-intent",
+            PublicMutationFault::SourceRecoveryCompletion,
+            "source-recovery",
+        ),
+        (
+            PublicMutationFault::SourceDatabaseCreationIntentCompletion,
+            "source-database-creation-intent",
         ),
         (
             PublicMutationFault::SourceDatabaseCompletion,
             "source-database-completion",
         ),
         (
+            PublicMutationFault::SourceDatabaseCreationIntentRemovalCompletion,
+            "source-database-creation-intent-removal",
+        ),
+        (
+            PublicMutationFault::SourceOwnershipCompletion,
+            "source-ownership",
+        ),
+        (
+            PublicMutationFault::SourceMarkerTableCompletion,
+            "source-marker-table",
+        ),
+        (
+            PublicMutationFault::SourceFullBackupCompletion,
+            "source-full-backup",
+        ),
+        (
+            PublicMutationFault::SourceLogBackupCompletion,
+            "source-log-backup",
+        ),
+        (
+            PublicMutationFault::SourceBackupVerificationCompletion,
+            "source-backup-verification",
+        ),
+        (
+            PublicMutationFault::AvailabilityGroupIntentCompletion,
+            "availability-group-ownership-intent",
+        ),
+        (
+            PublicMutationFault::AvailabilityGroupCreationIntentCompletion,
+            "availability-group-creation-intent",
+        ),
+        (
             PublicMutationFault::AvailabilityGroupCompletion,
             "availability-group-creation",
+        ),
+        (
+            PublicMutationFault::AvailabilityGroupBindingCompletion,
+            "availability-group-binding",
+        ),
+        (
+            PublicMutationFault::AvailabilityGroupCreationIntentRemovalCompletion,
+            "availability-group-creation-intent-removal",
+        ),
+        (
+            PublicMutationFault::PrimarySeedingGrantCompletion,
+            "primary-seeding-grant",
+        ),
+        (
+            PublicMutationFault::PrimarySeedingGrantEvidenceCompletion,
+            "primary-seeding-grant-evidence",
         ),
         (
             PublicMutationFault::FirstSecondaryJoinCompletion,
             "first-secondary-join",
         ),
         (
+            PublicMutationFault::FirstSecondarySeedingGrantCompletion,
+            "first-secondary-seeding-grant",
+        ),
+        (
+            PublicMutationFault::FirstSecondarySeedingGrantEvidenceCompletion,
+            "first-secondary-seeding-grant-evidence",
+        ),
+        (
             PublicMutationFault::SecondSecondaryJoinCompletion,
             "second-secondary-join",
+        ),
+        (
+            PublicMutationFault::SecondSecondarySeedingGrantCompletion,
+            "second-secondary-seeding-grant",
+        ),
+        (
+            PublicMutationFault::SecondSecondarySeedingGrantEvidenceCompletion,
+            "second-secondary-seeding-grant-evidence",
         ),
     ] {
         exercise_configuration_fault(base_root, fault, label).await?;
@@ -1237,6 +1305,12 @@ async fn exercise_configuration_fault(
     let config = FixtureConfig::for_test_fixture(&root)?;
     let mut launched = launch_three_members(config).await?;
     let prepared = launched.prepare_availability_group().await?;
+    if fault == PublicMutationFault::SourceRecoveryCompletion {
+        launched
+            .testing_set_primary_model_recovery_simple()
+            .await
+            .map_err(|error| format!("source-recovery setup failed: {error}"))?;
+    }
     if launched.journal().native_phase != NativeTopologyPhase::Prepared
         || launched.journal().native_binding.is_some()
     {
@@ -1260,14 +1334,7 @@ async fn exercise_configuration_fault(
     let error = first
         .err()
         .ok_or_else(|| format!("{label} unexpectedly published configuration success"))?;
-    let expected_effect = match fault {
-        PublicMutationFault::SourceDatabaseIntent
-        | PublicMutationFault::SourceDatabaseCompletion => "create source database",
-        PublicMutationFault::AvailabilityGroupCompletion => "create availability group",
-        PublicMutationFault::FirstSecondaryJoinCompletion
-        | PublicMutationFault::SecondSecondaryJoinCompletion => "join availability group",
-        PublicMutationFault::SeedDispatchCompletion => unreachable!("configuration fault set"),
-    };
+    let expected_effect = fault.effect_label();
     let diagnostic = error.to_string();
     if injected.hit_count() != 1
         || !diagnostic.contains(expected_effect)

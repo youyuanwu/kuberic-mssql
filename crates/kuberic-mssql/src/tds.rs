@@ -18,6 +18,7 @@ use crate::bootstrap::{
 use crate::executor::{QueryRow, SqlExecutor, SqlSession};
 use crate::mutation::{
     DATABASE_OWNERSHIP_QUERY, MutationEffect, STANDALONE_DATABASE_QUERY, SqlMutationExecutor,
+    source_backup_path, source_log_backup_path,
 };
 use crate::query::ReadQuery;
 use crate::runtime_config::{ConnectionSettings, read_bounded};
@@ -94,12 +95,17 @@ impl SqlMutationExecutor for TdsMutationExecutor {
             None,
         )
         .await?;
-        let name = database.as_str();
+        let name = database.as_str().to_owned();
+        let backup_path = source_backup_path(database);
+        let log_backup_path = source_log_backup_path(database);
         let snapshot = timeout(
             self.settings.query_timeout,
             panic_boundary::contain(STAGE, async move {
                 let mut stream = master
-                    .query(STANDALONE_DATABASE_QUERY, &[&name])
+                    .query(
+                        STANDALONE_DATABASE_QUERY,
+                        &[&name, &backup_path, &log_backup_path],
+                    )
                     .await
                     .map_err(|error| driver_error(STAGE, error))?;
                 let mut result = None;
@@ -140,11 +146,16 @@ impl SqlMutationExecutor for TdsMutationExecutor {
                         };
                         result = Some(StandaloneDatabaseSnapshot {
                             identity,
+                            creation_token: None,
                             ownership: None,
                             availability_group_ownership: None,
                             state,
                             recovery_model,
                             accessible: false,
+                            marker_table_ready: required_bool(&row, "marker_table_ready", STAGE)?,
+                            full_backup_ready: required_bool(&row, "full_backup_ready", STAGE)?,
+                            log_chain_ready: required_bool(&row, "log_chain_ready", STAGE)?,
+                            backup_verified: required_bool(&row, "backup_verified", STAGE)?,
                         });
                     }
                 }
@@ -210,26 +221,33 @@ impl SqlMutationExecutor for TdsMutationExecutor {
                                 ));
                             }
                         };
+                        let creation_token = optional_text(&row, "kuberic_creation_token", STAGE)?;
                         let availability_group_ownership = match (
                             optional_text(&row, "kuberic_ag_resource_id", STAGE)?,
                             optional_text(&row, "kuberic_ag_configuration_id", STAGE)?,
                             optional_text(&row, "kuberic_ag_name", STAGE)?,
+                            optional_guid(&row, "kuberic_ag_created_id", STAGE)?,
                             optional_guid(&row, "kuberic_ag_id", STAGE)?,
                         ) {
-                            (None, None, None, None) => None,
-                            (Some(resource_id), Some(configuration_id), Some(name), group_id) => {
-                                Some(AvailabilityGroupOwnership {
-                                    resource_id,
-                                    configuration_id,
-                                    name: AvailabilityGroupName::new(name).map_err(|_| {
-                                        malformed(
-                                            STAGE,
-                                            "availability-group ownership marker has an invalid name",
-                                        )
-                                    })?,
-                                    group_id,
-                                })
-                            }
+                            (None, None, None, None, None) => None,
+                            (
+                                Some(resource_id),
+                                Some(configuration_id),
+                                Some(name),
+                                creation_group_id,
+                                group_id,
+                            ) => Some(AvailabilityGroupOwnership {
+                                resource_id,
+                                configuration_id,
+                                name: AvailabilityGroupName::new(name).map_err(|_| {
+                                    malformed(
+                                        STAGE,
+                                        "availability-group ownership marker has an invalid name",
+                                    )
+                                })?,
+                                creation_group_id,
+                                group_id,
+                            }),
                             _ => {
                                 return Err(malformed(
                                     STAGE,
@@ -237,7 +255,11 @@ impl SqlMutationExecutor for TdsMutationExecutor {
                                 ));
                             }
                         };
-                        ownership = Some((database_ownership, availability_group_ownership));
+                        ownership = Some((
+                            creation_token,
+                            database_ownership,
+                            availability_group_ownership,
+                        ));
                     }
                 }
                 Ok(ownership)
@@ -245,12 +267,57 @@ impl SqlMutationExecutor for TdsMutationExecutor {
         )
         .await
         .map_err(|_| timed_out(STAGE))??;
-        if let Some((database_ownership, availability_group_ownership)) = ownership {
+        if let Some((creation_token, database_ownership, availability_group_ownership)) = ownership
+        {
+            snapshot.creation_token = creation_token;
             snapshot.ownership = database_ownership;
             snapshot.availability_group_ownership = availability_group_ownership;
         }
         snapshot.accessible = true;
         Ok(Some(snapshot))
+    }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        const STAGE: &str = "bootstrap effect evidence";
+        let Some(statement) = effect.completion_query() else {
+            return Ok(false);
+        };
+        let mut client = connect_client(
+            &self.settings,
+            "kuberic-sqlserver-bootstrap",
+            "mutation username",
+            "mutation password",
+            None,
+        )
+        .await?;
+        timeout(
+            self.settings.query_timeout,
+            panic_boundary::contain(STAGE, async move {
+                let mut stream = client
+                    .query(statement, &[])
+                    .await
+                    .map_err(|error| driver_error(STAGE, error))?;
+                let mut complete = None;
+                while let Some(item) = stream
+                    .try_next()
+                    .await
+                    .map_err(|error| driver_error(STAGE, error))?
+                {
+                    if let QueryItem::Row(row) = item {
+                        if complete.is_some() {
+                            return Err(malformed(STAGE, "effect evidence returned multiple rows"));
+                        }
+                        complete = Some(required_bool(&row, "is_complete", STAGE)?);
+                    }
+                }
+                complete.ok_or_else(|| malformed(STAGE, "effect evidence returned no row"))
+            }),
+        )
+        .await
+        .map_err(|_| timed_out(STAGE))?
     }
 
     async fn execute(&self, effect: &MutationEffect) -> Result<(), RuntimeError> {
@@ -312,6 +379,24 @@ fn required_text(
                 "standalone database row is missing a required column",
             )
         })
+}
+
+fn required_bool(
+    row: &tiberius::Row,
+    column: &'static str,
+    stage: &'static str,
+) -> Result<bool, RuntimeError> {
+    match row
+        .try_get::<i32, _>(column)
+        .map_err(|_| malformed(stage, "bootstrap evidence has an invalid boolean column"))?
+    {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(malformed(
+            stage,
+            "bootstrap evidence has a non-boolean value",
+        )),
+    }
 }
 
 #[allow(dead_code)]
@@ -658,11 +743,16 @@ mod tests {
     fn existing_database_error_4060_is_not_collapsed_into_absence() {
         let snapshot = StandaloneDatabaseSnapshot {
             identity: None,
+            creation_token: None,
             ownership: None,
             availability_group_ownership: None,
             state: "RESTORING".into(),
             recovery_model: "FULL".into(),
             accessible: false,
+            marker_table_ready: false,
+            full_backup_ready: false,
+            log_chain_ready: false,
+            backup_verified: false,
         };
         let mut unavailable = RuntimeError::new(
             ObservationFailureKind::Unsupported,
@@ -684,11 +774,16 @@ mod tests {
             existing_database_connect_error(
                 StandaloneDatabaseSnapshot {
                     identity: None,
+                    creation_token: None,
                     ownership: None,
                     availability_group_ownership: None,
                     state: "ONLINE".into(),
                     recovery_model: "FULL".into(),
                     accessible: false,
+                    marker_table_ready: false,
+                    full_backup_ready: false,
+                    log_chain_ready: false,
+                    backup_verified: false,
                 },
                 denied.clone(),
             ),

@@ -151,14 +151,23 @@ authorized target build wins a group-level seed dispatch.
 Kuberic's command/effect/build receipts and exact SQL Server postconditions
 remain the primary durable evidence. The application persists only the
 pre-association Intent/Dispatched ambiguity under its existing application
-root; exact source association removes that record. The owned source database
-also retains a narrow AG creation handshake: resource/configuration/name intent
-is written before creation, then SQL Server's generated AG GUID is frozen in
-the same metadata. Replay, join, and seed reject missing or mismatched markers,
-including an exact-profile foreign same-name AG or a later same-name AG with a
-new GUID. This follows PostgreSQL v2's separation of Kuberic authority,
-application-native evidence and database state without copying PostgreSQL
-recovery mechanics or creating a generic operation ledger.
+root; exact source association removes that record. The native bootstrap path also retains narrow database and AG creation
+handshakes. A deterministic scoped DDL trigger is persisted before each
+irreversible create; only the exact token-bearing typed statement can
+atomically write the generated creation receipt. The source database then
+retains resource/configuration ownership and the frozen AG GUID. Replay, join,
+and seed reject missing or mismatched markers, including an exact-profile
+foreign same-name resource or a later same-name AG with a new GUID. This
+follows PostgreSQL v2's separation of Kuberic authority, application-native
+evidence and database state without copying PostgreSQL recovery mechanics or
+creating a generic operation ledger.
+
+Source creation, full-recovery configuration, ownership, marker schema, full
+backup, log-chain establishment, backup verification, AG intent/create/GUID
+binding, each local join, each local seeding grant, and its narrow SQL-owned
+grant-completion marker are independently classified. Read-only `msdb` history
+and the marker joined to the current AG GUID prevent completed work from being
+repeated; a retry dispatches only the next missing safe step.
 
 No new TLS certificate provisioning, production mutation configuration or
 plaintext bypass was added. Licensed validation reuses fixture-owned endpoint
@@ -246,7 +255,9 @@ compaction, zero duplicate `ADD DATABASE`, exact report convergence and marker
 continuity. SQL Server processes are not restarted.
 
 The ignored live tests additionally prove handled-signal and SIGKILL recovery,
-every database/AG/join/seed/callback-publication interruption boundary, native
+lost replies plus same-root host replacement after every individual
+database/backup/AG/join/grant statement, every
+seed/callback-publication interruption boundary, native
 AG/replica/endpoint/database/lineage/incarnation conflicts through real
 callbacks, exact cleanup, and successful same-root retries.
 

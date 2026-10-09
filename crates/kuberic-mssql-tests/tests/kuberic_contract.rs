@@ -30,7 +30,7 @@ use kuberic_mssql::{
     SqlServerTopologyExpectation, SqlServerTopologyMemberExpectation, StandaloneDatabaseIdentity,
     StandaloneDatabaseOwnership, StandaloneDatabaseSnapshot, classify_availability_group,
     classify_bootstrap_ownership, classify_owned_availability_group, classify_replica_join,
-    classify_replica_seed,
+    classify_replica_seed, source_database_creation_token,
 };
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::application::{OpenMode, StatefulServiceReplica};
@@ -162,6 +162,13 @@ impl SqlMutationExecutor for GatedSeedMutationExecutor {
         self.complete.store(true, Ordering::SeqCst);
         Ok(())
     }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        Ok(effect.label() == "grant create any database")
+    }
 }
 
 #[async_trait]
@@ -178,6 +185,13 @@ impl SqlMutationExecutor for SeedMutationExecutor {
         self.executions.fetch_add(1, Ordering::SeqCst);
         self.complete.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        Ok(effect.label() == "grant create any database")
     }
 }
 
@@ -244,6 +258,13 @@ impl SqlMutationExecutor for ScriptedMutationExecutor {
             .pop_front()
             .unwrap_or(Ok(()))
     }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        Ok(effect.label() == "grant create any database")
+    }
 }
 
 struct GatedMutationExecutor {
@@ -283,6 +304,13 @@ impl SqlMutationExecutor for GatedMutationExecutor {
             .expect("mutation gate must be released once");
         release.await.expect("test must release mutation gate");
         Ok(())
+    }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        Ok(effect.label() == "grant create any database")
     }
 }
 
@@ -1107,26 +1135,34 @@ fn seeded_source_snapshot() -> InstanceSnapshot {
 }
 
 fn owned_standalone_database() -> StandaloneDatabaseSnapshot {
+    let identity = StandaloneDatabaseIdentity {
+        name: SqlIdentifier::new("app-db").unwrap(),
+        database_guid: guid(DATABASE_GUID),
+        family_guid: guid(FAMILY_GUID),
+        recovery_fork_guid: guid(FORK_ID),
+    };
+    let ownership = StandaloneDatabaseOwnership {
+        resource_id: "resource-a".into(),
+        configuration_id: configuration().configuration_id.to_string(),
+    };
     StandaloneDatabaseSnapshot {
-        identity: Some(StandaloneDatabaseIdentity {
-            name: SqlIdentifier::new("app-db").unwrap(),
-            database_guid: guid(DATABASE_GUID),
-            family_guid: guid(FAMILY_GUID),
-            recovery_fork_guid: guid(FORK_ID),
-        }),
-        ownership: Some(StandaloneDatabaseOwnership {
-            resource_id: "resource-a".into(),
-            configuration_id: configuration().configuration_id.to_string(),
-        }),
+        identity: Some(identity.clone()),
+        creation_token: Some(source_database_creation_token(&identity.name, &ownership)),
+        ownership: Some(ownership),
         availability_group_ownership: Some(AvailabilityGroupOwnership {
             resource_id: "resource-a".into(),
             configuration_id: configuration().configuration_id.to_string(),
             name: AvailabilityGroupName::new("test-ag").unwrap(),
+            creation_group_id: Some(guid(AG_ID)),
             group_id: Some(guid(AG_ID)),
         }),
         state: "ONLINE".into(),
         recovery_model: "FULL".into(),
         accessible: true,
+        marker_table_ready: true,
+        full_backup_ready: true,
+        log_chain_ready: true,
+        backup_verified: true,
     }
 }
 
@@ -1144,6 +1180,11 @@ fn owned_standalone_database_with_group_intent() -> StandaloneDatabaseSnapshot {
         .unwrap()
         .group_id = None;
     snapshot
+        .availability_group_ownership
+        .as_mut()
+        .unwrap()
+        .creation_group_id = None;
+    snapshot
 }
 
 #[test]
@@ -1155,6 +1196,7 @@ fn availability_group_ownership_classifier_rejects_unmarked_recreated_and_second
         resource_id: "resource-a".into(),
         configuration_id: configuration().configuration_id.to_string(),
         name: AvailabilityGroupName::new("test-ag").unwrap(),
+        creation_group_id: None,
         group_id: None,
     };
     let complete = bound_snapshot();
@@ -1179,6 +1221,7 @@ fn availability_group_ownership_classifier_rejects_unmarked_recreated_and_second
         resource_id: "resource-a".into(),
         configuration_id: configuration().configuration_id.to_string(),
         name: AvailabilityGroupName::new("test-ag").unwrap(),
+        creation_group_id: None,
         group_id: None,
     };
     assert_eq!(
@@ -1260,9 +1303,9 @@ async fn explicit_bootstrap_path_assigns_exact_effect_ownership_and_replays_from
     assert_eq!(
         *primary_mutation.effects.lock().unwrap(),
         vec![
-            "create source database",
+            "retain source database creation intent",
             "retain availability group intent",
-            "create availability group"
+            "retain availability group creation intent"
         ]
     );
     assert!(
@@ -1856,7 +1899,7 @@ async fn callback_deadline_cancels_gated_mutation_before_it_can_publish() {
     assert!(release_tx.send(()).is_err());
     assert_eq!(
         *executor.effects.lock().unwrap(),
-        vec!["create source database"]
+        vec!["retain source database creation intent"]
     );
     assert!(replicator.admitted_topology().is_none());
 }

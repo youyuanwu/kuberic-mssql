@@ -387,6 +387,17 @@ exists only for the demonstrated pre-association ambiguity; the AG marker only
 binds creation ownership and native identity. No general second operation
 database or result ledger was added.
 
+Bootstrap SQL is level-triggered at statement granularity. Scoped native DDL
+triggers persist the exact resource/configuration-derived creation intent before
+`CREATE DATABASE` and `CREATE AVAILABILITY GROUP`; only the corresponding
+token-bearing typed statement can atomically write the generated creation
+receipt. Recovery mode, ownership, marker schema, full backup, log backup,
+backup verification, AG binding, local join, seeding grant, and a narrow
+SQL-owned grant-completion marker then converge as separate classified steps.
+Read-only `msdb` history proves the full/log/VERIFY chain, while the local
+marker joined to the current AG GUID proves completion of `GRANT CREATE ANY
+DATABASE`; retries issue only the next missing safe statement.
+
 The current implementation tracks Kuberic `main`; `Cargo.lock` freezes the
 exact revision used by each build. The current pin
 `09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f` is the merge commit of
@@ -404,11 +415,12 @@ bound-listener handoff from
    immutable DMV snapshots, freshness, startup capability checks, an
    observe-only CLI, and Kuberic configuration-progress publication.
 3. **Bootstrap, join, and seed convergence** — implemented for explicit
-   bootstrap-capable hosts: deterministic database/AG/join ownership, one
-   build-authorized group seed dispatch, gap-driven seed metadata, exact native
-   postconditions, restart/cancellation/retry/lost-reply recovery, and licensed
-   fault/conflict validation. This stage adds neither certificate provisioning
-   nor a production mutation transport.
+   bootstrap-capable hosts: deterministic statement-level
+   database/backup/AG/join/grant convergence, one build-authorized group seed
+   dispatch, gap-driven seed metadata, exact native postconditions,
+   restart/cancellation/retry/lost-reply recovery, and licensed fault/conflict
+   validation. This stage adds neither certificate provisioning nor a
+   production mutation transport.
 4. **Fencing, reseed, switchover, and failover** — establish verified target and
    old-primary fencing before destructive reseed or role movement, then add
    external lease handling, sequence arbitration, authenticated fence and

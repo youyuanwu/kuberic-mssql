@@ -92,6 +92,29 @@ impl LaunchedMembers {
         self.context.deadline
     }
 
+    pub async fn testing_set_primary_model_recovery_simple(&self) -> Result<(), AdminError> {
+        let member = &self.members[0];
+        let endpoint = AdminEndpoint {
+            tcp_host: "127.0.0.1".to_owned(),
+            tls_hostname: "localhost".to_owned(),
+            port: member.host_port,
+            ca_certificate: member.ca_certificate.clone(),
+        };
+        let login = LoginFiles {
+            username: member.admin_username.clone(),
+            password: member.admin_password.clone(),
+        };
+        let deadlines = AdminDeadlines {
+            connect: self.context.config.deadlines().sql_connect,
+            query: self.context.config.deadlines().sql_batch,
+        };
+        let mut session =
+            AdminSession::connect_database(&endpoint, &login, deadlines, "master", false).await?;
+        session
+            .execute("ALTER DATABASE [model] SET RECOVERY SIMPLE;", &[])
+            .await
+    }
+
     pub fn cleanup(mut self) -> Result<CleanupEvidence, CombinedFixtureError> {
         self.context.cleanup_exact()
     }

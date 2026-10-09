@@ -39,6 +39,9 @@ pub struct AvailabilityGroupOwnership {
     pub resource_id: String,
     pub configuration_id: String,
     pub name: AvailabilityGroupName,
+    /// Identity captured atomically by the scoped server DDL trigger that
+    /// authorizes exactly one application-created availability group.
+    pub creation_group_id: Option<Guid>,
     /// `None` is the durable pre-create intent. A bound marker always freezes
     /// the SQL-generated availability-group identity.
     pub group_id: Option<Guid>,
@@ -47,11 +50,17 @@ pub struct AvailabilityGroupOwnership {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandaloneDatabaseSnapshot {
     pub identity: Option<StandaloneDatabaseIdentity>,
+    /// Token written atomically by the scoped CREATE_DATABASE DDL trigger.
+    pub creation_token: Option<String>,
     pub ownership: Option<StandaloneDatabaseOwnership>,
     pub availability_group_ownership: Option<AvailabilityGroupOwnership>,
     pub state: String,
     pub recovery_model: String,
     pub accessible: bool,
+    pub marker_table_ready: bool,
+    pub full_backup_ready: bool,
+    pub log_chain_ready: bool,
+    pub backup_verified: bool,
 }
 
 pub fn classify_standalone_database(
@@ -69,20 +78,61 @@ pub fn classify_standalone_database(
     if !snapshot.accessible {
         return NativeConvergenceState::Unsafe;
     }
-    if snapshot.ownership.as_ref() != Some(expected_ownership) {
-        return NativeConvergenceState::Conflicting;
-    }
     let Some(actual) = &snapshot.identity else {
         return NativeConvergenceState::Incomplete;
     };
-    if expected.is_some_and(|expected| actual != expected) || snapshot.recovery_model != "FULL" {
+    let expected_token = source_database_creation_token(&actual.name, expected_ownership);
+    if snapshot.creation_token.as_deref() != Some(expected_token.as_str()) {
         return NativeConvergenceState::Conflicting;
     }
-    if snapshot.state == "ONLINE" {
+    if expected.is_some_and(|expected| actual != expected) {
+        return NativeConvergenceState::Conflicting;
+    }
+    if snapshot
+        .ownership
+        .as_ref()
+        .is_some_and(|actual| actual != expected_ownership)
+    {
+        return NativeConvergenceState::Conflicting;
+    }
+    if snapshot.state == "ONLINE"
+        && snapshot.recovery_model == "FULL"
+        && snapshot.ownership.as_ref() == Some(expected_ownership)
+        && snapshot.marker_table_ready
+        && snapshot.full_backup_ready
+        && snapshot.log_chain_ready
+        && snapshot.backup_verified
+    {
         NativeConvergenceState::Complete
     } else {
         NativeConvergenceState::Incomplete
     }
+}
+
+pub fn source_database_creation_token(
+    database: &SqlIdentifier,
+    ownership: &StandaloneDatabaseOwnership,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    digest.update(b"kuberic-mssql-source-database-v1\0");
+    digest.update(ownership.resource_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(ownership.configuration_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(database.as_str().as_bytes());
+    hex(&digest.finalize())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push(DIGITS[usize::from(byte >> 4)] as char);
+        value.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    value
 }
 
 pub fn classify_owned_availability_group(
@@ -107,9 +157,6 @@ pub fn classify_owned_availability_group(
     let Some(ownership) = ownership else {
         return NativeConvergenceState::Conflicting;
     };
-    let Some(owned_group_id) = ownership.group_id.as_ref() else {
-        return NativeConvergenceState::Conflicting;
-    };
     if ownership.resource_id != expected_ownership.resource_id
         || ownership.configuration_id != expected_ownership.configuration_id
         || ownership.name != expected_ownership.name
@@ -117,6 +164,12 @@ pub fn classify_owned_availability_group(
     {
         return NativeConvergenceState::Conflicting;
     }
+    if ownership.creation_group_id.as_ref() != Some(&group.identity.group_id) {
+        return NativeConvergenceState::Conflicting;
+    }
+    let Some(owned_group_id) = ownership.group_id.as_ref() else {
+        return NativeConvergenceState::Incomplete;
+    };
     classify_availability_group(
         Some(group),
         &expected_ownership.name,

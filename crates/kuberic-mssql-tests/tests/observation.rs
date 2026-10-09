@@ -1605,7 +1605,15 @@ fn standalone_database_preflight_is_one_parameterized_read_only_statement() {
     assert!(sql.trim_start().starts_with("SELECT"));
     assert_eq!(sql.matches(';').count(), 1);
     assert!(sql.trim_end().ends_with(';'));
-    assert_eq!(sql.matches("@P1").count(), 1);
+    assert!(sql.matches("@P1").count() >= 1);
+    assert!(sql.contains("full_backup_ready"));
+    assert!(sql.contains("log_chain_ready"));
+    assert!(sql.contains("backup_verified"));
+    assert!(sql.contains("msdb.dbo.backupset"));
+    assert!(sql.contains("msdb.dbo.restorehistory"));
+    assert!(!sql.contains("BACKUP DATABASE"));
+    assert!(!sql.contains("BACKUP LOG"));
+    assert!(!sql.contains("RESTORE VERIFYONLY"));
     assert!(sql.contains("FROM sys.databases"));
     let tokens: BTreeSet<String> = sql
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')

@@ -26,7 +26,7 @@ pub use bootstrap::{
     AvailabilityGroupOwnership, NativeConvergenceState, StandaloneDatabaseIdentity,
     StandaloneDatabaseOwnership, StandaloneDatabaseSnapshot, classify_availability_group,
     classify_owned_availability_group, classify_replica_join, classify_replica_seed,
-    classify_standalone_database,
+    classify_standalone_database, source_database_creation_token,
 };
 #[cfg(feature = "kuberic-testing")]
 pub use bootstrap::{BootstrapOwnership, BootstrapOwnershipError, classify_bootstrap_ownership};

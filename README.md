@@ -375,7 +375,11 @@ certificate-authenticated endpoints and peer authentication. Explicit
 bootstrap-capable public `ReplicaHost` applications then create one managed
 database and external AG, join both secondaries, perform one group-level
 automatic-seeding dispatch through Kuberic build authority, and prove a marker
-is readable from every member.
+is readable from every member. Database create, full recovery, ownership,
+marker schema, full/log backup readiness, backup verification, AG intent,
+create, GUID binding, local join, seeding grant, and its SQL-owned completion
+marker are independently observed typed steps; a retry executes only the next
+missing safe step.
 
 The live path is ignored by default and is not part of `just`, `just check`, or
 direct Cargo test runs. The happy path runs after one-replica validation in
@@ -455,12 +459,14 @@ Cleanup removes only exactly journaled resources. Foreign, replaced, or
 otherwise unverifiable resources remain untouched and block reuse. The signal
 recipe interrupts an owned launch with SIGTERM, recovers it, reruns the
 complete happy path, and verifies idempotent cleanup. The recovery recipe also
-executes real SIGINT and SIGKILL subprocess cases. The fault recipe injects
-every database/AG/join/seed intent, dispatch, association, native-completion and
-callback-publication boundary and verifies same-root recovery without duplicate
-seed dispatch. The conflict recipe drives AG, replica, endpoint, database,
-lineage and SQL process-incarnation conflicts through real callback validators
-sequentially. Every scenario performs exact, idempotent cleanup.
+executes real SIGINT and SIGKILL subprocess cases. The fault recipe loses the reply after each individual database, backup,
+AG-create/bind, local-join, and seeding-permission statement, replaces the
+hosts on the same roots, and also covers seed intent, dispatch, association,
+native-completion, and callback-publication boundaries. It verifies convergence
+without duplicate bootstrap work or seed dispatch. The conflict recipe drives
+AG, replica, endpoint, database, lineage and SQL process-incarnation conflicts
+through real callback validators sequentially. Every scenario performs exact,
+idempotent cleanup.
 
 Direct test commands remain available:
 

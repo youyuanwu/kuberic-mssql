@@ -1402,6 +1402,22 @@ impl SqlServerReplicator {
             .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))
     }
 
+    async fn observe_effect_completion(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+        executor: &dyn SqlMutationExecutor,
+        effect: &MutationEffect,
+    ) -> Result<bool, KubericAdapterError> {
+        let remaining = bootstrap_remaining(deadline)?;
+        let result =
+            tokio::time::timeout(remaining, executor.observe_effect_completion(effect)).await;
+        drop(self.finish_operation(generation)?);
+        result
+            .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)?
+            .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))
+    }
+
     async fn require_availability_group_ownership(
         &self,
         generation: u64,
@@ -1450,6 +1466,7 @@ impl SqlServerReplicator {
             resource_id: expected_database_ownership.resource_id,
             configuration_id: expected_database_ownership.configuration_id,
             name: expected_group.name.clone(),
+            creation_group_id: Some(expected_group.group_id.clone()),
             group_id: Some(expected_group.group_id.clone()),
         };
         if snapshot
@@ -1515,8 +1532,20 @@ impl SqlServerReplicator {
                 .target()
                 .availability_group
                 .clone(),
+            creation_group_id: None,
             group_id: None,
         };
+        let retain_database_creation_intent =
+            MutationEffect::retain_source_database_creation_intent(
+                bootstrap.config.database.clone(),
+                &expected_ownership.resource_id,
+                &expected_ownership.configuration_id,
+            )
+            .map_err(|_| {
+                KubericAdapterError::InvalidConfiguration(
+                    "bootstrap database creation intent is invalid",
+                )
+            })?;
         let create_database = MutationEffect::create_source_database(
             bootstrap.config.database.clone(),
             &expected_ownership.resource_id,
@@ -1527,6 +1556,35 @@ impl SqlServerReplicator {
                 "bootstrap database ownership markers are invalid",
             )
         })?;
+        let remove_database_creation_intent =
+            MutationEffect::remove_source_database_creation_intent(
+                bootstrap.config.database(),
+                &expected_ownership.resource_id,
+                &expected_ownership.configuration_id,
+            )
+            .map_err(|_| {
+                KubericAdapterError::InvalidConfiguration(
+                    "bootstrap database creation intent is invalid",
+                )
+            })?;
+        let configure_database_recovery =
+            MutationEffect::configure_source_database_recovery(bootstrap.config.database.clone());
+        let retain_database_ownership = MutationEffect::retain_source_database_ownership(
+            bootstrap.config.database.clone(),
+            &expected_ownership.resource_id,
+            &expected_ownership.configuration_id,
+        )
+        .map_err(|_| {
+            KubericAdapterError::InvalidConfiguration(
+                "bootstrap database ownership markers are invalid",
+            )
+        })?;
+        let create_marker_table =
+            MutationEffect::create_source_marker_table(bootstrap.config.database.clone());
+        let backup_database =
+            MutationEffect::backup_source_database(bootstrap.config.database.clone());
+        let backup_log = MutationEffect::backup_source_log(bootstrap.config.database.clone());
+        let verify_backup = MutationEffect::verify_source_backup(bootstrap.config.database.clone());
         let retain_group_intent = MutationEffect::retain_availability_group_intent(
             bootstrap.config.database.clone(),
             self.source
@@ -1543,7 +1601,6 @@ impl SqlServerReplicator {
             )
         })?;
         let create_group = MutationEffect::create_availability_group(
-            bootstrap.config.database.clone(),
             self.source
                 .observer_config()
                 .target()
@@ -1556,6 +1613,41 @@ impl SqlServerReplicator {
         .map_err(|_| {
             KubericAdapterError::InvalidConfiguration("bootstrap replica descriptors are invalid")
         })?;
+        let retain_group_creation_intent =
+            MutationEffect::retain_availability_group_creation_intent(
+                bootstrap.config.database.clone(),
+                self.source
+                    .observer_config()
+                    .target()
+                    .availability_group
+                    .clone(),
+                &expected_ownership.resource_id,
+                &expected_ownership.configuration_id,
+            )
+            .map_err(|_| {
+                KubericAdapterError::InvalidConfiguration(
+                    "availability-group creation intent is invalid",
+                )
+            })?;
+        let bind_group = MutationEffect::bind_availability_group_ownership(
+            bootstrap.config.database.clone(),
+            self.source
+                .observer_config()
+                .target()
+                .availability_group
+                .clone(),
+        );
+        let remove_group_creation_intent =
+            MutationEffect::remove_availability_group_creation_intent(
+                &self.source.observer_config().target().availability_group,
+                &expected_ownership.resource_id,
+                &expected_ownership.configuration_id,
+            )
+            .map_err(|_| {
+                KubericAdapterError::InvalidConfiguration(
+                    "availability-group creation intent is invalid",
+                )
+            })?;
         let join_group = MutationEffect::join_availability_group(
             self.source
                 .observer_config()
@@ -1563,6 +1655,21 @@ impl SqlServerReplicator {
                 .availability_group
                 .clone(),
         );
+        let grant_create_any_database = MutationEffect::grant_create_any_database(
+            self.source
+                .observer_config()
+                .target()
+                .availability_group
+                .clone(),
+        );
+        let retain_create_any_database_evidence =
+            MutationEffect::retain_create_any_database_evidence(
+                self.source
+                    .observer_config()
+                    .target()
+                    .availability_group
+                    .clone(),
+            );
         let deadline = tokio::time::Instant::now() + self.source.observer_config().sample_timeout();
         let mut join_absence_observed = false;
         loop {
@@ -1599,12 +1706,84 @@ impl SqlServerReplicator {
             match ownership {
                 BootstrapOwnership::PrimaryTopology => {
                     match database_state {
-                        NativeConvergenceState::Absent | NativeConvergenceState::Incomplete => {
+                        NativeConvergenceState::Absent => {
+                            let intent_ready = self
+                                .observe_effect_completion(
+                                    generation,
+                                    deadline,
+                                    bootstrap.executor.as_ref(),
+                                    &retain_database_creation_intent,
+                                )
+                                .await?;
+                            let effect = if intent_ready {
+                                &create_database
+                            } else {
+                                &retain_database_creation_intent
+                            };
                             self.execute_bootstrap_effect(
                                 generation,
                                 deadline,
                                 bootstrap.executor.as_ref(),
-                                &create_database,
+                                effect,
+                            )
+                            .await?;
+                            continue;
+                        }
+                        NativeConvergenceState::Incomplete => {
+                            let snapshot = database.as_ref().ok_or(
+                                KubericAdapterError::NativeConvergenceUnsafe(
+                                    "standalone source database",
+                                ),
+                            )?;
+                            let expected_token = crate::bootstrap::source_database_creation_token(
+                                bootstrap.config.database(),
+                                &expected_ownership,
+                            );
+                            if snapshot.creation_token.as_deref() != Some(&expected_token) {
+                                return Err(KubericAdapterError::NativeConvergenceConflict(
+                                    "standalone source database creation",
+                                ));
+                            }
+                            if self
+                                .observe_effect_completion(
+                                    generation,
+                                    deadline,
+                                    bootstrap.executor.as_ref(),
+                                    &retain_database_creation_intent,
+                                )
+                                .await?
+                            {
+                                self.execute_bootstrap_effect(
+                                    generation,
+                                    deadline,
+                                    bootstrap.executor.as_ref(),
+                                    &remove_database_creation_intent,
+                                )
+                                .await?;
+                                continue;
+                            }
+                            let effect = if snapshot.recovery_model != "FULL" {
+                                &configure_database_recovery
+                            } else if snapshot.ownership.is_none() {
+                                &retain_database_ownership
+                            } else if !snapshot.marker_table_ready {
+                                &create_marker_table
+                            } else if !snapshot.full_backup_ready {
+                                &backup_database
+                            } else if !snapshot.log_chain_ready {
+                                &backup_log
+                            } else if !snapshot.backup_verified {
+                                &verify_backup
+                            } else {
+                                return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                                    "standalone source database classification",
+                                ));
+                            };
+                            self.execute_bootstrap_effect(
+                                generation,
+                                deadline,
+                                bootstrap.executor.as_ref(),
+                                effect,
                             )
                             .await?;
                             continue;
@@ -1644,6 +1823,49 @@ impl SqlServerReplicator {
                                 bootstrap_membership_ready(group, ownership, &descriptors)
                             }) =>
                         {
+                            if self
+                                .observe_effect_completion(
+                                    generation,
+                                    deadline,
+                                    bootstrap.executor.as_ref(),
+                                    &retain_group_creation_intent,
+                                )
+                                .await?
+                            {
+                                self.execute_bootstrap_effect(
+                                    generation,
+                                    deadline,
+                                    bootstrap.executor.as_ref(),
+                                    &remove_group_creation_intent,
+                                )
+                                .await?;
+                                continue;
+                            }
+                            if !self
+                                .observe_effect_completion(
+                                    generation,
+                                    deadline,
+                                    bootstrap.executor.as_ref(),
+                                    &grant_create_any_database,
+                                )
+                                .await?
+                            {
+                                self.execute_bootstrap_effect(
+                                    generation,
+                                    deadline,
+                                    bootstrap.executor.as_ref(),
+                                    &grant_create_any_database,
+                                )
+                                .await?;
+                                self.execute_bootstrap_effect(
+                                    generation,
+                                    deadline,
+                                    bootstrap.executor.as_ref(),
+                                    &retain_create_any_database_evidence,
+                                )
+                                .await?;
+                                continue;
+                            }
                             let group = group.expect("complete classifier requires a group");
                             drop(self.finish_operation(generation)?);
                             bootstrap_remaining(deadline)?;
@@ -1660,11 +1882,42 @@ impl SqlServerReplicator {
                             continue;
                         }
                         NativeConvergenceState::Incomplete if group.is_none() => {
+                            let effect = if self
+                                .observe_effect_completion(
+                                    generation,
+                                    deadline,
+                                    bootstrap.executor.as_ref(),
+                                    &retain_group_creation_intent,
+                                )
+                                .await?
+                            {
+                                &create_group
+                            } else {
+                                &retain_group_creation_intent
+                            };
                             self.execute_bootstrap_effect(
                                 generation,
                                 deadline,
                                 bootstrap.executor.as_ref(),
-                                &create_group,
+                                effect,
+                            )
+                            .await?;
+                            continue;
+                        }
+                        NativeConvergenceState::Incomplete
+                            if group.as_ref().is_some_and(|group| {
+                                availability_group_ownership.is_some_and(|marker| {
+                                    marker.group_id.is_none()
+                                        && marker.creation_group_id.as_ref()
+                                            == Some(&group.identity.group_id)
+                                })
+                            }) =>
+                        {
+                            self.execute_bootstrap_effect(
+                                generation,
+                                deadline,
+                                bootstrap.executor.as_ref(),
+                                &bind_group,
                             )
                             .await?;
                             continue;
@@ -1679,6 +1932,7 @@ impl SqlServerReplicator {
                                             .configuration_id
                                             .clone(),
                                         name: expected_group_ownership.name.clone(),
+                                        creation_group_id: Some(group.identity.group_id.clone()),
                                         group_id: Some(group.identity.group_id.clone()),
                                     })
                             }) {
@@ -1725,9 +1979,11 @@ impl SqlServerReplicator {
                             resource_id,
                             configuration_id,
                             name,
+                            creation_group_id: Some(creation_group_id),
                             group_id: Some(group_id),
                         }) if resource_id == &expected_ownership.resource_id
                             && configuration_id == &expected_ownership.configuration_id
+                            && creation_group_id == group_id
                             && name
                                 == &self.source.observer_config().target().availability_group =>
                         {
@@ -1782,6 +2038,7 @@ impl SqlServerReplicator {
                                         .configuration_id
                                         .clone(),
                                     name: expected_group_ownership.name.clone(),
+                                    creation_group_id: Some(group.identity.group_id.clone()),
                                     group_id: Some(group.identity.group_id.clone()),
                                 }) {
                                 "availability-group ownership marker"
@@ -1811,6 +2068,31 @@ impl SqlServerReplicator {
                         NativeConvergenceState::Complete
                             if bootstrap_membership_ready(&group, ownership, &descriptors) =>
                         {
+                            if !self
+                                .observe_effect_completion(
+                                    generation,
+                                    deadline,
+                                    bootstrap.executor.as_ref(),
+                                    &grant_create_any_database,
+                                )
+                                .await?
+                            {
+                                self.execute_bootstrap_effect(
+                                    generation,
+                                    deadline,
+                                    bootstrap.executor.as_ref(),
+                                    &grant_create_any_database,
+                                )
+                                .await?;
+                                self.execute_bootstrap_effect(
+                                    generation,
+                                    deadline,
+                                    bootstrap.executor.as_ref(),
+                                    &retain_create_any_database_evidence,
+                                )
+                                .await?;
+                                continue;
+                            }
                             drop(self.finish_operation(generation)?);
                             bootstrap_remaining(deadline)?;
                             return Ok((instance, group, observed_at, database_identity, deadline));
