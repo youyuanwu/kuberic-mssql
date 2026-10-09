@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -135,14 +136,21 @@ impl SeedDispatchRecord {
         self.group_database_id.as_deref()
     }
 
-    pub fn mark_dispatched(&mut self) {
+    pub fn mark_dispatched(&mut self) -> Result<(), SeedStateError> {
+        if self.phase != SeedDispatchPhase::Intent || self.group_database_id.is_some() {
+            return Err(SeedStateError::InvalidTransition);
+        }
         self.phase = SeedDispatchPhase::Dispatched;
+        Ok(())
     }
 
     pub fn associate_group_database(
         &mut self,
         group_database_id: impl Into<String>,
     ) -> Result<(), SeedStateError> {
+        if self.phase != SeedDispatchPhase::Dispatched {
+            return Err(SeedStateError::InvalidTransition);
+        }
         let group_database_id = group_database_id.into();
         validate_guid(&group_database_id)?;
         if self
@@ -160,7 +168,12 @@ impl SeedDispatchRecord {
         if self.schema_version != SEED_DISPATCH_SCHEMA_VERSION {
             return Err(SeedStateError::UnsupportedSchema(self.schema_version));
         }
-        if self.revision == 0 {
+        if self.revision == 0
+            || (self.phase == SeedDispatchPhase::Intent
+                && (self.revision != 1 || self.group_database_id.is_some()))
+            || (self.phase == SeedDispatchPhase::Dispatched && self.revision < 2)
+            || (self.group_database_id.is_some() && self.revision < 3)
+        {
             return Err(SeedStateError::Malformed);
         }
         for value in [
@@ -223,12 +236,48 @@ impl SeedDispatchRecord {
             && self.winning_build_id == other.winning_build_id
             && self.sqlserver_start_time == other.sqlserver_start_time
     }
+
+    fn validate_initial(&self) -> Result<(), SeedStateError> {
+        self.validate()?;
+        if self.revision != 1
+            || self.phase != SeedDispatchPhase::Intent
+            || self.group_database_id.is_some()
+        {
+            return Err(SeedStateError::InvalidTransition);
+        }
+        Ok(())
+    }
+
+    fn validate_transition(&self, next: &Self) -> Result<(), SeedStateError> {
+        if !self.same_identity(next) || self.revision.checked_add(1) != Some(next.revision) {
+            return Err(SeedStateError::RevisionMismatch);
+        }
+        match (
+            self.phase,
+            self.group_database_id.as_deref(),
+            next.phase,
+            next.group_database_id.as_deref(),
+        ) {
+            (SeedDispatchPhase::Intent, None, SeedDispatchPhase::Dispatched, None)
+            | (SeedDispatchPhase::Dispatched, None, SeedDispatchPhase::Dispatched, Some(_)) => {
+                Ok(())
+            }
+            (
+                SeedDispatchPhase::Dispatched,
+                Some(current),
+                SeedDispatchPhase::Dispatched,
+                Some(next),
+            ) if current == next => Ok(()),
+            _ => Err(SeedStateError::InvalidTransition),
+        }
+    }
 }
 
 pub struct SeedDispatchStore {
     root: BoundRoot,
     _owner: File,
     path: PathBuf,
+    transaction: Mutex<()>,
 }
 
 impl SeedDispatchStore {
@@ -251,6 +300,7 @@ impl SeedDispatchStore {
             root,
             _owner: owner,
             path,
+            transaction: Mutex::new(()),
         };
         if let Some(record) = store.load()? {
             record.validate()?;
@@ -263,6 +313,14 @@ impl SeedDispatchStore {
     }
 
     pub fn load(&self) -> Result<Option<SeedDispatchRecord>, SeedStateError> {
+        let _transaction = self
+            .transaction
+            .lock()
+            .map_err(|_| SeedStateError::UnsafeState)?;
+        self.load_unlocked()
+    }
+
+    fn load_unlocked(&self) -> Result<Option<SeedDispatchRecord>, SeedStateError> {
         let file = match self.root.openat(
             SEED_STATE_FILE,
             libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
@@ -287,10 +345,15 @@ impl SeedDispatchStore {
     }
 
     pub fn create(&self, record: &SeedDispatchRecord) -> Result<(), SeedStateError> {
-        if self.load()?.is_some() {
+        let _transaction = self
+            .transaction
+            .lock()
+            .map_err(|_| SeedStateError::UnsafeState)?;
+        record.validate_initial()?;
+        if self.load_unlocked()?.is_some() {
             return Err(SeedStateError::AlreadyExists);
         }
-        self.write(record)
+        self.write_unlocked(record)
     }
 
     pub fn replace(
@@ -298,26 +361,34 @@ impl SeedDispatchStore {
         expected_revision: u64,
         mut record: SeedDispatchRecord,
     ) -> Result<SeedDispatchRecord, SeedStateError> {
-        let current = self.load()?.ok_or(SeedStateError::Missing)?;
-        if current.revision != expected_revision
-            || record.revision != expected_revision
-            || !current.same_identity(&record)
-        {
+        let _transaction = self
+            .transaction
+            .lock()
+            .map_err(|_| SeedStateError::UnsafeState)?;
+        let current = self.load_unlocked()?.ok_or(SeedStateError::Missing)?;
+        if current.revision != expected_revision || record.revision != expected_revision {
             return Err(SeedStateError::RevisionMismatch);
         }
-
         record.revision = expected_revision
             .checked_add(1)
             .ok_or(SeedStateError::RevisionMismatch)?;
+        current.validate_transition(&record)?;
         record.validate()?;
-        self.write(&record)?;
+        self.write_unlocked(&record)?;
         Ok(record)
     }
 
     pub fn remove(&self, expected_revision: u64) -> Result<(), SeedStateError> {
-        let current = self.load()?.ok_or(SeedStateError::Missing)?;
+        let _transaction = self
+            .transaction
+            .lock()
+            .map_err(|_| SeedStateError::UnsafeState)?;
+        let current = self.load_unlocked()?.ok_or(SeedStateError::Missing)?;
         if current.revision != expected_revision {
             return Err(SeedStateError::RevisionMismatch);
+        }
+        if current.phase != SeedDispatchPhase::Dispatched || current.group_database_id.is_none() {
+            return Err(SeedStateError::InvalidTransition);
         }
         self.root
             .unlinkat(SEED_STATE_FILE)
@@ -325,7 +396,7 @@ impl SeedDispatchStore {
         self.root.file().sync_all().map_err(|_| SeedStateError::Io)
     }
 
-    fn write(&self, record: &SeedDispatchRecord) -> Result<(), SeedStateError> {
+    fn write_unlocked(&self, record: &SeedDispatchRecord) -> Result<(), SeedStateError> {
         record.validate()?;
         let bytes = serde_json::to_vec_pretty(record).map_err(|_| SeedStateError::Malformed)?;
         if bytes.len() as u64 > MAX_SEED_STATE_BYTES {
@@ -447,6 +518,7 @@ pub enum SeedStateError {
     AlreadyExists,
     Missing,
     RevisionMismatch,
+    InvalidTransition,
     Malformed,
     UnsupportedSchema(u32),
     Io,
@@ -470,6 +542,7 @@ impl std::fmt::Display for SeedStateError {
             Self::AlreadyExists => formatter.write_str("seed dispatch state already exists"),
             Self::Missing => formatter.write_str("seed dispatch state is missing"),
             Self::RevisionMismatch => formatter.write_str("seed dispatch revision differs"),
+            Self::InvalidTransition => formatter.write_str("seed dispatch transition is invalid"),
             Self::Malformed => formatter.write_str("seed dispatch state is malformed"),
             Self::UnsupportedSchema(version) => {
                 write!(

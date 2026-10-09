@@ -2,6 +2,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
 
 use kuberic_mssql::runtime_host::{
     PeerRoutes, PeerRoutesError, ResolverConfig, RuntimeBindingError, RuntimeBindingStore,
@@ -636,6 +637,15 @@ async fn runtime_binding_allows_one_owned_seed_dispatch_record() {
     let store = SeedDispatchStore::open(binding.root()).unwrap();
     assert_eq!(store.load().unwrap(), None);
     let record = seed_record();
+    let mut invalid_initial_value = serde_json::to_value(&record).unwrap();
+    invalid_initial_value["phase"] = serde_json::json!("dispatched");
+    let invalid_initial: SeedDispatchRecord =
+        serde_json::from_value(invalid_initial_value).unwrap();
+    assert_eq!(
+        store.create(&invalid_initial),
+        Err(SeedStateError::Malformed)
+    );
+    assert_eq!(store.load().unwrap(), None);
     store.create(&record).unwrap();
     assert_eq!(
         binding.storage_state().unwrap(),
@@ -664,7 +674,7 @@ async fn runtime_binding_allows_one_owned_seed_dispatch_record() {
     );
 
     let mut dispatched = record.clone();
-    dispatched.mark_dispatched();
+    dispatched.mark_dispatched().unwrap();
     let dispatched = store.replace(record.revision(), dispatched).unwrap();
     assert_eq!(dispatched.phase(), SeedDispatchPhase::Dispatched);
     assert_eq!(dispatched.revision(), 2);
@@ -673,15 +683,75 @@ async fn runtime_binding_allows_one_owned_seed_dispatch_record() {
         Err(SeedStateError::RevisionMismatch)
     );
 
+    let mut regressed_value = serde_json::to_value(&dispatched).unwrap();
+    regressed_value["phase"] = serde_json::json!("intent");
+    let regressed: SeedDispatchRecord = serde_json::from_value(regressed_value).unwrap();
+    assert_eq!(
+        store.replace(dispatched.revision(), regressed),
+        Err(SeedStateError::InvalidTransition)
+    );
+
     let mut associated = dispatched.clone();
     associated.associate_group_database(seed_guid(23)).unwrap();
     let associated = store.replace(dispatched.revision(), associated).unwrap();
     assert_eq!(associated.group_database_id(), Some(seed_guid(23).as_str()));
+
+    let mut cleared_value = serde_json::to_value(&associated).unwrap();
+    cleared_value["group_database_id"] = serde_json::Value::Null;
+    let cleared: SeedDispatchRecord = serde_json::from_value(cleared_value).unwrap();
+    assert_eq!(
+        store.replace(associated.revision(), cleared),
+        Err(SeedStateError::InvalidTransition)
+    );
+    let mut replaced_value = serde_json::to_value(&associated).unwrap();
+    replaced_value["group_database_id"] = serde_json::json!(seed_guid(24));
+    let replaced: SeedDispatchRecord = serde_json::from_value(replaced_value).unwrap();
+    assert_eq!(
+        store.replace(associated.revision(), replaced),
+        Err(SeedStateError::InvalidTransition)
+    );
+
     store.remove(associated.revision()).unwrap();
     assert_eq!(store.load().unwrap(), None);
     assert_eq!(
         binding.storage_state().unwrap(),
         ApplicationStorageState::Established
+    );
+}
+
+#[tokio::test]
+async fn seed_dispatch_store_serializes_concurrent_record_creation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let runtime_config = config(temporary.path()).await;
+    let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
+    binding.initialize().unwrap();
+    let store = Arc::new(SeedDispatchStore::open(binding.root()).unwrap());
+    let barrier = Arc::new(Barrier::new(3));
+
+    let results = std::thread::scope(|scope| {
+        let handles = (0..2)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    store.create(&seed_record())
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == Err(SeedStateError::AlreadyExists))
+            .count(),
+        1
     );
 }
 
@@ -696,6 +766,7 @@ async fn seed_dispatch_state_rejects_unknown_corrupt_and_active_temporary_files(
         let store = SeedDispatchStore::open(binding.root()).unwrap();
         store.create(&seed_record()).unwrap();
     }
+
     let original = fs::read(binding.root().join("seed-dispatch-v1.json")).unwrap();
     let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
     value["secret"] = serde_json::json!("do-not-echo");
@@ -726,6 +797,37 @@ async fn seed_dispatch_state_rejects_unknown_corrupt_and_active_temporary_files(
     assert!(!stale.exists());
 
     fs::write(binding.root().join("foreign"), "foreign").unwrap();
+    assert_eq!(
+        binding.storage_state(),
+        Err(RuntimeBindingError::UnsafeState)
+    );
+}
+
+#[tokio::test]
+async fn seed_dispatch_layout_rejects_symlinks_and_oversized_state() {
+    for entry in ["seed-dispatch-v1.json", "seed-dispatch-v1.owner"] {
+        let temporary = tempfile::tempdir().unwrap();
+        let runtime_config = config(temporary.path()).await;
+        let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
+        binding.initialize().unwrap();
+        let target = temporary.path().join("target");
+        write_private(&target, "{}");
+        symlink(&target, binding.root().join(entry)).unwrap();
+        assert_eq!(
+            binding.storage_state(),
+            Err(RuntimeBindingError::UnsafeState),
+            "{entry}"
+        );
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    let runtime_config = config(temporary.path()).await;
+    let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
+    binding.initialize().unwrap();
+    write_private(
+        &binding.root().join("seed-dispatch-v1.json"),
+        vec![b'x'; 65_537],
+    );
     assert_eq!(
         binding.storage_state(),
         Err(RuntimeBindingError::UnsafeState)

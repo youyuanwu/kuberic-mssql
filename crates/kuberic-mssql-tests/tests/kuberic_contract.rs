@@ -9,17 +9,20 @@ use kuberic_mssql::kuberic::{
     SqlServerService, SqlServerServiceConfig,
 };
 use kuberic_mssql::observation::{
-    AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, DatabaseSnapshot, InstanceMetadata,
-    InstanceSnapshot, LocalDatabaseSnapshot, LocalRecoveryMetadata, LocalReplicaSnapshot,
-    NativeProvenance, RecoveryLineageObservation, ReplicaSnapshot, ReplicaState,
+    AutomaticSeedingSnapshot, AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, DatabaseSnapshot,
+    InstanceMetadata, InstanceSnapshot, LocalDatabaseSnapshot, LocalRecoveryMetadata,
+    LocalReplicaSnapshot, NativeProvenance, RecoveryLineageObservation, ReplicaSnapshot,
+    ReplicaState,
 };
 use kuberic_mssql::runtime_config::ObserverConfig;
 use kuberic_mssql::runtime_error::RuntimeError;
 use kuberic_mssql::{
-    AvailabilityGroupIdentity, AvailabilityGroupName, ConfigurationSequence, DatabaseIdentity,
-    DatabaseLineage, DecimalProgress, Guid, NativeProgress, NativeRole, Observation,
-    ObservationFailure, ObservationFailureKind, ReplicaIdentity, ServerName, SqlIdentifier,
-    SqlServerTopologyExpectation, SqlServerTopologyMemberExpectation,
+    AvailabilityGroupIdentity, AvailabilityGroupName, BootstrapOwnership, BootstrapOwnershipError,
+    ConfigurationSequence, DatabaseIdentity, DatabaseLineage, DecimalProgress, Endpoint, Guid,
+    NativeConvergenceState, NativeProgress, NativeRole, Observation, ObservationFailure,
+    ObservationFailureKind, ReplicaDescriptor, ReplicaIdentity, ServerName, SqlIdentifier,
+    SqlServerTopologyExpectation, SqlServerTopologyMemberExpectation, classify_availability_group,
+    classify_bootstrap_ownership, classify_replica_join, classify_replica_seed,
 };
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::application::{OpenMode, StatefulServiceReplica};
@@ -349,6 +352,220 @@ fn topology_expectation_for(local_index: usize) -> SqlServerTopologyExpectation 
             .collect(),
     )
     .unwrap()
+}
+
+fn desired_descriptors() -> Vec<ReplicaDescriptor> {
+    (0..3)
+        .map(|index| ReplicaDescriptor {
+            identity: ReplicaIdentity::desired(format!("logical-{index}"), format!("pod-{index}"))
+                .unwrap(),
+            server_name: ServerName::new(format!("sql-{index}")).unwrap(),
+            endpoint: Endpoint::new(format!("sql-{index}"), 5022).unwrap(),
+        })
+        .collect()
+}
+
+#[test]
+fn bootstrap_ownership_is_derived_from_callback_configuration() {
+    let current = bound_replica_set();
+    assert_eq!(
+        classify_bootstrap_ownership(&kuberic_identity(1), &current),
+        Ok(BootstrapOwnership::PrimaryTopology)
+    );
+    assert_eq!(
+        classify_bootstrap_ownership(&kuberic_identity(2), &current),
+        Ok(BootstrapOwnership::LocalJoin)
+    );
+    assert_eq!(
+        classify_bootstrap_ownership(&kuberic_identity(9), &current),
+        Err(BootstrapOwnershipError::LocalMemberMissing)
+    );
+}
+
+#[test]
+fn native_bootstrap_classifiers_cover_every_operation_state() {
+    let descriptors = desired_descriptors();
+    assert_eq!(
+        classify_availability_group(
+            None,
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            None,
+            &descriptors,
+            false,
+        ),
+        NativeConvergenceState::Absent
+    );
+    let complete = bound_snapshot();
+    let complete_group = match &complete.availability_group {
+        Observation::Present { value, .. } => value,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        classify_availability_group(
+            Some(complete_group),
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            Some(&guid(AG_ID)),
+            &descriptors,
+            false,
+        ),
+        NativeConvergenceState::Complete
+    );
+    let mut incomplete = complete_group.clone();
+    incomplete.replicas.pop();
+    assert_eq!(
+        classify_availability_group(
+            Some(&incomplete),
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            Some(&guid(AG_ID)),
+            &descriptors,
+            false,
+        ),
+        NativeConvergenceState::Incomplete
+    );
+    let mut conflicting = complete_group.clone();
+    conflicting.replicas[0].seeding_mode = "MANUAL".into();
+    assert_eq!(
+        classify_availability_group(
+            Some(&conflicting),
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            Some(&guid(AG_ID)),
+            &descriptors,
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+    assert_eq!(
+        classify_availability_group(
+            Some(complete_group),
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            Some(&guid(AG_ID)),
+            &descriptors,
+            true,
+        ),
+        NativeConvergenceState::Unsafe
+    );
+
+    let secondary = bound_snapshot_for(1);
+    let secondary_group = match &secondary.availability_group {
+        Observation::Present { value, .. } => value,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        classify_replica_join(
+            Some(secondary_group),
+            &sql_identity(1),
+            &ServerName::new("sql-1").unwrap(),
+            "TCP://sql-1:5022",
+            false,
+        ),
+        NativeConvergenceState::Complete
+    );
+    let mut join_incomplete = secondary_group.clone();
+    join_incomplete.local_replica.state_available = false;
+    join_incomplete.local_replica.role = None;
+    assert_eq!(
+        classify_replica_join(
+            Some(&join_incomplete),
+            &sql_identity(1),
+            &ServerName::new("sql-1").unwrap(),
+            "TCP://sql-1:5022",
+            false,
+        ),
+        NativeConvergenceState::Incomplete
+    );
+    let mut join_conflict = secondary_group.clone();
+    join_conflict.replicas[1].endpoint_url = Some("TCP://other:5022".into());
+    assert_eq!(
+        classify_replica_join(
+            Some(&join_conflict),
+            &sql_identity(1),
+            &ServerName::new("sql-1").unwrap(),
+            "TCP://sql-1:5022",
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+    assert_eq!(
+        classify_replica_join(
+            Some(secondary_group),
+            &sql_identity(1),
+            &ServerName::new("sql-1").unwrap(),
+            "TCP://sql-1:5022",
+            true,
+        ),
+        NativeConvergenceState::Unsafe
+    );
+
+    let lineage = expected_lineage();
+    assert_eq!(
+        classify_replica_seed(
+            Some(secondary_group),
+            &lineage.database,
+            &lineage,
+            &guid(SECOND_ID),
+            false,
+        ),
+        NativeConvergenceState::Complete
+    );
+    let mut seed_incomplete = secondary_group.clone();
+    seed_incomplete.databases[0].replicas[0].synchronization_state = None;
+    assert_eq!(
+        classify_replica_seed(
+            Some(&seed_incomplete),
+            &lineage.database,
+            &lineage,
+            &guid(SECOND_ID),
+            false,
+        ),
+        NativeConvergenceState::Incomplete
+    );
+    let mut seed_conflict = secondary_group.clone();
+    seed_conflict.databases[0].replicas[0].lineage = RecoveryLineageObservation::Local {
+        value: DatabaseLineage {
+            database: lineage.database.clone(),
+            recovery_fork_id: guid(AG_ID),
+        },
+    };
+    assert_eq!(
+        classify_replica_seed(
+            Some(&seed_conflict),
+            &lineage.database,
+            &lineage,
+            &guid(SECOND_ID),
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
+    let mut seed_unsafe = secondary_group.clone();
+    seed_unsafe
+        .automatic_seeding
+        .push(AutomaticSeedingSnapshot {
+            group_database_id: lineage.database.group_database_id.clone(),
+            remote_replica_id: guid(SECOND_ID),
+            operation_id: guid(AG_ID),
+            is_source: true,
+            current_state: Some("FAILED".into()),
+            performed_seeding: Some(false),
+            failure_state: Some(1),
+            error_code: Some(1),
+            number_of_attempts: Some(1),
+            start_time: None,
+            completion_time: None,
+        });
+    assert_eq!(
+        classify_replica_seed(
+            Some(&seed_unsafe),
+            &lineage.database,
+            &lineage,
+            &guid(SECOND_ID),
+            false,
+        ),
+        NativeConvergenceState::Unsafe
+    );
+    assert_eq!(
+        classify_replica_seed(None, &lineage.database, &lineage, &guid(SECOND_ID), false),
+        NativeConvergenceState::Absent
+    );
 }
 
 fn bound_snapshot() -> InstanceSnapshot {

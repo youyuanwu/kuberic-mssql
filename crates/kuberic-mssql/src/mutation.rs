@@ -1,24 +1,33 @@
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+use crate::bootstrap::StandaloneDatabaseSnapshot;
 use crate::runtime_error::RuntimeError;
 use crate::{
-    AvailabilityGroupName, ReplicaDescriptor, SUPPORTED_REPLICA_COUNT, SqlIdentifier,
-    StandaloneDatabaseSnapshot,
+    AvailabilityGroupName, OperationPayload, OperationRequest, ReplicaDescriptor,
+    SUPPORTED_REPLICA_COUNT, SqlIdentifier,
 };
 
 pub const STANDALONE_DATABASE_QUERY: &str = r#"
 SELECT
-    CONVERT(nvarchar(20), d.database_id) AS database_id,
     CONVERT(nvarchar(60), d.state_desc) AS state_desc,
     CONVERT(nvarchar(60), d.recovery_model_desc) AS recovery_model_desc,
     CONVERT(nvarchar(36), drs.database_guid) AS database_guid,
     CONVERT(nvarchar(36), drs.family_guid) AS family_guid,
-    CONVERT(nvarchar(36), drs.recovery_fork_guid) AS recovery_fork_guid
+    CONVERT(nvarchar(36), drs.recovery_fork_guid) AS recovery_fork_guid,
+    CONVERT(nvarchar(512), ep_resource.value) AS kuberic_resource_id,
+    CONVERT(nvarchar(512), ep_configuration.value) AS kuberic_configuration_id
 FROM sys.databases AS d
 LEFT JOIN sys.database_recovery_status AS drs
     ON drs.database_id = d.database_id
-WHERE d.name = @P1;"#;
+OUTER APPLY sys.fn_listextendedproperty(
+    N'kuberic_resource_id', DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT
+) AS ep_resource
+OUTER APPLY sys.fn_listextendedproperty(
+    N'kuberic_configuration_id', DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT
+) AS ep_configuration
+WHERE d.name = DB_NAME();"#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutationEffect(MutationKind);
@@ -27,6 +36,8 @@ pub struct MutationEffect(MutationKind);
 enum MutationKind {
     CreateSourceDatabase {
         database: SqlIdentifier,
+        resource_id: String,
+        configuration_id: String,
     },
     CreateAvailabilityGroup {
         availability_group: AvailabilityGroupName,
@@ -41,9 +52,63 @@ enum MutationKind {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapMutationPlan {
+    effects: Vec<MutationEffect>,
+}
+
+impl BootstrapMutationPlan {
+    pub fn from_operation(request: &OperationRequest) -> Result<Self, MutationContractError> {
+        let effects = match request.payload() {
+            OperationPayload::EnsureAvailabilityGroup {
+                name,
+                database_name,
+                replicas,
+                ..
+            } => vec![
+                MutationEffect::create_source_database(
+                    database_name.clone(),
+                    request.resource_id(),
+                    request.source_configuration_id(),
+                )?,
+                MutationEffect::create_availability_group(name.clone(), replicas.clone())?,
+            ],
+            OperationPayload::EnsureReplicaJoined {
+                availability_group, ..
+            } => vec![MutationEffect::join_availability_group(
+                availability_group.name.clone(),
+            )],
+            OperationPayload::EnsureReplicaSeeded {
+                availability_group,
+                database,
+                ..
+            } => vec![MutationEffect::add_database(
+                availability_group.name.clone(),
+                database.name.clone(),
+            )],
+            _ => return Err(MutationContractError::UnsupportedOperation),
+        };
+        Ok(Self { effects })
+    }
+
+    pub fn effects(&self) -> &[MutationEffect] {
+        &self.effects
+    }
+}
+
 impl MutationEffect {
-    pub fn create_source_database(database: SqlIdentifier) -> Self {
-        Self(MutationKind::CreateSourceDatabase { database })
+    fn create_source_database(
+        database: SqlIdentifier,
+        resource_id: &str,
+        configuration_id: &str,
+    ) -> Result<Self, MutationContractError> {
+        validate_marker_value(resource_id)?;
+        validate_marker_value(configuration_id)?;
+        Ok(Self(MutationKind::CreateSourceDatabase {
+            database,
+            resource_id: resource_id.to_owned(),
+            configuration_id: configuration_id.to_owned(),
+        }))
     }
 
     pub fn create_availability_group(
@@ -79,14 +144,11 @@ impl MutationEffect {
         }))
     }
 
-    pub fn join_availability_group(availability_group: AvailabilityGroupName) -> Self {
+    fn join_availability_group(availability_group: AvailabilityGroupName) -> Self {
         Self(MutationKind::JoinAvailabilityGroup { availability_group })
     }
 
-    pub fn add_database(
-        availability_group: AvailabilityGroupName,
-        database: SqlIdentifier,
-    ) -> Self {
+    fn add_database(availability_group: AvailabilityGroupName, database: SqlIdentifier) -> Self {
         Self(MutationKind::AddDatabase {
             availability_group,
             database,
@@ -104,16 +166,29 @@ impl MutationEffect {
 
     pub fn statement(&self) -> String {
         match &self.0 {
-            MutationKind::CreateSourceDatabase { database } => {
-                let backup_literal = sql_literal(&format!("{}.bak", database.as_str()));
+            MutationKind::CreateSourceDatabase {
+                database,
+                resource_id,
+                configuration_id,
+            } => {
+                let backup_literal = format!(
+                    "/var/opt/mssql/data/kuberic-{}.bak",
+                    hex(&Sha256::digest(database.as_str().as_bytes()))
+                );
                 let database = database.quoted();
+                let resource_id = sql_literal(resource_id);
+                let configuration_id = sql_literal(configuration_id);
                 format!(
                     "CREATE DATABASE {database};\n\
                      ALTER DATABASE {database} SET RECOVERY FULL;\n\
                      BACKUP DATABASE {database} TO DISK = N'{backup_literal}' WITH INIT, CHECKSUM;\n\
                      RESTORE VERIFYONLY FROM DISK = N'{backup_literal}' WITH CHECKSUM;\n\
                      CREATE TABLE {database}.dbo.kuberic_marker(\
-                     marker_id int NOT NULL PRIMARY KEY, marker_value nvarchar(128) NOT NULL);"
+                     id uniqueidentifier NOT NULL PRIMARY KEY, value nvarchar(128) NOT NULL);\n\
+                     EXEC {database}.sys.sp_addextendedproperty \
+                     @name=N'kuberic_resource_id', @value=N'{resource_id}';\n\
+                     EXEC {database}.sys.sp_addextendedproperty \
+                     @name=N'kuberic_configuration_id', @value=N'{configuration_id}';"
                 )
             }
             MutationKind::CreateAvailabilityGroup {
@@ -184,6 +259,8 @@ pub enum MutationContractError {
     ReplicaCount,
     NativeBootstrapIdentity,
     DuplicateReplica,
+    InvalidMarker,
+    UnsupportedOperation,
 }
 
 impl std::fmt::Display for MutationContractError {
@@ -196,6 +273,10 @@ impl std::fmt::Display for MutationContractError {
             Self::DuplicateReplica => formatter.write_str(
                 "bootstrap mutation requires unique replica identities, server names and endpoints",
             ),
+            Self::InvalidMarker => formatter.write_str("bootstrap mutation marker is invalid"),
+            Self::UnsupportedOperation => {
+                formatter.write_str("operation is outside bootstrap convergence")
+            }
         }
     }
 }
@@ -204,4 +285,22 @@ impl std::error::Error for MutationContractError {}
 
 fn sql_literal(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+fn validate_marker_value(value: &str) -> Result<(), MutationContractError> {
+    if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+        Err(MutationContractError::InvalidMarker)
+    } else {
+        Ok(())
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push(DIGITS[usize::from(byte >> 4)] as char);
+        value.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    value
 }

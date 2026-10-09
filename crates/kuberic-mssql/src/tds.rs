@@ -11,15 +11,15 @@ use tokio::time::timeout;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use zeroize::Zeroizing;
 
+use crate::bootstrap::{
+    StandaloneDatabaseIdentity, StandaloneDatabaseOwnership, StandaloneDatabaseSnapshot,
+};
 use crate::executor::{QueryRow, SqlExecutor, SqlSession};
 use crate::mutation::{MutationEffect, STANDALONE_DATABASE_QUERY, SqlMutationExecutor};
 use crate::query::ReadQuery;
 use crate::runtime_config::{ConnectionSettings, read_bounded};
 use crate::runtime_error::RuntimeError;
-use crate::{
-    AvailabilityGroupName, Guid, ObservationFailureKind, SqlIdentifier, StandaloneDatabaseIdentity,
-    StandaloneDatabaseSnapshot,
-};
+use crate::{AvailabilityGroupName, Guid, ObservationFailureKind, SqlIdentifier};
 
 const MAX_SECRET_BYTES: u64 = 4096;
 const MAX_QUERY_ROWS: usize = 4096;
@@ -60,6 +60,7 @@ impl SqlExecutor for TdsExecutor {
             "kuberic-sqlserver-observer",
             "observer username",
             "observer password",
+            None,
         )
         .await?;
         Ok(Box::new(TdsSession {
@@ -76,19 +77,24 @@ impl SqlMutationExecutor for TdsMutationExecutor {
         database: &SqlIdentifier,
     ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
         const STAGE: &str = "standalone database preflight";
-        let mut client = connect_client(
+        let mut client = match connect_client(
             &self.settings,
             "kuberic-sqlserver-bootstrap",
             "mutation username",
             "mutation password",
+            Some(database.as_str()),
         )
-        .await?;
-        let name = database.as_str();
+        .await
+        {
+            Ok(client) => client,
+            Err(error) if error.server_code == Some(4060) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         timeout(
             self.settings.query_timeout,
             panic_boundary::contain(STAGE, async move {
                 let mut stream = client
-                    .query(STANDALONE_DATABASE_QUERY, &[&name])
+                    .query(STANDALONE_DATABASE_QUERY, &[])
                     .await
                     .map_err(|error| driver_error(STAGE, error))?;
                 let mut result = None;
@@ -127,8 +133,27 @@ impl SqlMutationExecutor for TdsMutationExecutor {
                                 ));
                             }
                         };
+                        let ownership = match (
+                            optional_text(&row, "kuberic_resource_id", STAGE)?,
+                            optional_text(&row, "kuberic_configuration_id", STAGE)?,
+                        ) {
+                            (Some(resource_id), Some(configuration_id)) => {
+                                Some(StandaloneDatabaseOwnership {
+                                    resource_id,
+                                    configuration_id,
+                                })
+                            }
+                            (None, None) => None,
+                            _ => {
+                                return Err(malformed(
+                                    STAGE,
+                                    "standalone database ownership marker is partial",
+                                ));
+                            }
+                        };
                         result = Some(StandaloneDatabaseSnapshot {
                             identity,
+                            ownership,
                             state,
                             recovery_model,
                         });
@@ -148,6 +173,7 @@ impl SqlMutationExecutor for TdsMutationExecutor {
             "kuberic-sqlserver-bootstrap",
             "mutation username",
             "mutation password",
+            None,
         )
         .await?;
         let statement = effect.statement();
@@ -204,16 +230,33 @@ fn optional_guid(
         .transpose()
 }
 
+#[allow(dead_code)]
+fn optional_text(
+    row: &tiberius::Row,
+    column: &'static str,
+    stage: &'static str,
+) -> Result<Option<String>, RuntimeError> {
+    row.try_get::<&str, _>(column)
+        .map_err(|_| {
+            malformed(
+                stage,
+                "standalone database row has an invalid marker column",
+            )
+        })
+        .map(|value| value.map(str::to_owned))
+}
+
 async fn connect_client(
     settings: &ConnectionSettings,
     application_name: &'static str,
     username_stage: &'static str,
     password_stage: &'static str,
+    database: Option<&str>,
 ) -> Result<Client<Compat<TcpStream>>, RuntimeError> {
     timeout(settings.connect_timeout, async {
         let username = read_secret(&settings.username_file, username_stage).await?;
         let password = read_secret(&settings.password_file, password_stage).await?;
-        let config = connection_config(settings, &username, &password, application_name);
+        let config = connection_config(settings, &username, &password, application_name, database);
         let tcp = TcpStream::connect((settings.endpoint.host(), settings.endpoint.port()))
             .await
             .map_err(|_| {
@@ -246,11 +289,12 @@ fn connection_config(
     username: &str,
     password: &str,
     application_name: &'static str,
+    database: Option<&str>,
 ) -> Config {
     let mut config = Config::new();
     config.host(settings.endpoint.host());
     config.port(settings.endpoint.port());
-    config.database("master");
+    config.database(database.unwrap_or("master"));
     config.application_name(application_name);
     // Required avoids both plaintext fallback and the driver's On/Off panic.
     config.encryption(EncryptionLevel::Required);

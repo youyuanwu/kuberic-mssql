@@ -1,18 +1,22 @@
 use kuberic_mssql::{
-    AvailabilityGroupBootstrapEvidence, AvailabilityGroupIdentity, AvailabilityGroupName,
-    AvailabilityMode, ClusterType, ConfigurationSequence, ContractError, DatabaseBootstrapEvidence,
-    DatabaseIdentity, DatabaseLineage, DecimalProgress, DestructiveApproval, Edition, Endpoint,
-    EngineArtifact, FailoverMode, FenceReference, Guid, MutationContractError, MutationEffect,
-    MutationMode, NativeConvergenceState, NativeEffectEvidence, NativePresence, NativeRole,
-    OPERATION_CONTRACT_VERSION, Observation, ObservationFailure, ObservationFailureKind,
-    OperationEnvelope, OperationPayload, OperationRecord, OperationRequest, PinnedImage,
-    PinnedPackage, ReplayDisposition, ReplicaDescriptor, ReplicaIdentity, ReplicaJoinEvidence,
-    ReplicaSeedEvidence, SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT, SecretRef,
-    SeedingMode, ServerName, SqlIdentifier, SqlServerEulaAcknowledgement, SqlServerSupportConfig,
-    StandaloneDatabaseIdentity, StandaloneDatabaseSnapshot, classify_standalone_database,
+    AvailabilityGroupIdentity, AvailabilityGroupName, AvailabilityMode, BootstrapMutationPlan,
+    ClusterType, ConfigurationSequence, ContractError, DatabaseIdentity, DatabaseLineage,
+    DecimalProgress, DestructiveApproval, Edition, Endpoint, EngineArtifact, FailoverMode,
+    FenceReference, Guid, MutationContractError, MutationEffect, MutationMode,
+    NativeConvergenceState, NativeRole, OPERATION_CONTRACT_VERSION, Observation,
+    ObservationFailure, ObservationFailureKind, OperationEnvelope, OperationPayload,
+    OperationRecord, OperationRequest, PinnedImage, PinnedPackage, ReplayDisposition,
+    ReplicaDescriptor, ReplicaIdentity, SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT,
+    SecretRef, SeedingMode, ServerName, SqlIdentifier, SqlMutationExecutor,
+    SqlServerEulaAcknowledgement, SqlServerSupportConfig, StandaloneDatabaseIdentity,
+    StandaloneDatabaseOwnership, StandaloneDatabaseSnapshot, classify_standalone_database,
 };
 
+use async_trait::async_trait;
 use std::num::NonZeroU32;
+use std::sync::Mutex;
+
+use kuberic_mssql::runtime_error::RuntimeError;
 
 fn guid(value: u32) -> Guid {
     Guid::parse(
@@ -142,56 +146,6 @@ fn supported_profile_is_explicit_and_observe_only_by_default() {
 }
 
 #[test]
-fn native_effect_classification_is_closed_and_fail_closed() {
-    let absent = NativeEffectEvidence {
-        presence: NativePresence::Absent,
-        postcondition_complete: false,
-        unsafe_state: false,
-    };
-    let incomplete = NativeEffectEvidence {
-        presence: NativePresence::Exact,
-        postcondition_complete: false,
-        unsafe_state: false,
-    };
-    let complete = NativeEffectEvidence {
-        presence: NativePresence::Exact,
-        postcondition_complete: true,
-        unsafe_state: false,
-    };
-    let conflicting = NativeEffectEvidence {
-        presence: NativePresence::Conflicting,
-        postcondition_complete: true,
-        unsafe_state: false,
-    };
-    let unsafe_state = NativeEffectEvidence {
-        presence: NativePresence::Exact,
-        postcondition_complete: true,
-        unsafe_state: true,
-    };
-
-    assert_eq!(
-        DatabaseBootstrapEvidence(absent).classify(),
-        NativeConvergenceState::Absent
-    );
-    assert_eq!(
-        AvailabilityGroupBootstrapEvidence(incomplete).classify(),
-        NativeConvergenceState::Incomplete
-    );
-    assert_eq!(
-        ReplicaJoinEvidence(complete).classify(),
-        NativeConvergenceState::Complete
-    );
-    assert_eq!(
-        ReplicaSeedEvidence(conflicting).classify(),
-        NativeConvergenceState::Conflicting
-    );
-    assert_eq!(
-        ReplicaSeedEvidence(unsafe_state).classify(),
-        NativeConvergenceState::Unsafe
-    );
-}
-
-#[test]
 fn standalone_database_preflight_refuses_unowned_same_name_state() {
     let identity = StandaloneDatabaseIdentity {
         name: SqlIdentifier::new("application").unwrap(),
@@ -201,63 +155,111 @@ fn standalone_database_preflight_refuses_unowned_same_name_state() {
     };
     let snapshot = StandaloneDatabaseSnapshot {
         identity: Some(identity.clone()),
+        ownership: Some(StandaloneDatabaseOwnership {
+            resource_id: "default/example".into(),
+            configuration_id: "configuration-1".into(),
+        }),
         state: "ONLINE".into(),
         recovery_model: "FULL".into(),
     };
+    let ownership = snapshot.ownership.clone().unwrap();
 
     assert_eq!(
-        classify_standalone_database(None, None, false),
+        classify_standalone_database(None, None, &ownership, false),
         NativeConvergenceState::Absent
     );
+    let mut foreign = snapshot.clone();
+    foreign.ownership = None;
     assert_eq!(
-        classify_standalone_database(Some(&snapshot), None, false),
+        classify_standalone_database(Some(&foreign), None, &ownership, false),
         NativeConvergenceState::Conflicting
     );
     assert_eq!(
-        classify_standalone_database(Some(&snapshot), Some(&identity), false),
+        classify_standalone_database(Some(&snapshot), None, &ownership, false),
+        NativeConvergenceState::Complete
+    );
+    assert_eq!(
+        classify_standalone_database(Some(&snapshot), Some(&identity), &ownership, false),
         NativeConvergenceState::Complete
     );
 
     let mut incomplete = snapshot.clone();
     incomplete.identity = None;
     assert_eq!(
-        classify_standalone_database(Some(&incomplete), Some(&identity), false),
+        classify_standalone_database(Some(&incomplete), Some(&identity), &ownership, false),
         NativeConvergenceState::Incomplete
     );
     assert_eq!(
-        classify_standalone_database(Some(&snapshot), Some(&identity), true),
+        classify_standalone_database(Some(&snapshot), Some(&identity), &ownership, true),
         NativeConvergenceState::Unsafe
     );
 }
 
 #[test]
 fn mutation_surface_is_typed_and_contains_only_approved_stage_three_effects() {
-    let database = SqlIdentifier::new("application").unwrap();
-    let availability_group = AvailabilityGroupName::new("kuberic-ag").unwrap();
-    let create_database = MutationEffect::create_source_database(database.clone());
+    let database_name = SqlIdentifier::new("application").unwrap();
+    let group_name = AvailabilityGroupName::new("kuberic-ag").unwrap();
+    let bootstrap = request(
+        "bootstrap-1",
+        1,
+        1,
+        OperationPayload::EnsureAvailabilityGroup {
+            name: group_name,
+            expected_group_id: None,
+            database_name,
+            replicas: vec![descriptor(1), descriptor(2), descriptor(3)],
+        },
+    );
+    let plan = BootstrapMutationPlan::from_operation(&bootstrap).unwrap();
+    assert_eq!(plan.effects().len(), 2);
+    let create_database = &plan.effects()[0];
     assert_eq!(create_database.label(), "create source database");
     let database_sql = create_database.statement();
     assert!(database_sql.contains("CREATE DATABASE [application]"));
     assert!(database_sql.contains("BACKUP DATABASE [application]"));
-    assert!(database_sql.contains("CREATE TABLE [application].dbo.kuberic_marker"));
+    assert!(database_sql.contains("/var/opt/mssql/data/kuberic-"));
+    assert!(!database_sql.contains("../"));
+    assert!(database_sql.contains(
+        "CREATE TABLE [application].dbo.kuberic_marker(id uniqueidentifier NOT NULL PRIMARY KEY"
+    ));
+    assert!(database_sql.contains("@name=N'kuberic_resource_id'"));
+    assert!(database_sql.contains("N'default/example'"));
 
-    let create_group = MutationEffect::create_availability_group(
-        availability_group.clone(),
-        vec![descriptor(1), descriptor(2), descriptor(3)],
-    )
-    .unwrap();
+    let create_group = &plan.effects()[1];
     let group_sql = create_group.statement();
     assert!(group_sql.contains("CREATE AVAILABILITY GROUP [kuberic-ag]"));
     assert_eq!(group_sql.matches("SEEDING_MODE = AUTOMATIC").count(), 3);
     assert!(group_sql.contains("REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 1"));
 
-    let join = MutationEffect::join_availability_group(availability_group.clone());
+    let join_request = request(
+        "join-1",
+        1,
+        1,
+        OperationPayload::EnsureReplicaJoined {
+            availability_group: availability_group(),
+            target: replica(2),
+        },
+    );
+    let join_plan = BootstrapMutationPlan::from_operation(&join_request).unwrap();
+    let join = &join_plan.effects()[0];
     assert!(
         join.statement()
             .contains("JOIN WITH (CLUSTER_TYPE = EXTERNAL)")
     );
 
-    let add = MutationEffect::add_database(availability_group, database);
+    let seed_request = request(
+        "seed-1",
+        1,
+        1,
+        OperationPayload::EnsureReplicaSeeded {
+            availability_group: availability_group(),
+            database: database(),
+            source: replica(1),
+            target: replica(2),
+        },
+    );
+    let seed_plan = BootstrapMutationPlan::from_operation(&seed_request).unwrap();
+    let add = &seed_plan.effects()[0];
     assert_eq!(
         add.statement(),
         "ALTER AVAILABILITY GROUP [kuberic-ag] ADD DATABASE [application];"
@@ -288,6 +290,95 @@ fn mutation_surface_rejects_wrong_shape_and_native_bootstrap_identity() {
     assert_eq!(
         MutationEffect::create_availability_group(availability_group, replicas),
         Err(MutationContractError::DuplicateReplica)
+    );
+}
+
+#[test]
+fn source_database_name_cannot_control_the_backup_filesystem_path() {
+    let request = request(
+        "bootstrap-safe-backup",
+        1,
+        1,
+        OperationPayload::EnsureAvailabilityGroup {
+            name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
+            expected_group_id: None,
+            database_name: SqlIdentifier::new("../application").unwrap(),
+            replicas: vec![descriptor(1), descriptor(2), descriptor(3)],
+        },
+    );
+    let plan = BootstrapMutationPlan::from_operation(&request).unwrap();
+    let sql = plan.effects()[0].statement();
+    let backup = sql
+        .split("TO DISK = N'")
+        .nth(1)
+        .unwrap()
+        .split('\'')
+        .next()
+        .unwrap();
+    assert!(backup.starts_with("/var/opt/mssql/data/kuberic-"));
+    assert!(backup.ends_with(".bak"));
+    assert!(!backup.contains(".."));
+    assert!(!backup.contains("../application"));
+}
+
+struct RecordingMutationExecutor {
+    labels: Mutex<Vec<&'static str>>,
+}
+
+#[async_trait]
+impl SqlMutationExecutor for RecordingMutationExecutor {
+    async fn observe_standalone_database(
+        &self,
+        _database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        Ok(None)
+    }
+
+    async fn execute(&self, effect: &MutationEffect) -> Result<(), RuntimeError> {
+        self.labels.lock().unwrap().push(effect.label());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn mutation_executor_accepts_only_typed_effects_derived_from_validated_operations() {
+    let bootstrap_request = request(
+        "bootstrap-typed",
+        1,
+        1,
+        OperationPayload::EnsureAvailabilityGroup {
+            name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
+            expected_group_id: None,
+            database_name: SqlIdentifier::new("application").unwrap(),
+            replicas: vec![descriptor(1), descriptor(2), descriptor(3)],
+        },
+    );
+    let plan = BootstrapMutationPlan::from_operation(&bootstrap_request).unwrap();
+    let executor = RecordingMutationExecutor {
+        labels: Mutex::new(Vec::new()),
+    };
+    for effect in plan.effects() {
+        executor.execute(effect).await.unwrap();
+    }
+    assert_eq!(
+        *executor.labels.lock().unwrap(),
+        vec!["create source database", "create availability group"]
+    );
+
+    let reseed = request(
+        "reseed-not-bootstrap",
+        1,
+        1,
+        OperationPayload::ReseedReplica {
+            availability_group: availability_group(),
+            database: database(),
+            source: replica(1),
+            target: replica(2),
+        },
+    );
+    assert_eq!(
+        BootstrapMutationPlan::from_operation(&reseed),
+        Err(MutationContractError::UnsupportedOperation)
     );
 }
 
