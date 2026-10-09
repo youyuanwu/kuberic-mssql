@@ -77,6 +77,8 @@ pub fn classify_availability_group(
     expected_name: &AvailabilityGroupName,
     expected_group_id: Option<&Guid>,
     expected_replicas: &[ReplicaDescriptor],
+    expected_database_name: &SqlIdentifier,
+    expected_database: Option<&StandaloneDatabaseIdentity>,
     unsafe_state: bool,
 ) -> NativeConvergenceState {
     if unsafe_state {
@@ -92,10 +94,31 @@ pub fn classify_availability_group(
         || group.basic_features
         || group.is_distributed
         || group.replicas.len() > expected_replicas.len()
+        || group.databases.len() > 1
     {
         return NativeConvergenceState::Conflicting;
     }
     let mut incomplete = group.replicas.len() != expected_replicas.len();
+    if let Some(database) = group.databases.first() {
+        let Some(expected_database) = expected_database else {
+            return NativeConvergenceState::Conflicting;
+        };
+        if database.identity.name != *expected_database_name {
+            return NativeConvergenceState::Conflicting;
+        }
+        let Some(local) = &database.local else {
+            return NativeConvergenceState::Incomplete;
+        };
+        let Some(recovery) = &local.recovery else {
+            return NativeConvergenceState::Incomplete;
+        };
+        if recovery.database_guid.as_ref() != Some(&expected_database.database_guid)
+            || recovery.family_guid.as_ref() != Some(&expected_database.family_guid)
+            || recovery.recovery_fork_guid.as_ref() != Some(&expected_database.recovery_fork_guid)
+        {
+            return NativeConvergenceState::Conflicting;
+        }
+    }
     for actual in &group.replicas {
         let Some(expected) = expected_replicas
             .iter()

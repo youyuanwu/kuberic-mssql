@@ -22,9 +22,9 @@ use kuberic_runtime::application::StatefulServiceReplica;
 use kuberic_runtime::control::proto::{self as wire, agent_control_client::AgentControlClient};
 use kuberic_runtime::host::{HostError, ReplicaHost, RunningReplica};
 use kuberic_runtime::protocol::types::{
-    ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch, PodUid, PvcUid,
-    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
-    derive_agent_generation, derive_initialization_id,
+    BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor, ConfigurationMember,
+    EffectivePolicy, Epoch, OperationId, PodUid, PvcUid, ReplicaId, ReplicaIdentity,
+    ReplicaInstanceId, ReplicaRole, ResourceUid, derive_agent_generation, derive_initialization_id,
 };
 use tonic::{Request, transport::Channel};
 
@@ -60,6 +60,14 @@ pub struct PublicMssqlGroup {
     native_binding: Option<NativeTopologyBinding>,
     operation_timeout: Duration,
     complete_deadline: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublicBuildCommand {
+    pub operation_id: OperationId,
+    pub build_id: OperationId,
+    pub target: ReplicaIdentity,
+    pub retire: bool,
 }
 
 struct HostAttempt {
@@ -441,6 +449,123 @@ impl PublicMssqlGroup {
             }
         }
         Ok(())
+    }
+
+    pub fn target_build_command(
+        &self,
+        target_index: usize,
+        operation_id: impl Into<String>,
+        build_id: impl Into<String>,
+    ) -> Result<PublicBuildCommand, MssqlGroupError> {
+        if !matches!(target_index, 1 | 2) {
+            return Err(MssqlGroupError::new(
+                "public bootstrap builds target secondary indexes 1 or 2",
+            ));
+        }
+        Ok(PublicBuildCommand {
+            operation_id: OperationId::new(operation_id.into()),
+            build_id: OperationId::new(build_id.into()),
+            target: self.pods[target_index].identity.clone(),
+            retire: false,
+        })
+    }
+
+    pub fn replay_build_command(&self, command: &PublicBuildCommand) -> PublicBuildCommand {
+        command.clone()
+    }
+
+    pub fn retire_build_command(
+        &self,
+        command: &PublicBuildCommand,
+        operation_id: impl Into<String>,
+    ) -> PublicBuildCommand {
+        PublicBuildCommand {
+            operation_id: OperationId::new(operation_id.into()),
+            build_id: command.build_id.clone(),
+            target: command.target.clone(),
+            retire: true,
+        }
+    }
+
+    pub fn supersede_build_command(
+        &self,
+        command: &PublicBuildCommand,
+        operation_id: impl Into<String>,
+        build_id: impl Into<String>,
+    ) -> PublicBuildCommand {
+        PublicBuildCommand {
+            operation_id: OperationId::new(operation_id.into()),
+            build_id: OperationId::new(build_id.into()),
+            target: command.target.clone(),
+            retire: false,
+        }
+    }
+
+    pub async fn execute_build_commands_sequential(
+        &self,
+        commands: &[PublicBuildCommand],
+    ) -> Vec<Result<(), tonic::Status>> {
+        let mut outcomes = Vec::with_capacity(commands.len());
+        for command in commands {
+            outcomes.push(self.execute_build_command(command).await);
+        }
+        outcomes
+    }
+
+    pub async fn execute_build_commands_concurrently(
+        &self,
+        commands: &[PublicBuildCommand],
+    ) -> Vec<Result<(), tonic::Status>> {
+        join_all(
+            commands
+                .iter()
+                .map(|command| self.execute_build_command(command)),
+        )
+        .await
+    }
+
+    async fn execute_build_command(
+        &self,
+        command: &PublicBuildCommand,
+    ) -> Result<(), tonic::Status> {
+        let source = &self.pods[0];
+        let timeout_duration = self.operation_timeout.min(
+            remaining(self.complete_deadline, "public target build")
+                .map_err(|error| tonic::Status::deadline_exceeded(error.to_string()))?,
+        );
+        let (mut client, report) = status(source, timeout_duration)
+            .await
+            .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+        let authority = BuildAuthority {
+            build_id: command.build_id.clone(),
+            kind: BuildAuthorityKind::Bootstrap,
+            source: source.identity.clone(),
+            target: command.target.clone(),
+            current_configuration: self.configuration.clone(),
+            replication_boundary_lsn: 0,
+        };
+        let request = authorized(wire::ExecuteCommandRequest {
+            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+            resource_uid: self.resource_uid.to_string(),
+            target: Some(source.identity.clone().into()),
+            expected_process_session_id: report.process_session_id,
+            command: Some(wire::execute_command_request::Command::EnsureReplicaBuild(
+                wire::EnsureReplicaBuildCommand {
+                    operation_id: command.operation_id.to_string(),
+                    local_replica_id: source.identity.replica_id.value(),
+                    expected_instance_id: source.identity.instance_id.to_string(),
+                    expected_agent_generation: source.identity.agent_generation.to_string(),
+                    target: Some(command.target.clone().into()),
+                    authority: Some(authority.into()),
+                    source_session_id: source.session.to_string(),
+                    retire: command.retire,
+                },
+            )),
+        });
+        tokio::time::timeout(timeout_duration, client.execute(request))
+            .await
+            .map_err(|_| tonic::Status::deadline_exceeded("public target build timed out"))?
+            .map(|_| ())
     }
 
     pub async fn shutdown_with_coordinator(

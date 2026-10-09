@@ -169,6 +169,16 @@ impl MutationEffect {
         }
     }
 
+    pub(crate) fn is_retryable_propagation_error(&self, error: &RuntimeError) -> bool {
+        matches!(
+            (&self.0, error.server_code),
+            (
+                MutationKind::JoinAvailabilityGroup { .. },
+                Some(35250 | 41158 | 41160)
+            )
+        )
+    }
+
     pub fn statement(&self) -> String {
         match &self.0 {
             MutationKind::CreateSourceDatabase {

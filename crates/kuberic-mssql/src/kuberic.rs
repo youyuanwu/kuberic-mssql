@@ -985,6 +985,7 @@ impl SqlServerReplicator {
     async fn bootstrap_observation(
         &self,
         generation: u64,
+        deadline: tokio::time::Instant,
     ) -> Result<
         (
             crate::observation::InstanceMetadata,
@@ -993,12 +994,12 @@ impl SqlServerReplicator {
         ),
         KubericAdapterError,
     > {
-        let observation = self
-            .source
-            .observe()
-            .await
-            .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))?;
+        let remaining = bootstrap_remaining(deadline)?;
+        let observation = tokio::time::timeout(remaining, self.source.observe()).await;
         drop(self.finish_operation(generation)?);
+        let observation = observation
+            .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)?
+            .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))?;
         let (snapshot, observed_at) = present_snapshot(observation)?;
         self.ensure_observation_fresh(observed_at)?;
         validate_bootstrap_instance(self.source.observer_config(), &snapshot.instance)?;
@@ -1023,18 +1024,39 @@ impl SqlServerReplicator {
     async fn execute_bootstrap_effect(
         &self,
         generation: u64,
+        deadline: tokio::time::Instant,
         executor: &dyn SqlMutationExecutor,
         effect: &MutationEffect,
-    ) -> Result<(), KubericAdapterError> {
-        executor.execute(effect).await.map_err(|error| {
-            KubericAdapterError::NativeMutationFailed {
+    ) -> Result<bool, KubericAdapterError> {
+        let remaining = bootstrap_remaining(deadline)?;
+        let result = tokio::time::timeout(remaining, executor.execute(effect)).await;
+        drop(self.finish_operation(generation)?);
+        let result = result.map_err(|_| KubericAdapterError::NativeConvergenceDeadline)?;
+        match result {
+            Ok(()) => Ok(true),
+            Err(error) if effect.is_retryable_propagation_error(&error) => Ok(false),
+            Err(error) => Err(KubericAdapterError::NativeMutationFailed {
                 effect: effect.label(),
                 kind: error.kind,
                 server_code: error.server_code,
-            }
-        })?;
+            }),
+        }
+    }
+
+    async fn observe_bootstrap_database(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+        executor: &dyn SqlMutationExecutor,
+        database: &SqlIdentifier,
+    ) -> Result<Option<crate::bootstrap::StandaloneDatabaseSnapshot>, KubericAdapterError> {
+        let remaining = bootstrap_remaining(deadline)?;
+        let result =
+            tokio::time::timeout(remaining, executor.observe_standalone_database(database)).await;
         drop(self.finish_operation(generation)?);
-        Ok(())
+        result
+            .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)?
+            .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))
     }
 
     async fn converge_bootstrap_configuration(
@@ -1046,6 +1068,8 @@ impl SqlServerReplicator {
             crate::observation::InstanceMetadata,
             AvailabilityGroupSnapshot,
             u64,
+            Option<crate::bootstrap::StandaloneDatabaseIdentity>,
+            tokio::time::Instant,
         ),
         KubericAdapterError,
     > {
@@ -1106,28 +1130,30 @@ impl SqlServerReplicator {
                 .clone(),
         );
         let deadline = tokio::time::Instant::now() + self.source.observer_config().sample_timeout();
+        let mut join_absence_observed = false;
         loop {
             drop(self.finish_operation(generation)?);
-            if tokio::time::Instant::now() >= deadline {
-                return Err(KubericAdapterError::NativeConvergenceDeadline);
-            }
+            bootstrap_remaining(deadline)?;
+            let database = self
+                .observe_bootstrap_database(
+                    generation,
+                    deadline,
+                    bootstrap.executor.as_ref(),
+                    bootstrap.config.database(),
+                )
+                .await?;
+            let database_state =
+                classify_standalone_database(database.as_ref(), None, &expected_ownership, false);
+            let database_identity = database
+                .as_ref()
+                .and_then(|database| database.identity.clone());
             match ownership {
                 BootstrapOwnership::PrimaryTopology => {
-                    let database = bootstrap
-                        .executor
-                        .observe_standalone_database(bootstrap.config.database())
-                        .await
-                        .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))?;
-                    drop(self.finish_operation(generation)?);
-                    match classify_standalone_database(
-                        database.as_ref(),
-                        None,
-                        &expected_ownership,
-                        false,
-                    ) {
+                    match database_state {
                         NativeConvergenceState::Absent | NativeConvergenceState::Incomplete => {
                             self.execute_bootstrap_effect(
                                 generation,
+                                deadline,
                                 bootstrap.executor.as_ref(),
                                 &create_database,
                             )
@@ -1147,10 +1173,18 @@ impl SqlServerReplicator {
                         }
                     }
                     let (instance, group, observed_at) =
-                        self.bootstrap_observation(generation).await?;
+                        match self.bootstrap_observation(generation, deadline).await {
+                            Ok(observation) => observation,
+                            Err(error) if is_retryable_bootstrap_observation(&error) => {
+                                self.wait_for_bootstrap_retry(generation, deadline).await?;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
                     let Some(group) = group else {
                         self.execute_bootstrap_effect(
                             generation,
+                            deadline,
                             bootstrap.executor.as_ref(),
                             &create_group,
                         )
@@ -1162,12 +1196,16 @@ impl SqlServerReplicator {
                         &self.source.observer_config().target().availability_group,
                         None,
                         &descriptors,
+                        bootstrap.config.database(),
+                        database_identity.as_ref(),
                         false,
                     ) {
                         NativeConvergenceState::Complete
                             if bootstrap_membership_ready(&group, ownership, &descriptors) =>
                         {
-                            return Ok((instance, group, observed_at));
+                            drop(self.finish_operation(generation)?);
+                            bootstrap_remaining(deadline)?;
+                            return Ok((instance, group, observed_at, database_identity, deadline));
                         }
                         NativeConvergenceState::Absent
                         | NativeConvergenceState::Incomplete
@@ -1185,15 +1223,47 @@ impl SqlServerReplicator {
                     }
                 }
                 BootstrapOwnership::LocalJoin => {
+                    match database_state {
+                        NativeConvergenceState::Absent
+                        | NativeConvergenceState::Incomplete
+                        | NativeConvergenceState::Complete => {}
+                        NativeConvergenceState::Conflicting => {
+                            return Err(KubericAdapterError::NativeConvergenceConflict(
+                                "managed database ownership",
+                            ));
+                        }
+                        NativeConvergenceState::Unsafe => {
+                            return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                                "managed database ownership",
+                            ));
+                        }
+                    }
                     let (instance, group, observed_at) =
-                        self.bootstrap_observation(generation).await?;
+                        match self.bootstrap_observation(generation, deadline).await {
+                            Ok(observation) => observation,
+                            Err(error) if is_retryable_bootstrap_observation(&error) => {
+                                self.wait_for_bootstrap_retry(generation, deadline).await?;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
                     let Some(group) = group else {
-                        self.execute_bootstrap_effect(
-                            generation,
-                            bootstrap.executor.as_ref(),
-                            &join_group,
-                        )
-                        .await?;
+                        if join_absence_observed {
+                            let dispatched = self
+                                .execute_bootstrap_effect(
+                                    generation,
+                                    deadline,
+                                    bootstrap.executor.as_ref(),
+                                    &join_group,
+                                )
+                                .await?;
+                            if dispatched {
+                                continue;
+                            }
+                        } else {
+                            join_absence_observed = true;
+                        }
+                        self.wait_for_bootstrap_retry(generation, deadline).await?;
                         continue;
                     };
                     match classify_availability_group(
@@ -1201,6 +1271,8 @@ impl SqlServerReplicator {
                         &self.source.observer_config().target().availability_group,
                         None,
                         &descriptors,
+                        bootstrap.config.database(),
+                        database_identity.as_ref(),
                         false,
                     ) {
                         NativeConvergenceState::Conflicting => {
@@ -1229,15 +1301,22 @@ impl SqlServerReplicator {
                         NativeConvergenceState::Complete
                             if bootstrap_membership_ready(&group, ownership, &descriptors) =>
                         {
-                            return Ok((instance, group, observed_at));
+                            drop(self.finish_operation(generation)?);
+                            bootstrap_remaining(deadline)?;
+                            return Ok((instance, group, observed_at, database_identity, deadline));
                         }
                         NativeConvergenceState::Absent | NativeConvergenceState::Incomplete => {
-                            self.execute_bootstrap_effect(
-                                generation,
-                                bootstrap.executor.as_ref(),
-                                &join_group,
-                            )
-                            .await?;
+                            let dispatched = self
+                                .execute_bootstrap_effect(
+                                    generation,
+                                    deadline,
+                                    bootstrap.executor.as_ref(),
+                                    &join_group,
+                                )
+                                .await?;
+                            if !dispatched {
+                                self.wait_for_bootstrap_retry(generation, deadline).await?;
+                            }
                             continue;
                         }
                         NativeConvergenceState::Complete => {}
@@ -1263,19 +1342,21 @@ impl SqlServerReplicator {
         generation: u64,
         deadline: tokio::time::Instant,
     ) -> Result<(), KubericAdapterError> {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(KubericAdapterError::NativeConvergenceDeadline);
-        }
-        tokio::time::sleep(
-            self.source
-                .observer_config()
-                .poll_interval()
-                .min(Duration::from_millis(100))
-                .min(remaining),
+        let remaining = bootstrap_remaining(deadline)?;
+        tokio::time::timeout(
+            remaining,
+            tokio::time::sleep(
+                self.source
+                    .observer_config()
+                    .poll_interval()
+                    .min(Duration::from_millis(100))
+                    .min(remaining),
+            ),
         )
-        .await;
+        .await
+        .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)?;
         drop(self.finish_operation(generation)?);
+        bootstrap_remaining(deadline)?;
         Ok(())
     }
 
@@ -1508,20 +1589,27 @@ impl PrimaryReplicator for SqlServerReplicator {
             .as_ref()
             .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
         let generation = self.begin_operation()?;
-        let (instance, group, observed_at) = if self.bootstrap.is_some() {
-            self.converge_bootstrap_configuration(generation, &current)
-                .await?
-        } else {
-            let observation = self
-                .source
-                .observe()
-                .await
-                .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))?;
-            drop(self.finish_operation(generation)?);
-            let (snapshot, observed_at) = present_snapshot(observation)?;
-            let (instance, group) = present_group(snapshot, observed_at)?;
-            (instance, group, observed_at)
-        };
+        let (instance, group, observed_at, bootstrap_database, bootstrap_deadline) =
+            if self.bootstrap.is_some() {
+                self.converge_bootstrap_configuration(generation, &current)
+                    .await?
+            } else {
+                let observation = self
+                    .source
+                    .observe()
+                    .await
+                    .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))?;
+                drop(self.finish_operation(generation)?);
+                let (snapshot, observed_at) = present_snapshot(observation)?;
+                let (instance, group) = present_group(snapshot, observed_at)?;
+                (
+                    instance,
+                    group,
+                    observed_at,
+                    None,
+                    tokio::time::Instant::now(),
+                )
+            };
         validate_eligible_snapshot(self.source.observer_config(), &instance, &group, false)?;
         let candidate = admit_topology(
             runtime_identity,
@@ -1533,6 +1621,11 @@ impl PrimaryReplicator for SqlServerReplicator {
             TopologyAdmissionOptions {
                 observer_config: self.source.observer_config(),
                 allow_unassociated_database: self.bootstrap.is_some(),
+                bootstrap_database_name: self
+                    .bootstrap
+                    .as_ref()
+                    .map(|bootstrap| bootstrap.config.database()),
+                bootstrap_database: bootstrap_database.as_ref(),
             },
         )?;
         self.ensure_observation_fresh(observed_at)?;
@@ -1545,6 +1638,9 @@ impl PrimaryReplicator for SqlServerReplicator {
             .admitted_configuration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.bootstrap.is_some() {
+            bootstrap_remaining(bootstrap_deadline)?;
+        }
         if let (Some(previous_topology), Some(previous_configuration)) =
             (&*admitted_topology, &*admitted_configuration)
         {
@@ -1614,6 +1710,22 @@ fn present_snapshot(
     }
 }
 
+fn bootstrap_remaining(deadline: tokio::time::Instant) -> Result<Duration, KubericAdapterError> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        Err(KubericAdapterError::NativeConvergenceDeadline)
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn is_retryable_bootstrap_observation(error: &KubericAdapterError) -> bool {
+    matches!(
+        error,
+        KubericAdapterError::ObservationUnavailable(ObservationFailureKind::Inconsistent)
+    )
+}
+
 fn present_group(
     snapshot: InstanceSnapshot,
     observed_at: u64,
@@ -1645,6 +1757,8 @@ fn present_group(
 struct TopologyAdmissionOptions<'a> {
     observer_config: &'a ObserverConfig,
     allow_unassociated_database: bool,
+    bootstrap_database_name: Option<&'a SqlIdentifier>,
+    bootstrap_database: Option<&'a crate::bootstrap::StandaloneDatabaseIdentity>,
 }
 
 fn admit_topology(
@@ -1678,6 +1792,51 @@ fn admit_topology(
         return Err(KubericAdapterError::TopologyBindingMismatch(
             "exactly one managed database is required",
         ));
+    }
+    if options.allow_unassociated_database {
+        match group.databases.as_slice() {
+            [] => {}
+            [database] => {
+                let expected_name = options.bootstrap_database_name.ok_or(
+                    KubericAdapterError::TopologyBindingMismatch(
+                        "bootstrap managed database name is unavailable",
+                    ),
+                )?;
+                let expected = options.bootstrap_database.ok_or(
+                    KubericAdapterError::TopologyBindingMismatch(
+                        "associated managed database ownership is unproven",
+                    ),
+                )?;
+                let local =
+                    database
+                        .local
+                        .as_ref()
+                        .ok_or(KubericAdapterError::TopologyBindingMismatch(
+                            "associated managed database has no local native identity",
+                        ))?;
+                let recovery =
+                    local
+                        .recovery
+                        .as_ref()
+                        .ok_or(KubericAdapterError::TopologyBindingMismatch(
+                            "associated managed database has no native recovery identity",
+                        ))?;
+                if database.identity.name != *expected_name
+                    || recovery.database_guid.as_ref() != Some(&expected.database_guid)
+                    || recovery.family_guid.as_ref() != Some(&expected.family_guid)
+                    || recovery.recovery_fork_guid.as_ref() != Some(&expected.recovery_fork_guid)
+                {
+                    return Err(KubericAdapterError::TopologyBindingMismatch(
+                        "associated managed database differs from the configured native ownership",
+                    ));
+                }
+            }
+            _ => {
+                return Err(KubericAdapterError::TopologyBindingMismatch(
+                    "unrelated or multiple managed databases are not admissible",
+                ));
+            }
+        }
     }
     let database_lineage = if let Some(database) = group.databases.first() {
         let recovery_fork_id = database
