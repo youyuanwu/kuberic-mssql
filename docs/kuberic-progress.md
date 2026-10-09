@@ -7,11 +7,13 @@ through Kuberic's fixed Service Fabric-compatible `Replicator` contract. It does
 not change Kuberic's API and does not convert SQL Server database log positions
 into a generic scalar.
 
-The integration is deliberately observe-only. It can open as a Kuberic
-application, validate a requested native role, and report current progress. It
-cannot build or remove replicas, change availability-group configuration, wait
-for catch-up, handle data loss, seed a database, grant write access, renew a
-lease, switch over, or fail over.
+Ordinary construction is deliberately observe-only. It can open as a Kuberic
+application, validate a requested native role, and report current progress. An
+explicit bootstrap-capable construction used by licensed validation can also
+create the managed source database and AG, join local secondaries, and execute
+one build-authorized automatic-seeding dispatch. Neither construction can
+remove/reseed replicas, grant write access, renew a lease, switch over, fail
+over, or handle data loss.
 
 ## Two Progress Domains
 
@@ -114,10 +116,12 @@ The locked controller comparison treats a member at the current sequence or one
 behind as not requiring full repair, and a member two or more behind as
 requiring it. Contract tests preserve that exact boundary.
 
-Unbound adapters still reject both operations. Previous/current transitions,
-catch-up configuration and quorum, build, removal, data loss, recovery, lease,
-switchover, and failover callbacks remain explicit observe-only errors. No
-callback returns a dummy success or fabricated value.
+Unbound and ordinary adapters reject bootstrap mutation and build operations.
+Only explicitly bootstrap-capable adapters accept initial current-configuration
+effects and target builds. Previous/current transitions, catch-up configuration
+and quorum, removal, data loss, destructive recovery, lease, switchover, and
+failover callbacks remain explicit unsupported errors. No callback returns a
+dummy success or fabricated value.
 
 ## Ownership Model
 
@@ -139,9 +143,23 @@ by the reviewed operators:
   StatefulSet, Service, and ensure-exists provisioning patterns, but it is
   single-replica and provides no HA precedent.
 
-Kuberic's replica-local runtime, rather than the Kubernetes controller, should
-eventually own SQL bootstrap, join, seeding, lease, and role transitions under
-durable Kuberic authority.
+Kuberic's replica-local runtime now owns the bounded bootstrap/join/initial-seed
+slice under durable Kuberic authority. The configured primary owns source
+database and AG convergence, each secondary owns only its local join, and one
+authorized target build wins a group-level seed dispatch.
+
+Kuberic's command/effect/build receipts and exact SQL Server postconditions
+remain the primary durable evidence. The application persists only the
+pre-association Intent/Dispatched ambiguity under its existing application
+root; exact source association removes that record. This follows PostgreSQL
+v2's separation of Kuberic authority, application-native evidence and database
+state without copying PostgreSQL recovery mechanics or creating a generic
+operation ledger.
+
+No new TLS certificate provisioning, production mutation configuration or
+plaintext bypass was added. Licensed validation reuses fixture-owned endpoint
+security and administrative credentials. Destructive reseed remains deferred
+until verified target fencing exists.
 
 ## Live Validation Paths
 
@@ -171,10 +189,13 @@ revalidation is idempotent. Production and future launchers remain responsible
 for explicit acknowledgement; the strict file-backed constructor and negative
 tests remain available for that purpose.
 
-Fixture-only administration creates and proves:
+Fixture-only preparation creates and proves:
 
 - one certificate-authenticated, started HADR endpoint on every member;
-- peer certificate users/logins with exact endpoint `CONNECT`;
+- peer certificate users/logins with exact endpoint `CONNECT`.
+
+Explicit bootstrap-capable hosts then create and prove:
+
 - one three-replica `CLUSTER_TYPE = EXTERNAL` AG;
 - synchronous commit, EXTERNAL failover metadata, automatic seeding, and
   readable secondary connections for every replica;
@@ -194,10 +215,10 @@ restart, container replacement, AG/database recreation, role drift, stale
 sample, sequence mismatch, suspended database, or unhealthy synchronization
 invalidates the binding.
 
-The licensed path then creates three public `ReplicaHost` applications for one
-shared Kuberic resource, initializes them through public control RPCs and
-admits the exact current configuration. Reports are bracketed by fresh direct
-observations and must show:
+The licensed path creates three public `ReplicaHost` applications for one shared
+Kuberic resource before the database and AG exist, initializes them through
+public control RPCs, and admits the exact current configuration and build
+authority. Reports are bracketed by fresh direct observations and must show:
 
 - one shared resource and current configuration with no previous
   configuration;
@@ -215,15 +236,15 @@ replicated marker is written only by the fixture administrator against the
 directly observed native primary.
 
 The licensed same-root restart test stops all three public hosts while retaining
-the SQL Server availability group and durable roots. Replacement hosts receive
-fresh process sessions, commands targeting every superseded session are
-rejected, exact reports reconverge within the bounded publication deadline, and
-the replicated marker remains readable from every native member. SQL Server
-processes are not restarted.
+SQL Server and durable roots. It covers retained seed Intent/Dispatched state,
+fresh replacement sessions, stale-session rejection, restart-driven
+compaction, zero duplicate `ADD DATABASE`, exact report convergence and marker
+continuity. SQL Server processes are not restarted.
 
 The ignored live tests additionally prove handled-signal and SIGKILL recovery,
-post-AG, post-agent, report-stage and post-restart fault checkpoints, exact
-cleanup, and a successful restart retry.
+every database/AG/join/seed/callback-publication interruption boundary, native
+AG/replica/endpoint/database/lineage/incarnation conflicts through real
+callbacks, exact cleanup, and successful same-root retries.
 
 The workspace tracks Kuberic `main`, with `Cargo.lock` recording the exact
 revision used by locked builds. The current pin
@@ -268,6 +289,9 @@ Run the real three-member path with an optional fixture root:
 
 ```bash
 just test-live-three-replica [root]
+just test-live-three-replica-restart [root]
+just test-live-three-replica-faults [root]
+just test-live-three-replica-conflicts [root]
 ```
 
 Recover the default or a selected journaled root:
@@ -282,19 +306,21 @@ Exercise handled SIGTERM, recovery, retry, and idempotent cleanup:
 just test-live-three-replica-signal [root]
 ```
 
-The three-replica happy path runs after the one-replica observer/CLI validation
-in `just ci`. Signal, recovery, and fault recipes remain explicit. The shipped acknowledgement example still
-contains `accepted: false` as documentation for the production/file-backed
-contract, but tests do not require it.
+The three-replica happy path and same-root restart run after the one-replica
+observer/CLI validation in `just ci`. Signal, recovery, fault and conflict
+recipes remain explicit. The shipped acknowledgement example still contains
+`accepted: false` as documentation for the production/file-backed contract, but
+tests do not require it.
 
 ## Deferred Work
 
 This integration does not yet provide:
 
 - SQL Server process ownership or restart containment;
-- production managed-database creation;
+- a supported production launcher/transport for managed-database, AG, join or
+  initial-seed convergence;
 - production endpoint certificate provisioning or rotation;
-- production replica join, automatic seeding, rebuild, or reseed;
+- destructive reseed before verified target fencing;
 - database-progress build and catch-up proofs;
 - application read/write access fencing;
 - external write-lease renewal and expiry evidence;

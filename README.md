@@ -5,6 +5,13 @@ Linux x86-64 instance and reports native HA evidence. It does not deploy a
 container, accept an EULA, start or restart `sqlservr`, create an AG, change a
 role, renew a write lease, or execute any mutation command.
 
+An explicit bootstrap-capable construction exists for licensed validation. The
+Rust fixture supplies three running SQL Server instances, HADR endpoints,
+authentication and administrative credentials; the three standalone
+`ReplicaHost` applications then create the managed database and AG, join local
+secondaries and perform one build-authorized automatic-seeding dispatch. This
+path is not exposed by the production CLI or runtime configuration.
+
 The library is compatible with the observation side of the level-triggered
 contract. Its optional Kuberic runtime publishes validated AG configuration
 sequence through the fixed Service Fabric-compatible progress API and hosts the
@@ -360,10 +367,12 @@ untouched.
 ### Three-replica licensed happy path
 
 The dedicated three-replica fixture complements the one-replica observer/CLI
-path above. It starts three real SQL Server processes, creates
-certificate-authenticated endpoints, joins one external AG, automatically
-seeds one database, runs three public `ReplicaHost` applications through agent
-control RPCs, and proves a marker is readable from every member.
+path above. It starts three real SQL Server processes and creates
+certificate-authenticated endpoints and peer authentication. Explicit
+bootstrap-capable public `ReplicaHost` applications then create one managed
+database and external AG, join both secondaries, perform one group-level
+automatic-seeding dispatch through Kuberic build authority, and prove a marker
+is readable from every member.
 
 The live path is ignored by default and is not part of `just`, `just check`, or
 direct Cargo test runs. The happy path runs after one-replica validation in
@@ -436,16 +445,19 @@ just test-live-three-replica-signal
 just test-live-three-replica-signal target/my-mssql-three-replica-signal
 just test-live-three-replica-recovery target/my-mssql-three-replica-recovery
 just test-live-three-replica-faults target/my-mssql-three-replica-faults
+just test-live-three-replica-conflicts target/my-mssql-three-replica-conflicts
 ```
 
 Cleanup removes only exactly journaled resources. Foreign, replaced, or
 otherwise unverifiable resources remain untouched and block reuse. The signal
 recipe interrupts an owned launch with SIGTERM, recovers it, reruns the
 complete happy path, and verifies idempotent cleanup. The recovery recipe also
-executes real SIGINT and SIGKILL subprocess cases. The fault recipe injects a
-post-AG failure, an actual panic after agent startup, a report-stage failure,
-and a failure after same-root replacement startup; each is followed by a
-separate exact cleanup process and a final same-root restart retry.
+executes real SIGINT and SIGKILL subprocess cases. The fault recipe injects
+every database/AG/join/seed intent, dispatch, association, native-completion and
+callback-publication boundary and verifies same-root recovery without duplicate
+seed dispatch. The conflict recipe drives AG, replica, endpoint, database,
+lineage and SQL process-incarnation conflicts through real callback validators
+sequentially. Every scenario performs exact, idempotent cleanup.
 
 Direct test commands remain available:
 
@@ -461,7 +473,8 @@ cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
 An explicitly requested live test fails if any of its prerequisites are
 missing; it never silently skips. The one-replica fixture uses observation
 principals and creates no AG, endpoint or database. The three-replica fixture
-performs test-only endpoint, AG, database, seeding, and marker mutation. Both
-lifecycles own and clean their exact resources; production remains observe-only.
-Local three-node failover, lease expiry, old-primary fencing, and fault
-injection remain unsupported and are not claims of this work.
+owns test-only containers, endpoint security, credentials and cleanup; explicit
+bootstrap-capable hosts own the database, AG, joins and seeding effects. Both
+lifecycles clean their exact resources, and ordinary production construction
+remains observe-only. Local three-node failover, lease expiry and old-primary
+fencing remain unsupported and are not claims of this work.
