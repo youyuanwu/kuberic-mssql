@@ -1,3 +1,4 @@
+pub mod bootstrap;
 pub mod config;
 pub mod error;
 pub mod executor;
@@ -5,6 +6,7 @@ pub mod instance;
 #[cfg(feature = "kuberic")]
 pub mod kuberic;
 pub mod monitor;
+pub mod mutation;
 pub mod observation;
 pub mod observer;
 pub mod operation;
@@ -19,6 +21,11 @@ pub mod tds;
 pub mod topology_config;
 pub mod types;
 
+pub use bootstrap::{
+    AvailabilityGroupBootstrapEvidence, DatabaseBootstrapEvidence, NativeConvergenceState,
+    NativeEffectEvidence, NativePresence, ReplicaJoinEvidence, ReplicaSeedEvidence,
+    StandaloneDatabaseIdentity, StandaloneDatabaseSnapshot, classify_standalone_database,
+};
 pub use config::{
     AvailabilityMode, ClusterType, Edition, FailoverMode, MutationMode, SUPPORTED_DATABASE_COUNT,
     SUPPORTED_ENGINE_MAJOR, SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT,
@@ -29,6 +36,9 @@ pub use error::ContractError;
 #[cfg(feature = "kuberic")]
 pub use kuberic::{
     HealthyTopologyBinding, HealthyTopologyMemberBinding, SqlServerStartIncarnation,
+};
+pub use mutation::{
+    MutationContractError, MutationEffect, STANDALONE_DATABASE_QUERY, SqlMutationExecutor,
 };
 pub use operation::{
     DestructiveApproval, EffectSignature, FenceReference, InputSignature,

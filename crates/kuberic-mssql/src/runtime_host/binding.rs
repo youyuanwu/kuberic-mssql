@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::config::RuntimeHostConfig;
+use super::seed_state::{
+    SEED_OWNER_FILE, SEED_STATE_FILE, recover_seed_temporary, validate_seed_entry,
+};
 
 pub const RUNTIME_BINDING_SCHEMA_VERSION: u32 = 1;
 const BINDING_FILE: &str = "runtime-binding.json";
@@ -117,33 +120,24 @@ impl RuntimeBindingStore {
         let mut entries = root.entries()?;
         let mut recovered = false;
         for entry in &entries {
-            if entry == BINDING_FILE {
-                continue;
-            }
             let Some(name) = entry.to_str() else {
                 return Err(RuntimeBindingError::UnsafeState);
             };
-            let Some(pid) = temporary_binding_pid(name) else {
-                return Err(RuntimeBindingError::UnsafeState);
-            };
-            if !process_is_gone(pid)? {
-                return Err(RuntimeBindingError::UnsafeState);
+            match name {
+                BINDING_FILE => {}
+                SEED_STATE_FILE | SEED_OWNER_FILE => {
+                    validate_seed_entry(&root, name).map_err(map_seed_error)?;
+                }
+                _ => {
+                    if recover_temporary(&root, name, BINDING_FILE)?
+                        || recover_seed_temporary(&root, name).map_err(map_seed_error)?
+                    {
+                        recovered = true;
+                    } else {
+                        return Err(RuntimeBindingError::UnsafeState);
+                    }
+                }
             }
-            let temporary = root
-                .openat(name, libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0)
-                .map_err(|_| RuntimeBindingError::UnsafeState)?;
-            let metadata = temporary
-                .metadata()
-                .map_err(|_| RuntimeBindingError::UnsafeState)?;
-            if !metadata.is_file()
-                || metadata.uid() != unsafe { libc::geteuid() }
-                || metadata.permissions().mode() & 0o077 != 0
-            {
-                return Err(RuntimeBindingError::UnsafeState);
-            }
-            drop(temporary);
-            root.unlinkat(name)?;
-            recovered = true;
         }
         if recovered {
             root.file.sync_all().map_err(|_| RuntimeBindingError::Io)?;
@@ -153,7 +147,11 @@ impl RuntimeBindingStore {
         if entries.is_empty() {
             return Ok(ApplicationStorageState::FreshEmpty);
         }
-        if entries.len() != 1 || entries[0] != BINDING_FILE {
+        if !entries.iter().any(|entry| entry == BINDING_FILE)
+            || entries.iter().any(|entry| {
+                entry != BINDING_FILE && entry != SEED_STATE_FILE && entry != SEED_OWNER_FILE
+            })
+        {
             return Err(RuntimeBindingError::UnsafeState);
         }
         let actual = self.load(&root)?;
@@ -253,15 +251,15 @@ impl RuntimeBindingStore {
     }
 }
 
-struct BoundRoot {
+pub(super) struct BoundRoot {
     path: PathBuf,
-    file: File,
+    pub(super) file: File,
     device: u64,
     inode: u64,
 }
 
 impl BoundRoot {
-    fn open(path: &Path) -> std::io::Result<Self> {
+    pub(super) fn open(path: &Path) -> std::io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -281,7 +279,15 @@ impl BoundRoot {
         })
     }
 
-    fn verify_path(&self) -> Result<(), RuntimeBindingError> {
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(super) fn file(&self) -> &File {
+        &self.file
+    }
+
+    pub(super) fn verify_path(&self) -> Result<(), RuntimeBindingError> {
         let metadata = fs::symlink_metadata(&self.path).map_err(|_| RuntimeBindingError::Io)?;
         if metadata.file_type().is_symlink()
             || !metadata.is_dir()
@@ -302,7 +308,12 @@ impl BoundRoot {
         Ok(())
     }
 
-    fn openat(&self, name: &str, flags: i32, mode: libc::mode_t) -> std::io::Result<File> {
+    pub(super) fn openat(
+        &self,
+        name: &str,
+        flags: i32,
+        mode: libc::mode_t,
+    ) -> std::io::Result<File> {
         let name = CString::new(name)
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
         let descriptor = unsafe { libc::openat(self.file.as_raw_fd(), name.as_ptr(), flags, mode) };
@@ -321,7 +332,7 @@ impl BoundRoot {
             .map_err(|_| RuntimeBindingError::Io)
     }
 
-    fn renameat(&self, from: &str, to: &str) -> Result<(), RuntimeBindingError> {
+    pub(super) fn renameat(&self, from: &str, to: &str) -> Result<(), RuntimeBindingError> {
         let from = CString::new(from).map_err(|_| RuntimeBindingError::Io)?;
         let to = CString::new(to).map_err(|_| RuntimeBindingError::Io)?;
         if unsafe {
@@ -339,7 +350,7 @@ impl BoundRoot {
         }
     }
 
-    fn unlinkat(&self, name: &str) -> Result<(), RuntimeBindingError> {
+    pub(super) fn unlinkat(&self, name: &str) -> Result<(), RuntimeBindingError> {
         let name = CString::new(name).map_err(|_| RuntimeBindingError::Io)?;
         if unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) } == 0 {
             Ok(())
@@ -349,8 +360,8 @@ impl BoundRoot {
     }
 }
 
-fn temporary_binding_pid(name: &str) -> Option<libc::pid_t> {
-    let prefix = format!(".{BINDING_FILE}.");
+pub(super) fn temporary_file_pid(name: &str, file_name: &str) -> Option<libc::pid_t> {
+    let prefix = format!(".{file_name}.");
     name.strip_prefix(&prefix)?
         .strip_suffix(".new")?
         .parse::<libc::pid_t>()
@@ -358,7 +369,7 @@ fn temporary_binding_pid(name: &str) -> Option<libc::pid_t> {
         .filter(|pid| *pid > 0)
 }
 
-fn process_is_gone(pid: libc::pid_t) -> Result<bool, RuntimeBindingError> {
+pub(super) fn process_is_gone(pid: libc::pid_t) -> Result<bool, RuntimeBindingError> {
     if unsafe { libc::kill(pid, 0) } == 0 {
         return Ok(false);
     }
@@ -366,6 +377,44 @@ fn process_is_gone(pid: libc::pid_t) -> Result<bool, RuntimeBindingError> {
         Some(libc::ESRCH) => Ok(true),
         Some(libc::EPERM) => Ok(false),
         _ => Err(RuntimeBindingError::Io),
+    }
+}
+
+fn recover_temporary(
+    root: &BoundRoot,
+    name: &str,
+    file_name: &str,
+) -> Result<bool, RuntimeBindingError> {
+    let Some(pid) = temporary_file_pid(name, file_name) else {
+        return Ok(false);
+    };
+    if !process_is_gone(pid)? {
+        return Err(RuntimeBindingError::UnsafeState);
+    }
+    let temporary = root
+        .openat(name, libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0)
+        .map_err(|_| RuntimeBindingError::UnsafeState)?;
+    let metadata = temporary
+        .metadata()
+        .map_err(|_| RuntimeBindingError::UnsafeState)?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(RuntimeBindingError::UnsafeState);
+    }
+    drop(temporary);
+    root.unlinkat(name)?;
+    Ok(true)
+}
+
+fn map_seed_error(error: super::seed_state::SeedStateError) -> RuntimeBindingError {
+    match error {
+        super::seed_state::SeedStateError::Malformed => RuntimeBindingError::Malformed,
+        super::seed_state::SeedStateError::UnsupportedSchema(version) => {
+            RuntimeBindingError::UnsupportedSchema(version)
+        }
+        _ => RuntimeBindingError::UnsafeState,
     }
 }
 

@@ -10,7 +10,7 @@ use kuberic_mssql::query::ReadQuery;
 use kuberic_mssql::runtime_error::RuntimeError;
 use kuberic_mssql::{
     AvailabilityGroupName, NativeRole, Observation, ObservationFailureKind, ReplicaIdentity,
-    ServerName,
+    STANDALONE_DATABASE_QUERY, ServerName,
 };
 use serde_json::Value;
 
@@ -1586,6 +1586,7 @@ fn query_set_is_closed_parameterized_named_nvarchar_selects_without_side_effects
                 query.label()
             );
         }
+
         let expressions = select_expressions(sql);
         assert_eq!(
             selected_names(query).len(),
@@ -1595,6 +1596,27 @@ fn query_set_is_closed_parameterized_named_nvarchar_selects_without_side_effects
         assert!(!sql.contains("failure_message"));
         assert!(!sql.contains("last_connect_error_description"));
         assert!(!sql.contains("write_lease"));
+    }
+}
+
+#[test]
+fn standalone_database_preflight_is_one_parameterized_read_only_statement() {
+    let sql = STANDALONE_DATABASE_QUERY;
+    assert!(sql.trim_start().starts_with("SELECT"));
+    assert_eq!(sql.matches(';').count(), 1);
+    assert!(sql.trim_end().ends_with(';'));
+    assert_eq!(sql.matches("@P1").count(), 1);
+    let tokens: BTreeSet<String> = sql
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect();
+    for forbidden in [
+        "INSERT", "UPDATE", "DELETE", "MERGE", "EXEC", "EXECUTE", "CREATE", "DROP", "ALTER",
+        "TRUNCATE", "USE", "BEGIN", "COMMIT", "ROLLBACK", "GRANT", "DENY", "REVOKE", "BACKUP",
+        "RESTORE", "INTO",
+    ] {
+        assert!(!tokens.contains(forbidden));
     }
 }
 

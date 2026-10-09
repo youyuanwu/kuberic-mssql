@@ -2,6 +2,7 @@ mod binding;
 mod config;
 mod process;
 mod routes;
+mod seed_state;
 
 pub use binding::{
     RUNTIME_BINDING_SCHEMA_VERSION, RuntimeBindingError, RuntimeBindingIdentity,
@@ -13,3 +14,7 @@ pub use process::testing_run_host_with_shutdown;
 pub use process::{RuntimeEndpointResolver, RuntimeHostApplication};
 pub use process::{RuntimeProcessError, run_from_env, run_runtime, run_runtime_with_shutdown};
 pub use routes::{PeerRoute, PeerRoutes, PeerRoutesError};
+pub use seed_state::{
+    SEED_DISPATCH_SCHEMA_VERSION, SeedDispatchPhase, SeedDispatchRecord, SeedDispatchStore,
+    SeedDispatchTarget, SeedStateError,
+};

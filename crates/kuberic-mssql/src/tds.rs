@@ -12,10 +12,14 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use zeroize::Zeroizing;
 
 use crate::executor::{QueryRow, SqlExecutor, SqlSession};
+use crate::mutation::{MutationEffect, STANDALONE_DATABASE_QUERY, SqlMutationExecutor};
 use crate::query::ReadQuery;
 use crate::runtime_config::{ConnectionSettings, read_bounded};
 use crate::runtime_error::RuntimeError;
-use crate::{AvailabilityGroupName, ObservationFailureKind};
+use crate::{
+    AvailabilityGroupName, Guid, ObservationFailureKind, SqlIdentifier, StandaloneDatabaseIdentity,
+    StandaloneDatabaseSnapshot,
+};
 
 const MAX_SECRET_BYTES: u64 = 4096;
 const MAX_QUERY_ROWS: usize = 4096;
@@ -25,8 +29,20 @@ pub struct TdsExecutor {
     settings: ConnectionSettings,
 }
 
+#[allow(dead_code)]
+pub(crate) struct TdsMutationExecutor {
+    settings: ConnectionSettings,
+}
+
 impl TdsExecutor {
     pub fn new(settings: ConnectionSettings) -> Self {
+        Self { settings }
+    }
+}
+
+#[allow(dead_code)]
+impl TdsMutationExecutor {
+    pub(crate) fn new(settings: ConnectionSettings) -> Self {
         Self { settings }
     }
 }
@@ -39,49 +55,203 @@ struct TdsSession {
 #[async_trait]
 impl SqlExecutor for TdsExecutor {
     async fn connect(&self) -> Result<Box<dyn SqlSession>, RuntimeError> {
-        timeout(self.settings.connect_timeout, async {
-            let username = read_secret(&self.settings.username_file, "observer username").await?;
-            let password = read_secret(&self.settings.password_file, "observer password").await?;
-            let config = connection_config(&self.settings, &username, &password);
-            let tcp =
-                TcpStream::connect((self.settings.endpoint.host(), self.settings.endpoint.port()))
-                    .await
-                    .map_err(|_| {
-                        RuntimeError::new(
-                            ObservationFailureKind::Unreachable,
-                            "TCP connect",
-                            "cannot reach the configured SQL Server endpoint",
-                        )
-                    })?;
-            tcp.set_nodelay(true).map_err(|_| {
-                RuntimeError::new(
-                    ObservationFailureKind::Unreachable,
-                    "TCP connect",
-                    "cannot configure the SQL Server connection",
-                )
-            })?;
-            let client = panic_boundary::contain("TLS/TDS login", async {
-                Client::connect(config, tcp.compat_write())
-                    .await
-                    .map_err(|error| driver_error("TLS/TDS login", error))
-            })
-            .await?;
-            Ok(Box::new(TdsSession {
-                client: Some(client),
-                query_timeout: self.settings.query_timeout,
-            }) as Box<dyn SqlSession>)
-        })
-        .await
-        .map_err(|_| timed_out("TLS/TDS connect"))?
+        let client = connect_client(
+            &self.settings,
+            "kuberic-sqlserver-observer",
+            "observer username",
+            "observer password",
+        )
+        .await?;
+        Ok(Box::new(TdsSession {
+            client: Some(client),
+            query_timeout: self.settings.query_timeout,
+        }) as Box<dyn SqlSession>)
     }
 }
 
-fn connection_config(settings: &ConnectionSettings, username: &str, password: &str) -> Config {
+#[async_trait]
+impl SqlMutationExecutor for TdsMutationExecutor {
+    async fn observe_standalone_database(
+        &self,
+        database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        const STAGE: &str = "standalone database preflight";
+        let mut client = connect_client(
+            &self.settings,
+            "kuberic-sqlserver-bootstrap",
+            "mutation username",
+            "mutation password",
+        )
+        .await?;
+        let name = database.as_str();
+        timeout(
+            self.settings.query_timeout,
+            panic_boundary::contain(STAGE, async move {
+                let mut stream = client
+                    .query(STANDALONE_DATABASE_QUERY, &[&name])
+                    .await
+                    .map_err(|error| driver_error(STAGE, error))?;
+                let mut result = None;
+                while let Some(item) = stream
+                    .try_next()
+                    .await
+                    .map_err(|error| driver_error(STAGE, error))?
+                {
+                    if let QueryItem::Row(row) = item {
+                        if result.is_some() {
+                            return Err(malformed(
+                                STAGE,
+                                "standalone database query returned multiple rows",
+                            ));
+                        }
+                        let state = required_text(&row, "state_desc", STAGE)?;
+                        let recovery_model = required_text(&row, "recovery_model_desc", STAGE)?;
+                        let identity = match (
+                            optional_guid(&row, "database_guid", STAGE)?,
+                            optional_guid(&row, "family_guid", STAGE)?,
+                            optional_guid(&row, "recovery_fork_guid", STAGE)?,
+                        ) {
+                            (Some(database_guid), Some(family_guid), Some(recovery_fork_guid)) => {
+                                Some(StandaloneDatabaseIdentity {
+                                    name: database.clone(),
+                                    database_guid,
+                                    family_guid,
+                                    recovery_fork_guid,
+                                })
+                            }
+                            (None, None, None) => None,
+                            _ => {
+                                return Err(malformed(
+                                    STAGE,
+                                    "standalone database recovery identity is partial",
+                                ));
+                            }
+                        };
+                        result = Some(StandaloneDatabaseSnapshot {
+                            identity,
+                            state,
+                            recovery_model,
+                        });
+                    }
+                }
+                Ok(result)
+            }),
+        )
+        .await
+        .map_err(|_| timed_out(STAGE))?
+    }
+
+    async fn execute(&self, effect: &MutationEffect) -> Result<(), RuntimeError> {
+        let stage = effect.label();
+        let mut client = connect_client(
+            &self.settings,
+            "kuberic-sqlserver-bootstrap",
+            "mutation username",
+            "mutation password",
+        )
+        .await?;
+        let statement = effect.statement();
+        timeout(
+            self.settings.query_timeout,
+            panic_boundary::contain(stage, async move {
+                let mut stream = client
+                    .query(statement, &[])
+                    .await
+                    .map_err(|error| driver_error(stage, error))?;
+                while stream
+                    .try_next()
+                    .await
+                    .map_err(|error| driver_error(stage, error))?
+                    .is_some()
+                {}
+                Ok(())
+            }),
+        )
+        .await
+        .map_err(|_| timed_out(stage))?
+    }
+}
+
+#[allow(dead_code)]
+fn required_text(
+    row: &tiberius::Row,
+    column: &'static str,
+    stage: &'static str,
+) -> Result<String, RuntimeError> {
+    row.try_get::<&str, _>(column)
+        .map_err(|_| malformed(stage, "standalone database row has an invalid text column"))?
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            malformed(
+                stage,
+                "standalone database row is missing a required column",
+            )
+        })
+}
+
+#[allow(dead_code)]
+fn optional_guid(
+    row: &tiberius::Row,
+    column: &'static str,
+    stage: &'static str,
+) -> Result<Option<Guid>, RuntimeError> {
+    row.try_get::<&str, _>(column)
+        .map_err(|_| malformed(stage, "standalone database row has an invalid GUID column"))?
+        .map(|value| {
+            Guid::parse(column, value)
+                .map_err(|_| malformed(stage, "standalone database row has a malformed GUID"))
+        })
+        .transpose()
+}
+
+async fn connect_client(
+    settings: &ConnectionSettings,
+    application_name: &'static str,
+    username_stage: &'static str,
+    password_stage: &'static str,
+) -> Result<Client<Compat<TcpStream>>, RuntimeError> {
+    timeout(settings.connect_timeout, async {
+        let username = read_secret(&settings.username_file, username_stage).await?;
+        let password = read_secret(&settings.password_file, password_stage).await?;
+        let config = connection_config(settings, &username, &password, application_name);
+        let tcp = TcpStream::connect((settings.endpoint.host(), settings.endpoint.port()))
+            .await
+            .map_err(|_| {
+                RuntimeError::new(
+                    ObservationFailureKind::Unreachable,
+                    "TCP connect",
+                    "cannot reach the configured SQL Server endpoint",
+                )
+            })?;
+        tcp.set_nodelay(true).map_err(|_| {
+            RuntimeError::new(
+                ObservationFailureKind::Unreachable,
+                "TCP connect",
+                "cannot configure the SQL Server connection",
+            )
+        })?;
+        panic_boundary::contain("TLS/TDS login", async {
+            Client::connect(config, tcp.compat_write())
+                .await
+                .map_err(|error| driver_error("TLS/TDS login", error))
+        })
+        .await
+    })
+    .await
+    .map_err(|_| timed_out("TLS/TDS connect"))?
+}
+
+fn connection_config(
+    settings: &ConnectionSettings,
+    username: &str,
+    password: &str,
+    application_name: &'static str,
+) -> Config {
     let mut config = Config::new();
     config.host(settings.endpoint.host());
     config.port(settings.endpoint.port());
     config.database("master");
-    config.application_name("kuberic-sqlserver-observer");
+    config.application_name(application_name);
     // Required avoids both plaintext fallback and the driver's On/Off panic.
     config.encryption(EncryptionLevel::Required);
     if let Some(path) = &settings.ca_certificate_file {
@@ -90,7 +260,7 @@ fn connection_config(settings: &ConnectionSettings, username: &str, password: &s
     }
     config.authentication(AuthMethod::sql_server(username, password));
     // ApplicationIntent is not a write fence and can trigger replica routing.
-    // Connect to the named instance directly; only ReadQuery statements are exposed.
+    // Connect to the named instance directly.
     config
 }
 
