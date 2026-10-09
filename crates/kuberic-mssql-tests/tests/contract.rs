@@ -223,20 +223,25 @@ fn mutation_surface_is_typed_and_contains_only_approved_stage_three_effects() {
     assert_eq!(create_database.label(), "create source database");
     let database_sql = create_database.statement();
     assert!(database_sql.contains("CREATE DATABASE [application]"));
+    assert!(database_sql.contains("IF DB_ID(N'application') IS NULL"));
     assert!(database_sql.contains("BACKUP DATABASE [application]"));
     assert!(database_sql.contains("/var/opt/mssql/data/kuberic-"));
     assert!(!database_sql.contains("../"));
-    assert!(database_sql.contains(
-        "CREATE TABLE [application].dbo.kuberic_marker(id uniqueidentifier NOT NULL PRIMARY KEY"
-    ));
-    assert!(database_sql.contains("@name=N'kuberic_resource_id'"));
-    assert!(database_sql.contains("N'default/example'"));
+    assert!(database_sql.contains("EXEC(N'USE [application]"));
+    assert!(
+        database_sql
+            .contains("CREATE TABLE dbo.kuberic_marker(id uniqueidentifier NOT NULL PRIMARY KEY")
+    );
+    assert!(database_sql.contains("@name=N''kuberic_resource_id''"));
+    assert!(database_sql.contains("N''default/example''"));
+    assert!(!database_sql.contains("ADD DATABASE"));
 
     let create_group = &plan.effects()[1];
     let group_sql = create_group.statement();
     assert!(group_sql.contains("CREATE AVAILABILITY GROUP [kuberic-ag]"));
     assert_eq!(group_sql.matches("SEEDING_MODE = AUTOMATIC").count(), 3);
     assert!(group_sql.contains("REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 1"));
+    assert!(!group_sql.contains("ADD DATABASE"));
 
     let join_request = request(
         "join-1",

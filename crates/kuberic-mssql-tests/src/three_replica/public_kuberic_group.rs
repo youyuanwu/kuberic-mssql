@@ -7,14 +7,16 @@ use std::time::{Duration, Instant};
 
 use futures::future::join_all;
 use kuberic_mssql::instance::SqlServerInstanceManager;
-use kuberic_mssql::kuberic::SqlServerObservationSource;
+use kuberic_mssql::kuberic::{
+    SqlServerBootstrapConfig, SqlServerObservationSource, SystemObservationClock,
+};
 use kuberic_mssql::observation::InstanceSnapshot;
 use kuberic_mssql::runtime_config::ObserverConfig;
 use kuberic_mssql::runtime_host::{
     RuntimeEndpointResolver, RuntimeHostApplication, RuntimeHostArgs, RuntimeHostConfig,
 };
-use kuberic_mssql::tds::TdsExecutor;
-use kuberic_mssql::{NativeRole, Observation};
+use kuberic_mssql::tds::{TdsExecutor, TdsMutationExecutor};
+use kuberic_mssql::{NativeRole, Observation, SqlIdentifier};
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::application::StatefulServiceReplica;
 use kuberic_runtime::control::proto::{self as wire, agent_control_client::AgentControlClient};
@@ -26,6 +28,7 @@ use kuberic_runtime::protocol::types::{
 };
 use tonic::{Request, transport::Channel};
 
+use super::availability_group::PreparedAvailabilityGroup;
 use super::cleanup::{CleanupClock, CleanupCoordinator};
 use super::kuberic_group::{MSSQL_FAILOVER_DELAY_SECONDS, MssqlGroupError};
 use super::member::ReadyMember;
@@ -54,7 +57,7 @@ pub struct PublicMssqlGroup {
     pub effective_policy: EffectivePolicy,
     pub configuration: ConfigurationDescriptor,
     pub pods: [PublicMssqlPod; 3],
-    native_binding: NativeTopologyBinding,
+    native_binding: Option<NativeTopologyBinding>,
     operation_timeout: Duration,
     complete_deadline: Instant,
 }
@@ -67,11 +70,17 @@ struct HostAttempt {
 struct RuntimeConfigContext<'a> {
     root: &'a Path,
     run: &'a TopologyRun,
-    native: &'a NativeTopologyBinding,
+    native: Option<&'a NativeTopologyBinding>,
+    prepared: Option<&'a PreparedAvailabilityGroup>,
     members: &'a [ReadyMember; 3],
     controls: &'a [SocketAddr; 3],
     replications: &'a [SocketAddr; 3],
     identities: &'a [ReplicaIdentity; 3],
+}
+
+enum AssemblyTopology<'a> {
+    Existing(&'a NativeTopologyBinding),
+    Prepared(&'a PreparedAvailabilityGroup),
 }
 
 impl PublicMssqlGroup {
@@ -84,10 +93,63 @@ impl PublicMssqlGroup {
         complete_deadline: Instant,
         cleanup: &CleanupCoordinator<impl CleanupClock>,
     ) -> Result<Self, MssqlGroupError> {
+        Self::assemble(
+            root,
+            run,
+            AssemblyTopology::Existing(native_binding),
+            members,
+            convergence_timeout,
+            complete_deadline,
+            cleanup,
+        )
+        .await
+    }
+
+    pub async fn from_prepared_with_coordinator(
+        root: &Path,
+        run: &TopologyRun,
+        prepared: &PreparedAvailabilityGroup,
+        members: &[ReadyMember; 3],
+        convergence_timeout: Duration,
+        complete_deadline: Instant,
+        cleanup: &CleanupCoordinator<impl CleanupClock>,
+    ) -> Result<Self, MssqlGroupError> {
+        Self::assemble(
+            root,
+            run,
+            AssemblyTopology::Prepared(prepared),
+            members,
+            convergence_timeout,
+            complete_deadline,
+            cleanup,
+        )
+        .await
+    }
+
+    async fn assemble(
+        root: &Path,
+        run: &TopologyRun,
+        topology: AssemblyTopology<'_>,
+        members: &[ReadyMember; 3],
+        convergence_timeout: Duration,
+        complete_deadline: Instant,
+        cleanup: &CleanupCoordinator<impl CleanupClock>,
+    ) -> Result<Self, MssqlGroupError> {
         check_deadline(complete_deadline, "public Kuberic assembly")?;
+        let (native_binding, prepared) = match topology {
+            AssemblyTopology::Existing(native) => (Some(native), None),
+            AssemblyTopology::Prepared(prepared) => (None, Some(prepared)),
+        };
         let resource_uid = ResourceUid::new(run.resource_uid.clone());
         let identities = identities(run, &resource_uid);
-        let roles = stable_roles(native_binding)?;
+        let roles = match native_binding {
+            Some(native) => stable_roles(native)?,
+            None => [
+                ReplicaRole::Primary,
+                ReplicaRole::ActiveSecondary,
+                ReplicaRole::ActiveSecondary,
+            ],
+        };
         let configuration = configuration(native_binding, &identities, roles)?;
         let effective_policy = EffectivePolicy::fixed(3, MSSQL_FAILOVER_DELAY_SECONDS)
             .ok_or_else(|| MssqlGroupError::new("three-member policy is invalid"))?;
@@ -110,6 +172,7 @@ impl PublicMssqlGroup {
             root,
             run,
             native: native_binding,
+            prepared,
             members,
             controls: &controls,
             replications: &replications,
@@ -120,18 +183,38 @@ impl PublicMssqlGroup {
             let observer = ObserverConfig::read(&members[index].observer_config)
                 .await
                 .map_err(display_error)?;
+            let mutation_settings = native_binding.is_none().then(|| {
+                observer.connection().testing_with_secret_files(
+                    members[index].admin_username.clone(),
+                    members[index].admin_password.clone(),
+                )
+            });
             let source = Arc::new(SqlServerInstanceManager::new(
                 TdsExecutor::new(observer.connection().clone()),
                 observer,
             )) as Source;
-            let application = Arc::new(
+            let application = Arc::new(if native_binding.is_some() {
                 RuntimeHostApplication::with_observation_source(
                     &config,
                     source.clone(),
-                    Arc::new(kuberic_mssql::kuberic::SystemObservationClock),
+                    Arc::new(SystemObservationClock),
                 )
-                .map_err(display_error)?,
-            );
+                .map_err(display_error)?
+            } else {
+                RuntimeHostApplication::testing_with_bootstrap_sources(
+                    &config,
+                    source.clone(),
+                    Arc::new(SystemObservationClock),
+                    SqlServerBootstrapConfig::new(
+                        SqlIdentifier::new(format!("km_db_{}", run.run_id))
+                            .map_err(display_error)?,
+                    ),
+                    Arc::new(TdsMutationExecutor::testing_new(
+                        mutation_settings.expect("bootstrap construction requires admin settings"),
+                    )),
+                )
+                .map_err(display_error)?
+            });
             let host = ReplicaHost::new(
                 config.replica_process_config(),
                 application.clone(),
@@ -163,8 +246,10 @@ impl PublicMssqlGroup {
             .map_err(|_| MssqlGroupError::new("exactly three public Kuberic pods required"))?;
 
         let result = async {
-            validate_observations(&pods, native_binding, operation_timeout, complete_deadline)
-                .await?;
+            if let Some(native_binding) = native_binding {
+                validate_observations(&pods, native_binding, operation_timeout, complete_deadline)
+                    .await?;
+            }
             let startup_reports =
                 startup_reports(&mut pods, &mut attempts, operation_timeout).await?;
             let uninitialized = startup_reports
@@ -261,7 +346,7 @@ impl PublicMssqlGroup {
             effective_policy,
             configuration,
             pods,
-            native_binding: native_binding.clone(),
+            native_binding: native_binding.cloned(),
             operation_timeout,
             complete_deadline,
         })
@@ -270,17 +355,37 @@ impl PublicMssqlGroup {
     pub async fn reports_bracketed(&self) -> Result<[wire::AgentStatusReport; 3], MssqlGroupError> {
         let before =
             observe_sources(&self.pods, self.operation_timeout, self.complete_deadline).await?;
-        validate_snapshots(&before, &self.native_binding)?;
+        if let Some(native_binding) = &self.native_binding {
+            validate_snapshots(&before, native_binding)?;
+        } else {
+            validate_bootstrap_snapshots(&before)?;
+        }
         let mut reports = Vec::new();
         for pod in &self.pods {
             reports.push(status(pod, self.operation_timeout).await?.1);
         }
         let after =
             observe_sources(&self.pods, self.operation_timeout, self.complete_deadline).await?;
-        validate_snapshots(&after, &self.native_binding)?;
+        if let Some(native_binding) = &self.native_binding {
+            validate_snapshots(&after, native_binding)?;
+        } else {
+            validate_bootstrap_snapshots(&after)?;
+        }
         reports
             .try_into()
             .map_err(|_| MssqlGroupError::new("exactly three public Kuberic reports required"))
+    }
+
+    pub async fn bootstrap_configuration_sequence(&self) -> Result<i64, MssqlGroupError> {
+        if self.native_binding.is_some() {
+            return Err(MssqlGroupError::new(
+                "bootstrap sequence is only available for prepared topology hosts",
+            ));
+        }
+        let snapshots =
+            observe_sources(&self.pods, self.operation_timeout, self.complete_deadline).await?;
+        validate_bootstrap_snapshots(&snapshots)?;
+        Ok(self.configuration.epoch.configuration_number)
     }
 
     pub async fn assert_superseded_sessions_rejected(
@@ -403,10 +508,23 @@ async fn runtime_config(
     let topology = runtime_root.join("topology.json");
     let topology_members = (0..3)
         .map(|index| {
+            let endpoint_url = context.native.map_or_else(
+                || {
+                    let prepared = context
+                        .prepared
+                        .expect("prepared bootstrap requires endpoint evidence");
+                    format!(
+                        "TCP://{}:{}",
+                        context.run.members[index].server_name,
+                        prepared.endpoint_evidence[index].port
+                    )
+                },
+                |native| native.members[index].endpoint_url.clone(),
+            );
             serde_json::json!({
                 "replica_id": context.run.kuberic_members[index].replica_id,
                 "server_name": context.run.members[index].server_name,
-                "endpoint_url": context.native.members[index].endpoint_url
+                "endpoint_url": endpoint_url
             })
         })
         .collect::<Vec<_>>();
@@ -495,7 +613,7 @@ fn stable_roles(native: &NativeTopologyBinding) -> Result<[ReplicaRole; 3], Mssq
 }
 
 fn configuration(
-    native: &NativeTopologyBinding,
+    native: Option<&NativeTopologyBinding>,
     identities: &[ReplicaIdentity; 3],
     roles: [ReplicaRole; 3],
 ) -> Result<ConfigurationDescriptor, MssqlGroupError> {
@@ -504,7 +622,10 @@ fn configuration(
         .position(|role| *role == ReplicaRole::Primary)
         .ok_or_else(|| MssqlGroupError::new("native topology has no primary"))?;
     Ok(ConfigurationDescriptor::new(
-        Epoch::new(0, native.configuration_sequence),
+        Epoch::new(
+            0,
+            native.map_or(1, |binding| binding.configuration_sequence),
+        ),
         identities[primary].replica_id,
         identities
             .iter()
@@ -876,6 +997,81 @@ fn validate_snapshots(
                 "direct observation differs from the frozen native topology",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_bootstrap_snapshots(snapshots: &[InstanceSnapshot; 3]) -> Result<(), MssqlGroupError> {
+    let mut group_id = None;
+    let mut primary_count = 0;
+    for snapshot in snapshots {
+        let group = match &snapshot.availability_group {
+            Observation::Present { value, .. } => value,
+            _ => {
+                return Err(MssqlGroupError::new(
+                    "bootstrap availability group is unavailable",
+                ));
+            }
+        };
+        if group.replicas.len() != 3
+            || !group.databases.is_empty()
+            || !group.cluster_type.eq_ignore_ascii_case("EXTERNAL")
+            || group.required_synchronized_secondaries_to_commit != 1
+            || group.basic_features
+            || group.is_distributed
+            || group.replicas.iter().any(|replica| {
+                replica.availability_mode != "SYNCHRONOUS_COMMIT"
+                    || replica.failover_mode != "EXTERNAL"
+                    || replica.seeding_mode != "AUTOMATIC"
+            })
+        {
+            return Err(MssqlGroupError::new(
+                "bootstrap availability-group profile differs",
+            ));
+        }
+        if group_id.get_or_insert_with(|| group.identity.group_id.clone())
+            != &group.identity.group_id
+        {
+            return Err(MssqlGroupError::new(
+                "bootstrap members do not report one native group identity",
+            ));
+        }
+        let expected_role = match group.local_replica.role {
+            Some(NativeRole::Primary) => {
+                primary_count += 1;
+                NativeRole::Primary
+            }
+            Some(NativeRole::Secondary) => NativeRole::Secondary,
+            _ => {
+                return Err(MssqlGroupError::new(
+                    "bootstrap local replica role is not stable",
+                ));
+            }
+        };
+        let local_id = group
+            .local_replica
+            .identity
+            .native_replica_id()
+            .ok_or_else(|| MssqlGroupError::new("bootstrap local replica ID is unavailable"))?;
+        let local = group
+            .replicas
+            .iter()
+            .find(|replica| &replica.replica_id == local_id)
+            .ok_or_else(|| MssqlGroupError::new("bootstrap local member is absent"))?;
+        if local.state.as_ref().is_none_or(|state| {
+            state.role.as_ref() != Some(&expected_role)
+                || state.operational_state.as_deref() != Some("ONLINE")
+                || state.connected_state.as_deref() != Some("CONNECTED")
+        }) {
+            return Err(MssqlGroupError::new(
+                "bootstrap local member is not online and connected",
+            ));
+        }
+    }
+    if primary_count != 1 {
+        return Err(MssqlGroupError::new(
+            "bootstrap topology does not contain exactly one primary",
+        ));
     }
     Ok(())
 }

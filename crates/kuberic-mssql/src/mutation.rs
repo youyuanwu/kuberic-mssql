@@ -102,7 +102,7 @@ impl BootstrapMutationPlan {
 }
 
 impl MutationEffect {
-    fn create_source_database(
+    pub fn create_source_database(
         database: SqlIdentifier,
         resource_id: &str,
         configuration_id: &str,
@@ -149,7 +149,7 @@ impl MutationEffect {
         }))
     }
 
-    fn join_availability_group(availability_group: AvailabilityGroupName) -> Self {
+    pub fn join_availability_group(availability_group: AvailabilityGroupName) -> Self {
         Self(MutationKind::JoinAvailabilityGroup { availability_group })
     }
 
@@ -180,20 +180,30 @@ impl MutationEffect {
                     "/var/opt/mssql/data/kuberic-{}.bak",
                     hex(&Sha256::digest(database.as_str().as_bytes()))
                 );
+                let database_name = sql_literal(database.as_str());
                 let database = database.quoted();
                 let resource_id = sql_literal(resource_id);
                 let configuration_id = sql_literal(configuration_id);
-                format!(
-                    "CREATE DATABASE {database};\n\
-                     ALTER DATABASE {database} SET RECOVERY FULL;\n\
-                     BACKUP DATABASE {database} TO DISK = N'{backup_literal}' WITH INIT, CHECKSUM;\n\
-                     RESTORE VERIFYONLY FROM DISK = N'{backup_literal}' WITH CHECKSUM;\n\
-                     CREATE TABLE {database}.dbo.kuberic_marker(\
-                     id uniqueidentifier NOT NULL PRIMARY KEY, value nvarchar(128) NOT NULL);\n\
-                     EXEC {database}.sys.sp_addextendedproperty \
+                let database_setup = sql_literal(&format!(
+                    "USE {database};\n\
+                     IF NOT EXISTS (SELECT 1 FROM sys.extended_properties \
+                     WHERE class = 0 AND name = N'kuberic_resource_id') \
+                     EXEC sys.sp_addextendedproperty \
                      @name=N'kuberic_resource_id', @value=N'{resource_id}';\n\
-                     EXEC {database}.sys.sp_addextendedproperty \
-                     @name=N'kuberic_configuration_id', @value=N'{configuration_id}';"
+                     IF NOT EXISTS (SELECT 1 FROM sys.extended_properties \
+                     WHERE class = 0 AND name = N'kuberic_configuration_id') \
+                     EXEC sys.sp_addextendedproperty \
+                     @name=N'kuberic_configuration_id', @value=N'{configuration_id}';\n\
+                     IF OBJECT_ID(N'dbo.kuberic_marker', N'U') IS NULL \
+                     CREATE TABLE dbo.kuberic_marker(\
+                     id uniqueidentifier NOT NULL PRIMARY KEY, value nvarchar(128) NOT NULL);"
+                ));
+                format!(
+                    "IF DB_ID(N'{database_name}') IS NULL CREATE DATABASE {database};\n\
+                     ALTER DATABASE {database} SET RECOVERY FULL;\n\
+                     EXEC(N'{database_setup}');\n\
+                     BACKUP DATABASE {database} TO DISK = N'{backup_literal}' WITH INIT, CHECKSUM;\n\
+                     RESTORE VERIFYONLY FROM DISK = N'{backup_literal}' WITH CHECKSUM;"
                 )
             }
             MutationKind::CreateAvailabilityGroup {

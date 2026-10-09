@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use kuberic_mssql::kuberic::{
-    ObservationClock, SqlServerObservationSource, SqlServerReplicator, SqlServerReplicatorFactory,
-    SqlServerService, SqlServerServiceConfig,
+    ObservationClock, SqlServerBootstrapConfig, SqlServerObservationSource, SqlServerReplicator,
+    SqlServerReplicatorFactory, SqlServerService, SqlServerServiceConfig,
 };
 use kuberic_mssql::observation::{
     AutomaticSeedingSnapshot, AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, DatabaseSnapshot,
@@ -19,10 +19,12 @@ use kuberic_mssql::runtime_error::RuntimeError;
 use kuberic_mssql::{
     AvailabilityGroupIdentity, AvailabilityGroupName, BootstrapOwnership, BootstrapOwnershipError,
     ConfigurationSequence, DatabaseIdentity, DatabaseLineage, DecimalProgress, Endpoint, Guid,
-    NativeConvergenceState, NativeProgress, NativeRole, Observation, ObservationFailure,
-    ObservationFailureKind, ReplicaDescriptor, ReplicaIdentity, ServerName, SqlIdentifier,
-    SqlServerTopologyExpectation, SqlServerTopologyMemberExpectation, classify_availability_group,
-    classify_bootstrap_ownership, classify_replica_join, classify_replica_seed,
+    MutationEffect, NativeConvergenceState, NativeProgress, NativeRole, Observation,
+    ObservationFailure, ObservationFailureKind, ReplicaDescriptor, ReplicaIdentity, ServerName,
+    SqlIdentifier, SqlMutationExecutor, SqlServerTopologyExpectation,
+    SqlServerTopologyMemberExpectation, StandaloneDatabaseIdentity, StandaloneDatabaseOwnership,
+    StandaloneDatabaseSnapshot, classify_availability_group, classify_bootstrap_ownership,
+    classify_replica_join, classify_replica_seed,
 };
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::application::{OpenMode, StatefulServiceReplica};
@@ -97,6 +99,30 @@ impl SqlServerObservationSource for ScriptedSource {
 struct CountingSource {
     inner: ScriptedSource,
     observations: AtomicUsize,
+}
+
+struct ScriptedMutationExecutor {
+    databases: Mutex<VecDeque<Result<Option<StandaloneDatabaseSnapshot>, RuntimeError>>>,
+    effects: Mutex<Vec<&'static str>>,
+}
+
+#[async_trait]
+impl SqlMutationExecutor for ScriptedMutationExecutor {
+    async fn observe_standalone_database(
+        &self,
+        _database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        self.databases
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("test must provide one standalone database sample")
+    }
+
+    async fn execute(&self, effect: &MutationEffect) -> Result<(), RuntimeError> {
+        self.effects.lock().unwrap().push(effect.label());
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -717,6 +743,214 @@ fn bound_snapshot_for(local_index: usize) -> InstanceSnapshot {
     sample
 }
 
+fn bootstrap_absent_snapshot(local_index: usize) -> InstanceSnapshot {
+    let mut sample = bound_snapshot_for(local_index);
+    sample.availability_group = Observation::Absent {
+        observed_at_unix_millis: OBSERVED_AT,
+    };
+    sample
+}
+
+fn bootstrap_membership_snapshot(local_index: usize) -> InstanceSnapshot {
+    let mut sample = bound_snapshot_for(local_index);
+    let group = match &mut sample.availability_group {
+        Observation::Present { value, .. } => value,
+        _ => unreachable!(),
+    };
+    group.databases.clear();
+    if local_index == 0 {
+        for (index, replica) in group.replicas.iter_mut().enumerate() {
+            replica.state = Some(ReplicaState {
+                provenance: if index == 0 {
+                    NativeProvenance::Local
+                } else {
+                    NativeProvenance::PrimaryRemote
+                },
+                role: Some(if index == 0 {
+                    NativeRole::Primary
+                } else {
+                    NativeRole::Secondary
+                }),
+                operational_state: Some("ONLINE".into()),
+                connected_state: Some("CONNECTED".into()),
+                recovery_health: Some("ONLINE".into()),
+                synchronization_health: Some("HEALTHY".into()),
+                last_connect_error_number: Some(0),
+            });
+        }
+    }
+    sample
+}
+
+fn bootstrap_membership_snapshot_with_sequence(
+    local_index: usize,
+    sequence: &str,
+) -> InstanceSnapshot {
+    let mut sample = bootstrap_membership_snapshot(local_index);
+    match &mut sample.availability_group {
+        Observation::Present { value, .. } => {
+            value.configuration_sequence = ConfigurationSequence::parse(sequence).unwrap();
+        }
+        _ => unreachable!(),
+    }
+    sample
+}
+
+fn owned_standalone_database() -> StandaloneDatabaseSnapshot {
+    StandaloneDatabaseSnapshot {
+        identity: Some(StandaloneDatabaseIdentity {
+            name: SqlIdentifier::new("app-db").unwrap(),
+            database_guid: guid(DATABASE_GUID),
+            family_guid: guid(FAMILY_GUID),
+            recovery_fork_guid: guid(FORK_ID),
+        }),
+        ownership: Some(StandaloneDatabaseOwnership {
+            resource_id: "resource-a".into(),
+            configuration_id: configuration().configuration_id.to_string(),
+        }),
+        state: "ONLINE".into(),
+        recovery_model: "FULL".into(),
+        accessible: true,
+    }
+}
+
+#[tokio::test]
+async fn explicit_bootstrap_path_assigns_exact_effect_ownership_and_replays_from_native_state() {
+    let (primary, primary_mutation) = bootstrap_replicator_for(
+        0,
+        vec![
+            Ok(present(bootstrap_absent_snapshot(0))),
+            Ok(present(bootstrap_membership_snapshot(0))),
+            Ok(present(bootstrap_membership_snapshot_with_sequence(
+                0, "43",
+            ))),
+            Ok(present(bootstrap_membership_snapshot_with_sequence(
+                0, "43",
+            ))),
+        ],
+        vec![
+            Ok(None),
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
+        ],
+    );
+    primary.open().await.unwrap();
+    primary
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap();
+    primary
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap();
+    assert_eq!(
+        *primary_mutation.effects.lock().unwrap(),
+        vec!["create source database", "create availability group"]
+    );
+    assert!(
+        primary
+            .admitted_topology()
+            .unwrap()
+            .database_lineage()
+            .is_none()
+    );
+    assert_eq!(primary.current_progress().await.unwrap(), 42);
+
+    for local_index in [1, 2] {
+        let (secondary, mutation) = bootstrap_replicator_for(
+            local_index,
+            vec![
+                Ok(present(bootstrap_absent_snapshot(local_index))),
+                Ok(present(bootstrap_membership_snapshot(local_index))),
+                Ok(present(bootstrap_membership_snapshot(local_index))),
+            ],
+            Vec::new(),
+        );
+        secondary.open().await.unwrap();
+        secondary
+            .update_current_replica_set_configuration(bound_replica_set())
+            .await
+            .unwrap();
+        secondary
+            .update_current_replica_set_configuration(bound_replica_set())
+            .await
+            .unwrap();
+        assert_eq!(
+            *mutation.effects.lock().unwrap(),
+            vec!["join availability group"]
+        );
+        assert!(secondary.admitted_topology().is_some());
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_path_fails_closed_on_foreign_standalone_database() {
+    let mut foreign = owned_standalone_database();
+    foreign.ownership = Some(StandaloneDatabaseOwnership {
+        resource_id: "foreign-resource".into(),
+        configuration_id: configuration().configuration_id.to_string(),
+    });
+    let (replicator, mutation) = bootstrap_replicator_for(0, Vec::new(), vec![Ok(Some(foreign))]);
+    replicator.open().await.unwrap();
+    let error = replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("conflicts"));
+    assert!(mutation.effects.lock().unwrap().is_empty());
+    assert!(replicator.admitted_topology().is_none());
+}
+
+#[tokio::test]
+async fn close_during_bootstrap_reobservation_fences_configuration_success() {
+    let executor = Arc::new(ScriptedMutationExecutor {
+        databases: Mutex::new(vec![Ok(Some(owned_standalone_database()))].into()),
+        effects: Mutex::new(Vec::new()),
+    });
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let replicator = Arc::new(
+        SqlServerReplicator::new_bootstrap_with_topology(
+            SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-1.example:5022")
+                .unwrap(),
+            Arc::new(GatedSource {
+                config: observer_config(),
+                samples: Mutex::new(vec![Ok(present(bootstrap_membership_snapshot(0)))].into()),
+                observations: AtomicUsize::new(0),
+                gate_at: 0,
+                entered: Mutex::new(Some(entered_tx)),
+                release: Mutex::new(Some(release_rx)),
+            }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+            kuberic_identity(1),
+            topology_expectation(),
+            SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+            executor,
+        )
+        .unwrap(),
+    );
+    replicator.open().await.unwrap();
+    let task = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    replicator.close().await.unwrap();
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    assert!(replicator.admitted_topology().is_none());
+}
+
 fn bound_replica_set() -> ReplicaSetConfiguration {
     replica_set_with_session_prefix("session")
 }
@@ -876,6 +1110,39 @@ fn bound_replicator_for(
         )
         .unwrap(),
     )
+}
+
+fn bootstrap_replicator_for(
+    local_index: usize,
+    samples: Vec<Result<Observation<InstanceSnapshot>, RuntimeError>>,
+    databases: Vec<Result<Option<StandaloneDatabaseSnapshot>, RuntimeError>>,
+) -> (Arc<SqlServerReplicator>, Arc<ScriptedMutationExecutor>) {
+    let executor = Arc::new(ScriptedMutationExecutor {
+        databases: Mutex::new(databases.into()),
+        effects: Mutex::new(Vec::new()),
+    });
+    let replicator = Arc::new(
+        SqlServerReplicator::new_bootstrap_with_topology(
+            SqlServerServiceConfig::new(
+                ResourceUid::new("resource-a"),
+                format!("replica-{}.example:5022", local_index + 1),
+            )
+            .unwrap(),
+            Arc::new(ScriptedSource {
+                config: observer_config_for(local_index),
+                samples: Mutex::new(samples.into()),
+            }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+            kuberic_identity(local_index as i64 + 1),
+            topology_expectation_for(local_index),
+            SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+            executor.clone(),
+        )
+        .unwrap(),
+    );
+    (replicator, executor)
 }
 
 fn gated_bound_replicator(

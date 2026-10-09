@@ -32,7 +32,7 @@ pub struct TdsExecutor {
 }
 
 #[allow(dead_code)]
-pub(crate) struct TdsMutationExecutor {
+pub struct TdsMutationExecutor {
     settings: ConnectionSettings,
 }
 
@@ -46,6 +46,12 @@ impl TdsExecutor {
 impl TdsMutationExecutor {
     pub(crate) fn new(settings: ConnectionSettings) -> Self {
         Self { settings }
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_new(settings: ConnectionSettings) -> Self {
+        Self::new(settings)
     }
 }
 

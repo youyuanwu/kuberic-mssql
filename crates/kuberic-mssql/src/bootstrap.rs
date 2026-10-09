@@ -87,7 +87,7 @@ pub fn classify_availability_group(
     };
     if group.identity.name != *expected_name
         || expected_group_id.is_some_and(|group_id| group.identity.group_id != *group_id)
-        || group.cluster_type != "EXTERNAL"
+        || !group.cluster_type.eq_ignore_ascii_case("EXTERNAL")
         || group.required_synchronized_secondaries_to_commit != 1
         || group.basic_features
         || group.is_distributed

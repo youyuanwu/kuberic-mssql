@@ -235,6 +235,46 @@ async fn start_public_group_with_retry<C: CleanupClock>(
     unreachable!("bounded public Kuberic retry loop always returns")
 }
 
+async fn start_prepared_public_group_with_retry<C: CleanupClock>(
+    root: &Path,
+    run: &TopologyRun,
+    prepared: &kuberic_mssql_tests::three_replica::PreparedAvailabilityGroup,
+    members: &[ReadyMember; 3],
+    convergence_timeout: Duration,
+    first_deadline: Instant,
+    cleanup: &CleanupCoordinator<C>,
+) -> Result<PublicMssqlGroup, MssqlGroupError> {
+    for attempt in 1..=3 {
+        let deadline = if attempt == 1 {
+            first_deadline
+        } else {
+            Instant::now() + convergence_timeout
+        };
+        match PublicMssqlGroup::from_prepared_with_coordinator(
+            root,
+            run,
+            prepared,
+            members,
+            convergence_timeout,
+            deadline,
+            cleanup,
+        )
+        .await
+        {
+            Ok(group) => return Ok(group),
+            Err(error)
+                if !error.agent_termination_unconfirmed()
+                    && error.to_string().contains("operation was cancelled")
+                    && attempt < 3 =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded prepared public Kuberic retry loop always returns")
+}
+
 async fn execute_live_lifecycle(
     root: &Path,
     config: FixtureConfig,
@@ -244,6 +284,9 @@ async fn execute_live_lifecycle(
     let mut launched = launch_three_members(config)
         .await
         .map_err(|error| -> TestError { Box::new(error) })?;
+    if !validate_restart {
+        return execute_phase2_bootstrap_lifecycle(root, launched, cancellation).await;
+    }
     let topology = launched.provision_availability_group().await?;
     if fault_checkpoint("fail-after-ag") {
         return Err("injected failure after AG provisioning".into());
@@ -365,11 +408,6 @@ async fn execute_live_lifecycle(
         let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
         return finish_runtime_outcome(root, launched, first_outcome, &cleanup);
     }
-    if !validate_restart {
-        let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
-        return finish_runtime_outcome(root, launched, first_outcome, &cleanup);
-    }
-
     let restart_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
     let restarted = match AssertUnwindSafe(start_public_group_with_retry(
         root,
@@ -467,6 +505,99 @@ async fn execute_live_lifecycle(
     if let Err(shutdown) = shutdown {
         let diagnostic = format!(
             "{}; replacement Kuberic shutdown failed before fixture cleanup: {shutdown}",
+            outcome.description()
+        );
+        if let Err(block) = launched.block_cleanup() {
+            return Err(
+                format!("{diagnostic}; ownership journal blocking also failed: {block}").into(),
+            );
+        }
+        return Err(diagnostic.into());
+    }
+    finish_runtime_outcome(root, launched, outcome, &cleanup)
+}
+
+async fn execute_phase2_bootstrap_lifecycle(
+    root: &Path,
+    mut launched: kuberic_mssql_tests::three_replica::LaunchedMembers,
+    cancellation: &mut CancellationSignals,
+) -> Result<(), TestError> {
+    let prepared = launched.prepare_availability_group().await?;
+    if launched.journal().native_binding.is_some() {
+        return Err("prepared fixture unexpectedly claimed a native topology binding".into());
+    }
+    if fault_checkpoint("fail-after-ag") {
+        return Err("injected failure after endpoint and peer preparation".into());
+    }
+    let startup_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let group = match AssertUnwindSafe(start_prepared_public_group_with_retry(
+        root,
+        &launched.run,
+        &prepared,
+        &launched.members,
+        launched.kuberic_convergence_timeout(),
+        launched.complete_deadline(),
+        &startup_cleanup,
+    ))
+    .catch_unwind()
+    .await
+    {
+        Ok(Ok(group)) => group,
+        Ok(Err(error)) => {
+            if error.agent_termination_unconfirmed() {
+                let diagnostic = format!("partial bootstrap host startup failed: {error}");
+                if let Err(block) = launched.block_cleanup() {
+                    return Err(format!(
+                        "{diagnostic}; ownership journal blocking also failed: {block}"
+                    )
+                    .into());
+                }
+                return Err(diagnostic.into());
+            }
+            let fixture_cleanup = launched.cleanup_with_coordinator(&startup_cleanup);
+            return match fixture_cleanup {
+                Ok(_) => Err(Box::new(error)),
+                Err(cleanup) => Err(format!(
+                    "partial bootstrap host startup failed: {error}; cleanup also failed: {cleanup}"
+                )
+                .into()),
+            };
+        }
+        Err(panic) => {
+            let fixture_cleanup = launched.cleanup_with_coordinator(&startup_cleanup);
+            if let Err(cleanup) = fixture_cleanup {
+                let primary = panic_message(&panic);
+                panic!(
+                    "partial bootstrap host startup panicked: {primary}; cleanup also failed: {cleanup}"
+                );
+            }
+            std::panic::resume_unwind(panic);
+        }
+    };
+    let outcome = {
+        let runtime = AssertUnwindSafe(async {
+            if fault_checkpoint("panic-after-agent-start") {
+                panic!("injected panic after bootstrap agent startup");
+            }
+            if fault_checkpoint("fail-during-report") {
+                return Err::<(), TestError>("injected failure during bracketed reporting".into());
+            }
+            let sequence = group.bootstrap_configuration_sequence().await?;
+            wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout())
+                .await?;
+            Ok(())
+        })
+        .catch_unwind();
+        tokio::pin!(runtime);
+        tokio::select! {
+            result = &mut runtime => RuntimeOutcome::Completed(result),
+            signal = cancellation.recv() => RuntimeOutcome::Interrupted(signal),
+        }
+    };
+    let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    if let Err(shutdown) = group.shutdown_with_coordinator(&cleanup).await {
+        let diagnostic = format!(
+            "{}; bootstrap Kuberic shutdown failed before fixture cleanup: {shutdown}",
             outcome.description()
         );
         if let Err(block) = launched.block_cleanup() {

@@ -51,6 +51,11 @@ pub struct ProvisionedAvailabilityGroup {
     pub binding: NativeTopologyBinding,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedAvailabilityGroup {
+    pub endpoint_evidence: [EndpointEvidence; 3],
+}
+
 #[derive(Debug)]
 pub enum AvailabilityGroupError {
     Deadline,
@@ -137,65 +142,30 @@ pub(crate) trait FrozenMemberVerifier {
     ) -> Result<(), AvailabilityGroupError>;
 }
 
-pub(crate) async fn provision<R: ProcessRunner>(
-    context: ProvisionContext<'_, R>,
-) -> Result<ProvisionedAvailabilityGroup, AvailabilityGroupError> {
-    let intent = native_intent(context.run, context.members)?;
-    if context.journal.native_intent.is_some() || context.journal.native_binding.is_some() {
-        return Err(AvailabilityGroupError::Intent);
-    }
-    context.journal.native_intent = Some(intent);
-    context
-        .store
-        .save(context.journal)
-        .map_err(|_| AvailabilityGroupError::Journal)?;
-
+pub(crate) async fn prepare<R: ProcessRunner>(
+    mut context: ProvisionContext<'_, R>,
+) -> Result<PreparedAvailabilityGroup, AvailabilityGroupError> {
     let formation_deadline = earlier(
         Instant::from_std(context.complete_deadline),
         Instant::now() + context.deadlines.availability_group,
     );
-    let mut endpoint_evidence = Vec::with_capacity(3);
-    for index in 0..3 {
-        let mut session =
-            connect_admin(&context, index, "master", false, formation_deadline).await?;
-        create_endpoint(
-            &context,
-            &mut session,
-            context.run,
-            index,
-            context.credentials,
-            formation_deadline,
-        )
-        .await?;
-        endpoint_evidence.push(
-            verify_endpoint(
-                &context,
-                &mut session,
-                context.run,
-                index,
-                formation_deadline,
-            )
-            .await?,
-        );
-    }
-    exchange_endpoint_certificates(&context, formation_deadline.into_std())?;
-    for target in 0..3 {
-        let mut session =
-            connect_admin(&context, target, "master", false, formation_deadline).await?;
-        for peer in 0..3 {
-            if peer != target {
-                authorize_peer(
-                    &context,
-                    &mut session,
-                    context.run,
-                    target,
-                    peer,
-                    formation_deadline,
-                )
-                .await?;
-            }
-        }
-    }
+    let endpoint_evidence = prepare_endpoints_and_peers(&mut context, formation_deadline).await?;
+    observe_fresh_instances(&context, formation_deadline).await?;
+    context.frozen_member_verifier.verify(
+        formation_deadline.into_std(),
+        context.deadlines.docker_command,
+    )?;
+    Ok(PreparedAvailabilityGroup { endpoint_evidence })
+}
+
+pub(crate) async fn provision<R: ProcessRunner>(
+    mut context: ProvisionContext<'_, R>,
+) -> Result<ProvisionedAvailabilityGroup, AvailabilityGroupError> {
+    let formation_deadline = earlier(
+        Instant::from_std(context.complete_deadline),
+        Instant::now() + context.deadlines.availability_group,
+    );
+    let endpoint_evidence = prepare_endpoints_and_peers(&mut context, formation_deadline).await?;
 
     create_and_join_group(&context, formation_deadline).await?;
     create_database(&context, formation_deadline).await?;
@@ -257,9 +227,6 @@ pub(crate) async fn provision<R: ProcessRunner>(
             return Err(AvailabilityGroupError::Deadline);
         }
     };
-    let endpoint_evidence: [EndpointEvidence; 3] = endpoint_evidence
-        .try_into()
-        .map_err(|_| AvailabilityGroupError::Intent)?;
     let fresh_instances = observe_fresh_instances(&context, formation_deadline).await?;
     context.frozen_member_verifier.verify(
         formation_deadline.into_std(),
@@ -287,6 +254,68 @@ pub(crate) async fn provision<R: ProcessRunner>(
         .save(context.journal)
         .map_err(|_| AvailabilityGroupError::Journal)?;
     Ok(ProvisionedAvailabilityGroup { evidence, binding })
+}
+
+async fn prepare_endpoints_and_peers<R: ProcessRunner>(
+    context: &mut ProvisionContext<'_, R>,
+    formation_deadline: Instant,
+) -> Result<[EndpointEvidence; 3], AvailabilityGroupError> {
+    let intent = native_intent(context.run, context.members)?;
+    if context.journal.native_intent.is_some() || context.journal.native_binding.is_some() {
+        return Err(AvailabilityGroupError::Intent);
+    }
+    context.journal.native_intent = Some(intent);
+    context
+        .store
+        .save(context.journal)
+        .map_err(|_| AvailabilityGroupError::Journal)?;
+
+    let mut endpoint_evidence = Vec::with_capacity(3);
+    for index in 0..3 {
+        let mut session =
+            connect_admin(context, index, "master", false, formation_deadline).await?;
+        create_endpoint(
+            context,
+            &mut session,
+            context.run,
+            index,
+            context.credentials,
+            formation_deadline,
+        )
+        .await?;
+        endpoint_evidence.push(
+            verify_endpoint(
+                context,
+                &mut session,
+                context.run,
+                index,
+                formation_deadline,
+            )
+            .await?,
+        );
+    }
+    exchange_endpoint_certificates(context, formation_deadline.into_std())?;
+    for target in 0..3 {
+        let mut session =
+            connect_admin(context, target, "master", false, formation_deadline).await?;
+        for peer in 0..3 {
+            if peer != target {
+                authorize_peer(
+                    context,
+                    &mut session,
+                    context.run,
+                    target,
+                    peer,
+                    formation_deadline,
+                )
+                .await?;
+            }
+        }
+    }
+
+    endpoint_evidence
+        .try_into()
+        .map_err(|_| AvailabilityGroupError::Intent)
 }
 
 fn native_intent(

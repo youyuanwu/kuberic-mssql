@@ -372,6 +372,9 @@ fn native_binding_rejects_sql_restart_after_member_readiness() {
         sql_start_time: format!("2027-01-15T08:00:0{index}"),
         sql_start_unix_millis: 1_800_000_000_000 + index as i64,
         observer_config: PathBuf::from(format!("/fixture/member-{}/observer.json", index + 1)),
+        admin_username: PathBuf::from("/fixture/credentials/admin-username"),
+        admin_password: PathBuf::from("/fixture/credentials/admin-password"),
+        ca_certificate: PathBuf::from("/fixture/tls/ca-certificate.pem"),
     });
     let frozen: [SqlMemberIncarnation; 3] = std::array::from_fn(|index| SqlMemberIncarnation {
         ordinal: launched[index].ordinal,

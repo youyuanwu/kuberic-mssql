@@ -18,7 +18,8 @@ pub use admin::{
 };
 pub use availability_group::{
     AvailabilityGroupError, EndpointEvidence, HADR_ENDPOINT_NAME, HADR_ENDPOINT_PORT,
-    ProvisionedAvailabilityGroup, validate_binding_incarnations, validate_endpoint_evidence,
+    PreparedAvailabilityGroup, ProvisionedAvailabilityGroup, validate_binding_incarnations,
+    validate_endpoint_evidence,
 };
 pub use cleanup::{
     CLEANUP_BUDGET, CancellationSignals, CleanupBackend, CleanupClock, CleanupCompletion,

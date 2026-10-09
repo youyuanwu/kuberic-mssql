@@ -12,8 +12,8 @@ use tokio::time::sleep;
 use kuberic_mssql::runtime_config::ObserverConfig;
 
 use super::availability_group::{
-    AvailabilityGroupError, FrozenMemberVerifier, ProvisionContext, ProvisionedAvailabilityGroup,
-    provision,
+    AvailabilityGroupError, FrozenMemberVerifier, PreparedAvailabilityGroup, ProvisionContext,
+    ProvisionedAvailabilityGroup, prepare, provision,
 };
 use super::data::{DataContext, DataError, MarkerEvidence, prove_replicated_marker};
 use crate::fixture::admin::{
@@ -58,6 +58,9 @@ pub struct ReadyMember {
     pub sql_start_time: String,
     pub sql_start_unix_millis: i64,
     pub observer_config: PathBuf,
+    pub admin_username: PathBuf,
+    pub admin_password: PathBuf,
+    pub ca_certificate: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +150,40 @@ impl LaunchedMembers {
         .await
         .map_err(NativePhaseError::AvailabilityGroup)?;
         Ok(provisioned)
+    }
+
+    pub async fn prepare_availability_group(
+        &mut self,
+    ) -> Result<PreparedAvailabilityGroup, NativePhaseError> {
+        let credentials = self
+            .context
+            .credentials
+            .as_ref()
+            .ok_or(NativePhaseError::Unavailable)?;
+        let tls = self
+            .context
+            .tls
+            .as_ref()
+            .ok_or(NativePhaseError::Unavailable)?;
+        let frozen_member_verifier = LaunchFrozenMemberVerifier {
+            docker: &self.context.docker,
+            containers: &self.context.containers,
+            image_id: &self.context.image_id,
+        };
+        prepare(ProvisionContext {
+            run: &self.run,
+            members: &self.members,
+            credentials,
+            tls,
+            deadlines: self.context.config.deadlines(),
+            complete_deadline: self.context.deadline,
+            store: &self.context.store,
+            journal: &mut self.context.journal,
+            runner: &self.context.runner,
+            frozen_member_verifier: &frozen_member_verifier,
+        })
+        .await
+        .map_err(NativePhaseError::AvailabilityGroup)
     }
 
     pub async fn commit_replicated_marker(
@@ -480,6 +517,9 @@ pub async fn create_blocked_owner_regression_fixture(root: &Path) -> Result<Path
         sql_start_time: "1970-01-01T00:00:00".to_owned(),
         sql_start_unix_millis: 1,
         observer_config: store_root_observer_path(root, index),
+        admin_username: root.join("credentials/admin-username"),
+        admin_password: root.join("credentials/admin-password"),
+        ca_certificate: root.join("tls/ca-certificate.pem"),
     });
     let mut launched = LaunchedMembers {
         context,
@@ -933,6 +973,9 @@ impl LaunchContext {
                 sql_start_time: evidence.sql_start_time,
                 sql_start_unix_millis: evidence.sql_start_unix_millis,
                 observer_config,
+                admin_username: credentials.admin_username.path().to_path_buf(),
+                admin_password: credentials.admin_password.path().to_path_buf(),
+                ca_certificate: tls.ca_certificate.path().to_path_buf(),
             });
             incarnations.push(incarnation);
         }

@@ -25,6 +25,23 @@ impl ConnectionSettings {
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
+
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_with_secret_files(
+        &self,
+        username_file: PathBuf,
+        password_file: PathBuf,
+    ) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            username_file,
+            password_file,
+            ca_certificate_file: self.ca_certificate_file.clone(),
+            connect_timeout: self.connect_timeout,
+            query_timeout: self.query_timeout,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
