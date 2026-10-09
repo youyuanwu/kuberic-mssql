@@ -3229,7 +3229,8 @@ async fn bound_evidence_rejects_identity_incarnation_lineage_role_and_health_dri
         assert!(
             message.contains("binding mismatch")
                 || message.contains("identities differ")
-                || message.contains("configuration or state"),
+                || message.contains("configuration or state")
+                || (name == "process restart" && message.contains("unsafe to continue")),
             "{name}: {message}"
         );
     }

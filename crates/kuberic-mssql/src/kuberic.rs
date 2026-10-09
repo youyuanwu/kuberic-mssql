@@ -758,6 +758,28 @@ pub struct SqlServerReplicator {
     lifecycle: RwLock<ReplicatorLifecycle>,
     role: Mutex<Option<ReplicaRole>>,
     epoch: Mutex<Option<Epoch>>,
+    #[cfg(feature = "kuberic-testing")]
+    observation_injection: Mutex<Option<TestingObservationInjection>>,
+}
+
+#[cfg(feature = "kuberic-testing")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum TestingBootstrapObservation {
+    AvailabilityGroupIdentityOrProfile,
+    LogicalReplicaNativeMismatch,
+    EndpointOrMemberProfile,
+    AssociatedDatabaseIdentityOrRecovery,
+    IncompatibleLineage,
+    SqlProcessIncarnationReplacement,
+}
+
+#[cfg(feature = "kuberic-testing")]
+struct TestingObservationInjection {
+    scenario: TestingBootstrapObservation,
+    snapshot: Option<InstanceSnapshot>,
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 #[derive(Clone)]
@@ -938,6 +960,54 @@ impl SqlServerReplicator {
         Ok(())
     }
 
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_inject_bootstrap_observation(
+        &self,
+        scenario: TestingBootstrapObservation,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), KubericAdapterError> {
+        let mut injection = self
+            .observation_injection
+            .lock()
+            .map_err(|_| KubericAdapterError::NativeConvergenceUnsafe("test observation seam"))?;
+        if injection.is_some() {
+            return Err(KubericAdapterError::SeedState(SeedStateError::AlreadyOwned));
+        }
+        *injection = Some(TestingObservationInjection {
+            scenario,
+            snapshot: None,
+            entered,
+            release,
+        });
+        Ok(())
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_inject_incarnation_observation(
+        &self,
+        snapshot: InstanceSnapshot,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), KubericAdapterError> {
+        let mut injection = self
+            .observation_injection
+            .lock()
+            .map_err(|_| KubericAdapterError::NativeConvergenceUnsafe("test observation seam"))?;
+        if injection.is_some() {
+            return Err(KubericAdapterError::SeedState(SeedStateError::AlreadyOwned));
+        }
+        *injection = Some(TestingObservationInjection {
+            scenario: TestingBootstrapObservation::SqlProcessIncarnationReplacement,
+            snapshot: Some(snapshot),
+            entered,
+            release,
+        });
+        Ok(())
+    }
+
     pub fn new(
         replication_address: String,
         source: Arc<dyn SqlServerObservationSource>,
@@ -1025,6 +1095,8 @@ impl SqlServerReplicator {
             }),
             role: Mutex::new(None),
             epoch: Mutex::new(None),
+            #[cfg(feature = "kuberic-testing")]
+            observation_injection: Mutex::new(None),
         }
     }
 
@@ -1068,6 +1140,21 @@ impl SqlServerReplicator {
         require_progress_role: bool,
         requested_role: Option<ReplicaRole>,
     ) -> Result<(AvailabilityGroupSnapshot, u64), KubericAdapterError> {
+        #[cfg(feature = "kuberic-testing")]
+        let injected = self.take_testing_incarnation_observation().await?;
+        #[cfg(feature = "kuberic-testing")]
+        let observation = match injected {
+            Some(snapshot) => Observation::Present {
+                observed_at_unix_millis: snapshot.observed_at_unix_millis,
+                value: snapshot,
+            },
+            None => self
+                .source
+                .observe()
+                .await
+                .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))?,
+        };
+        #[cfg(not(feature = "kuberic-testing"))]
         let observation = self
             .source
             .observe()
@@ -1200,6 +1287,62 @@ impl SqlServerReplicator {
             }
         };
         Ok((snapshot.instance, group, observed_at))
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    async fn inject_testing_observation(
+        &self,
+        group: &mut AvailabilityGroupSnapshot,
+    ) -> Result<(), KubericAdapterError> {
+        let injection = self
+            .observation_injection
+            .lock()
+            .map_err(|_| KubericAdapterError::NativeConvergenceUnsafe("test observation seam"))?
+            .take();
+        let Some(injection) = injection else {
+            return Ok(());
+        };
+        inject_testing_bootstrap_snapshot(group, injection.scenario)?;
+        let _ = injection.entered.send(());
+        injection
+            .release
+            .await
+            .map_err(|_| KubericAdapterError::Closed)
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    async fn take_testing_incarnation_observation(
+        &self,
+    ) -> Result<Option<InstanceSnapshot>, KubericAdapterError> {
+        let injection = {
+            let mut slot = self.observation_injection.lock().map_err(|_| {
+                KubericAdapterError::NativeConvergenceUnsafe("test observation seam")
+            })?;
+            if slot.as_ref().is_some_and(|injection| {
+                injection.scenario == TestingBootstrapObservation::SqlProcessIncarnationReplacement
+                    && injection.snapshot.is_some()
+            }) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        let Some(mut injection) = injection else {
+            return Ok(None);
+        };
+        let snapshot =
+            injection
+                .snapshot
+                .take()
+                .ok_or(KubericAdapterError::NativeConvergenceUnsafe(
+                    "test observation seam",
+                ))?;
+        let _ = injection.entered.send(());
+        injection
+            .release
+            .await
+            .map_err(|_| KubericAdapterError::Closed)?;
+        Ok(Some(snapshot))
     }
 
     async fn execute_bootstrap_effect(
@@ -1662,8 +1805,21 @@ impl SqlServerReplicator {
         context: &SeedBuildContext,
     ) -> Result<AvailabilityGroupSnapshot, KubericAdapterError> {
         let (instance, group, _) = self.bootstrap_observation(generation, deadline).await?;
-        let group = group.ok_or(KubericAdapterError::AvailabilityGroupAbsent)?;
-        validate_eligible_snapshot(self.source.observer_config(), &instance, &group, false)?;
+        let mut group = group.ok_or(KubericAdapterError::AvailabilityGroupAbsent)?;
+        #[cfg(feature = "kuberic-testing")]
+        self.inject_testing_observation(&mut group).await?;
+        if let Err(error) =
+            validate_eligible_snapshot(self.source.observer_config(), &instance, &group, false)
+        {
+            return Err(match error {
+                KubericAdapterError::UnsupportedProfile(_) => {
+                    KubericAdapterError::NativeConvergenceConflict(
+                        "seed build native availability-group profile",
+                    )
+                }
+                other => other,
+            });
+        }
         validate_seed_binding_evidence(&context.binding, &instance, &group)?;
         Ok(group)
     }
@@ -2279,23 +2435,123 @@ fn seed_member(
     .map_err(KubericAdapterError::SeedState)
 }
 
+#[cfg(feature = "kuberic-testing")]
+fn inject_testing_bootstrap_snapshot(
+    group: &mut AvailabilityGroupSnapshot,
+    scenario: TestingBootstrapObservation,
+) -> Result<(), KubericAdapterError> {
+    let alternate = |value: &str| {
+        Guid::parse("test bootstrap observation GUID", value)
+            .map_err(|_| KubericAdapterError::NativeConvergenceUnsafe("test observation seam"))
+    };
+    match scenario {
+        TestingBootstrapObservation::AvailabilityGroupIdentityOrProfile => {
+            group.identity.group_id = alternate("ffffffff-ffff-ffff-ffff-000000000201")?;
+            group.required_synchronized_secondaries_to_commit = 0;
+        }
+        TestingBootstrapObservation::LogicalReplicaNativeMismatch => {
+            let expected = group.local_replica.identity.clone();
+            let expected_native = expected.native_replica_id().cloned();
+            let conflicting_native = alternate("ffffffff-ffff-ffff-ffff-000000000202")?;
+            group.local_replica.identity = SqlReplicaIdentity::observed(
+                expected.logical_id(),
+                conflicting_native.clone(),
+                expected.incarnation(),
+            )
+            .map_err(|_| KubericAdapterError::NativeConvergenceUnsafe("test observation seam"))?;
+            if let Some(replica) = group
+                .replicas
+                .iter_mut()
+                .find(|replica| Some(&replica.replica_id) == expected_native.as_ref())
+            {
+                replica.replica_id = conflicting_native;
+            }
+        }
+        TestingBootstrapObservation::EndpointOrMemberProfile => {
+            let replica =
+                group
+                    .replicas
+                    .first_mut()
+                    .ok_or(KubericAdapterError::NativeConvergenceUnsafe(
+                        "test observation seam",
+                    ))?;
+            replica.endpoint_url = Some("tcp://conflicting.invalid:5022".to_owned());
+            replica.availability_mode = "ASYNCHRONOUS_COMMIT".to_owned();
+        }
+        TestingBootstrapObservation::AssociatedDatabaseIdentityOrRecovery => {
+            let recovery = group
+                .databases
+                .first_mut()
+                .and_then(|database| database.local.as_mut())
+                .and_then(|local| local.recovery.as_mut())
+                .ok_or(KubericAdapterError::NativeConvergenceUnsafe(
+                    "test observation seam",
+                ))?;
+            recovery.database_guid = Some(alternate("ffffffff-ffff-ffff-ffff-000000000203")?);
+        }
+        TestingBootstrapObservation::IncompatibleLineage => {
+            let local_replica_id = group
+                .local_replica
+                .identity
+                .native_replica_id()
+                .cloned()
+                .ok_or(KubericAdapterError::NativeConvergenceUnsafe(
+                    "test observation seam",
+                ))?;
+            let database =
+                group
+                    .databases
+                    .first_mut()
+                    .ok_or(KubericAdapterError::NativeConvergenceUnsafe(
+                        "test observation seam",
+                    ))?;
+            let database_identity = database.identity.clone();
+            let mut injected = false;
+            for target in database
+                .replicas
+                .iter_mut()
+                .filter(|replica| replica.replica_id != local_replica_id)
+            {
+                target.lineage = RecoveryLineageObservation::Local {
+                    value: DatabaseLineage {
+                        database: database_identity.clone(),
+                        recovery_fork_id: alternate("ffffffff-ffff-ffff-ffff-000000000204")?,
+                    },
+                };
+                injected = true;
+            }
+            if !injected {
+                return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                    "test observation seam",
+                ));
+            }
+        }
+        TestingBootstrapObservation::SqlProcessIncarnationReplacement => {}
+    }
+    Ok(())
+}
+
 fn validate_seed_binding_evidence(
     binding: &HealthyTopologyBinding,
     instance: &crate::observation::InstanceMetadata,
     group: &AvailabilityGroupSnapshot,
 ) -> Result<(), KubericAdapterError> {
     let local = binding.local_member();
+    if instance.sqlserver_start_time != binding.local_sql_server_start_incarnation.as_str() {
+        return Err(KubericAdapterError::NativeConvergenceUnsafe(
+            "SQL Server process incarnation",
+        ));
+    }
     if local.stable_role != ReplicaRole::Primary
         || instance.server_name != *local.server_name()
         || instance.property_server_name != *local.server_name()
-        || instance.sqlserver_start_time != binding.local_sql_server_start_incarnation.as_str()
         || group.identity != binding.availability_group
         || group.local_replica.identity != binding.local_sql_replica_identity
         || group.local_replica.role != Some(NativeRole::Primary)
         || group.replicas.len() != binding.members.len()
     {
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "seed build native source, availability group, or SQL incarnation differs",
+        return Err(KubericAdapterError::NativeConvergenceConflict(
+            "seed build native source or availability group differs",
         ));
     }
     for member in &binding.members {
@@ -2309,7 +2565,7 @@ fn validate_seed_binding_evidence(
             })
             .count();
         if matches != 1 {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
+            return Err(KubericAdapterError::NativeConvergenceConflict(
                 "seed build native replica membership differs",
             ));
         }
@@ -3224,6 +3480,11 @@ fn validate_bound_evidence(
 ) -> Result<(), KubericAdapterError> {
     let local = binding.local_member();
     let target = config.target();
+    if instance.sqlserver_start_time != binding.local_sql_server_start_incarnation.as_str() {
+        return Err(KubericAdapterError::NativeConvergenceUnsafe(
+            "SQL Server process incarnation",
+        ));
+    }
     if binding.database_lineage.is_some()
         && group.configuration_sequence != binding.native_configuration_sequence
     {
@@ -3235,7 +3496,6 @@ fn validate_bound_evidence(
         || target.replica.incarnation() != binding.local_sql_replica_identity.incarnation()
         || instance.server_name != *local.server_name()
         || instance.property_server_name != *local.server_name()
-        || instance.sqlserver_start_time != binding.local_sql_server_start_incarnation.as_str()
     {
         return Err(KubericAdapterError::TopologyBindingMismatch(
             "local SQL server or incarnation evidence differs",

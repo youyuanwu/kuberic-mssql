@@ -110,7 +110,7 @@ impl LaunchedMembers {
             .map_err(|_| NativeLaunchError::Journal)
     }
 
-    pub fn restart_sql_process_for_test(&self, index: usize) -> Result<(), NativeLaunchError> {
+    pub fn restart_sql_process_for_test(&mut self, index: usize) -> Result<u16, NativeLaunchError> {
         let member = self
             .members
             .get(index)
@@ -128,7 +128,25 @@ impl LaunchedMembers {
         self.context
             .docker
             .start_container(&member.container_id, timeout)
-            .map_err(NativeLaunchError::Docker)
+            .map_err(NativeLaunchError::Docker)?;
+        let inspection = self
+            .context
+            .docker
+            .inspect_container(
+                &member.container_id,
+                self.context
+                    .limit(self.context.config.deadlines().docker_command)?,
+            )
+            .map_err(NativeLaunchError::Docker)?
+            .ok_or(NativeLaunchError::Ownership)?;
+        let host_port = inspection
+            .ports
+            .iter()
+            .find(|port| port.container_port == 1433 && port.host_ip == "127.0.0.1")
+            .map(|port| port.host_port)
+            .ok_or(NativeLaunchError::Readiness)?;
+        self.members[index].host_port = host_port;
+        Ok(host_port)
     }
 
     pub async fn provision_native_topology(&mut self) -> Result<NativeDataProof, NativePhaseError> {

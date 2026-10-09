@@ -11,10 +11,9 @@ use futures::future::join_all;
 use kuberic_mssql::instance::SqlServerInstanceManager;
 use kuberic_mssql::kuberic::{
     SqlServerBootstrapConfig, SqlServerObservationSource, SystemObservationClock,
+    TestingBootstrapObservation,
 };
-use kuberic_mssql::observation::{
-    AvailabilityGroupSnapshot, InstanceSnapshot, RecoveryLineageObservation,
-};
+use kuberic_mssql::observation::InstanceSnapshot;
 use kuberic_mssql::runtime_config::ObserverConfig;
 use kuberic_mssql::runtime_error::RuntimeError;
 use kuberic_mssql::runtime_host::{
@@ -23,10 +22,8 @@ use kuberic_mssql::runtime_host::{
 };
 use kuberic_mssql::tds::{TdsExecutor, TdsMutationExecutor};
 use kuberic_mssql::{
-    DatabaseLineage, Endpoint, Guid, MutationEffect, NativeConvergenceState, NativeRole,
-    Observation, ObservationFailureKind, ReplicaDescriptor, ReplicaIdentity as SqlReplicaIdentity,
-    SqlIdentifier, SqlMutationExecutor, StandaloneDatabaseSnapshot, classify_availability_group,
-    classify_replica_join, classify_replica_seed, classify_standalone_database,
+    Guid, MutationEffect, NativeRole, Observation, ObservationFailureKind, SqlIdentifier,
+    SqlMutationExecutor, StandaloneDatabaseSnapshot,
 };
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::application::StatefulServiceReplica;
@@ -37,7 +34,9 @@ use kuberic_runtime::protocol::types::{
     EffectivePolicy, Epoch, OperationId, PodUid, PvcUid, ReplicaId, ReplicaIdentity,
     ReplicaInstanceId, ReplicaRole, ResourceUid, derive_agent_generation, derive_initialization_id,
 };
-use kuberic_runtime::replicator::{PrimaryReplicator, ReplicaInformation};
+use kuberic_runtime::replicator::{
+    PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, Replicator,
+};
 use tonic::{Request, transport::Channel};
 
 use super::availability_group::PreparedAvailabilityGroup;
@@ -63,7 +62,9 @@ pub struct PublicMssqlPod {
     source: Source,
     application: Arc<RuntimeHostApplication>,
     application_root: PathBuf,
+    observer_config_path: PathBuf,
     mutation: Option<Arc<PublicMutationExecutor>>,
+    conflict_injection: PublicConflictInjection,
 }
 
 pub struct PublicMssqlGroup {
@@ -106,16 +107,86 @@ struct PublicMutationExecutor {
     ordinal: u8,
     seed_dispatches: AtomicUsize,
     faults: PublicFaultInjection,
+    conflicts: PublicConflictInjection,
 }
 
 impl PublicMutationExecutor {
-    fn new(inner: TdsMutationExecutor, ordinal: u8, faults: PublicFaultInjection) -> Self {
+    fn new(
+        inner: TdsMutationExecutor,
+        ordinal: u8,
+        faults: PublicFaultInjection,
+        conflicts: PublicConflictInjection,
+    ) -> Self {
         Self {
             inner,
             ordinal,
             seed_dispatches: AtomicUsize::new(0),
             faults,
+            conflicts,
         }
+    }
+}
+
+#[derive(Default)]
+struct PublicConflictState {
+    scenario: Option<LicensedConflictScenario>,
+    gate: Option<SeedGate>,
+}
+
+#[derive(Clone, Default)]
+struct PublicConflictInjection {
+    state: Arc<Mutex<PublicConflictState>>,
+}
+
+struct SeedGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl PublicConflictInjection {
+    fn arm(
+        &self,
+        scenario: LicensedConflictScenario,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), MssqlGroupError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MssqlGroupError::new("licensed conflict injection lock is poisoned"))?;
+        if state.scenario.is_some() || state.gate.is_some() {
+            return Err(MssqlGroupError::new(
+                "licensed conflict injection is already armed",
+            ));
+        }
+        state.scenario = Some(scenario);
+        state.gate = Some(SeedGate { entered, release });
+        Ok(())
+    }
+
+    fn scenario(&self) -> Option<LicensedConflictScenario> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .scenario
+    }
+
+    async fn pause_once(&self) -> Result<(), RuntimeError> {
+        let gate = self.state.lock().map_err(|_| injected_fault())?.gate.take();
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            gate.release.await.map_err(|_| injected_fault())?;
+        }
+        Ok(())
+    }
+
+    fn clear(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.scenario = None;
+        state.gate = None;
     }
 }
 
@@ -202,7 +273,19 @@ impl SqlMutationExecutor for PublicMutationExecutor {
         &self,
         database: &SqlIdentifier,
     ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
-        self.inner.observe_standalone_database(database).await
+        let mut observation = self.inner.observe_standalone_database(database).await?;
+        if self.ordinal == 1
+            && self.conflicts.scenario()
+                == Some(LicensedConflictScenario::StandaloneDatabaseIdentityOrRecovery)
+        {
+            let snapshot = observation.as_mut().ok_or_else(injected_fault)?;
+            snapshot.recovery_model = "SIMPLE".to_owned();
+            if let Some(identity) = snapshot.identity.as_mut() {
+                identity.database_guid = alternate_guid(205).map_err(|_| injected_fault())?;
+            }
+            self.conflicts.pause_once().await?;
+        }
+        Ok(observation)
     }
 
     async fn execute(&self, effect: &MutationEffect) -> Result<(), RuntimeError> {
@@ -397,6 +480,7 @@ impl PublicMssqlGroup {
             identities: &identities,
         };
         for index in 0..3 {
+            let conflict_injection = PublicConflictInjection::default();
             let config = runtime_config(&config_context, index).await?;
             let application_root = config.application_root().to_owned();
             let observer = ObserverConfig::read(&members[index].observer_config)
@@ -413,6 +497,7 @@ impl PublicMssqlGroup {
                     TdsMutationExecutor::testing_new(settings),
                     index as u8 + 1,
                     faults.clone(),
+                    conflict_injection.clone(),
                 ))
             });
             let source = Arc::new(SqlServerInstanceManager::new(
@@ -466,7 +551,9 @@ impl PublicMssqlGroup {
                 source,
                 application,
                 application_root,
+                observer_config_path: members[index].observer_config.clone(),
                 mutation,
+                conflict_injection,
             });
         }
         let mut pods: [PublicMssqlPod; 3] = pods
@@ -842,6 +929,23 @@ impl PublicMssqlGroup {
         self.execute_admitted_seed_callback(command).await
     }
 
+    pub async fn testing_execute_admitted_seed_callback_with_retry(
+        &self,
+        command: &PublicBuildCommand,
+    ) -> Result<(), tonic::Status> {
+        let deadline = tokio::time::Instant::now() + self.operation_timeout;
+        loop {
+            let result = self.execute_admitted_seed_callback(command).await;
+            if result.as_ref().is_err_and(retryable_public_build_error)
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            return result;
+        }
+    }
+
     pub fn testing_spawn_admitted_seed_callback(
         &self,
         command: &PublicBuildCommand,
@@ -868,8 +972,21 @@ impl PublicMssqlGroup {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
+
             return result;
         }
+    }
+
+    pub async fn testing_admit_target_build_authority_only(
+        &self,
+        command: &PublicBuildCommand,
+    ) -> Result<(), tonic::Status> {
+        let timeout_duration = self.operation_timeout.min(
+            remaining(self.complete_deadline, "public target admission")
+                .map_err(|error| tonic::Status::deadline_exceeded(error.to_string()))?,
+        );
+        self.admit_target_build_authority(command, timeout_duration)
+            .await
     }
 
     pub async fn testing_assert_build_success_not_published(
@@ -891,217 +1008,241 @@ impl PublicMssqlGroup {
             .await
     }
 
-    pub async fn testing_classify_licensed_conflict(
+    pub fn testing_arm_licensed_conflict(
         &self,
         scenario: LicensedConflictScenario,
-    ) -> Result<NativeConvergenceState, MssqlGroupError> {
-        if scenario == LicensedConflictScenario::SqlProcessIncarnationReplacement {
-            let topology = self.pods[1]
-                .application
-                .testing_replicator()
-                .and_then(|replicator| replicator.admitted_topology())
-                .ok_or_else(|| MssqlGroupError::new("licensed admitted topology is unavailable"))?;
-            let observation = self.pods[1].source.observe().await;
-            let snapshot = match observation {
-                Ok(Observation::Present { value, .. }) => value,
-                Ok(Observation::Absent { .. } | Observation::Failed(_)) | Err(_) => {
-                    return Ok(NativeConvergenceState::Unsafe);
-                }
-            };
-            if topology
-                .validate_snapshot(
-                    self.pods[1].source.observer_config(),
-                    &snapshot,
-                    snapshot.observed_at_unix_millis,
-                    false,
-                    None,
-                )
-                .is_err()
-            {
-                return Ok(NativeConvergenceState::Unsafe);
-            }
-            return Err(MssqlGroupError::new(
-                "licensed SQL process replacement was not rejected",
-            ));
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), MssqlGroupError> {
+        if scenario == LicensedConflictScenario::StandaloneDatabaseIdentityOrRecovery {
+            return self.pods[0]
+                .conflict_injection
+                .arm(scenario, entered, release);
         }
-        let snapshots =
-            observe_sources(&self.pods, self.operation_timeout, self.complete_deadline).await?;
-        let primary = snapshots
-            .iter()
-            .find(|snapshot| {
-                matches!(
-                    &snapshot.availability_group,
-                    Observation::Present { value, .. }
-                        if value.local_replica.role == Some(NativeRole::Primary)
-                )
-            })
-            .ok_or_else(|| MssqlGroupError::new("licensed primary snapshot is unavailable"))?;
-        let group = present_group(primary)?.clone();
-        let descriptors = licensed_descriptors(&group)?;
-        let database = group
-            .databases
-            .first()
-            .ok_or_else(|| MssqlGroupError::new("licensed database snapshot is unavailable"))?;
-        let standalone = self.pods[0]
-            .mutation
-            .as_ref()
-            .ok_or_else(|| MssqlGroupError::new("licensed mutation executor is unavailable"))?
-            .observe_standalone_database(&database.identity.name)
-            .await
-            .map_err(display_error)?
-            .ok_or_else(|| MssqlGroupError::new("licensed standalone database is unavailable"))?;
-        let standalone_identity = standalone
-            .identity
-            .clone()
-            .ok_or_else(|| MssqlGroupError::new("licensed standalone identity is unavailable"))?;
-
-        Ok(match scenario {
+        let scenario = match scenario {
             LicensedConflictScenario::AvailabilityGroupIdentityOrProfile => {
-                let expected_group_id = group.identity.group_id.clone();
-                let mut conflicting = group.clone();
-                conflicting.identity.group_id = alternate_guid(201)?;
-                conflicting.required_synchronized_secondaries_to_commit = 0;
-                classify_availability_group(
-                    Some(&conflicting),
-                    &group.identity.name,
-                    Some(&expected_group_id),
-                    &descriptors,
-                    &database.identity.name,
-                    Some(&standalone_identity),
-                    false,
-                )
+                TestingBootstrapObservation::AvailabilityGroupIdentityOrProfile
             }
             LicensedConflictScenario::LogicalReplicaNativeMismatch => {
-                let expected = group.local_replica.identity.clone();
-                let mut conflicting = group.clone();
-                conflicting.local_replica.identity = SqlReplicaIdentity::observed(
-                    expected.logical_id(),
-                    alternate_guid(202)?,
-                    expected.incarnation(),
-                )
-                .map_err(display_error)?;
-                let local = group
-                    .replicas
-                    .iter()
-                    .find(|replica| expected.native_replica_id() == Some(&replica.replica_id))
-                    .ok_or_else(|| {
-                        MssqlGroupError::new("licensed local native replica is unavailable")
-                    })?;
-                classify_replica_join(
-                    Some(&conflicting),
-                    &group.identity,
-                    &expected,
-                    &local.server_name,
-                    local.endpoint_url.as_deref().unwrap_or_default(),
-                    false,
-                )
+                TestingBootstrapObservation::LogicalReplicaNativeMismatch
             }
             LicensedConflictScenario::EndpointOrMemberProfile => {
-                let mut conflicting = group.clone();
-                let replica = conflicting.replicas.first_mut().ok_or_else(|| {
-                    MssqlGroupError::new("licensed replica profile is unavailable")
-                })?;
-                replica.endpoint_url = Some("tcp://conflicting.invalid:5022".to_owned());
-                replica.availability_mode = "ASYNCHRONOUS_COMMIT".to_owned();
-                classify_availability_group(
-                    Some(&conflicting),
-                    &group.identity.name,
-                    Some(&group.identity.group_id),
-                    &descriptors,
-                    &database.identity.name,
-                    Some(&standalone_identity),
-                    false,
-                )
-            }
-            LicensedConflictScenario::StandaloneDatabaseIdentityOrRecovery => {
-                let mut conflicting = standalone.clone();
-                conflicting.recovery_model = "SIMPLE".to_owned();
-                let ownership = standalone.ownership.as_ref().ok_or_else(|| {
-                    MssqlGroupError::new("licensed standalone ownership is unavailable")
-                })?;
-                classify_standalone_database(
-                    Some(&conflicting),
-                    Some(&standalone_identity),
-                    ownership,
-                    false,
-                )
+                TestingBootstrapObservation::EndpointOrMemberProfile
             }
             LicensedConflictScenario::AssociatedDatabaseIdentityOrRecovery => {
-                let mut conflicting = group.clone();
-                let recovery = conflicting
-                    .databases
-                    .first_mut()
-                    .and_then(|database| database.local.as_mut())
-                    .and_then(|local| local.recovery.as_mut())
-                    .ok_or_else(|| {
-                        MssqlGroupError::new("licensed associated recovery is unavailable")
-                    })?;
-                recovery.database_guid = Some(alternate_guid(203)?);
-                classify_availability_group(
-                    Some(&conflicting),
-                    &group.identity.name,
-                    Some(&group.identity.group_id),
-                    &descriptors,
-                    &database.identity.name,
-                    Some(&standalone_identity),
-                    false,
-                )
+                TestingBootstrapObservation::AssociatedDatabaseIdentityOrRecovery
             }
             LicensedConflictScenario::IncompatibleLineage => {
-                let topology = self.pods[0]
-                    .application
-                    .testing_replicator()
-                    .and_then(|replicator| replicator.admitted_topology())
-                    .ok_or_else(|| {
-                        MssqlGroupError::new("licensed admitted topology is unavailable")
-                    })?;
-                let expected_lineage = topology.database_lineage().ok_or_else(|| {
-                    MssqlGroupError::new("licensed admitted lineage is unavailable")
-                })?;
-                let target = group
-                    .replicas
-                    .iter()
-                    .find(|replica| {
-                        replica.replica_id
-                            != *group
-                                .local_replica
-                                .identity
-                                .native_replica_id()
-                                .expect("licensed primary has a native ID")
-                    })
-                    .ok_or_else(|| MssqlGroupError::new("licensed target is unavailable"))?;
-                let mut conflicting = group.clone();
-                let target_snapshot = conflicting
-                    .databases
-                    .first_mut()
-                    .and_then(|database| {
-                        database
-                            .replicas
-                            .iter_mut()
-                            .find(|replica| replica.replica_id == target.replica_id)
-                    })
-                    .ok_or_else(|| {
-                        MssqlGroupError::new("licensed target database is unavailable")
-                    })?;
-                target_snapshot.lineage = RecoveryLineageObservation::Local {
-                    value: DatabaseLineage {
-                        database: database.identity.clone(),
-                        recovery_fork_id: alternate_guid(204)?,
-                    },
-                };
-                classify_replica_seed(
-                    Some(&conflicting),
-                    &group.identity,
-                    &database.identity,
-                    expected_lineage,
-                    &target.replica_id,
-                    false,
-                )
+                TestingBootstrapObservation::IncompatibleLineage
             }
             LicensedConflictScenario::SqlProcessIncarnationReplacement => {
-                unreachable!("SQL process replacement returns before the shared matrix")
+                TestingBootstrapObservation::SqlProcessIncarnationReplacement
             }
-        })
+            LicensedConflictScenario::StandaloneDatabaseIdentityOrRecovery => unreachable!(),
+        };
+        let pod_index =
+            usize::from(scenario == TestingBootstrapObservation::SqlProcessIncarnationReplacement);
+        self.pods[pod_index]
+            .application
+            .testing_replicator()
+            .ok_or_else(|| MssqlGroupError::new("bootstrap source replicator is unavailable"))?
+            .testing_inject_bootstrap_observation(scenario, entered, release)
+            .map_err(|error| MssqlGroupError::new(error.to_string()))
+    }
+
+    pub fn testing_clear_licensed_conflict(&self) {
+        self.pods[0].conflict_injection.clear();
+    }
+
+    pub fn testing_arm_incarnation_conflict(
+        &self,
+        snapshot: InstanceSnapshot,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), MssqlGroupError> {
+        self.pods[1]
+            .application
+            .testing_replicator()
+            .ok_or_else(|| MssqlGroupError::new("bootstrap secondary replicator is unavailable"))?
+            .testing_inject_incarnation_observation(snapshot, entered, release)
+            .map_err(|error| MssqlGroupError::new(error.to_string()))
+    }
+
+    pub async fn testing_execute_primary_configuration_callback(
+        &self,
+    ) -> Result<(), MssqlGroupError> {
+        self.testing_execute_configuration_callback(0).await
+    }
+
+    pub async fn testing_execute_secondary_admitted_validator(
+        &self,
+    ) -> Result<(), MssqlGroupError> {
+        self.pods[1]
+            .application
+            .testing_replicator()
+            .ok_or_else(|| MssqlGroupError::new("bootstrap secondary replicator is unavailable"))?
+            .current_progress()
+            .await
+            .map(|_| ())
+            .map_err(|error| MssqlGroupError::new(error.to_string()))
+    }
+
+    async fn testing_execute_configuration_callback(
+        &self,
+        pod_index: usize,
+    ) -> Result<(), MssqlGroupError> {
+        let replicator = self.pods[pod_index]
+            .application
+            .testing_replicator()
+            .ok_or_else(|| MssqlGroupError::new("bootstrap source replicator is unavailable"))?;
+        let replicas = self
+            .pods
+            .iter()
+            .map(|member| {
+                let mut replica = ReplicaInformation::new(
+                    OperationId::default(),
+                    member.identity.clone(),
+                    replicator
+                        .admitted_topology()
+                        .and_then(|topology| {
+                            topology
+                                .members()
+                                .iter()
+                                .find(|candidate| candidate.kuberic_identity() == &member.identity)
+                                .map(|candidate| candidate.replication_address().to_owned())
+                        })
+                        .unwrap_or_default(),
+                );
+                replica.process_session_id = member.session.clone();
+                replica.role = member.stable_role;
+                replica
+            })
+            .collect();
+        replicator
+            .update_current_replica_set_configuration(ReplicaSetConfiguration {
+                configuration: self.configuration.clone(),
+                replicas,
+            })
+            .await
+            .map_err(|error| MssqlGroupError::new(error.to_string()))
+    }
+
+    pub fn testing_frozen_secondary_start_identity(&self) -> Result<String, MssqlGroupError> {
+        self.testing_frozen_start_identity(1)
+    }
+
+    fn testing_frozen_start_identity(&self, pod_index: usize) -> Result<String, MssqlGroupError> {
+        self.pods[pod_index]
+            .application
+            .testing_replicator()
+            .and_then(|replicator| replicator.admitted_topology())
+            .map(|topology| {
+                topology
+                    .local_sql_server_start_incarnation()
+                    .as_str()
+                    .to_owned()
+            })
+            .ok_or_else(|| MssqlGroupError::new("licensed admitted topology is unavailable"))
+    }
+
+    pub async fn testing_wait_for_fresh_secondary_observation(
+        &self,
+        frozen: &str,
+        host_port: u16,
+        timeout: Duration,
+    ) -> Result<InstanceSnapshot, MssqlGroupError> {
+        let bytes = fs::read(&self.pods[1].observer_config_path).map_err(display_error)?;
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(display_error)?;
+        document["port"] = serde_json::Value::from(host_port);
+        let observer =
+            ObserverConfig::from_json(&serde_json::to_vec(&document).map_err(display_error)?)
+                .map_err(display_error)?;
+        let source = SqlServerInstanceManager::new(
+            TdsExecutor::new(observer.connection().clone()),
+            observer,
+        );
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut last_retryable = "no observation attempted".to_owned();
+        loop {
+            match source.observe().await {
+                Ok(Observation::Present { value, .. })
+                    if value.instance.sqlserver_start_time != frozen =>
+                {
+                    return Ok(value);
+                }
+                Ok(Observation::Present { .. }) if tokio::time::Instant::now() >= deadline => {
+                    return Err(MssqlGroupError::new(format!(
+                        "SQL Server restart retained the frozen start identity; last setup observation: {last_retryable}"
+                    )));
+                }
+                Ok(Observation::Absent { .. } | Observation::Failed(_)) | Err(_)
+                    if tokio::time::Instant::now() >= deadline =>
+                {
+                    return Err(MssqlGroupError::new(format!(
+                        "fresh present SQL Server observation was unavailable after restart; last setup observation: {last_retryable}"
+                    )));
+                }
+                Ok(Observation::Present { value, .. }) => {
+                    last_retryable = format!(
+                        "present with unchanged start identity {}",
+                        value.instance.sqlserver_start_time
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Ok(Observation::Absent { .. }) => {
+                    last_retryable = "absent".to_owned();
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Ok(Observation::Failed(failure)) => {
+                    last_retryable = format!("failed: {:?}", failure.kind);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Err(error) => {
+                    last_retryable = format!("unavailable: {error}");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+
+    pub async fn testing_assert_source_build_success_never_published(
+        &self,
+        command: &PublicBuildCommand,
+        duration: Duration,
+    ) -> Result<(), MssqlGroupError> {
+        let deadline = tokio::time::Instant::now() + duration;
+        loop {
+            self.testing_assert_source_build_success_not_published(command)
+                .await?;
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    pub async fn testing_assert_exactly_one_durable_build_success(
+        &self,
+        command: &PublicBuildCommand,
+    ) -> Result<(), MssqlGroupError> {
+        let mut count = 0;
+        for pod in &self.pods {
+            let (_, report) = status(pod, self.operation_timeout).await?;
+            count += report
+                .builds
+                .iter()
+                .filter(|build| build.build_id == command.build_id.as_str() && build.completed)
+                .count();
+        }
+        if count == 1 {
+            Ok(())
+        } else {
+            Err(MssqlGroupError::new(format!(
+                "build {} has {count} durable successes instead of exactly one",
+                command.build_id
+            )))
+        }
     }
 
     async fn assert_build_success_not_published_by(
@@ -1133,45 +1274,8 @@ impl PublicMssqlGroup {
                 .map_err(|error| tonic::Status::deadline_exceeded(error.to_string()))?,
         );
         if !command.retire {
-            let target = self
-                .pods
-                .iter()
-                .find(|pod| pod.identity == command.target)
-                .ok_or_else(|| tonic::Status::failed_precondition("target pod is unavailable"))?;
-            let (mut target_client, target_report) = status(target, timeout_duration)
-                .await
-                .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
-            let authority = BuildAuthority {
-                build_id: command.build_id.clone(),
-                kind: BuildAuthorityKind::Failover,
-                source: source.identity.clone(),
-                target: command.target.clone(),
-                current_configuration: self.configuration.clone(),
-                replication_boundary_lsn: 0,
-            };
-            let target_request = authorized(wire::ExecuteCommandRequest {
-                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
-                resource_uid: self.resource_uid.to_string(),
-                target: Some(command.target.clone().into()),
-                expected_process_session_id: target_report.process_session_id,
-                command: Some(wire::execute_command_request::Command::EnsureReplicaBuild(
-                    wire::EnsureReplicaBuildCommand {
-                        operation_id: command.operation_id.to_string(),
-                        local_replica_id: command.target.replica_id.value(),
-                        expected_instance_id: command.target.instance_id.to_string(),
-                        expected_agent_generation: command.target.agent_generation.to_string(),
-                        target: Some(command.target.clone().into()),
-                        authority: Some(authority.into()),
-                        source_session_id: source.session.to_string(),
-                        retire: false,
-                    },
-                )),
-            });
-            tokio::time::timeout(timeout_duration, target_client.execute(target_request))
-                .await
-                .map_err(|_| {
-                    tonic::Status::deadline_exceeded("public target admission timed out")
-                })??;
+            self.admit_target_build_authority(command, timeout_duration)
+                .await?;
         }
         let (mut client, report) = status(source, timeout_duration)
             .await
@@ -1201,6 +1305,52 @@ impl PublicMssqlGroup {
         if command.retire {
             return Ok(());
         }
+        Ok(())
+    }
+
+    async fn admit_target_build_authority(
+        &self,
+        command: &PublicBuildCommand,
+        timeout_duration: Duration,
+    ) -> Result<(), tonic::Status> {
+        let source = &self.pods[0];
+        let target = self
+            .pods
+            .iter()
+            .find(|pod| pod.identity == command.target)
+            .ok_or_else(|| tonic::Status::failed_precondition("target pod is unavailable"))?;
+        let (mut target_client, target_report) = status(target, timeout_duration)
+            .await
+            .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+        let authority = BuildAuthority {
+            build_id: command.build_id.clone(),
+            kind: BuildAuthorityKind::Failover,
+            source: source.identity.clone(),
+            target: command.target.clone(),
+            current_configuration: self.configuration.clone(),
+            replication_boundary_lsn: 0,
+        };
+        let target_request = authorized(wire::ExecuteCommandRequest {
+            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+            resource_uid: self.resource_uid.to_string(),
+            target: Some(command.target.clone().into()),
+            expected_process_session_id: target_report.process_session_id,
+            command: Some(wire::execute_command_request::Command::EnsureReplicaBuild(
+                wire::EnsureReplicaBuildCommand {
+                    operation_id: command.operation_id.to_string(),
+                    local_replica_id: command.target.replica_id.value(),
+                    expected_instance_id: command.target.instance_id.to_string(),
+                    expected_agent_generation: command.target.agent_generation.to_string(),
+                    target: Some(command.target.clone().into()),
+                    authority: Some(authority.into()),
+                    source_session_id: source.session.to_string(),
+                    retire: false,
+                },
+            )),
+        });
+        tokio::time::timeout(timeout_duration, target_client.execute(target_request))
+            .await
+            .map_err(|_| tonic::Status::deadline_exceeded("public target admission timed out"))??;
         Ok(())
     }
 
@@ -1331,40 +1481,6 @@ impl PublicMssqlGroup {
     }
 }
 
-fn present_group(
-    snapshot: &InstanceSnapshot,
-) -> Result<&AvailabilityGroupSnapshot, MssqlGroupError> {
-    match &snapshot.availability_group {
-        Observation::Present { value, .. } => Ok(value),
-        _ => Err(MssqlGroupError::new(
-            "licensed availability-group snapshot is unavailable",
-        )),
-    }
-}
-
-fn licensed_descriptors(
-    group: &AvailabilityGroupSnapshot,
-) -> Result<Vec<ReplicaDescriptor>, MssqlGroupError> {
-    group
-        .replicas
-        .iter()
-        .enumerate()
-        .map(|(index, replica)| {
-            Ok(ReplicaDescriptor {
-                identity: SqlReplicaIdentity::observed(
-                    format!("licensed-conflict-replica-{}", index + 1),
-                    replica.replica_id.clone(),
-                    format!("licensed-conflict-incarnation-{}", index + 1),
-                )
-                .map_err(display_error)?,
-                server_name: replica.server_name.clone(),
-                endpoint: Endpoint::new(replica.server_name.as_str(), 5022)
-                    .map_err(display_error)?,
-            })
-        })
-        .collect()
-}
-
 fn alternate_guid(index: u16) -> Result<Guid, MssqlGroupError> {
     Guid::parse(
         "licensed conflict GUID",
@@ -1381,6 +1497,10 @@ fn retryable_public_build_error(error: &tonic::Status) -> bool {
             && error
                 .message()
                 .contains("SQL Server observation is unavailable: Malformed"))
+        || (error.code() == tonic::Code::Internal
+            && error
+                .message()
+                .contains("current configuration replay differs from the admitted value"))
 }
 
 async fn admit_bootstrap_replicators(

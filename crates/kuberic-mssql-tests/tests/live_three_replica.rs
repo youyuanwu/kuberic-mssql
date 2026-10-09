@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
-use kuberic_mssql::{NativeConvergenceState, runtime_host::SeedDispatchPhase};
+use kuberic_mssql::runtime_host::SeedDispatchPhase;
 use kuberic_mssql_tests::three_replica::{
     CLEANUP_BUDGET, CancellationSignals, CleanupClock, CleanupCoordinator, CombinedFixtureError,
     FixtureConfig, HandledCancellationSignal, JournalStore, LaunchedMembers,
@@ -1223,7 +1223,8 @@ async fn execute_phase4_fault_boundaries(base_root: &Path) -> Result<(), TestErr
     ] {
         exercise_configuration_fault(base_root, fault, label).await?;
     }
-    exercise_seed_faults(&base_root.join("seed-boundaries")).await
+    exercise_seed_faults(&base_root.join("seed-boundaries")).await?;
+    exercise_post_native_success_replay(&base_root.join("post-native-success")).await
 }
 
 async fn exercise_configuration_fault(
@@ -1311,7 +1312,7 @@ async fn converge_minimal_seeded_topology(
     let winner =
         group.target_build_command(1, format!("{label}-build-2"), format!("{label}-build-2"))?;
     group
-        .testing_execute_admitted_seed_callback(&winner)
+        .testing_execute_admitted_seed_callback_with_retry(&winner)
         .await
         .map_err(|error| format!("{label} same-root seed retry failed: {error}"))?;
     let topology = launched
@@ -1320,7 +1321,7 @@ async fn converge_minimal_seeded_topology(
     let peer =
         group.target_build_command(2, format!("{label}-build-3"), format!("{label}-build-3"))?;
     group
-        .testing_execute_admitted_seed_callback(&peer)
+        .testing_execute_admitted_seed_callback_with_retry(&peer)
         .await
         .map_err(|error| format!("{label} native-only peer retry failed: {error}"))?;
     if launched.journal().native_phase != NativeTopologyPhase::Converged
@@ -1472,6 +1473,126 @@ async fn exercise_seed_faults(root: &Path) -> Result<(), TestError> {
     Ok(())
 }
 
+async fn exercise_post_native_success_replay(root: &Path) -> Result<(), TestError> {
+    cleanup_three_replica_fixture(root)?;
+    let config = FixtureConfig::for_test_fixture(root)?;
+    let mut launched = launch_three_members(config).await?;
+    let prepared = launched.prepare_availability_group().await?;
+    let convergence = launched.kuberic_convergence_timeout();
+    let first_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let first = start_prepared_public_group_with_retry(
+        root,
+        &launched.run,
+        &prepared,
+        &launched.members,
+        convergence,
+        launched.complete_deadline(),
+        &first_cleanup,
+    )
+    .await?;
+    let sequence = first.bootstrap_configuration_sequence().await?;
+    wait_for_exact_reports(&first, sequence, convergence).await?;
+    let stable_resource = first.resource_uid.clone();
+    let stable_policy = first.effective_policy.clone();
+    let stable_configuration = first.configuration.clone();
+    let stable_pods = first.pods.each_ref().map(|pod| {
+        (
+            pod.identity.clone(),
+            pod.stable_role,
+            pod.pod_uid.clone(),
+            pod.pvc_uid.clone(),
+        )
+    });
+    let command =
+        first.target_build_command(1, "post-native-success-build", "post-native-success-build")?;
+    first
+        .testing_admit_target_build_authority_only(&command)
+        .await
+        .map_err(|error| format!("post-native-success target admission failed: {error}"))?;
+    let marker = {
+        first
+            .testing_execute_admitted_seed_callback_with_retry(&command)
+            .await
+            .map_err(|error| format!("post-native-success callback failed: {error}"))?;
+        if first.testing_seed_dispatch_count()? != 1 {
+            return Err(
+                "post-native-success checkpoint did not execute exactly one ADD DATABASE".into(),
+            );
+        }
+        first
+            .testing_assert_source_build_success_not_published(&command)
+            .await?;
+        let topology = launched
+            .finalize_prepared_availability_group(&prepared)
+            .await?;
+        let marker = launched
+            .commit_replicated_marker(&topology.evidence)
+            .await?;
+
+        first.testing_abort_seed_source();
+        marker
+    };
+    first
+        .testing_assert_source_build_success_not_published(&command)
+        .await?;
+    first.shutdown_with_coordinator(&first_cleanup).await?;
+
+    let replacement_cleanup =
+        CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let replacement = start_prepared_public_group_with_retry(
+        root,
+        &launched.run,
+        &prepared,
+        &launched.members,
+        convergence,
+        Instant::now() + convergence,
+        &replacement_cleanup,
+    )
+    .await?;
+    if replacement.resource_uid != stable_resource
+        || replacement.effective_policy != stable_policy
+        || replacement.configuration != stable_configuration
+        || replacement.pods.iter().zip(&stable_pods).any(
+            |(pod, (identity, role, pod_uid, pvc_uid))| {
+                &pod.identity != identity
+                    || pod.stable_role != *role
+                    || &pod.pod_uid != pod_uid
+                    || &pod.pvc_uid != pvc_uid
+            },
+        )
+    {
+        return Err("post-native-success replacement changed exact durable authority".into());
+    }
+    replacement
+        .testing_execute_kuberic_build_command(&command)
+        .await
+        .map_err(|error| format!("exact build replay after host replacement failed: {error}"))?;
+    if replacement.testing_seed_dispatch_count()? != 0 {
+        return Err("post-native-success replay issued a second ADD DATABASE".into());
+    }
+    replacement
+        .testing_assert_exactly_one_durable_build_success(&command)
+        .await?;
+    if replacement.testing_seed_dispatch_record()?.is_some() {
+        return Err("post-native-success replay retained resolved seed authority".into());
+    }
+    let verified_marker = launched.verify_replicated_marker(&marker).await?;
+    if verified_marker != marker || verified_marker.readable_ordinals != [1, 2, 3] {
+        return Err("post-native-success replay changed the exact native result".into());
+    }
+    replacement
+        .shutdown_with_coordinator(&replacement_cleanup)
+        .await?;
+    let evidence = launched.cleanup_with_coordinator(&replacement_cleanup)?;
+    if evidence.removed_container_ids.len() != 3 || evidence.removed_network_id.is_empty() {
+        return Err("post-native-success cleanup did not remove exact owned resources".into());
+    }
+    assert_removed(root);
+    cleanup_three_replica_fixture(root)?;
+    assert_removed(root);
+    Ok(())
+}
+
 async fn await_checkpoint(
     entered: tokio::sync::oneshot::Receiver<()>,
     callback: &mut tokio::task::JoinHandle<Result<(), tonic::Status>>,
@@ -1488,6 +1609,63 @@ async fn await_checkpoint(
 }
 
 async fn execute_phase4_conflict_matrix(root: &Path) -> Result<(), TestError> {
+    for (index, (scenario, label, expected)) in [
+        (
+            LicensedConflictScenario::AvailabilityGroupIdentityOrProfile,
+            "availability-group-identity-profile",
+            "conflicts with the requested bootstrap topology",
+        ),
+        (
+            LicensedConflictScenario::LogicalReplicaNativeMismatch,
+            "logical-replica-native-identity",
+            "conflicts with the requested bootstrap topology",
+        ),
+        (
+            LicensedConflictScenario::EndpointOrMemberProfile,
+            "endpoint-member-profile",
+            "conflicts with the requested bootstrap topology",
+        ),
+        (
+            LicensedConflictScenario::StandaloneDatabaseIdentityOrRecovery,
+            "standalone-database-identity-recovery",
+            "conflicts with the requested bootstrap topology",
+        ),
+        (
+            LicensedConflictScenario::AssociatedDatabaseIdentityOrRecovery,
+            "associated-database-identity-recovery",
+            "conflicts with the requested bootstrap topology",
+        ),
+        (
+            LicensedConflictScenario::IncompatibleLineage,
+            "target-lineage",
+            "conflicts with the requested bootstrap topology",
+        ),
+        (
+            LicensedConflictScenario::SqlProcessIncarnationReplacement,
+            "sql-process-incarnation",
+            "is unsafe to continue",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        exercise_conflict_scenario(
+            &root.join(format!("{index:02}-{label}")),
+            scenario,
+            label,
+            expected,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn exercise_conflict_scenario(
+    root: &Path,
+    scenario: LicensedConflictScenario,
+    label: &str,
+    expected: &str,
+) -> Result<(), TestError> {
     cleanup_three_replica_fixture(root)?;
     let config = FixtureConfig::for_test_fixture(root)?;
     let mut launched = launch_three_members(config).await?;
@@ -1503,85 +1681,99 @@ async fn execute_phase4_conflict_matrix(root: &Path) -> Result<(), TestError> {
         &cleanup,
     )
     .await?;
-    converge_minimal_seeded_topology(&group, &mut launched, &prepared, "conflict-matrix").await?;
+    converge_minimal_seeded_topology(&group, &mut launched, &prepared, label).await?;
+    let command = group.target_build_command(
+        1,
+        format!("{label}-no-late-success"),
+        format!("{label}-no-late-success"),
+    )?;
+    group
+        .testing_assert_source_build_success_not_published(&command)
+        .await?;
 
-    for (index, (scenario, expected)) in [
-        (
-            LicensedConflictScenario::AvailabilityGroupIdentityOrProfile,
-            NativeConvergenceState::Conflicting,
-        ),
-        (
-            LicensedConflictScenario::LogicalReplicaNativeMismatch,
-            NativeConvergenceState::Conflicting,
-        ),
-        (
-            LicensedConflictScenario::EndpointOrMemberProfile,
-            NativeConvergenceState::Conflicting,
-        ),
-        (
-            LicensedConflictScenario::StandaloneDatabaseIdentityOrRecovery,
-            NativeConvergenceState::Conflicting,
-        ),
-        (
-            LicensedConflictScenario::AssociatedDatabaseIdentityOrRecovery,
-            NativeConvergenceState::Conflicting,
-        ),
-        (
-            LicensedConflictScenario::IncompatibleLineage,
-            NativeConvergenceState::Conflicting,
-        ),
-        (
-            LicensedConflictScenario::SqlProcessIncarnationReplacement,
-            NativeConvergenceState::Unsafe,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let command = group.target_build_command(
-            1,
-            format!("conflict-no-success-{index}"),
-            format!("conflict-no-success-{index}"),
-        )?;
-        group
-            .testing_assert_source_build_success_not_published(&command)
-            .await?;
-        let actual = if scenario == LicensedConflictScenario::SqlProcessIncarnationReplacement {
-            launched.restart_sql_process_for_test(1)?;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
-            loop {
-                match group.testing_classify_licensed_conflict(scenario).await {
-                    Ok(actual) => break actual,
-                    Err(_) if tokio::time::Instant::now() < deadline => {
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
-                    Err(error) => {
-                        return Err(format!(
-                            "licensed SQL process replacement was not observable: {error}"
-                        )
-                        .into());
-                    }
-                }
+    let incarnation_snapshot =
+        if scenario == LicensedConflictScenario::SqlProcessIncarnationReplacement {
+            let frozen = group.testing_frozen_secondary_start_identity()?;
+            let host_port = launched.restart_sql_process_for_test(1)?;
+            let fresh = group
+                .testing_wait_for_fresh_secondary_observation(
+                    &frozen,
+                    host_port,
+                    launched.kuberic_convergence_timeout(),
+                )
+                .await?;
+            if fresh.instance.sqlserver_start_time == frozen {
+                return Err("SQL process replacement retained its frozen start identity".into());
             }
+            Some(fresh)
         } else {
-            group.testing_classify_licensed_conflict(scenario).await?
+            None
         };
-        if actual != expected {
-            return Err(format!(
-                "licensed conflict {scenario:?} classified as {actual:?}, expected {expected:?}"
-            )
-            .into());
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    if let Some(snapshot) = incarnation_snapshot {
+        group.testing_arm_incarnation_conflict(snapshot, entered_tx, release_rx)?;
+    } else {
+        group.testing_arm_licensed_conflict(scenario, entered_tx, release_rx)?;
+    }
+    let error = {
+        let callback = async {
+            if scenario == LicensedConflictScenario::StandaloneDatabaseIdentityOrRecovery {
+                group
+                    .testing_execute_primary_configuration_callback()
+                    .await
+                    .map_err(|error| tonic::Status::internal(error.to_string()))
+            } else if scenario == LicensedConflictScenario::SqlProcessIncarnationReplacement {
+                group
+                    .testing_execute_secondary_admitted_validator()
+                    .await
+                    .map_err(|error| tonic::Status::internal(error.to_string()))
+            } else {
+                group.testing_execute_admitted_seed_callback(&command).await
+            }
+        };
+        tokio::pin!(callback);
+        tokio::select! {
+            entered = entered_rx => entered
+                .map_err(|_| format!("{label} callback ended before consuming its injected observation"))?,
+            result = &mut callback => {
+                return Err(format!("{label} callback was not genuinely delayed: {result:?}").into());
+            }
+            _ = tokio::time::sleep(Duration::from_secs(120)) => {
+                return Err(format!("{label} callback did not consume its injected observation").into());
+            }
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
         group
             .testing_assert_source_build_success_not_published(&command)
             .await?;
+        release_tx
+            .send(())
+            .map_err(|_| format!("{label} callback released before classification"))?;
+        match callback.await {
+            Err(error) => error,
+            Ok(()) => {
+                return Err(format!(
+                    "{label} callback returned success for an injected terminal conflict"
+                )
+                .into());
+            }
+        }
+    };
+    group.testing_clear_licensed_conflict();
+    if !error.to_string().contains(expected) {
+        return Err(format!(
+            "{label} returned the wrong terminal classification: {error}; expected {expected}"
+        )
+        .into());
     }
-
+    group
+        .testing_assert_source_build_success_never_published(&command, Duration::from_secs(2))
+        .await?;
     group.shutdown_with_coordinator(&cleanup).await?;
     let evidence = launched.cleanup_with_coordinator(&cleanup)?;
     if evidence.removed_container_ids.len() != 3 || evidence.removed_network_id.is_empty() {
-        return Err("conflict-matrix cleanup did not remove exact owned resources".into());
+        return Err(format!("{label} cleanup did not remove exact owned resources").into());
     }
     assert_removed(root);
     cleanup_three_replica_fixture(root)?;
