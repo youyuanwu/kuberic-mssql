@@ -16,6 +16,7 @@ use kuberic_mssql::observation::{
 use kuberic_mssql::runtime_error::RuntimeError;
 use kuberic_mssql::runtime_host::{
     RuntimeEndpointResolver, RuntimeHostApplication, RuntimeHostArgs, RuntimeHostConfig,
+    SeedDispatchRecord, SeedDispatchStore, SeedDispatchTarget,
 };
 use kuberic_mssql::{
     AvailabilityGroupIdentity, AvailabilityGroupName, ConfigurationSequence, DatabaseIdentity,
@@ -84,6 +85,7 @@ impl ObservationClock for FixedClock {
 
 struct HostAttempt {
     control: SocketAddr,
+    application_root: PathBuf,
     task: tokio::task::JoinHandle<kuberic_runtime::host::Result<RunningReplica>>,
 }
 
@@ -378,6 +380,7 @@ async fn start_attempts(root: &Path) -> Vec<HostAttempt> {
             RuntimeHostApplication::with_observation_source(&config, source, Arc::new(FixedClock))
                 .unwrap(),
         );
+        let application_root = config.application_root().to_owned();
         let host = ReplicaHost::new(
             config.replica_process_config(),
             application.clone(),
@@ -387,10 +390,42 @@ async fn start_attempts(root: &Path) -> Vec<HostAttempt> {
         .with_application_storage_paths(application.storage_paths());
         attempts.push(HostAttempt {
             control: controls[index],
+            application_root,
             task: tokio::spawn(host.start()),
         });
     }
+
     attempts
+}
+
+fn retained_seed_record(sessions: &[String], winning_target: usize) -> SeedDispatchRecord {
+    let identities = identities();
+    let member = |index: usize| {
+        SeedDispatchTarget::new(
+            identities[index].replica_id.to_string(),
+            identities[index].instance_id.to_string(),
+            identities[index].agent_generation.to_string(),
+            sessions[index].clone(),
+            NATIVE_IDS[index],
+        )
+        .unwrap()
+    };
+    SeedDispatchRecord::new(
+        "runtime-host-test",
+        configuration().configuration_id.to_string(),
+        "app-ag",
+        "66666666-6666-4666-8666-666666666666",
+        "app-db",
+        "77777777-7777-4777-8777-777777777777",
+        "88888888-8888-4888-8888-888888888888",
+        "55555555-5555-4555-8555-555555555555",
+        member(0),
+        [member(1), member(2)],
+        identities[winning_target].replica_id.to_string(),
+        format!("build-{}", winning_target + 1),
+        "2026-10-07T12:00:00",
+    )
+    .unwrap()
 }
 
 async fn assert_initialization_listeners(attempts: &mut [HostAttempt]) {
@@ -715,6 +750,65 @@ async fn public_hosts_initialize_report_and_restart_with_fresh_sessions_case() {
     stop_all(&mut restarted).await;
 }
 
+async fn retained_dispatch_survives_runtime_restart_as_historical_session_evidence_case() {
+    let temporary = tempfile::tempdir().unwrap();
+    let mut first_attempts = start_attempts(temporary.path()).await;
+    assert_initialization_listeners(&mut first_attempts).await;
+    let (mut first_replicas, first_sessions) = initialize_attempts(&mut first_attempts).await;
+    let primary_application_root = first_attempts[0].application_root.clone();
+    stop_all(&mut first_replicas).await;
+    drop(first_replicas);
+
+    {
+        let store = SeedDispatchStore::open(&primary_application_root).unwrap();
+        let intent = retained_seed_record(&first_sessions, 1);
+        store.create(&intent).unwrap();
+        let mut dispatched = intent.clone();
+        dispatched.mark_dispatched().unwrap();
+        store.replace(intent.revision(), dispatched).unwrap();
+    }
+
+    let mut restarted_attempts = start_attempts(temporary.path()).await;
+    let mut restarted = Vec::new();
+    for attempt in &mut restarted_attempts {
+        restarted.push(
+            tokio::time::timeout(Duration::from_secs(30), &mut attempt.task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    let restarted_reports = reports(&restarted_attempts).await;
+    let restarted_sessions = restarted_reports
+        .iter()
+        .map(|report| report.process_session_id.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        first_sessions
+            .iter()
+            .zip(&restarted_sessions)
+            .all(|(first, restarted)| first != restarted)
+    );
+
+    {
+        let store = SeedDispatchStore::open(&primary_application_root).unwrap();
+        let historical = store.load().unwrap().unwrap();
+        let current = retained_seed_record(&restarted_sessions, 2);
+        assert!(historical.same_dispatch_context(&current));
+        assert!(!historical.same_intent_owner(&current));
+        assert_eq!(historical.source().process_session_id(), first_sessions[0]);
+        let mut associated = historical.clone();
+        associated
+            .associate_group_database("44444444-4444-4444-8444-444444444444")
+            .unwrap();
+        let associated = store.replace(historical.revision(), associated).unwrap();
+        store.remove(associated.revision()).unwrap();
+    }
+
+    stop_all(&mut restarted).await;
+}
+
 async fn application_binding_without_agent_metadata_is_reported_unsafe_case() {
     let temporary = tempfile::tempdir().unwrap();
     let (controls, replications) = free_host_addresses();
@@ -858,6 +952,11 @@ async fn established_public_host_rejects_changed_application_path_and_topology_c
 #[test]
 fn public_hosts_initialize_report_and_restart_with_fresh_sessions() {
     run_host_test(public_hosts_initialize_report_and_restart_with_fresh_sessions_case);
+}
+
+#[test]
+fn retained_dispatch_survives_runtime_restart_as_historical_session_evidence() {
+    run_host_test(retained_dispatch_survives_runtime_restart_as_historical_session_evidence_case);
 }
 
 #[test]

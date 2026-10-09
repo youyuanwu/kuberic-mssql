@@ -772,6 +772,14 @@ struct SeedCoordinator {
     root: PathBuf,
     store: Mutex<Option<Arc<SeedDispatchStore>>>,
     arbiter: tokio::sync::Mutex<()>,
+    #[cfg(feature = "kuberic-testing")]
+    intent_gate: Mutex<Option<SeedIntentGate>>,
+}
+
+#[cfg(feature = "kuberic-testing")]
+struct SeedIntentGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl SeedCoordinator {
@@ -780,6 +788,8 @@ impl SeedCoordinator {
             root,
             store: Mutex::new(None),
             arbiter: tokio::sync::Mutex::new(()),
+            #[cfg(feature = "kuberic-testing")]
+            intent_gate: Mutex::new(None),
         }
     }
 
@@ -795,6 +805,22 @@ impl SeedCoordinator {
             Arc::new(SeedDispatchStore::open(&self.root).map_err(KubericAdapterError::SeedState)?);
         *slot = Some(store.clone());
         Ok(store)
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    async fn pause_after_intent_if_requested(&self) -> Result<(), KubericAdapterError> {
+        let gate = self
+            .intent_gate
+            .lock()
+            .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?
+            .take();
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            gate.release
+                .await
+                .map_err(|_| KubericAdapterError::Closed)?;
+        }
+        Ok(())
     }
 }
 
@@ -818,6 +844,29 @@ enum SourceAssociation {
 }
 
 impl SqlServerReplicator {
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_gate_seed_intent(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), KubericAdapterError> {
+        let seed = &self
+            .bootstrap
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?
+            .seed;
+        let mut gate = seed
+            .intent_gate
+            .lock()
+            .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?;
+        if gate.is_some() {
+            return Err(KubericAdapterError::SeedState(SeedStateError::AlreadyOwned));
+        }
+        *gate = Some(SeedIntentGate { entered, release });
+        Ok(())
+    }
+
     pub fn new(
         replication_address: String,
         source: Arc<dyn SqlServerObservationSource>,
@@ -1615,20 +1664,12 @@ impl SqlServerReplicator {
                 self.validate_seed_record(&record, &context.record)?;
                 match record.phase() {
                     SeedDispatchPhase::Dispatched => return Ok(None),
-                    SeedDispatchPhase::Intent
-                        if record.winning_target_replica_id()
-                            != context.record.winning_target_replica_id() =>
-                    {
-                        return Ok(None);
+                    SeedDispatchPhase::Intent if record.same_intent_owner(&context.record) => {
+                        record
                     }
-                    SeedDispatchPhase::Intent
-                        if record.winning_build_id() != context.record.winning_build_id() =>
-                    {
-                        return Err(KubericAdapterError::SeedState(
-                            SeedStateError::IdentityMismatch,
-                        ));
-                    }
-                    SeedDispatchPhase::Intent => record,
+                    SeedDispatchPhase::Intent => store
+                        .replace_intent(record.revision(), context.record.clone())
+                        .map_err(KubericAdapterError::SeedState)?,
                 }
             }
             None => {
@@ -1638,6 +1679,9 @@ impl SqlServerReplicator {
                 context.record.clone()
             }
         };
+        #[cfg(feature = "kuberic-testing")]
+        bootstrap.seed.pause_after_intent_if_requested().await?;
+        drop(self.finish_operation(generation)?);
         record
             .mark_dispatched()
             .map_err(KubericAdapterError::SeedState)?;

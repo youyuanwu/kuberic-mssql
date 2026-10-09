@@ -73,6 +73,13 @@ impl SeedDispatchTarget {
     pub fn native_replica_id(&self) -> &str {
         &self.native_replica_id
     }
+
+    fn same_dispatch_identity(&self, other: &Self) -> bool {
+        self.replica_id == other.replica_id
+            && self.instance_id == other.instance_id
+            && self.agent_generation == other.agent_generation
+            && self.native_replica_id == other.native_replica_id
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,8 +205,7 @@ impl SeedDispatchRecord {
             return Err(SeedStateError::UnsupportedSchema(self.schema_version));
         }
         if self.revision == 0
-            || (self.phase == SeedDispatchPhase::Intent
-                && (self.revision != 1 || self.group_database_id.is_some()))
+            || (self.phase == SeedDispatchPhase::Intent && self.group_database_id.is_some())
             || (self.phase == SeedDispatchPhase::Dispatched && self.revision < 2)
             || (self.group_database_id.is_some() && self.revision < 3)
         {
@@ -276,9 +282,18 @@ impl SeedDispatchRecord {
             && self.database_guid == other.database_guid
             && self.family_guid == other.family_guid
             && self.recovery_fork_guid == other.recovery_fork_guid
-            && self.source == other.source
-            && self.targets == other.targets
+            && self.source.same_dispatch_identity(&other.source)
+            && self.targets[0].same_dispatch_identity(&other.targets[0])
+            && self.targets[1].same_dispatch_identity(&other.targets[1])
             && self.sqlserver_start_time == other.sqlserver_start_time
+    }
+
+    pub fn same_intent_owner(&self, other: &Self) -> bool {
+        self.same_dispatch_context(other)
+            && self.source.process_session_id == other.source.process_session_id
+            && self.targets == other.targets
+            && self.winning_target_replica_id == other.winning_target_replica_id
+            && self.winning_build_id == other.winning_build_id
     }
 
     fn validate_initial(&self) -> Result<(), SeedStateError> {
@@ -417,6 +432,33 @@ impl SeedDispatchStore {
             .checked_add(1)
             .ok_or(SeedStateError::RevisionMismatch)?;
         current.validate_transition(&record)?;
+        record.validate()?;
+        self.write_unlocked(&record)?;
+        Ok(record)
+    }
+
+    pub fn replace_intent(
+        &self,
+        expected_revision: u64,
+        mut record: SeedDispatchRecord,
+    ) -> Result<SeedDispatchRecord, SeedStateError> {
+        let _transaction = self
+            .transaction
+            .lock()
+            .map_err(|_| SeedStateError::UnsafeState)?;
+        let current = self.load_unlocked()?.ok_or(SeedStateError::Missing)?;
+        if current.revision != expected_revision
+            || current.phase != SeedDispatchPhase::Intent
+            || current.group_database_id.is_some()
+            || record.phase != SeedDispatchPhase::Intent
+            || record.group_database_id.is_some()
+            || !current.same_dispatch_context(&record)
+        {
+            return Err(SeedStateError::InvalidTransition);
+        }
+        record.revision = expected_revision
+            .checked_add(1)
+            .ok_or(SeedStateError::RevisionMismatch)?;
         record.validate()?;
         self.write_unlocked(&record)?;
         Ok(record)

@@ -526,21 +526,7 @@ impl PublicMssqlGroup {
     ) -> Vec<Result<(), tonic::Status>> {
         let mut outcomes = Vec::with_capacity(commands.len());
         for command in commands {
-            let mut attempts = 0;
-            loop {
-                attempts += 1;
-                let result = self.execute_build_command(command).await;
-                if result
-                    .as_ref()
-                    .is_err_and(|error| error.code() == tonic::Code::Cancelled)
-                    && attempts < 3
-                {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-                outcomes.push(result);
-                break;
-            }
+            outcomes.push(self.execute_build_command_with_retry(command).await);
         }
         outcomes
     }
@@ -552,7 +538,7 @@ impl PublicMssqlGroup {
         join_all(
             commands
                 .iter()
-                .map(|command| self.execute_build_command(command)),
+                .map(|command| self.execute_build_command_with_retry(command)),
         )
         .await
     }
@@ -561,9 +547,34 @@ impl PublicMssqlGroup {
         &self,
         command: &PublicBuildCommand,
     ) -> Result<(), tonic::Status> {
-        self.execute_build_command(command).await?;
+        self.execute_build_command_with_retry(command).await?;
         std::future::pending::<()>().await;
         unreachable!("withheld build reply never completes")
+    }
+
+    pub fn testing_gate_next_seed_intent(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), MssqlGroupError> {
+        let replicator = self.pods[0]
+            .application
+            .testing_replicator()
+            .ok_or_else(|| MssqlGroupError::new("bootstrap source replicator is unavailable"))?;
+        replicator
+            .testing_gate_seed_intent(entered, release)
+            .map_err(|error| MssqlGroupError::new(error.to_string()))
+    }
+
+    pub fn testing_abort_seed_source(&self) {
+        self.pods[0].application.abort();
+    }
+
+    pub async fn testing_execute_admitted_seed_callback(
+        &self,
+        command: &PublicBuildCommand,
+    ) -> Result<(), tonic::Status> {
+        self.execute_admitted_seed_callback(command).await
     }
 
     async fn execute_build_command(
@@ -644,6 +655,18 @@ impl PublicMssqlGroup {
         if command.retire {
             return Ok(());
         }
+        self.execute_admitted_seed_callback(command).await
+    }
+
+    async fn execute_admitted_seed_callback(
+        &self,
+        command: &PublicBuildCommand,
+    ) -> Result<(), tonic::Status> {
+        let source = &self.pods[0];
+        let timeout_duration = self.operation_timeout.min(
+            remaining(self.complete_deadline, "public target build")
+                .map_err(|error| tonic::Status::deadline_exceeded(error.to_string()))?,
+        );
         let replicator = source.application.testing_replicator().ok_or_else(|| {
             tonic::Status::failed_precondition("bootstrap source replicator is unavailable")
         })?;
@@ -667,6 +690,23 @@ impl PublicMssqlGroup {
             .await
             .map_err(|_| tonic::Status::deadline_exceeded("bootstrap seed callback timed out"))?
             .map_err(|error| tonic::Status::internal(error.to_string()))
+    }
+
+    async fn execute_build_command_with_retry(
+        &self,
+        command: &PublicBuildCommand,
+    ) -> Result<(), tonic::Status> {
+        let deadline = tokio::time::Instant::now() + self.operation_timeout;
+        loop {
+            let result = self.execute_build_command(command).await;
+            if result.as_ref().is_err_and(retryable_public_build_error)
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            return result;
+        }
     }
 
     pub async fn shutdown_with_coordinator(
@@ -718,6 +758,16 @@ impl PublicMssqlGroup {
             )))
         }
     }
+}
+
+fn retryable_public_build_error(error: &tonic::Status) -> bool {
+    error.code() == tonic::Code::Cancelled
+        || (error.code() == tonic::Code::Unavailable
+            && error.message().contains("reconfiguration is still pending"))
+        || (error.code() == tonic::Code::Internal
+            && error
+                .message()
+                .contains("SQL Server observation is unavailable: Malformed"))
 }
 
 async fn admit_bootstrap_replicators(

@@ -592,7 +592,37 @@ async fn execute_phase2_bootstrap_lifecycle(
                 group.target_build_command(1, "seed-build-target-2", "seed-build-target-2")?,
                 group.target_build_command(2, "seed-build-target-3", "seed-build-target-3")?,
             ];
-            let outcomes = group.execute_build_commands_sequential(&builds[..1]).await;
+            let replay = group.replay_build_command(&builds[0]);
+            if replay.operation_id != builds[0].operation_id
+                || replay.build_id != builds[0].build_id
+                || replay.target != builds[0].target
+                || replay.retire
+            {
+                return Err("public replay helper changed exact build authority".into());
+            }
+            let retirement = group.retire_build_command(&builds[0], "retire-seed-build-target-2");
+            if retirement.build_id != builds[0].build_id
+                || retirement.target != builds[0].target
+                || !retirement.retire
+            {
+                return Err("public retirement helper changed exact build authority".into());
+            }
+            let successor = group.supersede_build_command(
+                &builds[0],
+                "successor-seed-build-target-2",
+                "successor-seed-build-target-2",
+            );
+            if successor.build_id == builds[0].build_id
+                || successor.target != builds[0].target
+                || successor.retire
+            {
+                return Err(
+                    "public supersession helper did not replace only build identity".into(),
+                );
+            }
+            let outcomes = group
+                .execute_build_commands_concurrently(&builds[..1])
+                .await;
             if let Some(error) = outcomes.into_iter().find_map(Result::err) {
                 return Err::<(), TestError>(format!("public target build failed: {error}").into());
             }
@@ -609,7 +639,9 @@ async fn execute_phase2_bootstrap_lifecycle(
                     "build-owned seeding marker was not readable from all exact members".into(),
                 );
             }
-            let outcomes = group.execute_build_commands_sequential(&builds[1..]).await;
+            let outcomes = group
+                .execute_build_commands_concurrently(&builds[1..])
+                .await;
             if let Some(error) = outcomes.into_iter().find_map(Result::err) {
                 return Err::<(), TestError>(
                     format!("native-only peer target build failed: {error}").into(),
@@ -686,6 +718,32 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
     let first_sessions = first.pods.each_ref().map(|pod| pod.session.clone());
     let first_sequence = first.bootstrap_configuration_sequence().await?;
     wait_for_exact_reports(&first, first_sequence, convergence).await?;
+    let interrupted_build =
+        first.target_build_command(1, "restart-intent-build-2", "restart-intent-build-2")?;
+    let (intent_entered_tx, intent_entered_rx) = tokio::sync::oneshot::channel();
+    let (intent_release_tx, intent_release_rx) = tokio::sync::oneshot::channel();
+    first.testing_gate_next_seed_intent(intent_entered_tx, intent_release_rx)?;
+    {
+        let interrupted = first.testing_execute_admitted_seed_callback(&interrupted_build);
+        tokio::pin!(interrupted);
+        tokio::select! {
+            entered = intent_entered_rx => entered
+                .map_err(|_| "licensed pre-association build ended before durable intent")?,
+            result = &mut interrupted => {
+                return Err(format!(
+                    "licensed pre-association build completed before interruption: {result:?}"
+                )
+                .into());
+            }
+        }
+        first.testing_abort_seed_source();
+        intent_release_tx
+            .send(())
+            .map_err(|_| "licensed pre-association intent gate was not retained")?;
+        if interrupted.await.is_ok() {
+            return Err("superseded pre-association callback published success".into());
+        }
+    }
     first.shutdown_with_coordinator(&first_cleanup).await?;
 
     let seed_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
