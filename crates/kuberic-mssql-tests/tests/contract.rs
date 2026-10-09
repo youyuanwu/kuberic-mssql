@@ -161,6 +161,7 @@ fn standalone_database_preflight_refuses_unowned_same_name_state() {
         }),
         state: "ONLINE".into(),
         recovery_model: "FULL".into(),
+        accessible: true,
     };
     let ownership = snapshot.ownership.clone().unwrap();
 
@@ -191,6 +192,12 @@ fn standalone_database_preflight_refuses_unowned_same_name_state() {
     );
     assert_eq!(
         classify_standalone_database(Some(&snapshot), Some(&identity), &ownership, true),
+        NativeConvergenceState::Unsafe
+    );
+    let mut inaccessible = snapshot;
+    inaccessible.accessible = false;
+    assert_eq!(
+        classify_standalone_database(Some(&inaccessible), None, &ownership, false),
         NativeConvergenceState::Unsafe
     );
 }

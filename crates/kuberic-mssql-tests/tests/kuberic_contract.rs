@@ -434,6 +434,18 @@ fn native_bootstrap_classifiers_cover_every_operation_state() {
         ),
         NativeConvergenceState::Conflicting
     );
+    let mut foreign_member = complete_group.clone();
+    foreign_member.replicas[2] = replica(THIRD_ID, "foreign-sql");
+    assert_eq!(
+        classify_availability_group(
+            Some(&foreign_member),
+            &AvailabilityGroupName::new("test-ag").unwrap(),
+            Some(&guid(AG_ID)),
+            &descriptors,
+            false,
+        ),
+        NativeConvergenceState::Conflicting
+    );
     assert_eq!(
         classify_availability_group(
             Some(complete_group),
@@ -452,7 +464,19 @@ fn native_bootstrap_classifiers_cover_every_operation_state() {
     };
     assert_eq!(
         classify_replica_join(
+            None,
+            &complete_group.identity,
+            &sql_identity(1),
+            &ServerName::new("sql-1").unwrap(),
+            "TCP://sql-1:5022",
+            false,
+        ),
+        NativeConvergenceState::Absent
+    );
+    assert_eq!(
+        classify_replica_join(
             Some(secondary_group),
+            &complete_group.identity,
             &sql_identity(1),
             &ServerName::new("sql-1").unwrap(),
             "TCP://sql-1:5022",
@@ -466,6 +490,7 @@ fn native_bootstrap_classifiers_cover_every_operation_state() {
     assert_eq!(
         classify_replica_join(
             Some(&join_incomplete),
+            &complete_group.identity,
             &sql_identity(1),
             &ServerName::new("sql-1").unwrap(),
             "TCP://sql-1:5022",
@@ -478,6 +503,7 @@ fn native_bootstrap_classifiers_cover_every_operation_state() {
     assert_eq!(
         classify_replica_join(
             Some(&join_conflict),
+            &complete_group.identity,
             &sql_identity(1),
             &ServerName::new("sql-1").unwrap(),
             "TCP://sql-1:5022",
@@ -488,6 +514,7 @@ fn native_bootstrap_classifiers_cover_every_operation_state() {
     assert_eq!(
         classify_replica_join(
             Some(secondary_group),
+            &complete_group.identity,
             &sql_identity(1),
             &ServerName::new("sql-1").unwrap(),
             "TCP://sql-1:5022",
@@ -495,11 +522,34 @@ fn native_bootstrap_classifiers_cover_every_operation_state() {
         ),
         NativeConvergenceState::Unsafe
     );
+    for wrong_group in [
+        AvailabilityGroupIdentity {
+            name: AvailabilityGroupName::new("other-ag").unwrap(),
+            group_id: complete_group.identity.group_id.clone(),
+        },
+        AvailabilityGroupIdentity {
+            name: complete_group.identity.name.clone(),
+            group_id: guid(FORK_ID),
+        },
+    ] {
+        assert_eq!(
+            classify_replica_join(
+                Some(secondary_group),
+                &wrong_group,
+                &sql_identity(1),
+                &ServerName::new("sql-1").unwrap(),
+                "TCP://sql-1:5022",
+                false,
+            ),
+            NativeConvergenceState::Conflicting
+        );
+    }
 
     let lineage = expected_lineage();
     assert_eq!(
         classify_replica_seed(
             Some(secondary_group),
+            &complete_group.identity,
             &lineage.database,
             &lineage,
             &guid(SECOND_ID),
@@ -512,6 +562,7 @@ fn native_bootstrap_classifiers_cover_every_operation_state() {
     assert_eq!(
         classify_replica_seed(
             Some(&seed_incomplete),
+            &complete_group.identity,
             &lineage.database,
             &lineage,
             &guid(SECOND_ID),
@@ -529,6 +580,7 @@ fn native_bootstrap_classifiers_cover_every_operation_state() {
     assert_eq!(
         classify_replica_seed(
             Some(&seed_conflict),
+            &complete_group.identity,
             &lineage.database,
             &lineage,
             &guid(SECOND_ID),
@@ -555,6 +607,7 @@ fn native_bootstrap_classifiers_cover_every_operation_state() {
     assert_eq!(
         classify_replica_seed(
             Some(&seed_unsafe),
+            &complete_group.identity,
             &lineage.database,
             &lineage,
             &guid(SECOND_ID),
@@ -562,8 +615,37 @@ fn native_bootstrap_classifiers_cover_every_operation_state() {
         ),
         NativeConvergenceState::Unsafe
     );
+    for wrong_group in [
+        AvailabilityGroupIdentity {
+            name: AvailabilityGroupName::new("other-ag").unwrap(),
+            group_id: complete_group.identity.group_id.clone(),
+        },
+        AvailabilityGroupIdentity {
+            name: complete_group.identity.name.clone(),
+            group_id: guid(FORK_ID),
+        },
+    ] {
+        assert_eq!(
+            classify_replica_seed(
+                Some(secondary_group),
+                &wrong_group,
+                &lineage.database,
+                &lineage,
+                &guid(SECOND_ID),
+                false,
+            ),
+            NativeConvergenceState::Conflicting
+        );
+    }
     assert_eq!(
-        classify_replica_seed(None, &lineage.database, &lineage, &guid(SECOND_ID), false),
+        classify_replica_seed(
+            None,
+            &complete_group.identity,
+            &lineage.database,
+            &lineage,
+            &guid(SECOND_ID),
+            false,
+        ),
         NativeConvergenceState::Absent
     );
 }

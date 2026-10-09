@@ -1605,10 +1605,8 @@ fn standalone_database_preflight_is_one_parameterized_read_only_statement() {
     assert!(sql.trim_start().starts_with("SELECT"));
     assert_eq!(sql.matches(';').count(), 1);
     assert!(sql.trim_end().ends_with(';'));
-    assert!(!sql.contains("@P1"));
-    assert!(sql.contains("d.name = DB_NAME()"));
-    assert!(sql.contains("kuberic_resource_id"));
-    assert!(sql.contains("kuberic_configuration_id"));
+    assert_eq!(sql.matches("@P1").count(), 1);
+    assert!(sql.contains("FROM sys.databases"));
     let tokens: BTreeSet<String> = sql
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .filter(|token| !token.is_empty())

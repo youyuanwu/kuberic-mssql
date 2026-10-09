@@ -1,7 +1,7 @@
 use crate::observation::{AvailabilityGroupSnapshot, NativeProvenance, RecoveryLineageObservation};
 use crate::{
-    AvailabilityGroupName, DatabaseIdentity, DatabaseLineage, Guid, NativeRole, ReplicaDescriptor,
-    ReplicaIdentity, ServerName, SqlIdentifier,
+    AvailabilityGroupIdentity, AvailabilityGroupName, DatabaseIdentity, DatabaseLineage, Guid,
+    NativeRole, ReplicaDescriptor, ReplicaIdentity, ServerName, SqlIdentifier,
 };
 
 #[cfg(feature = "kuberic")]
@@ -38,6 +38,7 @@ pub struct StandaloneDatabaseSnapshot {
     pub ownership: Option<StandaloneDatabaseOwnership>,
     pub state: String,
     pub recovery_model: String,
+    pub accessible: bool,
 }
 
 pub fn classify_standalone_database(
@@ -52,6 +53,9 @@ pub fn classify_standalone_database(
     let Some(snapshot) = snapshot else {
         return NativeConvergenceState::Absent;
     };
+    if !snapshot.accessible {
+        return NativeConvergenceState::Unsafe;
+    }
     if snapshot.ownership.as_ref() != Some(expected_ownership) {
         return NativeConvergenceState::Conflicting;
     }
@@ -92,6 +96,24 @@ pub fn classify_availability_group(
         return NativeConvergenceState::Conflicting;
     }
     let mut incomplete = group.replicas.len() != expected_replicas.len();
+    for actual in &group.replicas {
+        let Some(expected) = expected_replicas
+            .iter()
+            .find(|expected| expected.server_name == actual.server_name)
+        else {
+            return NativeConvergenceState::Conflicting;
+        };
+        if actual
+            .endpoint_url
+            .as_deref()
+            .is_none_or(|endpoint| !endpoint.eq_ignore_ascii_case(&expected.endpoint.to_string()))
+            || actual.availability_mode != "SYNCHRONOUS_COMMIT"
+            || actual.failover_mode != "EXTERNAL"
+            || actual.seeding_mode != "AUTOMATIC"
+        {
+            return NativeConvergenceState::Conflicting;
+        }
+    }
     for expected in expected_replicas {
         let Some(actual) = group
             .replicas
@@ -121,6 +143,7 @@ pub fn classify_availability_group(
 
 pub fn classify_replica_join(
     group: Option<&AvailabilityGroupSnapshot>,
+    availability_group: &AvailabilityGroupIdentity,
     expected: &ReplicaIdentity,
     expected_server: &ServerName,
     expected_endpoint: &str,
@@ -132,6 +155,9 @@ pub fn classify_replica_join(
     let Some(group) = group else {
         return NativeConvergenceState::Absent;
     };
+    if group.identity != *availability_group {
+        return NativeConvergenceState::Conflicting;
+    }
     let Some(native_id) = expected.native_replica_id() else {
         return NativeConvergenceState::Conflicting;
     };
@@ -170,6 +196,7 @@ pub fn classify_replica_join(
 
 pub fn classify_replica_seed(
     group: Option<&AvailabilityGroupSnapshot>,
+    availability_group: &AvailabilityGroupIdentity,
     database: &DatabaseIdentity,
     lineage: &DatabaseLineage,
     target_replica_id: &Guid,
@@ -181,6 +208,9 @@ pub fn classify_replica_seed(
     let Some(group) = group else {
         return NativeConvergenceState::Absent;
     };
+    if group.identity != *availability_group {
+        return NativeConvergenceState::Conflicting;
+    }
     if group.automatic_seeding.iter().any(|seed| {
         seed.group_database_id == database.group_database_id
             && seed.remote_replica_id == *target_replica_id

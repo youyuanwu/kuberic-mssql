@@ -15,7 +15,9 @@ use crate::bootstrap::{
     StandaloneDatabaseIdentity, StandaloneDatabaseOwnership, StandaloneDatabaseSnapshot,
 };
 use crate::executor::{QueryRow, SqlExecutor, SqlSession};
-use crate::mutation::{MutationEffect, STANDALONE_DATABASE_QUERY, SqlMutationExecutor};
+use crate::mutation::{
+    DATABASE_OWNERSHIP_QUERY, MutationEffect, STANDALONE_DATABASE_QUERY, SqlMutationExecutor,
+};
 use crate::query::ReadQuery;
 use crate::runtime_config::{ConnectionSettings, read_bounded};
 use crate::runtime_error::RuntimeError;
@@ -77,24 +79,20 @@ impl SqlMutationExecutor for TdsMutationExecutor {
         database: &SqlIdentifier,
     ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
         const STAGE: &str = "standalone database preflight";
-        let mut client = match connect_client(
+        let mut master = connect_client(
             &self.settings,
             "kuberic-sqlserver-bootstrap",
             "mutation username",
             "mutation password",
-            Some(database.as_str()),
+            None,
         )
-        .await
-        {
-            Ok(client) => client,
-            Err(error) if error.server_code == Some(4060) => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        timeout(
+        .await?;
+        let name = database.as_str();
+        let snapshot = timeout(
             self.settings.query_timeout,
             panic_boundary::contain(STAGE, async move {
-                let mut stream = client
-                    .query(STANDALONE_DATABASE_QUERY, &[])
+                let mut stream = master
+                    .query(STANDALONE_DATABASE_QUERY, &[&name])
                     .await
                     .map_err(|error| driver_error(STAGE, error))?;
                 let mut result = None;
@@ -133,7 +131,60 @@ impl SqlMutationExecutor for TdsMutationExecutor {
                                 ));
                             }
                         };
-                        let ownership = match (
+                        result = Some(StandaloneDatabaseSnapshot {
+                            identity,
+                            ownership: None,
+                            state,
+                            recovery_model,
+                            accessible: false,
+                        });
+                    }
+                }
+                Ok(result)
+            }),
+        )
+        .await
+        .map_err(|_| timed_out(STAGE))??;
+        let Some(mut snapshot) = snapshot else {
+            return Ok(None);
+        };
+        if snapshot.state != "ONLINE" {
+            return Ok(Some(snapshot));
+        }
+        let mut database_client = match connect_client(
+            &self.settings,
+            "kuberic-sqlserver-bootstrap",
+            "mutation username",
+            "mutation password",
+            Some(database.as_str()),
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(error) => return existing_database_connect_error(snapshot, error).map(Some),
+        };
+        snapshot.ownership = timeout(
+            self.settings.query_timeout,
+            panic_boundary::contain(STAGE, async move {
+                let mut stream = database_client
+                    .query(DATABASE_OWNERSHIP_QUERY, &[])
+                    .await
+                    .map_err(|error| driver_error(STAGE, error))?;
+                let mut ownership = None;
+                while let Some(item) = stream
+                    .try_next()
+                    .await
+                    .map_err(|error| driver_error(STAGE, error))?
+                {
+                    if let QueryItem::Row(row) = item {
+                        if ownership.is_some() {
+                            return Err(malformed(
+                                STAGE,
+                                "database ownership query returned multiple rows",
+                            ));
+                        }
+
+                        ownership = match (
                             optional_text(&row, "kuberic_resource_id", STAGE)?,
                             optional_text(&row, "kuberic_configuration_id", STAGE)?,
                         ) {
@@ -151,19 +202,15 @@ impl SqlMutationExecutor for TdsMutationExecutor {
                                 ));
                             }
                         };
-                        result = Some(StandaloneDatabaseSnapshot {
-                            identity,
-                            ownership,
-                            state,
-                            recovery_model,
-                        });
                     }
                 }
-                Ok(result)
+                Ok(ownership)
             }),
         )
         .await
-        .map_err(|_| timed_out(STAGE))?
+        .map_err(|_| timed_out(STAGE))??;
+        snapshot.accessible = true;
+        Ok(Some(snapshot))
     }
 
     async fn execute(&self, effect: &MutationEffect) -> Result<(), RuntimeError> {
@@ -195,6 +242,18 @@ impl SqlMutationExecutor for TdsMutationExecutor {
         )
         .await
         .map_err(|_| timed_out(stage))?
+    }
+}
+
+#[allow(dead_code)]
+fn existing_database_connect_error(
+    snapshot: StandaloneDatabaseSnapshot,
+    error: RuntimeError,
+) -> Result<StandaloneDatabaseSnapshot, RuntimeError> {
+    if error.server_code == Some(4060) {
+        Ok(snapshot)
+    } else {
+        Err(error)
     }
 }
 
@@ -552,6 +611,46 @@ mod tests {
         assert_eq!(
             server_error(Some(208)).0,
             ObservationFailureKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn existing_database_error_4060_is_not_collapsed_into_absence() {
+        let snapshot = StandaloneDatabaseSnapshot {
+            identity: None,
+            ownership: None,
+            state: "RESTORING".into(),
+            recovery_model: "FULL".into(),
+            accessible: false,
+        };
+        let mut unavailable = RuntimeError::new(
+            ObservationFailureKind::Unsupported,
+            "TLS/TDS login",
+            "SQL Server rejected the database connection",
+        );
+        unavailable.server_code = Some(4060);
+        assert_eq!(
+            existing_database_connect_error(snapshot.clone(), unavailable),
+            Ok(snapshot)
+        );
+
+        let denied = RuntimeError::new(
+            ObservationFailureKind::Authentication,
+            "TLS/TDS login",
+            "SQL Server authentication failed",
+        );
+        assert_eq!(
+            existing_database_connect_error(
+                StandaloneDatabaseSnapshot {
+                    identity: None,
+                    ownership: None,
+                    state: "ONLINE".into(),
+                    recovery_model: "FULL".into(),
+                    accessible: false,
+                },
+                denied.clone(),
+            ),
+            Err(denied)
         );
     }
 

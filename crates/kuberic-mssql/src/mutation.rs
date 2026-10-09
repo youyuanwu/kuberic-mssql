@@ -15,19 +15,24 @@ SELECT
     CONVERT(nvarchar(60), d.recovery_model_desc) AS recovery_model_desc,
     CONVERT(nvarchar(36), drs.database_guid) AS database_guid,
     CONVERT(nvarchar(36), drs.family_guid) AS family_guid,
-    CONVERT(nvarchar(36), drs.recovery_fork_guid) AS recovery_fork_guid,
-    CONVERT(nvarchar(512), ep_resource.value) AS kuberic_resource_id,
-    CONVERT(nvarchar(512), ep_configuration.value) AS kuberic_configuration_id
+    CONVERT(nvarchar(36), drs.recovery_fork_guid) AS recovery_fork_guid
 FROM sys.databases AS d
 LEFT JOIN sys.database_recovery_status AS drs
     ON drs.database_id = d.database_id
+WHERE d.name = @P1;"#;
+
+#[allow(dead_code)]
+pub(crate) const DATABASE_OWNERSHIP_QUERY: &str = r#"
+SELECT
+    CONVERT(nvarchar(512), ep_resource.value) AS kuberic_resource_id,
+    CONVERT(nvarchar(512), ep_configuration.value) AS kuberic_configuration_id
+FROM (VALUES (1)) AS singleton(value)
 OUTER APPLY sys.fn_listextendedproperty(
     N'kuberic_resource_id', DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT
 ) AS ep_resource
 OUTER APPLY sys.fn_listextendedproperty(
     N'kuberic_configuration_id', DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT
-) AS ep_configuration
-WHERE d.name = DB_NAME();"#;
+) AS ep_configuration;"#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutationEffect(MutationKind);
