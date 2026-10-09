@@ -49,6 +49,12 @@ fn three_replica_mssql_bootstrap_fault_boundaries() {
 }
 
 #[test]
+#[ignore = "exercises licensed seed dispatch handshake faults sequentially on a qualified local Docker host"]
+fn three_replica_mssql_seed_dispatch_handshake_faults() {
+    run_phase4_test(Phase4LiveTest::SeedDispatchHandshake);
+}
+
+#[test]
 #[ignore = "exercises licensed native conflict classifications sequentially on a qualified local Docker host"]
 fn three_replica_mssql_native_conflict_matrix() {
     run_phase4_test(Phase4LiveTest::ConflictMatrix);
@@ -74,6 +80,7 @@ fn run_three_replica_test(validate_restart: bool) {
 #[derive(Clone, Copy)]
 enum Phase4LiveTest {
     FaultBoundaries,
+    SeedDispatchHandshake,
     ConflictMatrix,
 }
 
@@ -92,6 +99,9 @@ fn run_phase4_test(test: Phase4LiveTest) {
                     match test {
                         Phase4LiveTest::FaultBoundaries => {
                             execute_phase4_fault_boundaries(&root).await
+                        }
+                        Phase4LiveTest::SeedDispatchHandshake => {
+                            execute_seed_dispatch_handshake_faults(&root).await
                         }
                         Phase4LiveTest::ConflictMatrix => {
                             execute_phase4_conflict_matrix(&root).await
@@ -826,10 +836,10 @@ async fn exercise_public_build_retirement_and_supersession(
     let mut final_callback = final_callback;
     tokio::select! {
         entered = compaction_entered_rx => entered
-            .map_err(|_| "final replacement ended before the Dispatched checkpoint")?,
+            .map_err(|_| "final replacement ended before the accepted-dispatch checkpoint")?,
         result = &mut final_callback => {
             return Err(format!(
-                "final replacement completed before the Dispatched checkpoint: {result:?}"
+                "final replacement completed before the accepted-dispatch checkpoint: {result:?}"
             )
             .into());
         }
@@ -996,11 +1006,13 @@ async fn exercise_dispatched_build_lifecycle_commands(
     let retained = group
         .testing_seed_dispatch_record()?
         .ok_or("dispatched lifecycle commands released the retained seed record")?;
-    if retained.phase() != SeedDispatchPhase::Dispatched
-        || retained.winning_build_id() != winner.build_id.as_str()
+    if !matches!(
+        retained.phase(),
+        SeedDispatchPhase::Submitting | SeedDispatchPhase::Accepted | SeedDispatchPhase::Ambiguous
+    ) || retained.winning_build_id() != winner.build_id.as_str()
         || group.testing_seed_dispatch_count()? != 1
     {
-        return Err("retirement or supersession mutated durable Dispatched seed authority".into());
+        return Err("retirement or supersession mutated durable seed authority".into());
     }
     Ok(())
 }
@@ -1085,8 +1097,10 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
     let retained = first
         .testing_seed_dispatch_record()?
         .ok_or("compaction checkpoint did not retain seed authority")?;
-    if retained.phase() != SeedDispatchPhase::Dispatched
-        || retained.winning_build_id() != interrupted_build.build_id.as_str()
+    if !matches!(
+        retained.phase(),
+        SeedDispatchPhase::Submitting | SeedDispatchPhase::Accepted | SeedDispatchPhase::Ambiguous
+    ) || retained.winning_build_id() != interrupted_build.build_id.as_str()
     {
         return Err("compaction checkpoint retained the wrong seed authority".into());
     }
@@ -1100,7 +1114,10 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
     let retained = first
         .testing_seed_dispatch_record()?
         .ok_or("host abort released a durably dispatched seed record")?;
-    if retained.phase() != SeedDispatchPhase::Dispatched {
+    if !matches!(
+        retained.phase(),
+        SeedDispatchPhase::Submitting | SeedDispatchPhase::Accepted | SeedDispatchPhase::Ambiguous
+    ) {
         return Err("host abort made dispatched seed authority releasable".into());
     }
     first.shutdown_with_coordinator(&first_cleanup).await?;
@@ -1199,6 +1216,13 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
 }
 
 async fn execute_phase4_fault_boundaries(base_root: &Path) -> Result<(), TestError> {
+    execute_configuration_faults(base_root).await?;
+    execute_seed_dispatch_handshake_faults(&base_root.join("seed-dispatch-handshake")).await?;
+    exercise_seed_faults(&base_root.join("seed-boundaries")).await?;
+    exercise_post_native_success_replay(&base_root.join("post-native-success")).await
+}
+
+async fn execute_configuration_faults(base_root: &Path) -> Result<(), TestError> {
     for (fault, label) in [
         (
             PublicMutationFault::SourceRecoveryCompletion,
@@ -1291,8 +1315,129 @@ async fn execute_phase4_fault_boundaries(base_root: &Path) -> Result<(), TestErr
     ] {
         exercise_configuration_fault(base_root, fault, label).await?;
     }
-    exercise_seed_faults(&base_root.join("seed-boundaries")).await?;
-    exercise_post_native_success_replay(&base_root.join("post-native-success")).await
+    Ok(())
+}
+
+async fn execute_seed_dispatch_handshake_faults(base_root: &Path) -> Result<(), TestError> {
+    let filter = std::env::var("KUBERIC_MSSQL_SEED_FAULT_FILTER").ok();
+    for (fault, label) in [
+        (
+            PublicMutationFault::SeedBeforeRequestSubmission,
+            "seed-before-request-submission",
+        ),
+        (
+            PublicMutationFault::SeedAfterRequestSubmission,
+            "seed-after-request-submission",
+        ),
+        (
+            PublicMutationFault::SeedAcceptedReplyLost,
+            "seed-accepted-reply-lost",
+        ),
+        (
+            PublicMutationFault::SeedDefiniteSqlRejection,
+            "seed-definite-sql-rejection",
+        ),
+    ] {
+        if filter.as_deref().is_some_and(|filter| filter != label) {
+            continue;
+        }
+        exercise_seed_submission_fault(&base_root.join(label), fault, label).await?;
+    }
+    Ok(())
+}
+
+async fn exercise_seed_submission_fault(
+    root: &Path,
+    fault: PublicMutationFault,
+    label: &str,
+) -> Result<(), TestError> {
+    cleanup_three_replica_fixture(root)?;
+    let config = FixtureConfig::for_test_fixture(root)?;
+    let mut launched = launch_three_members(config).await?;
+    let prepared = launched.prepare_availability_group().await?;
+    let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let group = start_prepared_public_group_with_retry(
+        root,
+        &launched.run,
+        &prepared,
+        &launched.members,
+        launched.kuberic_convergence_timeout(),
+        launched.complete_deadline(),
+        &cleanup,
+    )
+    .await?;
+    let sequence = group.bootstrap_configuration_sequence().await?;
+    wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout()).await?;
+    let command =
+        group.target_build_command(1, format!("{label}-build"), format!("{label}-build"))?;
+    group
+        .testing_execute_kuberic_build_command(&command)
+        .await
+        .map_err(|error| format!("{label} build admission failed: {error}"))?;
+
+    group.testing_arm_mutation_fault(fault);
+    let first = group.testing_execute_admitted_seed_callback(&command).await;
+    if group.testing_mutation_fault_hits() != 1 {
+        return Err(format!(
+            "{label} did not hit the exact TDS submission checkpoint; callback={first:?}"
+        )
+        .into());
+    }
+    if let Err(error) = &first
+        && error.to_string().contains("bounded callback budget")
+    {
+        return Err(format!("{label} degraded to a convergence deadline: {error}").into());
+    }
+    group
+        .testing_assert_source_build_success_not_published(&command)
+        .await?;
+    group
+        .testing_execute_admitted_seed_callback_with_retry(&command)
+        .await
+        .map_err(|error| format!("{label} safe callback retry failed: {error}"))?;
+    if group.testing_seed_dispatch_record()?.is_some() {
+        return Err(format!("{label} retained resolved dispatch ambiguity").into());
+    }
+    let attempts = group.testing_seed_dispatch_count()?;
+    match fault {
+        PublicMutationFault::SeedAcceptedReplyLost if attempts != 1 => {
+            return Err(format!("{label} repeated an accepted ADD DATABASE request").into());
+        }
+        PublicMutationFault::SeedBeforeRequestSubmission
+        | PublicMutationFault::SeedDefiniteSqlRejection
+            if attempts != 2 =>
+        {
+            return Err(format!("{label} did not perform exactly one proven-safe retry").into());
+        }
+        PublicMutationFault::SeedAfterRequestSubmission if !(1..=2).contains(&attempts) => {
+            return Err(format!("{label} produced an invalid submission count {attempts}").into());
+        }
+        _ => {}
+    }
+
+    let topology = launched
+        .finalize_prepared_availability_group(&prepared)
+        .await?;
+    let peer = group.target_build_command(2, format!("{label}-peer"), format!("{label}-peer"))?;
+    group
+        .testing_execute_admitted_seed_callback_with_retry(&peer)
+        .await
+        .map_err(|error| format!("{label} peer callback failed: {error}"))?;
+    let marker = launched
+        .commit_replicated_marker(&topology.evidence)
+        .await?;
+    if marker.readable_ordinals != [1, 2, 3] {
+        return Err(format!("{label} did not converge the exact seeded topology").into());
+    }
+    group.shutdown_with_coordinator(&cleanup).await?;
+    let evidence = launched.cleanup_with_coordinator(&cleanup)?;
+    if evidence.removed_container_ids.len() != 3 || evidence.removed_network_id.is_empty() {
+        return Err(format!("{label} cleanup did not remove exact owned resources").into());
+    }
+    assert_removed(root);
+    cleanup_three_replica_fixture(root)?;
+    assert_removed(root);
+    Ok(())
 }
 
 async fn exercise_configuration_fault(
@@ -1444,22 +1589,6 @@ async fn exercise_seed_faults(root: &Path) -> Result<(), TestError> {
         .testing_assert_source_build_success_not_published(&command)
         .await?;
 
-    group.testing_arm_mutation_fault(PublicMutationFault::SeedDispatchCompletion);
-    let dispatch_error = group
-        .testing_execute_admitted_seed_callback(&command)
-        .await
-        .expect_err("seed dispatch completion fault must interrupt its callback reply");
-    if !dispatch_error.to_string().contains("Unreachable")
-        || group.testing_mutation_fault_hits() != 1
-    {
-        return Err(
-            format!("seed dispatch did not stop at the exact boundary: {dispatch_error}").into(),
-        );
-    }
-    group
-        .testing_assert_source_build_success_not_published(&command)
-        .await?;
-
     let (association_entered_tx, association_entered_rx) = tokio::sync::oneshot::channel();
     let (_association_release_tx, association_release_rx) = tokio::sync::oneshot::channel();
     group.testing_gate_next_seed_compaction(association_entered_tx, association_release_rx)?;
@@ -1475,7 +1604,10 @@ async fn exercise_seed_faults(root: &Path) -> Result<(), TestError> {
     let retained = group
         .testing_seed_dispatch_record()?
         .ok_or("target-association interruption lost dispatched seed authority")?;
-    if retained.phase() != SeedDispatchPhase::Dispatched {
+    if !matches!(
+        retained.phase(),
+        SeedDispatchPhase::Submitting | SeedDispatchPhase::Accepted | SeedDispatchPhase::Ambiguous
+    ) {
         return Err("target-association interruption changed dispatched authority".into());
     }
     group

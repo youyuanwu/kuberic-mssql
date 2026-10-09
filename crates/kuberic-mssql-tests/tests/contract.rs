@@ -7,7 +7,7 @@ use kuberic_mssql::{
     ObservationFailure, ObservationFailureKind, OperationEnvelope, OperationPayload,
     OperationRecord, OperationRequest, PinnedImage, PinnedPackage, ReplayDisposition,
     ReplicaDescriptor, ReplicaIdentity, SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT,
-    SecretRef, SeedingMode, ServerName, SqlIdentifier, SqlMutationExecutor,
+    SecretRef, SeedDispatchRequest, SeedingMode, ServerName, SqlIdentifier, SqlMutationExecutor,
     SqlServerEulaAcknowledgement, SqlServerSupportConfig, StandaloneDatabaseIdentity,
     StandaloneDatabaseOwnership, StandaloneDatabaseSnapshot, classify_standalone_database,
     source_database_creation_token,
@@ -329,6 +329,30 @@ fn mutation_surface_is_typed_and_contains_only_approved_stage_three_effects() {
         add.statement(),
         "ALTER AVAILABILITY GROUP [kuberic-ag] ADD DATABASE [application];"
     );
+
+    let dispatch = SeedDispatchRequest::new(
+        AvailabilityGroupName::new("kuberic-ag").unwrap(),
+        guid(30),
+        SqlIdentifier::new("application").unwrap(),
+        guid(31),
+        "a".repeat(64),
+    )
+    .unwrap();
+    let submit = dispatch.testing_submission_statement(false);
+    assert!(submit.contains("dbo.kuberic_seed_dispatch"));
+    assert!(submit.contains("sp_getapplock"));
+    assert!(submit.contains("phase=N'submitting'"));
+    assert!(submit.contains("phase=N'accepted'"));
+    assert!(submit.contains("phase=N'failed_retryable'"));
+    assert!(submit.contains("ALTER AVAILABILITY GROUP [kuberic-ag] ADD DATABASE [application]"));
+    assert!(submit.find("phase=N'submitting'").unwrap() < submit.find("ADD DATABASE").unwrap());
+    let reject = dispatch.testing_submission_statement(true);
+    assert!(reject.contains("THROW 51001"));
+    assert!(reject.find("THROW 51001").unwrap() < reject.find("ADD DATABASE").unwrap());
+    let reconcile = dispatch.testing_reconciliation_statement();
+    assert!(reconcile.contains("@LockTimeout=0"));
+    assert!(reconcile.contains("N'ambiguous' AS dispatch_phase"));
+    assert!(reconcile.contains("phase=N'failed_retryable'"));
 }
 
 #[test]

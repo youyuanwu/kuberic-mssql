@@ -20,10 +20,13 @@ use kuberic_mssql::runtime_host::{
     RuntimeEndpointResolver, RuntimeHostApplication, RuntimeHostArgs, RuntimeHostConfig,
     SeedDispatchRecord,
 };
-use kuberic_mssql::tds::{TdsExecutor, TdsMutationExecutor};
+use kuberic_mssql::tds::{
+    SeedSubmissionAction, SeedSubmissionCheckpoint, SeedSubmissionProbe, TdsExecutor,
+    TdsMutationExecutor,
+};
 use kuberic_mssql::{
-    Guid, MutationEffect, NativeRole, Observation, ObservationFailureKind, SqlIdentifier,
-    SqlMutationExecutor, StandaloneDatabaseSnapshot,
+    Guid, MutationEffect, NativeRole, Observation, ObservationFailureKind, SeedDispatchEvidence,
+    SeedDispatchRequest, SqlIdentifier, SqlMutationExecutor, StandaloneDatabaseSnapshot,
 };
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::application::StatefulServiceReplica;
@@ -217,7 +220,10 @@ pub enum PublicMutationFault {
     SecondSecondaryJoinCompletion,
     SecondSecondarySeedingGrantCompletion,
     SecondSecondarySeedingGrantEvidenceCompletion,
-    SeedDispatchCompletion,
+    SeedBeforeRequestSubmission,
+    SeedAfterRequestSubmission,
+    SeedAcceptedReplyLost,
+    SeedDefiniteSqlRejection,
 }
 
 impl PublicMutationFault {
@@ -256,7 +262,10 @@ impl PublicMutationFault {
             Self::FirstSecondaryJoinCompletion | Self::SecondSecondaryJoinCompletion => {
                 "join availability group"
             }
-            Self::SeedDispatchCompletion => "add database to availability group",
+            Self::SeedBeforeRequestSubmission
+            | Self::SeedAfterRequestSubmission
+            | Self::SeedAcceptedReplyLost
+            | Self::SeedDefiniteSqlRejection => "add database to availability group",
         }
     }
 
@@ -323,6 +332,42 @@ impl PublicFaultInjection {
 }
 
 #[async_trait]
+impl SeedSubmissionProbe for PublicFaultInjection {
+    async fn checkpoint(
+        &self,
+        checkpoint: SeedSubmissionCheckpoint,
+    ) -> Result<SeedSubmissionAction, RuntimeError> {
+        let mut armed = self.state.armed.lock().map_err(|_| injected_fault())?;
+        let matches = matches!(
+            (*armed, checkpoint),
+            (
+                Some(PublicMutationFault::SeedBeforeRequestSubmission),
+                SeedSubmissionCheckpoint::BeforeRequestSubmission
+            ) | (
+                Some(PublicMutationFault::SeedAfterRequestSubmission),
+                SeedSubmissionCheckpoint::AfterRequestSubmission
+            ) | (
+                Some(PublicMutationFault::SeedAcceptedReplyLost),
+                SeedSubmissionCheckpoint::AfterAcceptedBeforeReply
+            ) | (
+                Some(PublicMutationFault::SeedDefiniteSqlRejection),
+                SeedSubmissionCheckpoint::BeforeRequestSubmission
+            )
+        );
+        if !matches {
+            return Ok(SeedSubmissionAction::Continue);
+        }
+        let fault = armed.take().expect("matched armed seed fault");
+        self.state.hits.fetch_add(1, Ordering::SeqCst);
+        if fault == PublicMutationFault::SeedDefiniteSqlRejection {
+            Ok(SeedSubmissionAction::InjectDefiniteRejection)
+        } else {
+            Err(injected_fault())
+        }
+    }
+}
+
+#[async_trait]
 impl SqlMutationExecutor for PublicMutationExecutor {
     async fn observe_standalone_database(
         &self,
@@ -355,6 +400,21 @@ impl SqlMutationExecutor for PublicMutationExecutor {
         effect: &MutationEffect,
     ) -> Result<bool, RuntimeError> {
         self.mutation.observe_effect_completion(effect).await
+    }
+
+    async fn reconcile_seed_dispatch(
+        &self,
+        request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        self.mutation.reconcile_seed_dispatch(request).await
+    }
+
+    async fn submit_seed_dispatch(
+        &self,
+        request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        self.seed_dispatches.fetch_add(1, Ordering::SeqCst);
+        self.mutation.submit_seed_dispatch(request).await
     }
 
     async fn execute(&self, effect: &MutationEffect) -> Result<(), RuntimeError> {
@@ -574,7 +634,10 @@ impl PublicMssqlGroup {
             });
             let mutation = mutation_settings.map(|settings| {
                 Arc::new(PublicMutationExecutor::new(
-                    TdsMutationExecutor::testing_new(settings),
+                    TdsMutationExecutor::testing_new_with_seed_probe(
+                        settings,
+                        Arc::new(faults.clone()),
+                    ),
                     TdsMutationExecutor::testing_new(
                         primary_mutation_settings
                             .clone()
@@ -1585,7 +1648,19 @@ fn retryable_public_build_error(error: &tonic::Status) -> bool {
         || (error.code() == tonic::Code::Internal
             && error
                 .message()
+                .contains("SQL Server observation is unavailable: Unsupported"))
+        || (error.code() == tonic::Code::Internal
+            && error
+                .message()
                 .contains("current configuration replay differs from the admitted value"))
+        || (error.code() == tonic::Code::Internal
+            && error.message().contains(
+                "current replica session, address, or role differs from the frozen member",
+            ))
+        || (error.code() == tonic::Code::Internal
+            && error
+                .message()
+                .contains("genuinely ambiguous SQL submission outcome"))
 }
 
 async fn admit_bootstrap_replicators(

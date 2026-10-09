@@ -17,8 +17,8 @@ use crate::bootstrap::{
 };
 use crate::executor::{QueryRow, SqlExecutor, SqlSession};
 use crate::mutation::{
-    DATABASE_OWNERSHIP_QUERY, MutationEffect, STANDALONE_DATABASE_QUERY, SqlMutationExecutor,
-    source_backup_path, source_log_backup_path,
+    DATABASE_OWNERSHIP_QUERY, MutationEffect, STANDALONE_DATABASE_QUERY, SeedDispatchEvidence,
+    SeedDispatchRequest, SqlMutationExecutor, source_backup_path, source_log_backup_path,
 };
 use crate::query::ReadQuery;
 use crate::runtime_config::{ConnectionSettings, read_bounded};
@@ -36,6 +36,8 @@ pub struct TdsExecutor {
 #[allow(dead_code)]
 pub struct TdsMutationExecutor {
     settings: ConnectionSettings,
+    #[cfg(feature = "kuberic-testing")]
+    seed_probe: Option<std::sync::Arc<dyn SeedSubmissionProbe>>,
 }
 
 impl TdsExecutor {
@@ -47,7 +49,11 @@ impl TdsExecutor {
 #[allow(dead_code)]
 impl TdsMutationExecutor {
     pub(crate) fn new(settings: ConnectionSettings) -> Self {
-        Self { settings }
+        Self {
+            settings,
+            #[cfg(feature = "kuberic-testing")]
+            seed_probe: None,
+        }
     }
 
     #[cfg(feature = "kuberic-testing")]
@@ -55,6 +61,42 @@ impl TdsMutationExecutor {
     pub fn testing_new(settings: ConnectionSettings) -> Self {
         Self::new(settings)
     }
+
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_new_with_seed_probe(
+        settings: ConnectionSettings,
+        seed_probe: std::sync::Arc<dyn SeedSubmissionProbe>,
+    ) -> Self {
+        Self {
+            settings,
+            seed_probe: Some(seed_probe),
+        }
+    }
+}
+
+#[cfg(feature = "kuberic-testing")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedSubmissionCheckpoint {
+    BeforeRequestSubmission,
+    AfterRequestSubmission,
+    AfterAcceptedBeforeReply,
+}
+
+#[cfg(feature = "kuberic-testing")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedSubmissionAction {
+    Continue,
+    InjectDefiniteRejection,
+}
+
+#[cfg(feature = "kuberic-testing")]
+#[async_trait]
+pub trait SeedSubmissionProbe: Send + Sync {
+    async fn checkpoint(
+        &self,
+        checkpoint: SeedSubmissionCheckpoint,
+    ) -> Result<SeedSubmissionAction, RuntimeError>;
 }
 
 struct TdsSession {
@@ -320,6 +362,95 @@ impl SqlMutationExecutor for TdsMutationExecutor {
         .map_err(|_| timed_out(STAGE))?
     }
 
+    async fn reconcile_seed_dispatch(
+        &self,
+        request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        #[cfg(feature = "kuberic-testing")]
+        if let Some(probe) = &self.seed_probe
+            && matches!(
+                probe
+                    .checkpoint(SeedSubmissionCheckpoint::AfterAcceptedBeforeReply)
+                    .await?,
+                SeedSubmissionAction::InjectDefiniteRejection
+            )
+        {
+            return Err(RuntimeError::new(
+                ObservationFailureKind::Unsupported,
+                "seed dispatch reconciliation",
+                "invalid seed submission probe action",
+            ));
+        }
+        match self
+            .execute_seed_protocol(
+                "seed dispatch reconciliation",
+                request.reconciliation_statement(),
+                None,
+            )
+            .await
+        {
+            Err(error) if error.server_code == Some(988) => Ok(SeedDispatchEvidence::Ambiguous),
+            result => result,
+        }
+    }
+
+    async fn submit_seed_dispatch(
+        &self,
+        request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        const STAGE: &str = "seed ADD DATABASE submission";
+        let mut client = connect_client(
+            &self.settings,
+            "kuberic-sqlserver-bootstrap",
+            "mutation username",
+            "mutation password",
+            None,
+        )
+        .await?;
+        #[cfg(feature = "kuberic-testing")]
+        let inject_definite_rejection = if let Some(probe) = &self.seed_probe {
+            matches!(
+                probe
+                    .checkpoint(SeedSubmissionCheckpoint::BeforeRequestSubmission)
+                    .await?,
+                SeedSubmissionAction::InjectDefiniteRejection
+            )
+        } else {
+            false
+        };
+        #[cfg(not(feature = "kuberic-testing"))]
+        let inject_definite_rejection = false;
+        let statement = request.submission_statement(inject_definite_rejection);
+        let query_timeout = self.settings.query_timeout;
+        #[cfg(feature = "kuberic-testing")]
+        let seed_probe = self.seed_probe.clone();
+        timeout(
+            query_timeout,
+            panic_boundary::contain(STAGE, async {
+                let mut stream = client
+                    .query(statement, &[])
+                    .await
+                    .map_err(|error| driver_error(STAGE, error))?;
+                #[cfg(feature = "kuberic-testing")]
+                if let Some(probe) = &seed_probe {
+                    let _ = probe
+                        .checkpoint(SeedSubmissionCheckpoint::AfterRequestSubmission)
+                        .await?;
+                }
+                let evidence = read_seed_dispatch_evidence(STAGE, &mut stream).await?;
+                #[cfg(feature = "kuberic-testing")]
+                if let Some(probe) = &seed_probe {
+                    let _ = probe
+                        .checkpoint(SeedSubmissionCheckpoint::AfterAcceptedBeforeReply)
+                        .await?;
+                }
+                Ok(evidence)
+            }),
+        )
+        .await
+        .map_err(|_| timed_out(STAGE))?
+    }
+
     async fn execute(&self, effect: &MutationEffect) -> Result<(), RuntimeError> {
         let stage = effect.label();
         let mut client = connect_client(
@@ -350,6 +481,63 @@ impl SqlMutationExecutor for TdsMutationExecutor {
         .await
         .map_err(|_| timed_out(stage))?
     }
+}
+
+impl TdsMutationExecutor {
+    async fn execute_seed_protocol(
+        &self,
+        stage: &'static str,
+        statement: String,
+        database: Option<&str>,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        let mut client = connect_client(
+            &self.settings,
+            "kuberic-sqlserver-bootstrap",
+            "mutation username",
+            "mutation password",
+            database,
+        )
+        .await?;
+        timeout(
+            self.settings.query_timeout,
+            panic_boundary::contain(stage, async move {
+                let mut stream = client
+                    .query(statement, &[])
+                    .await
+                    .map_err(|error| driver_error(stage, error))?;
+                read_seed_dispatch_evidence(stage, &mut stream).await
+            }),
+        )
+        .await
+        .map_err(|_| timed_out(stage))?
+    }
+}
+
+async fn read_seed_dispatch_evidence(
+    stage: &'static str,
+    stream: &mut tiberius::QueryStream<'_>,
+) -> Result<SeedDispatchEvidence, RuntimeError> {
+    let mut evidence = None;
+    while let Some(item) = stream
+        .try_next()
+        .await
+        .map_err(|error| driver_error(stage, error))?
+    {
+        if let QueryItem::Row(row) = item
+            && let Some(phase) = optional_text(&row, "dispatch_phase", stage)?
+        {
+            evidence = Some(match phase.as_str() {
+                "absent" => SeedDispatchEvidence::Absent,
+                "submitting" => SeedDispatchEvidence::Submitting,
+                "accepted" => SeedDispatchEvidence::Accepted,
+                "ambiguous" => SeedDispatchEvidence::Ambiguous,
+                "failed_retryable" => SeedDispatchEvidence::FailedRetryable,
+                "conflict" => SeedDispatchEvidence::Conflict,
+                _ => return Err(malformed(stage, "seed dispatch phase is invalid")),
+            });
+        }
+    }
+    evidence.ok_or_else(|| malformed(stage, "seed dispatch evidence returned no phase"))
 }
 
 #[allow(dead_code)]

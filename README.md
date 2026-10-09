@@ -290,7 +290,12 @@ types are not part of the application API.
 Stage 3 did not select operation-envelope serialization or a generic result
 journal. Callback-visible authority and Kuberic's retained command/build
 evidence are reconciled with exact native SQL postconditions; only the bounded
-pre-association seed-dispatch ambiguity uses application metadata. The existing
+pre-association seed-dispatch ambiguity uses application metadata. Its durable
+file phases distinguish intent, submitting, accepted/ambiguous, and definite
+retryable failure. A matching singleton SQL-owned token row and token-scoped
+application lock prove acceptance, active ambiguity, or a safe pre-effect
+retry; a local `Submitting` phase never claims that SQL accepted the request.
+The existing
 canonical signatures and approval/fence bindings remain contracts for later
 command transport. Observation JSON is output, not an authenticated command
 protocol.

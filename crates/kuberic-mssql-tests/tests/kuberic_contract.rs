@@ -26,11 +26,12 @@ use kuberic_mssql::{
     BootstrapOwnership, BootstrapOwnershipError, ConfigurationSequence, DatabaseIdentity,
     DatabaseLineage, DecimalProgress, Endpoint, Guid, MutationEffect, NativeConvergenceState,
     NativeProgress, NativeRole, Observation, ObservationFailure, ObservationFailureKind,
-    ReplicaDescriptor, ReplicaIdentity, ServerName, SqlIdentifier, SqlMutationExecutor,
-    SqlServerTopologyExpectation, SqlServerTopologyMemberExpectation, StandaloneDatabaseIdentity,
-    StandaloneDatabaseOwnership, StandaloneDatabaseSnapshot, classify_availability_group,
-    classify_bootstrap_ownership, classify_owned_availability_group, classify_replica_join,
-    classify_replica_seed, source_database_creation_token,
+    ReplicaDescriptor, ReplicaIdentity, SeedDispatchEvidence, SeedDispatchRequest, ServerName,
+    SqlIdentifier, SqlMutationExecutor, SqlServerTopologyExpectation,
+    SqlServerTopologyMemberExpectation, StandaloneDatabaseIdentity, StandaloneDatabaseOwnership,
+    StandaloneDatabaseSnapshot, classify_availability_group, classify_bootstrap_ownership,
+    classify_owned_availability_group, classify_replica_join, classify_replica_seed,
+    source_database_creation_token,
 };
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::application::{OpenMode, StatefulServiceReplica};
@@ -131,6 +132,22 @@ struct GatedSeedMutationExecutor {
     release: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
+struct SubmittedThenFailedSeedExecutor {
+    executions: AtomicUsize,
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+struct AcceptedReplyLostSeedExecutor {
+    complete: Arc<AtomicBool>,
+    executions: AtomicUsize,
+}
+
+struct RejectOnceSeedExecutor {
+    complete: Arc<AtomicBool>,
+    executions: AtomicUsize,
+}
+
 #[async_trait]
 impl SqlMutationExecutor for GatedSeedMutationExecutor {
     async fn observe_standalone_database(
@@ -161,6 +178,122 @@ impl SqlMutationExecutor for GatedSeedMutationExecutor {
             .expect("seed dispatch test must release the gate");
         self.complete.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        Ok(effect.label() == "grant create any database")
+    }
+}
+
+#[async_trait]
+impl SqlMutationExecutor for SubmittedThenFailedSeedExecutor {
+    async fn observe_standalone_database(
+        &self,
+        _database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        Ok(Some(owned_standalone_database()))
+    }
+
+    async fn submit_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        self.entered
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .send(())
+            .unwrap();
+        let release = self.release.lock().unwrap().take().unwrap();
+        let _ = release.await;
+        Err(RuntimeError::new(
+            ObservationFailureKind::Unreachable,
+            "seed ADD DATABASE submission",
+            "SQL Server transport failed",
+        ))
+    }
+
+    async fn execute(&self, _effect: &MutationEffect) -> Result<(), RuntimeError> {
+        unreachable!("seed protocol executor uses submit_seed_dispatch")
+    }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        Ok(effect.label() == "grant create any database")
+    }
+}
+
+#[async_trait]
+impl SqlMutationExecutor for AcceptedReplyLostSeedExecutor {
+    async fn observe_standalone_database(
+        &self,
+        _database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        Ok(Some(owned_standalone_database()))
+    }
+
+    async fn submit_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        self.complete.store(true, Ordering::SeqCst);
+        Err(RuntimeError::new(
+            ObservationFailureKind::Unreachable,
+            "seed ADD DATABASE submission",
+            "SQL Server transport failed",
+        ))
+    }
+
+    async fn execute(&self, _effect: &MutationEffect) -> Result<(), RuntimeError> {
+        unreachable!("seed protocol executor uses submit_seed_dispatch")
+    }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        Ok(effect.label() == "grant create any database")
+    }
+}
+
+#[async_trait]
+impl SqlMutationExecutor for RejectOnceSeedExecutor {
+    async fn observe_standalone_database(
+        &self,
+        _database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        Ok(Some(owned_standalone_database()))
+    }
+
+    async fn submit_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        let attempt = self.executions.fetch_add(1, Ordering::SeqCst);
+        if attempt == 0 {
+            let mut error = RuntimeError::new(
+                ObservationFailureKind::Unsupported,
+                "seed ADD DATABASE submission",
+                "SQL Server rejected the observation query",
+            );
+            error.server_code = Some(51001);
+            Err(error)
+        } else {
+            self.complete.store(true, Ordering::SeqCst);
+            Ok(SeedDispatchEvidence::Accepted)
+        }
+    }
+
+    async fn execute(&self, _effect: &MutationEffect) -> Result<(), RuntimeError> {
+        unreachable!("seed protocol executor uses submit_seed_dispatch")
     }
 
     async fn observe_effect_completion(
@@ -3891,6 +4024,195 @@ async fn winner_cancellation_before_durable_dispatch_allows_safe_rearbitration()
 }
 
 #[tokio::test]
+async fn crash_immediately_before_request_submission_retries_from_submitting_without_false_acceptance()
+ {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let first_executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let first = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete.clone(),
+        first_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator(&first).await;
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    first
+        .testing_gate_seed_submission(entered_tx, release_rx)
+        .unwrap();
+    let callback = tokio::spawn({
+        let first = first.clone();
+        async move {
+            first
+                .build_replica(target_build(1, "crash-before-request"))
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    let retained: SeedDispatchRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(retained.phase(), SeedDispatchPhase::Submitting);
+    assert_eq!(first_executor.executions.load(Ordering::SeqCst), 0);
+    first.abort();
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        callback.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    drop(first);
+
+    let replacement_executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replacement = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete,
+        replacement_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
+    replacement
+        .build_replica(target_build_with_sessions(
+            2,
+            "retry-after-pre-submit-crash",
+            "replacement-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replacement_executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn crash_immediately_after_request_submission_retries_after_proven_pre_effect_failure() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let first_executor = Arc::new(SubmittedThenFailedSeedExecutor {
+        executions: AtomicUsize::new(0),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release_rx)),
+    });
+    let first = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete.clone(),
+        first_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator(&first).await;
+    let callback = tokio::spawn({
+        let first = first.clone();
+        async move {
+            first
+                .build_replica(target_build(1, "crash-after-request"))
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    let retained: SeedDispatchRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(retained.phase(), SeedDispatchPhase::Submitting);
+    callback.abort();
+    assert!(callback.await.unwrap_err().is_cancelled());
+    drop(release_tx);
+    tokio::task::yield_now().await;
+    first.close().await.unwrap();
+    drop(first);
+
+    let replacement_executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replacement = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete,
+        replacement_executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
+    replacement
+        .build_replica(target_build_with_sessions(
+            1,
+            "retry-after-post-submit-crash",
+            "replacement-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_executor.executions.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement_executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn accepted_sql_with_lost_reply_replays_from_native_evidence_without_redispatch() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(AcceptedReplyLostSeedExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replicator = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete,
+        executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator(&replicator).await;
+    let first = replicator
+        .build_replica(target_build(1, "accepted-reply-lost"))
+        .await;
+    assert!(first.is_err());
+    replicator
+        .build_replica(target_build(1, "accepted-reply-lost"))
+        .await
+        .unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn definite_sql_rejection_is_retryable_and_does_not_degrade_to_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(RejectOnceSeedExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replicator = seed_replicator_with_executor(
+        root.path().to_owned(),
+        complete,
+        executor.clone() as Arc<dyn SqlMutationExecutor>,
+    );
+    admit_seed_replicator(&replicator).await;
+    let message = application_error(
+        replicator
+            .build_replica(target_build(1, "definite-rejection"))
+            .await
+            .unwrap_err(),
+    );
+    assert!(message.contains("SQL Server error 51001"), "{message}");
+    assert!(!message.contains("bounded callback budget"), "{message}");
+    let retained: SeedDispatchRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(retained.phase(), SeedDispatchPhase::FailedRetryable);
+
+    replicator
+        .build_replica(target_build(1, "definite-rejection"))
+        .await
+        .unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 2);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
 async fn cancellation_after_durable_dispatch_restart_compacts_without_redispatch() {
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -3921,7 +4243,7 @@ async fn cancellation_after_durable_dispatch_restart_compacts_without_redispatch
     let retained: SeedDispatchRecord =
         serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
             .unwrap();
-    assert_eq!(retained.phase(), SeedDispatchPhase::Dispatched);
+    assert_eq!(retained.phase(), SeedDispatchPhase::Submitting);
     callback.abort();
     assert!(callback.await.unwrap_err().is_cancelled());
     release_tx.send(()).unwrap();
@@ -3987,7 +4309,7 @@ async fn compaction_checkpoint_fences_stale_callback_and_replacement_redispatch(
     let retained: SeedDispatchRecord =
         serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
             .unwrap();
-    assert_eq!(retained.phase(), SeedDispatchPhase::Dispatched);
+    assert_eq!(retained.phase(), SeedDispatchPhase::Accepted);
     stale.abort();
     release_tx.send(()).unwrap();
     assert!(matches!(
@@ -4027,9 +4349,9 @@ async fn restart_compacts_a_dispatch_crashed_after_source_association_before_rem
         let store = SeedDispatchStore::open(root.path()).unwrap();
         let intent = exact_seed_record_with_sessions(1, "historical-build", "historical-session");
         store.create(&intent).unwrap();
-        let mut dispatched = intent.clone();
-        dispatched.mark_dispatched().unwrap();
-        let mut associated = store.replace(intent.revision(), dispatched).unwrap();
+        let mut accepted = intent.clone();
+        accepted.mark_accepted().unwrap();
+        let mut associated = store.replace(intent.revision(), accepted).unwrap();
         associated.associate_group_database(DATABASE_ID).unwrap();
         store.replace(associated.revision(), associated).unwrap();
     }
@@ -4151,9 +4473,11 @@ async fn retained_dispatch_accepts_fresh_source_and_target_sessions_but_rejects_
         let store = SeedDispatchStore::open(root.path()).unwrap();
         let record = exact_seed_record_with_sessions(1, "historical-build", "historical-session");
         store.create(&record).unwrap();
-        let mut dispatched = record.clone();
-        dispatched.mark_dispatched().unwrap();
-        store.replace(record.revision(), dispatched).unwrap();
+        let mut ambiguous = record.clone();
+        ambiguous.mark_submitting().unwrap();
+        let mut ambiguous = store.replace(record.revision(), ambiguous).unwrap();
+        ambiguous.mark_ambiguous().unwrap();
+        store.replace(ambiguous.revision(), ambiguous).unwrap();
     }
 
     let complete = Arc::new(AtomicBool::new(true));

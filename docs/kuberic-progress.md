@@ -150,8 +150,18 @@ authorized target build wins a group-level seed dispatch.
 
 Kuberic's command/effect/build receipts and exact SQL Server postconditions
 remain the primary durable evidence. The application persists only the
-pre-association Intent/Dispatched ambiguity under its existing application
-root; exact source association removes that record. The native bootstrap path also retains narrow database and AG creation
+pre-association `Intent`/`Submitting`/`Accepted`/`Ambiguous`/
+`FailedRetryable` handshake under its existing application root; exact source
+association removes that temporary record. A schema-v1 `Dispatched` record is
+migrated conservatively to `Ambiguous`.
+
+The owned source database retains one matching singleton dispatch row with a
+derived operation token, exact AG/database identities, and SQL-owned phase. A
+token-scoped SQL application lock distinguishes an active/ambiguous submission
+from a session that ended before any native effect. Accepted token or exact
+association evidence suppresses redispatch; proven pre-effect or definite SQL
+rejection becomes retryable instead of degrading into a later deadline. The
+native bootstrap path also retains narrow database and AG creation
 handshakes. A deterministic scoped DDL trigger is persisted before each
 irreversible create; only the exact token-bearing typed statement can
 atomically write the generated creation receipt. The source database then
@@ -249,7 +259,7 @@ replicated marker is written only by the fixture administrator against the
 directly observed native primary.
 
 The licensed same-root restart test stops all three public hosts while retaining
-SQL Server and durable roots. It covers retained seed Intent/Dispatched state,
+SQL Server and durable roots. It covers every retained seed handshake phase,
 fresh replacement sessions, stale-session rejection, restart-driven
 compaction, zero duplicate `ADD DATABASE`, exact report convergence and marker
 continuity. SQL Server processes are not restarted.
@@ -257,7 +267,9 @@ continuity. SQL Server processes are not restarted.
 The ignored live tests additionally prove handled-signal and SIGKILL recovery,
 lost replies plus same-root host replacement after every individual
 database/backup/AG/join/grant statement, every
-seed/callback-publication interruption boundary, native
+seed/callback-publication interruption boundary, exact TDS checkpoints before
+request submission, after request submission, after SQL acceptance with a lost
+reply, and after definite SQL rejection, native
 AG/replica/endpoint/database/lineage/incarnation conflicts through real
 callbacks, exact cleanup, and successful same-root retries.
 

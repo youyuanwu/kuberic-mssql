@@ -658,7 +658,7 @@ async fn runtime_binding_allows_one_owned_seed_dispatch_record() {
     assert_eq!(store.load().unwrap(), None);
     let record = seed_record();
     let mut invalid_initial_value = serde_json::to_value(&record).unwrap();
-    invalid_initial_value["phase"] = serde_json::json!("dispatched");
+    invalid_initial_value["phase"] = serde_json::json!("accepted");
     let invalid_initial: SeedDispatchRecord =
         serde_json::from_value(invalid_initial_value).unwrap();
     assert_eq!(
@@ -693,27 +693,32 @@ async fn runtime_binding_allows_one_owned_seed_dispatch_record() {
         Err(SeedStateError::RevisionMismatch)
     );
 
-    let mut dispatched = record.clone();
-    dispatched.mark_dispatched().unwrap();
-    let dispatched = store.replace(record.revision(), dispatched).unwrap();
-    assert_eq!(dispatched.phase(), SeedDispatchPhase::Dispatched);
-    assert_eq!(dispatched.revision(), 2);
+    let mut submitting = record.clone();
+    submitting.mark_submitting().unwrap();
+    let submitting = store.replace(record.revision(), submitting).unwrap();
+    assert_eq!(submitting.phase(), SeedDispatchPhase::Submitting);
+    assert_eq!(submitting.revision(), 2);
     assert_eq!(
-        store.replace(record.revision(), dispatched.clone()),
+        store.replace(record.revision(), submitting.clone()),
         Err(SeedStateError::RevisionMismatch)
     );
 
-    let mut regressed_value = serde_json::to_value(&dispatched).unwrap();
+    let mut regressed_value = serde_json::to_value(&submitting).unwrap();
     regressed_value["phase"] = serde_json::json!("intent");
     let regressed: SeedDispatchRecord = serde_json::from_value(regressed_value).unwrap();
     assert_eq!(
-        store.replace(dispatched.revision(), regressed),
+        store.replace(submitting.revision(), regressed),
         Err(SeedStateError::InvalidTransition)
     );
 
-    let mut associated = dispatched.clone();
+    let mut accepted = submitting.clone();
+    accepted.mark_accepted().unwrap();
+    let accepted = store.replace(submitting.revision(), accepted).unwrap();
+    assert_eq!(accepted.phase(), SeedDispatchPhase::Accepted);
+
+    let mut associated = accepted.clone();
     associated.associate_group_database(seed_guid(23)).unwrap();
-    let associated = store.replace(dispatched.revision(), associated).unwrap();
+    let associated = store.replace(accepted.revision(), associated).unwrap();
     assert_eq!(associated.group_database_id(), Some(seed_guid(23).as_str()));
 
     let mut cleared_value = serde_json::to_value(&associated).unwrap();
@@ -776,7 +781,7 @@ async fn seed_dispatch_store_serializes_concurrent_record_creation() {
 }
 
 #[tokio::test]
-async fn intent_only_claim_can_be_released_but_dispatched_claim_cannot_regress() {
+async fn intent_and_definite_failure_can_be_released_but_submitting_cannot() {
     let temporary = tempfile::tempdir().unwrap();
     let runtime_config = config(temporary.path()).await;
     let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
@@ -789,14 +794,43 @@ async fn intent_only_claim_can_be_released_but_dispatched_claim_cannot_regress()
     assert_eq!(store.load().unwrap(), None);
 
     store.create(&record).unwrap();
-    let mut dispatched = record.clone();
-    dispatched.mark_dispatched().unwrap();
-    let dispatched = store.replace(record.revision(), dispatched).unwrap();
+    let mut submitting = record.clone();
+    submitting.mark_submitting().unwrap();
+    let submitting = store.replace(record.revision(), submitting).unwrap();
     assert_eq!(
-        store.remove_intent(dispatched.revision()),
+        store.remove_intent(submitting.revision()),
         Err(SeedStateError::InvalidTransition)
     );
-    assert_eq!(store.load().unwrap(), Some(dispatched));
+    let mut failed = submitting.clone();
+    failed.mark_failed_retryable().unwrap();
+    let failed = store.replace(submitting.revision(), failed).unwrap();
+    assert_eq!(failed.phase(), SeedDispatchPhase::FailedRetryable);
+    store.remove_intent(failed.revision()).unwrap();
+    assert_eq!(store.load().unwrap(), None);
+}
+
+#[tokio::test]
+async fn legacy_dispatched_seed_state_migrates_to_ambiguous_without_claiming_acceptance() {
+    let temporary = tempfile::tempdir().unwrap();
+    let runtime_config = config(temporary.path()).await;
+    let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
+    binding.initialize().unwrap();
+    let path = binding.root().join("seed-dispatch-v1.json");
+    let mut legacy = serde_json::to_value(seed_record()).unwrap();
+    legacy["schema_version"] = serde_json::json!(1);
+    legacy["revision"] = serde_json::json!(2);
+    legacy["phase"] = serde_json::json!("dispatched");
+    legacy.as_object_mut().unwrap().remove("operation_token");
+    write_private(&path, serde_json::to_string_pretty(&legacy).unwrap());
+
+    let store = SeedDispatchStore::open(binding.root()).unwrap();
+    let migrated = store.load().unwrap().unwrap();
+    assert_eq!(migrated.phase(), SeedDispatchPhase::Ambiguous);
+    assert_eq!(migrated.revision(), 2);
+    assert_eq!(migrated.operation_token().len(), 64);
+    let persisted: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(persisted["schema_version"], serde_json::json!(2));
+    assert_eq!(persisted["phase"], serde_json::json!("ambiguous"));
 }
 
 #[tokio::test]

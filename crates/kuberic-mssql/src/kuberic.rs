@@ -25,7 +25,9 @@ use crate::bootstrap::{
 };
 use crate::executor::SqlExecutor;
 use crate::instance::{SqlServerInstanceManager, unix_millis};
-use crate::mutation::{MutationEffect, SqlMutationExecutor};
+use crate::mutation::{
+    MutationEffect, SeedDispatchEvidence, SeedDispatchRequest, SqlMutationExecutor,
+};
 use crate::observation::{
     AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, InstanceSnapshot, NativeProvenance,
     RecoveryLineageObservation,
@@ -97,6 +99,7 @@ pub enum KubericAdapterError {
         kind: ObservationFailureKind,
         server_code: Option<u32>,
     },
+    NativeMutationAmbiguous(&'static str),
     SeedState(SeedStateError),
     UnsupportedOperation(ObserveOnlyOperation),
     NotOpen,
@@ -169,6 +172,12 @@ impl fmt::Display for KubericAdapterError {
                     write!(formatter, " (SQL Server error {code})")?;
                 }
                 Ok(())
+            }
+            Self::NativeMutationAmbiguous(effect) => {
+                write!(
+                    formatter,
+                    "{effect} has a genuinely ambiguous SQL submission outcome"
+                )
             }
             Self::SeedState(error) => write!(formatter, "seed dispatch state failed: {error}"),
             Self::UnsupportedOperation(operation) => write!(
@@ -794,8 +803,11 @@ struct SeedCoordinator {
     root: PathBuf,
     store: Mutex<Option<Arc<SeedDispatchStore>>>,
     arbiter: tokio::sync::Mutex<()>,
+    submission_active: std::sync::atomic::AtomicBool,
     #[cfg(feature = "kuberic-testing")]
     intent_gate: Mutex<Option<SeedGate>>,
+    #[cfg(feature = "kuberic-testing")]
+    submission_gate: Mutex<Option<SeedGate>>,
     #[cfg(feature = "kuberic-testing")]
     compaction_gate: Mutex<Option<SeedGate>>,
     #[cfg(feature = "kuberic-testing")]
@@ -814,8 +826,11 @@ impl SeedCoordinator {
             root,
             store: Mutex::new(None),
             arbiter: tokio::sync::Mutex::new(()),
+            submission_active: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "kuberic-testing")]
             intent_gate: Mutex::new(None),
+            #[cfg(feature = "kuberic-testing")]
+            submission_gate: Mutex::new(None),
             #[cfg(feature = "kuberic-testing")]
             compaction_gate: Mutex::new(None),
             #[cfg(feature = "kuberic-testing")]
@@ -840,6 +855,11 @@ impl SeedCoordinator {
     #[cfg(feature = "kuberic-testing")]
     async fn pause_after_intent_if_requested(&self) -> Result<(), KubericAdapterError> {
         self.pause_if_requested(&self.intent_gate).await
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    async fn pause_before_submission_if_requested(&self) -> Result<(), KubericAdapterError> {
+        self.pause_if_requested(&self.submission_gate).await
     }
 
     #[cfg(feature = "kuberic-testing")]
@@ -871,6 +891,16 @@ impl SeedCoordinator {
     }
 }
 
+struct ActiveSeedSubmission(Arc<SeedCoordinator>);
+
+impl Drop for ActiveSeedSubmission {
+    fn drop(&mut self) {
+        self.0
+            .submission_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ReplicatorLifecycle {
     state: u8,
@@ -882,6 +912,16 @@ struct SeedBuildContext {
     database: StandaloneDatabaseIdentity,
     record: SeedDispatchRecord,
     target_native_replica_id: Guid,
+}
+
+struct SeedDispatchAttempt {
+    request: SeedDispatchRequest,
+    task: tokio::task::JoinHandle<Result<SeedDispatchEvidence, RuntimeError>>,
+}
+
+enum SeedDispatchAction {
+    ObserveAmbiguous,
+    Submitted(SeedDispatchAttempt),
 }
 
 enum SourceAssociation {
@@ -905,6 +945,29 @@ impl SqlServerReplicator {
             .seed;
         let mut gate = seed
             .intent_gate
+            .lock()
+            .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?;
+        if gate.is_some() {
+            return Err(KubericAdapterError::SeedState(SeedStateError::AlreadyOwned));
+        }
+        *gate = Some(SeedGate { entered, release });
+        Ok(())
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_gate_seed_submission(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), KubericAdapterError> {
+        let seed = &self
+            .bootstrap
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?
+            .seed;
+        let mut gate = seed
+            .submission_gate
             .lock()
             .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?;
         if gate.is_some() {
@@ -2313,7 +2376,7 @@ impl SqlServerReplicator {
         mut record: SeedDispatchRecord,
         database: &DatabaseIdentity,
     ) -> Result<(), KubericAdapterError> {
-        if record.phase() != SeedDispatchPhase::Dispatched {
+        if record.phase() != SeedDispatchPhase::Accepted {
             return Err(KubericAdapterError::SeedState(
                 SeedStateError::InvalidTransition,
             ));
@@ -2331,13 +2394,108 @@ impl SqlServerReplicator {
             .map_err(KubericAdapterError::SeedState)
     }
 
+    fn persist_seed_dispatch_evidence(
+        &self,
+        store: &SeedDispatchStore,
+        context: &SeedBuildContext,
+        evidence: SeedDispatchEvidence,
+    ) -> Result<SeedDispatchRecord, KubericAdapterError> {
+        let Some(mut record) = store.load().map_err(KubericAdapterError::SeedState)? else {
+            if evidence == SeedDispatchEvidence::Accepted {
+                let mut accepted = context.record.clone();
+                accepted
+                    .mark_accepted()
+                    .map_err(KubericAdapterError::SeedState)?;
+                return Ok(accepted);
+            }
+            return Err(KubericAdapterError::SeedState(SeedStateError::Missing));
+        };
+        self.validate_seed_record(&record, &context.record)?;
+        let previous_phase = record.phase();
+        match evidence {
+            SeedDispatchEvidence::Accepted => {
+                if record.phase() != SeedDispatchPhase::Accepted {
+                    record
+                        .mark_accepted()
+                        .map_err(KubericAdapterError::SeedState)?;
+                }
+            }
+            SeedDispatchEvidence::Submitting | SeedDispatchEvidence::Ambiguous => {
+                if record.phase() == SeedDispatchPhase::Submitting {
+                    record
+                        .mark_ambiguous()
+                        .map_err(KubericAdapterError::SeedState)?;
+                } else if record.phase() != SeedDispatchPhase::Ambiguous {
+                    return Err(KubericAdapterError::SeedState(
+                        SeedStateError::InvalidTransition,
+                    ));
+                }
+            }
+            SeedDispatchEvidence::Absent | SeedDispatchEvidence::FailedRetryable => {
+                if matches!(
+                    record.phase(),
+                    SeedDispatchPhase::Submitting | SeedDispatchPhase::Ambiguous
+                ) {
+                    record
+                        .mark_failed_retryable()
+                        .map_err(KubericAdapterError::SeedState)?;
+                } else if !matches!(
+                    record.phase(),
+                    SeedDispatchPhase::Intent | SeedDispatchPhase::FailedRetryable
+                ) {
+                    return Err(KubericAdapterError::NativeConvergenceConflict(
+                        "accepted seed dispatch SQL evidence",
+                    ));
+                }
+            }
+            SeedDispatchEvidence::Conflict => {
+                return Err(KubericAdapterError::NativeConvergenceConflict(
+                    "seed dispatch SQL metadata",
+                ));
+            }
+        }
+        if record.phase() != previous_phase {
+            record = store
+                .replace(record.revision(), record)
+                .map_err(KubericAdapterError::SeedState)?;
+        }
+        Ok(record)
+    }
+
+    async fn reconcile_seed_dispatch_evidence(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+        request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, KubericAdapterError> {
+        let executor = &self
+            .bootstrap
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?
+            .executor;
+        let evidence = tokio::time::timeout(
+            bootstrap_remaining(deadline)?,
+            executor.reconcile_seed_dispatch(request),
+        )
+        .await
+        .map_err(|_| {
+            KubericAdapterError::NativeMutationAmbiguous("add database to availability group")
+        })?
+        .map_err(|error| KubericAdapterError::NativeMutationFailed {
+            effect: "reconcile add database submission",
+            kind: error.kind,
+            server_code: error.server_code,
+        })?;
+        drop(self.finish_operation(generation)?);
+        Ok(evidence)
+    }
+
     async fn arbitrate_seed_dispatch(
         &self,
         generation: u64,
         deadline: tokio::time::Instant,
         context: &SeedBuildContext,
-    ) -> Result<Option<tokio::task::JoinHandle<Result<(), RuntimeError>>>, KubericAdapterError>
-    {
+    ) -> Result<SeedDispatchAction, KubericAdapterError> {
         let bootstrap = self
             .bootstrap
             .as_ref()
@@ -2351,7 +2509,7 @@ impl SqlServerReplicator {
             source_association(&group, &context.database)?,
             SourceAssociation::Absent
         ) {
-            return Ok(None);
+            return Ok(SeedDispatchAction::ObserveAmbiguous);
         }
         let store = bootstrap.seed.store()?;
         let existing = store.load().map_err(KubericAdapterError::SeedState)?;
@@ -2359,13 +2517,21 @@ impl SqlServerReplicator {
             Some(record) => {
                 self.validate_seed_record(&record, &context.record)?;
                 match record.phase() {
-                    SeedDispatchPhase::Dispatched => return Ok(None),
                     SeedDispatchPhase::Intent if record.same_intent_owner(&context.record) => {
                         record
                     }
-                    SeedDispatchPhase::Intent => store
-                        .replace_intent(record.revision(), context.record.clone())
-                        .map_err(KubericAdapterError::SeedState)?,
+                    SeedDispatchPhase::Intent | SeedDispatchPhase::FailedRetryable
+                        if !record.same_intent_owner(&context.record) =>
+                    {
+                        store
+                            .replace_intent(record.revision(), context.record.clone())
+                            .map_err(KubericAdapterError::SeedState)?
+                    }
+                    SeedDispatchPhase::Intent
+                    | SeedDispatchPhase::Submitting
+                    | SeedDispatchPhase::Accepted
+                    | SeedDispatchPhase::Ambiguous
+                    | SeedDispatchPhase::FailedRetryable => record,
                 }
             }
             None => {
@@ -2375,27 +2541,78 @@ impl SqlServerReplicator {
                 context.record.clone()
             }
         };
+        let request = SeedDispatchRequest::new(
+            context.binding.availability_group.name.clone(),
+            context.binding.availability_group.group_id.clone(),
+            context.database.name.clone(),
+            context.database.database_guid.clone(),
+            record.operation_token(),
+        )
+        .map_err(|_| {
+            KubericAdapterError::NativeConvergenceUnsafe("seed dispatch operation token")
+        })?;
+        if record.phase() == SeedDispatchPhase::Submitting
+            && bootstrap
+                .seed
+                .submission_active
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(SeedDispatchAction::ObserveAmbiguous);
+        }
+        let evidence = self
+            .reconcile_seed_dispatch_evidence(generation, deadline, &request)
+            .await?;
+        record = self.persist_seed_dispatch_evidence(store.as_ref(), context, evidence)?;
+        match record.phase() {
+            SeedDispatchPhase::Accepted | SeedDispatchPhase::Ambiguous => {
+                return Ok(SeedDispatchAction::ObserveAmbiguous);
+            }
+            SeedDispatchPhase::Submitting => {
+                return Err(KubericAdapterError::SeedState(
+                    SeedStateError::InvalidTransition,
+                ));
+            }
+            SeedDispatchPhase::Intent | SeedDispatchPhase::FailedRetryable => {}
+        }
         #[cfg(feature = "kuberic-testing")]
         bootstrap.seed.pause_after_intent_if_requested().await?;
         drop(self.finish_operation(generation)?);
         record
-            .mark_dispatched()
+            .mark_submitting()
             .map_err(KubericAdapterError::SeedState)?;
-        store
+        let record = store
             .replace(record.revision(), record)
             .map_err(KubericAdapterError::SeedState)?;
+        #[cfg(feature = "kuberic-testing")]
+        bootstrap
+            .seed
+            .pause_before_submission_if_requested()
+            .await?;
+        drop(self.finish_operation(generation)?);
         let executor = bootstrap.executor.clone();
-        let effect = MutationEffect::add_database(
-            self.source
-                .observer_config()
-                .target()
-                .availability_group
-                .clone(),
-            bootstrap.config.database.clone(),
-        );
-        Ok(Some(tokio::spawn(async move {
-            executor.execute(&effect).await
-        })))
+        let request = SeedDispatchRequest::new(
+            context.binding.availability_group.name.clone(),
+            context.binding.availability_group.group_id.clone(),
+            context.database.name.clone(),
+            context.database.database_guid.clone(),
+            record.operation_token(),
+        )
+        .map_err(|_| {
+            KubericAdapterError::NativeConvergenceUnsafe("seed dispatch operation token")
+        })?;
+        let submitted_request = request.clone();
+        bootstrap
+            .seed
+            .submission_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let seed = bootstrap.seed.clone();
+        Ok(SeedDispatchAction::Submitted(SeedDispatchAttempt {
+            request,
+            task: tokio::spawn(async move {
+                let _active = ActiveSeedSubmission(seed);
+                executor.submit_seed_dispatch(&submitted_request).await
+            }),
+        }))
     }
 
     async fn converge_seed_build(
@@ -2417,7 +2634,6 @@ impl SqlServerReplicator {
             &context.binding.availability_group,
         )
         .await?;
-        let mut dispatch_checked = false;
         loop {
             drop(self.finish_operation(generation)?);
             bootstrap_remaining(deadline)?;
@@ -2448,7 +2664,15 @@ impl SqlServerReplicator {
                             .await?;
                         drop(self.finish_operation(generation)?);
                     }
-                    if let Some(record) = record {
+                    if let Some(mut record) = record {
+                        if record.phase() != SeedDispatchPhase::Accepted {
+                            record
+                                .mark_accepted()
+                                .map_err(KubericAdapterError::SeedState)?;
+                            record = store
+                                .replace(record.revision(), record)
+                                .map_err(KubericAdapterError::SeedState)?;
+                        }
                         self.compact_seed_record(store.as_ref(), record, &database)?;
                     }
                     match classify_source_seed_completion(
@@ -2480,40 +2704,95 @@ impl SqlServerReplicator {
                     }
                 }
                 SourceAssociation::Incomplete => {}
-                SourceAssociation::Absent if !dispatch_checked => {
-                    dispatch_checked = true;
+                SourceAssociation::Absent => {
                     let dispatch = match self
                         .arbitrate_seed_dispatch(generation, deadline, &context)
                         .await
                     {
                         Ok(dispatch) => dispatch,
                         Err(error) if is_retryable_bootstrap_observation(&error) => {
-                            dispatch_checked = false;
                             self.wait_for_bootstrap_retry(generation, deadline).await?;
                             continue;
                         }
                         Err(error) => return Err(error),
                     };
-                    if let Some(mut dispatch) = dispatch {
-                        let result =
-                            tokio::time::timeout(bootstrap_remaining(deadline)?, &mut dispatch)
-                                .await
-                                .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)?
-                                .map_err(|_| {
-                                    KubericAdapterError::NativeConvergenceUnsafe(
-                                        "seed dispatch task terminated",
-                                    )
-                                })?;
-                        drop(self.finish_operation(generation)?);
-                        result.map_err(|error| KubericAdapterError::NativeMutationFailed {
-                            effect: "add database to availability group",
-                            kind: error.kind,
-                            server_code: error.server_code,
-                        })?;
+                    match dispatch {
+                        SeedDispatchAction::ObserveAmbiguous => {
+                            self.wait_for_bootstrap_retry(generation, deadline).await?;
+                        }
+                        SeedDispatchAction::Submitted(mut dispatch) => {
+                            let result = tokio::time::timeout(
+                                bootstrap_remaining(deadline)?,
+                                &mut dispatch.task,
+                            )
+                            .await
+                            .map_err(|_| {
+                                KubericAdapterError::NativeMutationAmbiguous(
+                                    "add database to availability group",
+                                )
+                            })?
+                            .map_err(|_| {
+                                KubericAdapterError::NativeConvergenceUnsafe(
+                                    "seed dispatch task terminated",
+                                )
+                            })?;
+                            drop(self.finish_operation(generation)?);
+                            let store = bootstrap.seed.store()?;
+                            match result {
+                                Ok(evidence) => {
+                                    let record = self.persist_seed_dispatch_evidence(
+                                        store.as_ref(),
+                                        &context,
+                                        evidence,
+                                    )?;
+                                    if record.phase() == SeedDispatchPhase::FailedRetryable {
+                                        return Err(KubericAdapterError::NativeMutationFailed {
+                                            effect: "add database to availability group",
+                                            kind: ObservationFailureKind::Unsupported,
+                                            server_code: None,
+                                        });
+                                    }
+                                }
+                                Err(error) => {
+                                    let evidence = self
+                                        .reconcile_seed_dispatch_evidence(
+                                            generation,
+                                            deadline,
+                                            &dispatch.request,
+                                        )
+                                        .await?;
+                                    let record = self.persist_seed_dispatch_evidence(
+                                        store.as_ref(),
+                                        &context,
+                                        evidence,
+                                    )?;
+                                    match record.phase() {
+                                        SeedDispatchPhase::Accepted => {}
+                                        SeedDispatchPhase::FailedRetryable
+                                        | SeedDispatchPhase::Intent => {
+                                            return Err(
+                                                KubericAdapterError::NativeMutationFailed {
+                                                    effect: "add database to availability group",
+                                                    kind: error.kind,
+                                                    server_code: error.server_code,
+                                                },
+                                            );
+                                        }
+                                        SeedDispatchPhase::Submitting
+                                        | SeedDispatchPhase::Ambiguous => {
+                                            return Err(
+                                                KubericAdapterError::NativeMutationAmbiguous(
+                                                    "add database to availability group",
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     continue;
                 }
-                SourceAssociation::Absent => {}
             }
             self.wait_for_bootstrap_retry(generation, deadline).await?;
         }

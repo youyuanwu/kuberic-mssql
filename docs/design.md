@@ -359,14 +359,30 @@ only while native SQL cannot prove whether group seeding was dispatched, one
 bounded `seed-dispatch-v1.json` record under the same authorized application
 root. Kuberic's private authority store remains behind the public host boundary.
 The already-owned source database separately retains narrow SQL extended
-properties for AG creation intent and the exact SQL-generated AG GUID. Current
-configuration replay, secondary join, and seed build require that native marker
-to match the resource, accepted configuration, AG name, and observed GUID; an
-unmarked same-name AG or a same-name replacement with another GUID is a
-terminal conflict rather than an adoption candidate.
-The seed record binds exact authority and native identities, uses exclusive
-ownership and monotonic atomic transitions, and is removed as soon as exact
-source database-to-AG association proves dispatch. Previous/current
+properties for AG creation intent and the exact SQL-generated AG GUID. It also
+retains one singleton `dbo.kuberic_seed_dispatch` row containing a derived
+64-character operation token, the exact AG/database identities, and the native
+submission phase. This is bounded operation metadata, not a general command or
+result ledger.
+
+The file record binds exact authority and native identities and distinguishes
+`Intent`, `Submitting`, `Accepted`, genuinely `Ambiguous`, and
+`FailedRetryable`. `Submitting` alone never suppresses another attempt after a
+restart. The SQL batch takes a token-scoped session application lock, publishes
+`submitting` before `ALTER AVAILABILITY GROUP ... ADD DATABASE`, and writes
+`accepted` or `failed_retryable` before releasing that lock. Recovery can
+acquire the same lock to prove the old submitting session is gone: exact native
+association or an accepted token suppresses redispatch, a held lock is
+ambiguous, and an absent effect after lock acquisition is definitely retryable.
+Schema-v1 file records migrate conservatively: old `Dispatched` becomes
+`Ambiguous`, never accepted by assertion.
+
+Current configuration replay, secondary join, and seed build require native
+markers to match the resource, accepted configuration, AG name, and observed
+GUID; an unmarked same-name AG or a same-name replacement with another GUID is
+a terminal conflict rather than an adoption candidate. The temporary file
+record is removed as soon as exact source database-to-AG association proves the
+accepted operation. Previous/current
 transitions, catch-up quorum, removal, data loss, destructive recovery, failover
 and lease behavior remain explicit unsupported errors.
 
@@ -382,10 +398,11 @@ v2 precedent uses three distinct owners: Kuberic agent SQLite metadata,
 application-owned checksummed metadata, and PGDATA. MSSQL applies the same
 ownership discipline with Kuberic authority, native SQL state, the immutable
 runtime binding, the AG identity marker in the owned source database, and one
-bounded seed-dispatch record under the existing application root. The record
-exists only for the demonstrated pre-association ambiguity; the AG marker only
-binds creation ownership and native identity. No general second operation
-database or result ledger was added.
+bounded seed-dispatch file under the existing application root plus one
+singleton SQL-owned dispatch row. Those records exist only for the demonstrated
+pre-association ambiguity; the AG marker only binds creation ownership and
+native identity. No general second operation database or result ledger was
+added.
 
 Bootstrap SQL is level-triggered at statement granularity. Scoped native DDL
 triggers persist the exact resource/configuration-derived creation intent before

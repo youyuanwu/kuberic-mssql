@@ -44,7 +44,7 @@ pub use kuberic::{
 #[cfg(feature = "kuberic-testing")]
 pub use mutation::{
     BootstrapMutationPlan, MutationContractError, MutationEffect, STANDALONE_DATABASE_QUERY,
-    SqlMutationExecutor,
+    SeedDispatchEvidence, SeedDispatchRequest, SqlMutationExecutor,
 };
 pub use operation::{
     DestructiveApproval, EffectSignature, FenceReference, InputSignature,

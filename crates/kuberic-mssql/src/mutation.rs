@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use crate::bootstrap::StandaloneDatabaseSnapshot;
 use crate::runtime_error::RuntimeError;
 use crate::{
-    AvailabilityGroupName, OperationPayload, OperationRequest, ReplicaDescriptor,
+    AvailabilityGroupName, Guid, OperationPayload, OperationRequest, ReplicaDescriptor,
     SUPPORTED_REPLICA_COUNT, SqlIdentifier,
 };
 
@@ -110,6 +110,214 @@ OUTER APPLY sys.fn_listextendedproperty(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutationEffect(MutationKind);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedDispatchEvidence {
+    Absent,
+    Submitting,
+    Accepted,
+    Ambiguous,
+    FailedRetryable,
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedDispatchRequest {
+    availability_group: AvailabilityGroupName,
+    availability_group_id: Guid,
+    database: SqlIdentifier,
+    database_guid: Guid,
+    operation_token: String,
+}
+
+impl SeedDispatchRequest {
+    pub fn new(
+        availability_group: AvailabilityGroupName,
+        availability_group_id: Guid,
+        database: SqlIdentifier,
+        database_guid: Guid,
+        operation_token: impl Into<String>,
+    ) -> Result<Self, MutationContractError> {
+        let operation_token = operation_token.into();
+        if operation_token.len() != 64
+            || !operation_token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(MutationContractError::InvalidMarker);
+        }
+        Ok(Self {
+            availability_group,
+            availability_group_id,
+            database,
+            database_guid,
+            operation_token,
+        })
+    }
+
+    pub fn effect(&self) -> MutationEffect {
+        MutationEffect::add_database(self.availability_group.clone(), self.database.clone())
+    }
+
+    pub fn operation_token(&self) -> &str {
+        &self.operation_token
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_reconciliation_statement(&self) -> String {
+        self.reconciliation_statement()
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_submission_statement(&self, inject_definite_rejection: bool) -> String {
+        self.submission_statement(inject_definite_rejection)
+    }
+
+    pub(crate) fn reconciliation_statement(&self) -> String {
+        let table = format!("{}.dbo.kuberic_seed_dispatch", self.database.quoted());
+        let token = sql_literal(&self.operation_token);
+        let lock = sql_literal(&format!("kuberic-seed-{}", self.operation_token));
+        let association = self.exact_association_predicate();
+        format!(
+            "IF OBJECT_ID(N'{table}', N'U') IS NULL\n\
+             BEGIN\n\
+             SELECT N'absent' AS dispatch_phase;\n\
+             RETURN;\n\
+             END;\n\
+             IF (SELECT COUNT_BIG(*) FROM {table}) > 1\n\
+             BEGIN\n\
+             SELECT N'conflict' AS dispatch_phase;\n\
+             RETURN;\n\
+             END;\n\
+             IF NOT EXISTS (SELECT 1 FROM {table})\n\
+             BEGIN\n\
+             SELECT N'absent' AS dispatch_phase;\n\
+             RETURN;\n\
+             END;\n\
+             IF NOT EXISTS (SELECT 1 FROM {table} WHERE singleton = 1 \
+             AND operation_token = N'{token}' \
+             AND availability_group_id = CONVERT(uniqueidentifier, N'{group_id}') \
+             AND database_guid = CONVERT(uniqueidentifier, N'{database_guid}'))\n\
+             BEGIN\n\
+             SELECT N'conflict' AS dispatch_phase;\n\
+             RETURN;\n\
+             END;\n\
+             DECLARE @phase nvarchar(32) = (SELECT phase FROM {table} WHERE singleton = 1);\n\
+             IF @phase = N'accepted'\n\
+             BEGIN\n\
+             SELECT N'accepted' AS dispatch_phase;\n\
+             RETURN;\n\
+             END;\n\
+             DECLARE @lock_result int;\n\
+             EXEC @lock_result = sys.sp_getapplock @Resource=N'{lock}', \
+             @LockMode=N'Exclusive', @LockOwner=N'Session', @LockTimeout=0;\n\
+             IF @lock_result < 0\n\
+             BEGIN\n\
+             SELECT N'ambiguous' AS dispatch_phase;\n\
+             RETURN;\n\
+             END;\n\
+             IF {association}\n\
+             BEGIN\n\
+             UPDATE {table} SET phase=N'accepted', error_code=NULL WHERE singleton=1;\n\
+             SET @phase=N'accepted';\n\
+             END\n\
+             ELSE IF @phase IN (N'intent', N'submitting', N'ambiguous')\n\
+             BEGIN\n\
+             UPDATE {table} SET phase=N'failed_retryable' WHERE singleton=1;\n\
+             SET @phase=N'failed_retryable';\n\
+             END;\n\
+             EXEC sys.sp_releaseapplock @Resource=N'{lock}', @LockOwner=N'Session';\n\
+             SELECT @phase AS dispatch_phase;",
+            group_id = self.availability_group_id.as_str(),
+            database_guid = self.database_guid.as_str(),
+        )
+    }
+
+    pub(crate) fn submission_statement(&self, inject_definite_rejection: bool) -> String {
+        let table = format!("{}.dbo.kuberic_seed_dispatch", self.database.quoted());
+        let token = sql_literal(&self.operation_token);
+        let lock = sql_literal(&format!("kuberic-seed-{}", self.operation_token));
+        let association = self.exact_association_predicate();
+        let rejection = if inject_definite_rejection {
+            "THROW 51001, N'injected definite seed dispatch rejection', 1;"
+        } else {
+            ""
+        };
+        format!(
+            "IF OBJECT_ID(N'{table}', N'U') IS NULL\n\
+             BEGIN\n\
+             CREATE TABLE {table}(\
+             singleton tinyint NOT NULL CONSTRAINT PK_kuberic_seed_dispatch PRIMARY KEY \
+             CONSTRAINT CK_kuberic_seed_dispatch_singleton CHECK (singleton = 1),\
+             operation_token char(64) NOT NULL,\
+             availability_group_id uniqueidentifier NOT NULL,\
+             database_guid uniqueidentifier NOT NULL,\
+             phase nvarchar(32) NOT NULL \
+             CONSTRAINT CK_kuberic_seed_dispatch_phase CHECK \
+             (phase IN (N'intent',N'submitting',N'accepted',N'ambiguous',N'failed_retryable')),\
+             error_code int NULL);\n\
+             END;\n\
+             IF EXISTS (SELECT 1 FROM {table} WHERE singleton <> 1 \
+             OR operation_token <> N'{token}' \
+             OR availability_group_id <> CONVERT(uniqueidentifier, N'{group_id}') \
+             OR database_guid <> CONVERT(uniqueidentifier, N'{database_guid}'))\n\
+             THROW 51000, N'seed dispatch metadata conflicts with the requested operation', 1;\n\
+             IF NOT EXISTS (SELECT 1 FROM {table} WHERE singleton=1)\n\
+             INSERT {table}(singleton, operation_token, availability_group_id, database_guid, phase) \
+             VALUES(1, N'{token}', CONVERT(uniqueidentifier, N'{group_id}'), \
+             CONVERT(uniqueidentifier, N'{database_guid}'), N'intent');\n\
+             DECLARE @lock_result int;\n\
+             EXEC @lock_result = sys.sp_getapplock @Resource=N'{lock}', \
+             @LockMode=N'Exclusive', @LockOwner=N'Session', @LockTimeout=0;\n\
+             IF @lock_result < 0 THROW 51000, N'seed dispatch operation is already submitting', 1;\n\
+             IF EXISTS (SELECT 1 FROM {table} WHERE singleton=1 AND phase=N'accepted')\n\
+             BEGIN\n\
+             EXEC sys.sp_releaseapplock @Resource=N'{lock}', @LockOwner=N'Session';\n\
+             SELECT N'accepted' AS dispatch_phase;\n\
+             RETURN;\n\
+             END;\n\
+             UPDATE {table} SET phase=N'submitting', error_code=NULL WHERE singleton=1;\n\
+             SELECT N'submitting' AS dispatch_phase;\n\
+             BEGIN TRY\n\
+             {rejection}\n\
+             ALTER AVAILABILITY GROUP {availability_group} ADD DATABASE {database};\n\
+             UPDATE {table} SET phase=N'accepted', error_code=NULL WHERE singleton=1;\n\
+             EXEC sys.sp_releaseapplock @Resource=N'{lock}', @LockOwner=N'Session';\n\
+             SELECT N'accepted' AS dispatch_phase;\n\
+             END TRY\n\
+             BEGIN CATCH\n\
+             DECLARE @error_number int = ERROR_NUMBER();\n\
+             IF {association}\n\
+             UPDATE {table} SET phase=N'accepted', error_code=NULL WHERE singleton=1;\n\
+             ELSE\n\
+             UPDATE {table} SET phase=N'failed_retryable', error_code=@error_number WHERE singleton=1;\n\
+             EXEC sys.sp_releaseapplock @Resource=N'{lock}', @LockOwner=N'Session';\n\
+             THROW;\n\
+             END CATCH;",
+            group_id = self.availability_group_id.as_str(),
+            database_guid = self.database_guid.as_str(),
+            availability_group = self.availability_group.quoted(),
+            database = self.database.quoted(),
+        )
+    }
+
+    fn exact_association_predicate(&self) -> String {
+        format!(
+            "EXISTS (SELECT 1 FROM sys.availability_databases_cluster AS adc \
+             INNER JOIN sys.availability_groups AS ag ON ag.group_id = adc.group_id \
+             INNER JOIN sys.databases AS d ON d.name = adc.database_name \
+             INNER JOIN sys.database_recovery_status AS drs ON drs.database_id = d.database_id \
+             WHERE ag.name = N'{}' \
+             AND ag.group_id = CONVERT(uniqueidentifier, N'{}') \
+             AND adc.database_name = N'{}' \
+             AND drs.database_guid = CONVERT(uniqueidentifier, N'{}'))",
+            sql_literal(self.availability_group.as_str()),
+            self.availability_group_id.as_str(),
+            sql_literal(self.database.as_str()),
+            self.database_guid.as_str(),
+        )
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MutationKind {
@@ -820,6 +1028,21 @@ pub trait SqlMutationExecutor: Send + Sync {
         _effect: &MutationEffect,
     ) -> Result<bool, RuntimeError> {
         Ok(false)
+    }
+
+    async fn reconcile_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        Ok(SeedDispatchEvidence::Absent)
+    }
+
+    async fn submit_seed_dispatch(
+        &self,
+        request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        self.execute(&request.effect()).await?;
+        Ok(SeedDispatchEvidence::Accepted)
     }
 
     async fn execute(&self, effect: &MutationEffect) -> Result<(), RuntimeError>;

@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::binding::{BoundRoot, process_is_gone, temporary_file_pid};
 
-pub const SEED_DISPATCH_SCHEMA_VERSION: u32 = 1;
+pub const SEED_DISPATCH_SCHEMA_VERSION: u32 = 2;
 pub(super) const SEED_STATE_FILE: &str = "seed-dispatch-v1.json";
 pub(super) const SEED_OWNER_FILE: &str = "seed-dispatch-v1.owner";
 pub(super) const MAX_SEED_STATE_BYTES: u64 = 65_536;
@@ -20,7 +21,10 @@ const MAX_ID_BYTES: usize = 512;
 #[serde(rename_all = "snake_case")]
 pub enum SeedDispatchPhase {
     Intent,
-    Dispatched,
+    Submitting,
+    Accepted,
+    Ambiguous,
+    FailedRetryable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +106,7 @@ pub struct SeedDispatchRecord {
     winning_target_replica_id: String,
     winning_build_id: String,
     sqlserver_start_time: String,
+    operation_token: String,
     phase: SeedDispatchPhase,
     group_database_id: Option<String>,
 }
@@ -123,7 +128,7 @@ impl SeedDispatchRecord {
         winning_build_id: impl Into<String>,
         sqlserver_start_time: impl Into<String>,
     ) -> Result<Self, SeedStateError> {
-        let record = Self {
+        let mut record = Self {
             schema_version: SEED_DISPATCH_SCHEMA_VERSION,
             revision: 1,
             resource_uid: resource_uid.into(),
@@ -139,9 +144,11 @@ impl SeedDispatchRecord {
             winning_target_replica_id: winning_target_replica_id.into(),
             winning_build_id: winning_build_id.into(),
             sqlserver_start_time: sqlserver_start_time.into(),
+            operation_token: String::new(),
             phase: SeedDispatchPhase::Intent,
             group_database_id: None,
         };
+        record.operation_token = record.derive_operation_token();
         record.validate()?;
         Ok(record)
     }
@@ -174,11 +181,60 @@ impl SeedDispatchRecord {
         self.group_database_id.as_deref()
     }
 
-    pub fn mark_dispatched(&mut self) -> Result<(), SeedStateError> {
-        if self.phase != SeedDispatchPhase::Intent || self.group_database_id.is_some() {
+    pub fn operation_token(&self) -> &str {
+        &self.operation_token
+    }
+
+    pub fn mark_submitting(&mut self) -> Result<(), SeedStateError> {
+        if !matches!(
+            self.phase,
+            SeedDispatchPhase::Intent | SeedDispatchPhase::FailedRetryable
+        ) || self.group_database_id.is_some()
+        {
             return Err(SeedStateError::InvalidTransition);
         }
-        self.phase = SeedDispatchPhase::Dispatched;
+        self.phase = SeedDispatchPhase::Submitting;
+        Ok(())
+    }
+
+    pub fn mark_accepted(&mut self) -> Result<(), SeedStateError> {
+        if !matches!(
+            self.phase,
+            SeedDispatchPhase::Intent
+                | SeedDispatchPhase::Submitting
+                | SeedDispatchPhase::Ambiguous
+                | SeedDispatchPhase::Accepted
+                | SeedDispatchPhase::FailedRetryable
+        ) {
+            return Err(SeedStateError::InvalidTransition);
+        }
+        self.phase = SeedDispatchPhase::Accepted;
+        Ok(())
+    }
+
+    pub fn mark_ambiguous(&mut self) -> Result<(), SeedStateError> {
+        if !matches!(
+            self.phase,
+            SeedDispatchPhase::Submitting | SeedDispatchPhase::Ambiguous
+        ) || self.group_database_id.is_some()
+        {
+            return Err(SeedStateError::InvalidTransition);
+        }
+        self.phase = SeedDispatchPhase::Ambiguous;
+        Ok(())
+    }
+
+    pub fn mark_failed_retryable(&mut self) -> Result<(), SeedStateError> {
+        if !matches!(
+            self.phase,
+            SeedDispatchPhase::Submitting
+                | SeedDispatchPhase::Ambiguous
+                | SeedDispatchPhase::FailedRetryable
+        ) || self.group_database_id.is_some()
+        {
+            return Err(SeedStateError::InvalidTransition);
+        }
+        self.phase = SeedDispatchPhase::FailedRetryable;
         Ok(())
     }
 
@@ -186,7 +242,7 @@ impl SeedDispatchRecord {
         &mut self,
         group_database_id: impl Into<String>,
     ) -> Result<(), SeedStateError> {
-        if self.phase != SeedDispatchPhase::Dispatched {
+        if self.phase != SeedDispatchPhase::Accepted {
             return Err(SeedStateError::InvalidTransition);
         }
         let group_database_id = group_database_id.into();
@@ -208,8 +264,14 @@ impl SeedDispatchRecord {
         }
         if self.revision == 0
             || (self.phase == SeedDispatchPhase::Intent && self.group_database_id.is_some())
-            || (self.phase == SeedDispatchPhase::Dispatched && self.revision < 2)
+            || (self.phase != SeedDispatchPhase::Intent && self.revision < 2)
             || (self.group_database_id.is_some() && self.revision < 3)
+            || self.operation_token.len() != 64
+            || !self
+                .operation_token
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.operation_token != self.derive_operation_token()
         {
             return Err(SeedStateError::Malformed);
         }
@@ -272,6 +334,7 @@ impl SeedDispatchRecord {
             && self.winning_target_replica_id == other.winning_target_replica_id
             && self.winning_build_id == other.winning_build_id
             && self.sqlserver_start_time == other.sqlserver_start_time
+            && self.operation_token == other.operation_token
     }
 
     pub fn same_dispatch_context(&self, other: &Self) -> bool {
@@ -319,18 +382,55 @@ impl SeedDispatchRecord {
             next.phase,
             next.group_database_id.as_deref(),
         ) {
-            (SeedDispatchPhase::Intent, None, SeedDispatchPhase::Dispatched, None)
-            | (SeedDispatchPhase::Dispatched, None, SeedDispatchPhase::Dispatched, Some(_)) => {
-                Ok(())
-            }
+            (SeedDispatchPhase::Intent, None, SeedDispatchPhase::Submitting, None)
+            | (SeedDispatchPhase::Intent, None, SeedDispatchPhase::Accepted, None)
+            | (SeedDispatchPhase::FailedRetryable, None, SeedDispatchPhase::Submitting, None)
+            | (SeedDispatchPhase::FailedRetryable, None, SeedDispatchPhase::Accepted, None)
+            | (SeedDispatchPhase::Submitting, None, SeedDispatchPhase::Accepted, None)
+            | (SeedDispatchPhase::Submitting, None, SeedDispatchPhase::Ambiguous, None)
+            | (SeedDispatchPhase::Submitting, None, SeedDispatchPhase::FailedRetryable, None)
+            | (SeedDispatchPhase::Ambiguous, None, SeedDispatchPhase::Accepted, None)
+            | (SeedDispatchPhase::Ambiguous, None, SeedDispatchPhase::FailedRetryable, None)
+            | (SeedDispatchPhase::Accepted, None, SeedDispatchPhase::Accepted, Some(_)) => Ok(()),
             (
-                SeedDispatchPhase::Dispatched,
+                SeedDispatchPhase::Accepted,
                 Some(current),
-                SeedDispatchPhase::Dispatched,
+                SeedDispatchPhase::Accepted,
                 Some(next),
             ) if current == next => Ok(()),
             _ => Err(SeedStateError::InvalidTransition),
         }
+    }
+
+    fn derive_operation_token(&self) -> String {
+        let mut digest = Sha256::new();
+        for value in [
+            "kuberic-mssql-seed-dispatch-v2",
+            &self.resource_uid,
+            &self.configuration_id,
+            &self.availability_group_name,
+            &self.availability_group_id,
+            &self.database_name,
+            &self.database_guid,
+            &self.family_guid,
+            &self.recovery_fork_guid,
+            &self.sqlserver_start_time,
+        ] {
+            digest.update(value.as_bytes());
+            digest.update(b"\0");
+        }
+        for member in std::iter::once(&self.source).chain(self.targets.iter()) {
+            for value in [
+                &member.replica_id,
+                &member.instance_id,
+                &member.agent_generation,
+                &member.native_replica_id,
+            ] {
+                digest.update(value.as_bytes());
+                digest.update(b"\0");
+            }
+        }
+        hex(&digest.finalize())
     }
 }
 
@@ -399,9 +499,11 @@ impl SeedDispatchStore {
         if bytes.len() as u64 > MAX_SEED_STATE_BYTES {
             return Err(SeedStateError::UnsafeState);
         }
-        let record: SeedDispatchRecord =
-            serde_json::from_slice(&bytes).map_err(|_| SeedStateError::Malformed)?;
+        let (record, migrated) = decode_record(&bytes)?;
         record.validate()?;
+        if migrated {
+            self.write_unlocked(&record)?;
+        }
         Ok(Some(record))
     }
 
@@ -450,7 +552,10 @@ impl SeedDispatchStore {
             .map_err(|_| SeedStateError::UnsafeState)?;
         let current = self.load_unlocked()?.ok_or(SeedStateError::Missing)?;
         if current.revision != expected_revision
-            || current.phase != SeedDispatchPhase::Intent
+            || !matches!(
+                current.phase,
+                SeedDispatchPhase::Intent | SeedDispatchPhase::FailedRetryable
+            )
             || current.group_database_id.is_some()
             || record.phase != SeedDispatchPhase::Intent
             || record.group_database_id.is_some()
@@ -475,7 +580,7 @@ impl SeedDispatchStore {
         if current.revision != expected_revision {
             return Err(SeedStateError::RevisionMismatch);
         }
-        if current.phase != SeedDispatchPhase::Dispatched || current.group_database_id.is_none() {
+        if current.phase != SeedDispatchPhase::Accepted || current.group_database_id.is_none() {
             return Err(SeedStateError::InvalidTransition);
         }
         self.root
@@ -493,7 +598,11 @@ impl SeedDispatchStore {
         if current.revision != expected_revision {
             return Err(SeedStateError::RevisionMismatch);
         }
-        if current.phase != SeedDispatchPhase::Intent || current.group_database_id.is_some() {
+        if !matches!(
+            current.phase,
+            SeedDispatchPhase::Intent | SeedDispatchPhase::FailedRetryable
+        ) || current.group_database_id.is_some()
+        {
             return Err(SeedStateError::InvalidTransition);
         }
         self.root
@@ -551,8 +660,7 @@ pub(super) fn validate_seed_entry(root: &BoundRoot, name: &str) -> Result<(), Se
         if bytes.len() as u64 > MAX_SEED_STATE_BYTES {
             return Err(SeedStateError::UnsafeState);
         }
-        let record: SeedDispatchRecord =
-            serde_json::from_slice(&bytes).map_err(|_| SeedStateError::Malformed)?;
+        let (record, _) = decode_record(&bytes)?;
         record.validate()?;
     }
     Ok(())
@@ -606,6 +714,108 @@ fn validate_guid(value: &str) -> Result<(), SeedStateError> {
     } else {
         Err(SeedStateError::Malformed)
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacySeedDispatchRecord {
+    schema_version: u32,
+    revision: u64,
+    resource_uid: String,
+    configuration_id: String,
+    availability_group_name: String,
+    availability_group_id: String,
+    database_name: String,
+    database_guid: String,
+    family_guid: String,
+    recovery_fork_guid: String,
+    source: SeedDispatchTarget,
+    targets: [SeedDispatchTarget; 2],
+    winning_target_replica_id: String,
+    winning_build_id: String,
+    sqlserver_start_time: String,
+    phase: LegacySeedDispatchPhase,
+    group_database_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacySeedDispatchPhase {
+    Intent,
+    Dispatched,
+}
+
+fn decode_record(bytes: &[u8]) -> Result<(SeedDispatchRecord, bool), SeedStateError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| SeedStateError::Malformed)?;
+    match value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(version) if version == u64::from(SEED_DISPATCH_SCHEMA_VERSION) => {
+            let record = serde_json::from_value(value).map_err(|_| SeedStateError::Malformed)?;
+            Ok((record, false))
+        }
+        Some(1) => {
+            let legacy: LegacySeedDispatchRecord =
+                serde_json::from_value(value).map_err(|_| SeedStateError::Malformed)?;
+            if legacy.schema_version != 1
+                || legacy.revision == 0
+                || matches!(legacy.phase, LegacySeedDispatchPhase::Intent)
+                    && (legacy.revision != 1 || legacy.group_database_id.is_some())
+                || matches!(legacy.phase, LegacySeedDispatchPhase::Dispatched)
+                    && legacy.revision < 2
+            {
+                return Err(SeedStateError::Malformed);
+            }
+            let mut record = SeedDispatchRecord {
+                schema_version: SEED_DISPATCH_SCHEMA_VERSION,
+                revision: legacy.revision,
+                resource_uid: legacy.resource_uid,
+                configuration_id: legacy.configuration_id,
+                availability_group_name: legacy.availability_group_name,
+                availability_group_id: legacy.availability_group_id,
+                database_name: legacy.database_name,
+                database_guid: legacy.database_guid,
+                family_guid: legacy.family_guid,
+                recovery_fork_guid: legacy.recovery_fork_guid,
+                source: legacy.source,
+                targets: legacy.targets,
+                winning_target_replica_id: legacy.winning_target_replica_id,
+                winning_build_id: legacy.winning_build_id,
+                sqlserver_start_time: legacy.sqlserver_start_time,
+                operation_token: String::new(),
+                phase: match legacy.phase {
+                    LegacySeedDispatchPhase::Intent => SeedDispatchPhase::Intent,
+                    LegacySeedDispatchPhase::Dispatched => {
+                        if legacy.group_database_id.is_some() {
+                            SeedDispatchPhase::Accepted
+                        } else {
+                            SeedDispatchPhase::Ambiguous
+                        }
+                    }
+                },
+                group_database_id: legacy.group_database_id,
+            };
+            record.operation_token = record.derive_operation_token();
+            record.validate()?;
+            Ok((record, true))
+        }
+        Some(version) => Err(SeedStateError::UnsupportedSchema(
+            u32::try_from(version).unwrap_or(u32::MAX),
+        )),
+        None => Err(SeedStateError::Malformed),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push(DIGITS[usize::from(byte >> 4)] as char);
+        value.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    value
 }
 
 fn map_root_error(error: std::io::Error) -> SeedStateError {

@@ -763,9 +763,11 @@ async fn retained_dispatch_survives_runtime_restart_as_historical_session_eviden
         let store = SeedDispatchStore::open(&primary_application_root).unwrap();
         let intent = retained_seed_record(&first_sessions, 1);
         store.create(&intent).unwrap();
-        let mut dispatched = intent.clone();
-        dispatched.mark_dispatched().unwrap();
-        store.replace(intent.revision(), dispatched).unwrap();
+        let mut ambiguous = intent.clone();
+        ambiguous.mark_submitting().unwrap();
+        let mut ambiguous = store.replace(intent.revision(), ambiguous).unwrap();
+        ambiguous.mark_ambiguous().unwrap();
+        store.replace(ambiguous.revision(), ambiguous).unwrap();
     }
 
     let mut restarted_attempts = start_attempts(temporary.path()).await;
@@ -799,10 +801,13 @@ async fn retained_dispatch_survives_runtime_restart_as_historical_session_eviden
         assert!(!historical.same_intent_owner(&current));
         assert_eq!(historical.source().process_session_id(), first_sessions[0]);
         let mut associated = historical.clone();
+        associated.mark_accepted().unwrap();
+        let mut associated = store.replace(historical.revision(), associated).unwrap();
         associated
             .associate_group_database("44444444-4444-4444-8444-444444444444")
             .unwrap();
-        let associated = store.replace(historical.revision(), associated).unwrap();
+        let revision = associated.revision();
+        let associated = store.replace(revision, associated).unwrap();
         store.remove(associated.revision()).unwrap();
     }
 
