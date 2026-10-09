@@ -3644,17 +3644,15 @@ async fn cancellation_after_durable_dispatch_restart_compacts_without_redispatch
 }
 
 #[tokio::test]
-async fn superseded_dispatch_callback_cannot_publish_and_fresh_sessions_recover_natively() {
+async fn compaction_checkpoint_fences_stale_callback_and_replacement_redispatch() {
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let complete = Arc::new(AtomicBool::new(false));
     let (entered_tx, entered_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
-    let stale_executor = Arc::new(GatedSeedMutationExecutor {
+    let stale_executor = Arc::new(SeedMutationExecutor {
         complete: complete.clone(),
         executions: AtomicUsize::new(0),
-        entered: Mutex::new(Some(entered_tx)),
-        release: Mutex::new(Some(release_rx)),
     });
     let stale = seed_replicator_with_executor(
         root.path().to_owned(),
@@ -3662,6 +3660,9 @@ async fn superseded_dispatch_callback_cannot_publish_and_fresh_sessions_recover_
         stale_executor.clone() as Arc<dyn SqlMutationExecutor>,
     );
     admit_seed_replicator(&stale).await;
+    stale
+        .testing_gate_seed_compaction(entered_tx, release_rx)
+        .unwrap();
     let callback = tokio::spawn({
         let stale = stale.clone();
         async move {
@@ -3671,6 +3672,10 @@ async fn superseded_dispatch_callback_cannot_publish_and_fresh_sessions_recover_
         }
     });
     entered_rx.await.unwrap();
+    let retained: SeedDispatchRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(retained.phase(), SeedDispatchPhase::Dispatched);
     stale.abort();
     release_tx.send(()).unwrap();
     assert!(matches!(

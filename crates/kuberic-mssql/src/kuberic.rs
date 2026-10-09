@@ -773,11 +773,13 @@ struct SeedCoordinator {
     store: Mutex<Option<Arc<SeedDispatchStore>>>,
     arbiter: tokio::sync::Mutex<()>,
     #[cfg(feature = "kuberic-testing")]
-    intent_gate: Mutex<Option<SeedIntentGate>>,
+    intent_gate: Mutex<Option<SeedGate>>,
+    #[cfg(feature = "kuberic-testing")]
+    compaction_gate: Mutex<Option<SeedGate>>,
 }
 
 #[cfg(feature = "kuberic-testing")]
-struct SeedIntentGate {
+struct SeedGate {
     entered: tokio::sync::oneshot::Sender<()>,
     release: tokio::sync::oneshot::Receiver<()>,
 }
@@ -790,6 +792,8 @@ impl SeedCoordinator {
             arbiter: tokio::sync::Mutex::new(()),
             #[cfg(feature = "kuberic-testing")]
             intent_gate: Mutex::new(None),
+            #[cfg(feature = "kuberic-testing")]
+            compaction_gate: Mutex::new(None),
         }
     }
 
@@ -809,8 +813,20 @@ impl SeedCoordinator {
 
     #[cfg(feature = "kuberic-testing")]
     async fn pause_after_intent_if_requested(&self) -> Result<(), KubericAdapterError> {
-        let gate = self
-            .intent_gate
+        self.pause_if_requested(&self.intent_gate).await
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    async fn pause_before_compaction_if_requested(&self) -> Result<(), KubericAdapterError> {
+        self.pause_if_requested(&self.compaction_gate).await
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    async fn pause_if_requested(
+        &self,
+        slot: &Mutex<Option<SeedGate>>,
+    ) -> Result<(), KubericAdapterError> {
+        let gate = slot
             .lock()
             .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?
             .take();
@@ -863,7 +879,30 @@ impl SqlServerReplicator {
         if gate.is_some() {
             return Err(KubericAdapterError::SeedState(SeedStateError::AlreadyOwned));
         }
-        *gate = Some(SeedIntentGate { entered, release });
+        *gate = Some(SeedGate { entered, release });
+        Ok(())
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_gate_seed_compaction(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), KubericAdapterError> {
+        let seed = &self
+            .bootstrap
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?
+            .seed;
+        let mut gate = seed
+            .compaction_gate
+            .lock()
+            .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?;
+        if gate.is_some() {
+            return Err(KubericAdapterError::SeedState(SeedStateError::AlreadyOwned));
+        }
+        *gate = Some(SeedGate { entered, release });
         Ok(())
     }
 
@@ -1736,6 +1775,14 @@ impl SqlServerReplicator {
             }
             match association {
                 SourceAssociation::Exact(database) => {
+                    #[cfg(feature = "kuberic-testing")]
+                    if record.is_some() {
+                        bootstrap
+                            .seed
+                            .pause_before_compaction_if_requested()
+                            .await?;
+                        drop(self.finish_operation(generation)?);
+                    }
                     if let Some(record) = record {
                         self.compact_seed_record(store.as_ref(), record, &database)?;
                     }

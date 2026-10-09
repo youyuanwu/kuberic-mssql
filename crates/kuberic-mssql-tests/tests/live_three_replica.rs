@@ -9,17 +9,25 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
+use kuberic_mssql::runtime_host::SeedDispatchPhase;
 use kuberic_mssql_tests::three_replica::{
     CLEANUP_BUDGET, CancellationSignals, CleanupClock, CleanupCoordinator, CombinedFixtureError,
     FixtureConfig, HandledCancellationSignal, JournalStore, LaunchedMembers, MssqlGroupError,
-    NativeTopologyBinding, OwnershipJournal, PublicMssqlGroup, ReadyMember, ResourceState,
-    RunState, SystemCleanupClock, TopologyRun, cleanup_three_replica_fixture, launch_three_members,
+    NativeTopologyBinding, OwnershipJournal, PublicBuildCommand, PublicMssqlGroup, ReadyMember,
+    ResourceState, RunState, SystemCleanupClock, TopologyRun, cleanup_three_replica_fixture,
+    launch_three_members,
 };
 use kuberic_runtime::control::proto;
 
 type TestError = Box<dyn Error + Send + Sync>;
 const HAPPY_PATH_TEST: &str = "three_replica_mssql_happy_path";
 const SAME_ROOT_RESTART_TEST: &str = "three_replica_mssql_same_root_restart";
+
+struct PendingSeedCompaction {
+    command: PublicBuildCommand,
+    release: tokio::sync::oneshot::Sender<()>,
+    callback: tokio::task::JoinHandle<Result<(), tonic::Status>>,
+}
 
 #[test]
 #[ignore = "auto-accepts the SQL Server EULA for this test fixture and requires a qualified local Docker host"]
@@ -588,47 +596,23 @@ async fn execute_phase2_bootstrap_lifecycle(
             let sequence = group.bootstrap_configuration_sequence().await?;
             wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout())
                 .await?;
-            let builds = [
-                group.target_build_command(1, "seed-build-target-2", "seed-build-target-2")?,
-                group.target_build_command(2, "seed-build-target-3", "seed-build-target-3")?,
-            ];
-            let replay = group.replay_build_command(&builds[0]);
-            if replay.operation_id != builds[0].operation_id
-                || replay.build_id != builds[0].build_id
-                || replay.target != builds[0].target
-                || replay.retire
-            {
-                return Err("public replay helper changed exact build authority".into());
-            }
-            let retirement = group.retire_build_command(&builds[0], "retire-seed-build-target-2");
-            if retirement.build_id != builds[0].build_id
-                || retirement.target != builds[0].target
-                || !retirement.retire
-            {
-                return Err("public retirement helper changed exact build authority".into());
-            }
-            let successor = group.supersede_build_command(
-                &builds[0],
-                "successor-seed-build-target-2",
-                "successor-seed-build-target-2",
-            );
-            if successor.build_id == builds[0].build_id
-                || successor.target != builds[0].target
-                || successor.retire
-            {
-                return Err(
-                    "public supersession helper did not replace only build identity".into(),
-                );
-            }
-            let outcomes = group
-                .execute_build_commands_concurrently(&builds[..1])
-                .await;
-            if let Some(error) = outcomes.into_iter().find_map(Result::err) {
-                return Err::<(), TestError>(format!("public target build failed: {error}").into());
-            }
+            let pending = exercise_public_build_retirement_and_supersession(&group).await?;
             let topology = launched
                 .finalize_prepared_availability_group(&prepared)
                 .await?;
+            exercise_dispatched_build_lifecycle_commands(&group, &pending.command).await?;
+            pending
+                .release
+                .send(())
+                .map_err(|_| "final replacement compaction checkpoint was not retained")?;
+            pending
+                .callback
+                .await
+                .map_err(|error| format!("final replacement callback task failed: {error}"))?
+                .map_err(|error| format!("final replacement build failed: {error}"))?;
+            if group.testing_seed_dispatch_count()? != 1 {
+                return Err("final replacement did not dispatch exactly one ADD DATABASE".into());
+            }
             let marker = launched
                 .commit_replicated_marker(&topology.evidence)
                 .await?;
@@ -639,9 +623,12 @@ async fn execute_phase2_bootstrap_lifecycle(
                     "build-owned seeding marker was not readable from all exact members".into(),
                 );
             }
-            let outcomes = group
-                .execute_build_commands_concurrently(&builds[1..])
-                .await;
+            let peer = group.target_build_command(
+                2,
+                "native-only-seed-build-target-3",
+                "native-only-seed-build-target-3",
+            )?;
+            let outcomes = group.execute_build_commands_concurrently(&[peer]).await;
             if let Some(error) = outcomes.into_iter().find_map(Result::err) {
                 return Err::<(), TestError>(
                     format!("native-only peer target build failed: {error}").into(),
@@ -670,6 +657,305 @@ async fn execute_phase2_bootstrap_lifecycle(
         return Err(diagnostic.into());
     }
     finish_runtime_outcome(root, launched, outcome, &cleanup)
+}
+
+async fn exercise_public_build_retirement_and_supersession(
+    group: &PublicMssqlGroup,
+) -> Result<PendingSeedCompaction, TestError> {
+    let retired_winner =
+        group.target_build_command(1, "retired-winning-build", "retired-winning-build")?;
+    let (retired_winner_release, retired_winner_callback) =
+        submit_build_at_intent_checkpoint(group, &retired_winner, "retired winner").await?;
+    assert_seed_intent_owner(group, &retired_winner, "retired winner")?;
+    group
+        .testing_execute_kuberic_build_command(&group.retire_build_command(&retired_winner))
+        .await
+        .map_err(|error| format!("winning build retirement failed: {error}"))?;
+    assert_callback_cancelled(retired_winner_callback, "retired winning callback").await?;
+    if retired_winner_release.send(()).is_ok() {
+        return Err("retired winning callback remained live after exact retirement".into());
+    }
+    assert_seed_intent_owner(group, &retired_winner, "retired winner residue")?;
+    assert_kuberic_build_rejected(group, &retired_winner, "retired winner replay").await?;
+    group
+        .testing_assert_source_build_success_not_published(&retired_winner)
+        .await?;
+
+    let superseded_winner =
+        group.target_build_command(1, "superseded-winning-build", "superseded-winning-build")?;
+    let (superseded_winner_release, superseded_winner_callback) =
+        submit_build_at_intent_checkpoint(group, &superseded_winner, "superseded winner").await?;
+    assert_seed_intent_owner(group, &superseded_winner, "replacement after retirement")?;
+    group
+        .testing_assert_build_success_not_published(&retired_winner)
+        .await?;
+
+    let current_winner = group.supersede_build_command(&superseded_winner, "current-winning-build");
+    group
+        .testing_execute_kuberic_build_command(&current_winner)
+        .await
+        .map_err(|error| format!("winning build supersession failed: {error}"))?;
+    assert_callback_cancelled(superseded_winner_callback, "superseded winning callback").await?;
+    if superseded_winner_release.send(()).is_ok() {
+        return Err("superseded winning callback remained live after replacement".into());
+    }
+    let (current_release_tx, current_callback) =
+        spawn_callback_at_intent_checkpoint(group, &current_winner, "superseding winner").await?;
+    assert_seed_intent_owner(group, &current_winner, "superseding winner")?;
+    assert_kuberic_build_rejected(group, &superseded_winner, "superseded winner replay").await?;
+    group
+        .testing_assert_build_success_not_published(&superseded_winner)
+        .await?;
+
+    let retired_loser =
+        group.target_build_command(2, "retired-losing-build", "retired-losing-build")?;
+    group
+        .testing_execute_kuberic_build_command(&retired_loser)
+        .await
+        .map_err(|error| format!("losing build admission failed: {error}"))?;
+    let retired_loser_callback = group
+        .testing_spawn_admitted_seed_callback(&retired_loser)
+        .map_err(|error| format!("losing build callback failed to start: {error}"))?;
+    group
+        .testing_execute_kuberic_build_command(&group.retire_build_command(&retired_loser))
+        .await
+        .map_err(|error| format!("losing build retirement failed: {error}"))?;
+    assert_callback_cancelled(retired_loser_callback, "retired losing callback").await?;
+    assert_seed_intent_owner(group, &current_winner, "winner after losing retirement")?;
+    assert_kuberic_build_rejected(group, &retired_loser, "retired loser replay").await?;
+    group
+        .testing_assert_source_build_success_not_published(&retired_loser)
+        .await?;
+
+    let superseded_loser =
+        group.target_build_command(2, "superseded-losing-build", "superseded-losing-build")?;
+    group
+        .testing_execute_kuberic_build_command(&superseded_loser)
+        .await
+        .map_err(|error| format!("losing build admission before supersession failed: {error}"))?;
+    group
+        .testing_assert_build_success_not_published(&retired_loser)
+        .await?;
+    let superseded_loser_callback = group
+        .testing_spawn_admitted_seed_callback(&superseded_loser)
+        .map_err(|error| format!("superseded losing callback failed to start: {error}"))?;
+    let final_winner = group.supersede_build_command(&superseded_loser, "replacement-losing-build");
+    group
+        .testing_execute_kuberic_build_command(&final_winner)
+        .await
+        .map_err(|error| format!("losing build supersession failed: {error}"))?;
+    assert_callback_cancelled(superseded_loser_callback, "superseded losing callback").await?;
+    assert_seed_intent_owner(group, &current_winner, "winner after losing supersession")?;
+    assert_kuberic_build_rejected(group, &superseded_loser, "superseded loser replay").await?;
+    group
+        .testing_assert_build_success_not_published(&superseded_loser)
+        .await?;
+
+    group
+        .testing_execute_kuberic_build_command(&group.retire_build_command(&current_winner))
+        .await
+        .map_err(|error| format!("current winner retirement failed: {error}"))?;
+    assert_callback_cancelled(current_callback, "retired current winning callback").await?;
+    if current_release_tx.send(()).is_ok() {
+        return Err("retired current winner callback remained live".into());
+    }
+    group
+        .testing_assert_source_build_success_not_published(&current_winner)
+        .await?;
+    let (final_release_tx, final_callback) =
+        spawn_callback_at_intent_checkpoint(group, &final_winner, "replacement losing build")
+            .await?;
+    assert_seed_intent_owner(group, &final_winner, "final replacement winner")?;
+    if group.testing_seed_dispatch_count()? != 0 {
+        return Err("retirement or supersession dispatched ADD DATABASE".into());
+    }
+
+    let (compaction_entered_tx, compaction_entered_rx) = tokio::sync::oneshot::channel();
+    let (compaction_release_tx, compaction_release_rx) = tokio::sync::oneshot::channel();
+    group.testing_gate_next_seed_compaction(compaction_entered_tx, compaction_release_rx)?;
+    final_release_tx
+        .send(())
+        .map_err(|_| "final replacement intent checkpoint was not retained")?;
+    let mut final_callback = final_callback;
+    tokio::select! {
+        entered = compaction_entered_rx => entered
+            .map_err(|_| "final replacement ended before the Dispatched checkpoint")?,
+        result = &mut final_callback => {
+            return Err(format!(
+                "final replacement completed before the Dispatched checkpoint: {result:?}"
+            )
+            .into());
+        }
+    }
+    Ok(PendingSeedCompaction {
+        command: final_winner,
+        release: compaction_release_tx,
+        callback: final_callback,
+    })
+}
+
+async fn submit_build_at_intent_checkpoint(
+    group: &PublicMssqlGroup,
+    command: &PublicBuildCommand,
+    label: &str,
+) -> Result<
+    (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::Status>>,
+    ),
+    TestError,
+> {
+    group
+        .testing_execute_kuberic_build_command(command)
+        .await
+        .map_err(|error| format!("{label} Kuberic command failed: {error}"))?;
+    spawn_callback_at_intent_checkpoint(group, command, label).await
+}
+
+async fn spawn_callback_at_intent_checkpoint(
+    group: &PublicMssqlGroup,
+    command: &PublicBuildCommand,
+    label: &str,
+) -> Result<
+    (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::Status>>,
+    ),
+    TestError,
+> {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    group.testing_gate_next_seed_intent(entered_tx, release_rx)?;
+    let mut callback = group
+        .testing_spawn_admitted_seed_callback(command)
+        .map_err(|error| format!("{label} callback failed to start: {error}"))?;
+    tokio::select! {
+        entered = entered_rx => entered
+            .map_err(|_| format!("{label} callback ended before its seed checkpoint"))?,
+        result = &mut callback => {
+            return Err(format!("{label} callback completed before its seed checkpoint: {result:?}").into());
+        }
+        _ = tokio::time::sleep(Duration::from_secs(120)) => {
+            return Err(format!("{label} did not reach its deterministic seed checkpoint").into());
+        }
+    }
+    Ok((release_tx, callback))
+}
+
+async fn assert_callback_cancelled(
+    callback: tokio::task::JoinHandle<Result<(), tonic::Status>>,
+    label: &str,
+) -> Result<(), TestError> {
+    // The pinned runtime has no public source-callback delivery command. The
+    // owned task models the callback future that Kuberic cancels after the
+    // durable retirement or supersession command has completed.
+    callback.abort();
+    match callback.await {
+        Err(error) if error.is_cancelled() => Ok(()),
+        result => {
+            Err(format!("{label} was able to publish after losing authority: {result:?}").into())
+        }
+    }
+}
+
+fn assert_seed_intent_owner(
+    group: &PublicMssqlGroup,
+    command: &PublicBuildCommand,
+    label: &str,
+) -> Result<(), TestError> {
+    let record = group
+        .testing_seed_dispatch_record()?
+        .ok_or_else(|| format!("{label} did not retain seed intent"))?;
+    if record.phase() != SeedDispatchPhase::Intent
+        || record.winning_build_id() != command.build_id.as_str()
+    {
+        return Err(format!("{label} did not own the exact retained seed intent").into());
+    }
+    Ok(())
+}
+
+async fn assert_kuberic_build_rejected(
+    group: &PublicMssqlGroup,
+    command: &PublicBuildCommand,
+    label: &str,
+) -> Result<(), TestError> {
+    if group
+        .testing_execute_kuberic_build_command(command)
+        .await
+        .is_ok()
+    {
+        return Err(format!("{label} was accepted after losing durable authority").into());
+    }
+    Ok(())
+}
+
+async fn exercise_dispatched_build_lifecycle_commands(
+    group: &PublicMssqlGroup,
+    winner: &PublicBuildCommand,
+) -> Result<(), TestError> {
+    let retired_loser =
+        group.target_build_command(2, "dispatched-retired-loser", "dispatched-retired-loser")?;
+    group
+        .testing_execute_kuberic_build_command(&retired_loser)
+        .await
+        .map_err(|error| format!("dispatched losing build admission failed: {error}"))?;
+    group
+        .testing_execute_kuberic_build_command(&group.retire_build_command(&retired_loser))
+        .await
+        .map_err(|error| format!("dispatched losing build retirement failed: {error}"))?;
+    assert_kuberic_build_rejected(group, &retired_loser, "dispatched retired loser replay").await?;
+    group
+        .testing_assert_source_build_success_not_published(&retired_loser)
+        .await?;
+
+    let superseded_loser = group.target_build_command(
+        2,
+        "dispatched-superseded-loser",
+        "dispatched-superseded-loser",
+    )?;
+    group
+        .testing_execute_kuberic_build_command(&superseded_loser)
+        .await
+        .map_err(|error| format!("dispatched losing build admission failed: {error}"))?;
+    group
+        .testing_assert_build_success_not_published(&retired_loser)
+        .await?;
+    let replacement_loser =
+        group.supersede_build_command(&superseded_loser, "dispatched-replacement-loser");
+    group
+        .testing_execute_kuberic_build_command(&replacement_loser)
+        .await
+        .map_err(|error| format!("dispatched losing build supersession failed: {error}"))?;
+    assert_kuberic_build_rejected(
+        group,
+        &superseded_loser,
+        "dispatched superseded loser replay",
+    )
+    .await?;
+    group
+        .testing_assert_build_success_not_published(&superseded_loser)
+        .await?;
+
+    let replacement_winner = group.supersede_build_command(winner, "dispatched-replacement-winner");
+    group
+        .testing_execute_kuberic_build_command(&replacement_winner)
+        .await
+        .map_err(|error| format!("dispatched winning build supersession failed: {error}"))?;
+    assert_kuberic_build_rejected(group, winner, "dispatched stale winner replay").await?;
+    group
+        .testing_assert_build_success_not_published(winner)
+        .await?;
+
+    let retained = group
+        .testing_seed_dispatch_record()?
+        .ok_or("dispatched lifecycle commands released the retained seed record")?;
+    if retained.phase() != SeedDispatchPhase::Dispatched
+        || retained.winning_build_id() != winner.build_id.as_str()
+        || group.testing_seed_dispatch_count()? != 1
+    {
+        return Err("retirement or supersession mutated durable Dispatched seed authority".into());
+    }
+    Ok(())
 }
 
 async fn execute_phase3_bootstrap_restart_lifecycle(
@@ -718,168 +1004,150 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
     let first_sessions = first.pods.each_ref().map(|pod| pod.session.clone());
     let first_sequence = first.bootstrap_configuration_sequence().await?;
     wait_for_exact_reports(&first, first_sequence, convergence).await?;
-    let interrupted_build =
-        first.target_build_command(1, "restart-intent-build-2", "restart-intent-build-2")?;
-    let (intent_entered_tx, intent_entered_rx) = tokio::sync::oneshot::channel();
-    let (intent_release_tx, intent_release_rx) = tokio::sync::oneshot::channel();
-    first.testing_gate_next_seed_intent(intent_entered_tx, intent_release_rx)?;
-    {
-        let interrupted = first.testing_execute_admitted_seed_callback(&interrupted_build);
-        tokio::pin!(interrupted);
-        tokio::select! {
-            entered = intent_entered_rx => entered
-                .map_err(|_| "licensed pre-association build ended before durable intent")?,
-            result = &mut interrupted => {
-                return Err(format!(
-                    "licensed pre-association build completed before interruption: {result:?}"
-                )
-                .into());
-            }
-        }
-        first.testing_abort_seed_source();
-        intent_release_tx
-            .send(())
-            .map_err(|_| "licensed pre-association intent gate was not retained")?;
-        if interrupted.await.is_ok() {
-            return Err("superseded pre-association callback published success".into());
+    let interrupted_build = first.target_build_command(
+        1,
+        "restart-dispatched-build-2",
+        "restart-dispatched-build-2",
+    )?;
+    let (dispatch_entered_tx, dispatch_entered_rx) = tokio::sync::oneshot::channel();
+    let (dispatch_release_tx, dispatch_release_rx) = tokio::sync::oneshot::channel();
+    first.testing_gate_next_seed_compaction(dispatch_entered_tx, dispatch_release_rx)?;
+    first
+        .testing_execute_kuberic_build_command(&interrupted_build)
+        .await
+        .map_err(|error| format!("licensed restart build command failed: {error}"))?;
+    let mut interrupted = first
+        .testing_spawn_admitted_seed_callback(&interrupted_build)
+        .map_err(|error| format!("licensed restart callback failed to start: {error}"))?;
+    tokio::select! {
+        entered = dispatch_entered_rx => entered
+            .map_err(|_| "licensed build ended before the compaction checkpoint")?,
+        result = &mut interrupted => {
+            return Err(format!(
+                "licensed build completed before the compaction checkpoint: {result:?}"
+            )
+            .into());
         }
     }
+    let topology = launched
+        .finalize_prepared_availability_group(&prepared)
+        .await?;
+    let marker = launched
+        .commit_replicated_marker(&topology.evidence)
+        .await?;
+    let retained = first
+        .testing_seed_dispatch_record()?
+        .ok_or("compaction checkpoint did not retain seed authority")?;
+    if retained.phase() != SeedDispatchPhase::Dispatched
+        || retained.winning_build_id() != interrupted_build.build_id.as_str()
+    {
+        return Err("compaction checkpoint retained the wrong seed authority".into());
+    }
+    if first.testing_seed_dispatch_count()? != 1 {
+        return Err("compaction checkpoint did not execute exactly one ADD DATABASE".into());
+    }
+    first.testing_abort_seed_source();
+    dispatch_release_tx
+        .send(())
+        .map_err(|_| "licensed compaction checkpoint was not retained")?;
+    let retained = first
+        .testing_seed_dispatch_record()?
+        .ok_or("host abort released a durably dispatched seed record")?;
+    if retained.phase() != SeedDispatchPhase::Dispatched {
+        return Err("host abort made dispatched seed authority releasable".into());
+    }
     first.shutdown_with_coordinator(&first_cleanup).await?;
+    match interrupted.await {
+        Ok(Err(_)) => {}
+        result => {
+            return Err(format!(
+                "stale dispatched callback published after host shutdown: {result:?}"
+            )
+            .into());
+        }
+    }
 
-    let seed_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
-    let seeded = match start_prepared_public_group_with_retry(
+    let replacement_cleanup =
+        CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let replacement = match start_prepared_public_group_with_retry(
         root,
         &launched.run,
         &prepared,
         &launched.members,
         convergence,
         Instant::now() + convergence,
-        &seed_cleanup,
+        &replacement_cleanup,
     )
     .await
     {
         Ok(group) => group,
         Err(error) => {
-            let cleanup = launched.cleanup_with_coordinator(&seed_cleanup);
+            let cleanup = launched.cleanup_with_coordinator(&replacement_cleanup);
             return match cleanup {
-                Ok(_) => Err(Box::new(error)),
+                Ok(_) => Err(format!("dispatched replacement startup failed: {error}").into()),
                 Err(cleanup) => Err(format!(
-                    "pre-association replacement startup failed: {error}; cleanup also failed: {cleanup}"
+                    "dispatched replacement startup failed: {error}; cleanup also failed: {cleanup}"
                 )
                 .into()),
             };
         }
     };
-    seeded
+    replacement
         .assert_superseded_sessions_rejected(&first_sessions)
         .await?;
-    if seeded.resource_uid != stable_resource
-        || seeded.effective_policy != stable_policy
-        || seeded.configuration != stable_configuration
-        || seeded
-            .pods
-            .iter()
-            .zip(&stable_pods)
-            .any(|(pod, (identity, role, pod_uid, pvc_uid))| {
+    if replacement.resource_uid != stable_resource
+        || replacement.effective_policy != stable_policy
+        || replacement.configuration != stable_configuration
+        || replacement.pods.iter().zip(&stable_pods).any(
+            |(pod, (identity, role, pod_uid, pvc_uid))| {
                 &pod.identity != identity
                     || pod.stable_role != *role
                     || &pod.pod_uid != pod_uid
                     || &pod.pvc_uid != pvc_uid
-            })
+            },
+        )
     {
-        return Err("pre-association replacement changed stable authority".into());
+        return Err("dispatched replacement changed stable authority".into());
     }
     let builds = [
-        seeded.target_build_command(1, "restart-seed-build-2", "restart-seed-build-2")?,
-        seeded.target_build_command(2, "restart-seed-build-3", "restart-seed-build-3")?,
-    ];
-    let topology = {
-        let withheld = seeded.execute_build_withheld_after_native_completion(&builds[0]);
-        let finalized = launched.finalize_prepared_availability_group(&prepared);
-        tokio::pin!(withheld);
-        tokio::pin!(finalized);
-        tokio::select! {
-            result = &mut finalized => result?,
-            result = &mut withheld => {
-                return Err(match result {
-                    Ok(()) => "withheld native-complete build reply returned unexpectedly".into(),
-                    Err(error) => format!("replacement target build failed: {error}").into(),
-                });
-            }
-        }
-    };
-    let first_marker = launched
-        .commit_replicated_marker(&topology.evidence)
-        .await?;
-    if first_marker.primary_ordinal != topology.evidence.primary_ordinal
-        || first_marker.readable_ordinals != [1, 2, 3]
-    {
-        return Err("replacement seed marker was not readable from all exact members".into());
-    }
-    let seeded_sessions = seeded.pods.each_ref().map(|pod| pod.session.clone());
-    seeded.shutdown_with_coordinator(&seed_cleanup).await?;
-
-    let completed_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
-    let completed = match start_prepared_public_group_with_retry(
-        root,
-        &launched.run,
-        &prepared,
-        &launched.members,
-        convergence,
-        Instant::now() + convergence,
-        &completed_cleanup,
-    )
-    .await
-    {
-        Ok(group) => group,
-        Err(error) => {
-            let cleanup = launched.cleanup_with_coordinator(&completed_cleanup);
-            return match cleanup {
-                Ok(_) => Err(Box::new(error)),
-                Err(cleanup) => Err(format!(
-                    "native-complete replacement startup failed: {error}; cleanup also failed: {cleanup}"
-                )
-                .into()),
-            };
-        }
-    };
-    completed
-        .assert_superseded_sessions_rejected(&seeded_sessions)
-        .await?;
-    let native_only = [
-        completed.target_build_command(
+        replacement.target_build_command(
             1,
-            "native-only-build-target-2",
-            "native-only-build-target-2",
+            "replacement-native-build-2",
+            "replacement-native-build-2",
         )?,
-        completed.target_build_command(
+        replacement.target_build_command(
             2,
-            "native-only-build-target-3",
-            "native-only-build-target-3",
+            "replacement-native-build-3",
+            "replacement-native-build-3",
         )?,
     ];
-    let outcomes = completed
-        .execute_build_commands_sequential(&native_only)
+    let outcomes = replacement
+        .execute_build_commands_concurrently(&builds)
         .await;
     if let Some(error) = outcomes.into_iter().find_map(Result::err) {
         return Err(format!("native-only replacement build failed: {error}").into());
     }
-    let continued_marker = launched
-        .commit_replicated_marker(&topology.evidence)
-        .await?;
-    if continued_marker.primary_ordinal != first_marker.primary_ordinal
-        || continued_marker.readable_ordinals != first_marker.readable_ordinals
-    {
-        return Err("marker continuity changed after native-complete replacement".into());
+    if replacement.testing_seed_dispatch_count()? != 0 {
+        return Err("replacement host issued a second ADD DATABASE dispatch".into());
     }
-    completed
-        .shutdown_with_coordinator(&completed_cleanup)
+    if replacement.testing_seed_dispatch_record()?.is_some() {
+        return Err("replacement host did not compact the dispatched seed record".into());
+    }
+    let verified_marker = launched.verify_replicated_marker(&marker).await?;
+    if verified_marker != marker
+        || verified_marker.primary_ordinal != topology.evidence.primary_ordinal
+        || verified_marker.readable_ordinals != [1, 2, 3]
+    {
+        return Err("exact pre-restart marker changed after dispatched replacement".into());
+    }
+    replacement
+        .shutdown_with_coordinator(&replacement_cleanup)
         .await?;
     finish_runtime_outcome(
         root,
         launched,
         RuntimeOutcome::Completed(Ok(Ok(()))),
-        &completed_cleanup,
+        &replacement_cleanup,
     )
 }
 

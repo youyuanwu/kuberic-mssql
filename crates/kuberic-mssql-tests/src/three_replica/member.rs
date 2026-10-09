@@ -15,7 +15,9 @@ use super::availability_group::{
     AvailabilityGroupError, FrozenMemberVerifier, PreparedAvailabilityGroup, ProvisionContext,
     ProvisionedAvailabilityGroup, finalize_prepared, prepare, provision,
 };
-use super::data::{DataContext, DataError, MarkerEvidence, prove_replicated_marker};
+use super::data::{
+    DataContext, DataError, MarkerEvidence, prove_replicated_marker, verify_replicated_marker,
+};
 use crate::fixture::admin::{
     AdminDeadlines, AdminEndpoint, AdminError, AdminSession, LoginFiles, MemberReadinessEvidence,
 };
@@ -244,6 +246,30 @@ impl LaunchedMembers {
                 complete_deadline: self.context.deadline,
             },
             evidence,
+        )
+        .await
+    }
+
+    pub async fn verify_replicated_marker(
+        &self,
+        marker: &MarkerEvidence,
+    ) -> Result<MarkerEvidence, DataError> {
+        let credentials = self
+            .context
+            .credentials
+            .as_ref()
+            .ok_or(DataError::WrongDatabase)?;
+        let tls = self.context.tls.as_ref().ok_or(DataError::WrongDatabase)?;
+        verify_replicated_marker(
+            &DataContext {
+                run: &self.run,
+                members: &self.members,
+                credentials,
+                tls,
+                deadlines: self.context.config.deadlines(),
+                complete_deadline: self.context.deadline,
+            },
+            marker,
         )
         .await
     }

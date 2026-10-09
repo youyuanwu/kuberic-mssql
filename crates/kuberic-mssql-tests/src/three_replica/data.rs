@@ -212,6 +212,62 @@ WHERE id = CONVERT(uniqueidentifier, @P1);"#,
     }
 }
 
+pub(crate) async fn verify_replicated_marker(
+    context: &DataContext<'_>,
+    marker: &MarkerEvidence,
+) -> Result<MarkerEvidence, DataError> {
+    let database = database_name(context.run);
+    let complete_deadline = Instant::from_std(context.complete_deadline);
+    let deadline = earlier(
+        complete_deadline,
+        Instant::now() + context.deadlines.marker_convergence,
+    );
+    loop {
+        let mut readable = Vec::with_capacity(3);
+        for index in 0..3 {
+            let result = async {
+                let mut session = connect(context, index, &database, true, deadline).await?;
+                let row = single_row(
+                    query_rows(
+                        context,
+                        &mut session,
+                        r#"
+SET NOCOUNT ON;
+SELECT CONVERT(nvarchar(128), value)
+FROM dbo.kuberic_marker
+WHERE id = CONVERT(uniqueidentifier, @P1);"#,
+                        &[&marker.marker_id.as_str() as &dyn ToSql],
+                        deadline,
+                    )
+                    .await?,
+                )
+                .map_err(DataError::Admin)?;
+                if required_text(&row, 0).map_err(DataError::Admin)? != marker.marker_value {
+                    return Err(DataError::MarkerMismatch);
+                }
+                Ok::<u8, DataError>((index + 1) as u8)
+            }
+            .await;
+            match result {
+                Ok(ordinal) => readable.push(ordinal),
+                Err(DataError::Deadline) => return Err(DataError::Deadline),
+                Err(_) => {}
+            }
+        }
+        if let Ok(readable_ordinals) =
+            validate_marker_observations(&readable, StdInstant::now(), deadline.into_std())
+        {
+            let mut verified = marker.clone();
+            verified.readable_ordinals = readable_ordinals;
+            return Ok(verified);
+        }
+        if Instant::now() >= deadline {
+            return Err(DataError::Deadline);
+        }
+        sleep(MARKER_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()))).await;
+    }
+}
+
 pub fn validate_marker_observations(
     readable_ordinals: &[u8],
     now: StdInstant,

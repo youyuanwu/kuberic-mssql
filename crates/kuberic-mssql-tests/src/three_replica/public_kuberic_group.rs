@@ -1,10 +1,12 @@
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use futures::future::join_all;
 use kuberic_mssql::instance::SqlServerInstanceManager;
 use kuberic_mssql::kuberic::{
@@ -12,11 +14,16 @@ use kuberic_mssql::kuberic::{
 };
 use kuberic_mssql::observation::InstanceSnapshot;
 use kuberic_mssql::runtime_config::ObserverConfig;
+use kuberic_mssql::runtime_error::RuntimeError;
 use kuberic_mssql::runtime_host::{
     RuntimeEndpointResolver, RuntimeHostApplication, RuntimeHostArgs, RuntimeHostConfig,
+    SeedDispatchRecord,
 };
 use kuberic_mssql::tds::{TdsExecutor, TdsMutationExecutor};
-use kuberic_mssql::{NativeRole, Observation, SqlIdentifier};
+use kuberic_mssql::{
+    MutationEffect, NativeRole, Observation, SqlIdentifier, SqlMutationExecutor,
+    StandaloneDatabaseSnapshot,
+};
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::application::StatefulServiceReplica;
 use kuberic_runtime::control::proto::{self as wire, agent_control_client::AgentControlClient};
@@ -51,6 +58,8 @@ pub struct PublicMssqlPod {
     running: Option<RunningReplica>,
     source: Source,
     application: Arc<RuntimeHostApplication>,
+    application_root: PathBuf,
+    mutation: Option<Arc<PublicMutationExecutor>>,
 }
 
 pub struct PublicMssqlGroup {
@@ -74,6 +83,38 @@ pub struct PublicBuildCommand {
 struct HostAttempt {
     shutdown: tokio::sync::watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<kuberic_runtime::host::Result<Option<RunningReplica>>>>,
+}
+
+struct PublicMutationExecutor {
+    inner: TdsMutationExecutor,
+    seed_dispatches: AtomicUsize,
+}
+
+impl PublicMutationExecutor {
+    fn new(inner: TdsMutationExecutor) -> Self {
+        Self {
+            inner,
+            seed_dispatches: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl SqlMutationExecutor for PublicMutationExecutor {
+    async fn observe_standalone_database(
+        &self,
+        database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        self.inner.observe_standalone_database(database).await
+    }
+
+    async fn execute(&self, effect: &MutationEffect) -> Result<(), RuntimeError> {
+        let is_seed_dispatch = effect.label() == "add database to availability group";
+        if is_seed_dispatch {
+            self.seed_dispatches.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.execute(effect).await
+    }
 }
 
 struct RuntimeConfigContext<'a> {
@@ -189,6 +230,7 @@ impl PublicMssqlGroup {
         };
         for index in 0..3 {
             let config = runtime_config(&config_context, index).await?;
+            let application_root = config.application_root().to_owned();
             let observer = ObserverConfig::read(&members[index].observer_config)
                 .await
                 .map_err(display_error)?;
@@ -197,6 +239,11 @@ impl PublicMssqlGroup {
                     members[index].admin_username.clone(),
                     members[index].admin_password.clone(),
                 )
+            });
+            let mutation = mutation_settings.map(|settings| {
+                Arc::new(PublicMutationExecutor::new(
+                    TdsMutationExecutor::testing_new(settings),
+                ))
             });
             let source = Arc::new(SqlServerInstanceManager::new(
                 TdsExecutor::new(observer.connection().clone()),
@@ -218,9 +265,9 @@ impl PublicMssqlGroup {
                         SqlIdentifier::new(format!("km_db_{}", run.run_id))
                             .map_err(display_error)?,
                     ),
-                    Arc::new(TdsMutationExecutor::testing_new(
-                        mutation_settings.expect("bootstrap construction requires admin settings"),
-                    )),
+                    mutation
+                        .clone()
+                        .expect("bootstrap construction requires a mutation executor"),
                 )
                 .map_err(display_error)?
             });
@@ -248,6 +295,8 @@ impl PublicMssqlGroup {
                 running: None,
                 source,
                 application,
+                application_root,
+                mutation,
             });
         }
         let mut pods: [PublicMssqlPod; 3] = pods
@@ -493,13 +542,9 @@ impl PublicMssqlGroup {
         command.clone()
     }
 
-    pub fn retire_build_command(
-        &self,
-        command: &PublicBuildCommand,
-        operation_id: impl Into<String>,
-    ) -> PublicBuildCommand {
+    pub fn retire_build_command(&self, command: &PublicBuildCommand) -> PublicBuildCommand {
         PublicBuildCommand {
-            operation_id: OperationId::new(operation_id.into()),
+            operation_id: command.operation_id.clone(),
             build_id: command.build_id.clone(),
             target: command.target.clone(),
             retire: true,
@@ -509,12 +554,12 @@ impl PublicMssqlGroup {
     pub fn supersede_build_command(
         &self,
         command: &PublicBuildCommand,
-        operation_id: impl Into<String>,
         build_id: impl Into<String>,
     ) -> PublicBuildCommand {
+        let build_id = OperationId::new(build_id.into());
         PublicBuildCommand {
-            operation_id: OperationId::new(operation_id.into()),
-            build_id: OperationId::new(build_id.into()),
+            operation_id: build_id.clone(),
+            build_id,
             target: command.target.clone(),
             retire: false,
         }
@@ -543,15 +588,6 @@ impl PublicMssqlGroup {
         .await
     }
 
-    pub async fn execute_build_withheld_after_native_completion(
-        &self,
-        command: &PublicBuildCommand,
-    ) -> Result<(), tonic::Status> {
-        self.execute_build_command_with_retry(command).await?;
-        std::future::pending::<()>().await;
-        unreachable!("withheld build reply never completes")
-    }
-
     pub fn testing_gate_next_seed_intent(
         &self,
         entered: tokio::sync::oneshot::Sender<()>,
@@ -566,6 +602,42 @@ impl PublicMssqlGroup {
             .map_err(|error| MssqlGroupError::new(error.to_string()))
     }
 
+    pub fn testing_gate_next_seed_compaction(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), MssqlGroupError> {
+        self.pods[0]
+            .application
+            .testing_replicator()
+            .ok_or_else(|| MssqlGroupError::new("bootstrap source replicator is unavailable"))?
+            .testing_gate_seed_compaction(entered, release)
+            .map_err(|error| MssqlGroupError::new(error.to_string()))
+    }
+
+    pub fn testing_seed_dispatch_count(&self) -> Result<usize, MssqlGroupError> {
+        Ok(self.pods[0]
+            .mutation
+            .as_ref()
+            .ok_or_else(|| MssqlGroupError::new("bootstrap mutation executor is unavailable"))?
+            .seed_dispatches
+            .load(Ordering::SeqCst))
+    }
+
+    pub fn testing_seed_dispatch_record(
+        &self,
+    ) -> Result<Option<SeedDispatchRecord>, MssqlGroupError> {
+        let path = self.pods[0].application_root.join("seed-dispatch-v1.json");
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(MssqlGroupError::new(error.to_string())),
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| MssqlGroupError::new(error.to_string()))
+    }
+
     pub fn testing_abort_seed_source(&self) {
         self.pods[0].application.abort();
     }
@@ -577,7 +649,75 @@ impl PublicMssqlGroup {
         self.execute_admitted_seed_callback(command).await
     }
 
-    async fn execute_build_command(
+    pub fn testing_spawn_admitted_seed_callback(
+        &self,
+        command: &PublicBuildCommand,
+    ) -> Result<tokio::task::JoinHandle<Result<(), tonic::Status>>, tonic::Status> {
+        let (replicator, build) = self.admitted_seed_callback(command)?;
+        Ok(tokio::spawn(async move {
+            replicator
+                .build_replica(build)
+                .await
+                .map_err(|error| tonic::Status::internal(error.to_string()))
+        }))
+    }
+
+    pub async fn testing_execute_kuberic_build_command(
+        &self,
+        command: &PublicBuildCommand,
+    ) -> Result<(), tonic::Status> {
+        let deadline = tokio::time::Instant::now() + self.operation_timeout;
+        loop {
+            let result = self.execute_kuberic_build_command(command).await;
+            if result.as_ref().is_err_and(retryable_public_build_error)
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            return result;
+        }
+    }
+
+    pub async fn testing_assert_build_success_not_published(
+        &self,
+        command: &PublicBuildCommand,
+    ) -> Result<(), MssqlGroupError> {
+        for pod in &self.pods {
+            self.assert_build_success_not_published_by(pod, command)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn testing_assert_source_build_success_not_published(
+        &self,
+        command: &PublicBuildCommand,
+    ) -> Result<(), MssqlGroupError> {
+        self.assert_build_success_not_published_by(&self.pods[0], command)
+            .await
+    }
+
+    async fn assert_build_success_not_published_by(
+        &self,
+        pod: &PublicMssqlPod,
+        command: &PublicBuildCommand,
+    ) -> Result<(), MssqlGroupError> {
+        let (_, report) = status(pod, self.operation_timeout).await?;
+        if report
+            .builds
+            .iter()
+            .any(|build| build.build_id == command.build_id.as_str() && build.completed)
+        {
+            return Err(MssqlGroupError::new(format!(
+                "stale build {} published completion from member {}",
+                command.build_id, pod.ordinal
+            )));
+        }
+        Ok(())
+    }
+
+    async fn execute_kuberic_build_command(
         &self,
         command: &PublicBuildCommand,
     ) -> Result<(), tonic::Status> {
@@ -655,6 +795,17 @@ impl PublicMssqlGroup {
         if command.retire {
             return Ok(());
         }
+        Ok(())
+    }
+
+    async fn execute_build_command(
+        &self,
+        command: &PublicBuildCommand,
+    ) -> Result<(), tonic::Status> {
+        self.execute_kuberic_build_command(command).await?;
+        if command.retire {
+            return Ok(());
+        }
         self.execute_admitted_seed_callback(command).await
     }
 
@@ -662,11 +813,28 @@ impl PublicMssqlGroup {
         &self,
         command: &PublicBuildCommand,
     ) -> Result<(), tonic::Status> {
-        let source = &self.pods[0];
         let timeout_duration = self.operation_timeout.min(
             remaining(self.complete_deadline, "public target build")
                 .map_err(|error| tonic::Status::deadline_exceeded(error.to_string()))?,
         );
+        let (replicator, build) = self.admitted_seed_callback(command)?;
+        tokio::time::timeout(timeout_duration, replicator.build_replica(build))
+            .await
+            .map_err(|_| tonic::Status::deadline_exceeded("bootstrap seed callback timed out"))?
+            .map_err(|error| tonic::Status::internal(error.to_string()))
+    }
+
+    fn admitted_seed_callback(
+        &self,
+        command: &PublicBuildCommand,
+    ) -> Result<
+        (
+            Arc<kuberic_mssql::kuberic::SqlServerReplicator>,
+            ReplicaInformation,
+        ),
+        tonic::Status,
+    > {
+        let source = &self.pods[0];
         let replicator = source.application.testing_replicator().ok_or_else(|| {
             tonic::Status::failed_precondition("bootstrap source replicator is unavailable")
         })?;
@@ -686,10 +854,7 @@ impl PublicMssqlGroup {
             target.replication_address().to_owned(),
         );
         build.process_session_id = target.process_session_id().clone();
-        tokio::time::timeout(timeout_duration, replicator.build_replica(build))
-            .await
-            .map_err(|_| tonic::Status::deadline_exceeded("bootstrap seed callback timed out"))?
-            .map_err(|error| tonic::Status::internal(error.to_string()))
+        Ok((replicator, build))
     }
 
     async fn execute_build_command_with_retry(

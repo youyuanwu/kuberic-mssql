@@ -75,6 +75,6 @@ pub use process::{
     BoundedProcessRunner, ChildDisposition, CommandSpec, ProcessError, ProcessErrorKind,
     ProcessResult, ProcessRunner,
 };
-pub use public_kuberic_group::{PublicMssqlGroup, PublicMssqlPod};
+pub use public_kuberic_group::{PublicBuildCommand, PublicMssqlGroup, PublicMssqlPod};
 pub use secrets::CredentialFiles;
 pub use tls::TlsAssets;
