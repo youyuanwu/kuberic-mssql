@@ -287,10 +287,13 @@ application binding, public `ReplicaHost` assembly, startup cancellation and
 shutdown/error composition. Kuberic's private SQLite store and runtime-effect
 types are not part of the application API.
 
-Operation-envelope serialization/decoding and the durable result journal
-remain stage 3 work. The existing canonical signatures and approval/fence
-bindings are unchanged. Observation JSON is an output format, not a new
-authenticated command protocol.
+Stage 3 did not select operation-envelope serialization or a generic result
+journal. Callback-visible authority and Kuberic's retained command/build
+evidence are reconciled with exact native SQL postconditions; only the bounded
+pre-association seed-dispatch ambiguity uses application metadata. The existing
+canonical signatures and approval/fence bindings remain contracts for later
+command transport. Observation JSON is output, not an authenticated command
+protocol.
 
 ## Testing
 

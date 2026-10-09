@@ -126,7 +126,7 @@ administrative SQL or container authority.
 The crate remained independent when the classic runtime was removed. The
 `sqlserver-observer` binary
 and runtime remain independently testable without the replication runtime.
-See the [observe-only runtime guide](observation.md) for configuration,
+See the [observe-only runtime guide](../README.md#configuration) for configuration,
 permissions, output semantics, and tests.
 
 Two capabilities named in this design are defined but not yet enforceable, and
@@ -368,16 +368,14 @@ address is published and there is no external write lease. The fixture's marker
 write uses its private administrator connection to the directly observed native
 primary and is not a Kuberic client-access decision.
 
-Before Stage 3 adds mutable application metadata, each transition must identify
-what Kuberic's private agent store already retains and what exact SQL Server
-postcondition can be reobserved after restart. The PostgreSQL v2 precedent uses
-three distinct owners: Kuberic agent SQLite metadata, application-owned
-checksummed metadata under its application root, and PGDATA. MSSQL should use
-the corresponding Kuberic authority and native SQL state first. If an ambiguity
-remains, the smallest required SQL-specific intent or transition stage may be
-stored under the existing MSSQL application root, beside but not inside the
-immutable runtime binding. A general second operation database or result ledger
-is not a Stage 3 prerequisite.
+Stage 3 first identifies what Kuberic's private agent store retains and what
+exact SQL Server postcondition can be reobserved after restart. The PostgreSQL
+v2 precedent uses three distinct owners: Kuberic agent SQLite metadata,
+application-owned checksummed metadata, and PGDATA. MSSQL applies the same
+ownership discipline with Kuberic authority, native SQL state, the immutable
+runtime binding, and one bounded seed-dispatch record under the existing
+application root. The record exists only for the demonstrated pre-association
+ambiguity; no general second operation database or result ledger was added.
 
 The current implementation tracks Kuberic `main`; `Cargo.lock` freezes the
 exact revision used by each build. The current pin
