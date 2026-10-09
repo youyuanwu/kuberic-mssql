@@ -5,9 +5,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use kuberic_mssql_tests::three_replica::{
-    JournalStore, OwnershipJournal, ProcessIncarnation, RunState, cleanup_three_replica_fixture,
-    create_blocked_owner_regression_fixture, process_incarnation, process_incarnation_matches_stat,
-    retry_owner_regression_fixture,
+    JOURNAL_SCHEMA_VERSION, JournalStore, OwnershipJournal, ProcessIncarnation, RunState,
+    cleanup_three_replica_fixture, create_blocked_owner_regression_fixture, process_incarnation,
+    process_incarnation_matches_stat, retry_owner_regression_fixture,
 };
 
 const CHILD_MODE: &str = "KUBERIC_MSSQL_BLOCKED_OWNER_CHILD";
@@ -136,7 +136,10 @@ fn schema_five_unknown_owner_refuses_cleanup_while_live_and_after_death() {
     assert!(resource.is_dir());
     let migrated_value: serde_json::Value =
         serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
-    assert_eq!(migrated_value["schema_version"], serde_json::json!(7));
+    assert_eq!(
+        migrated_value["schema_version"],
+        serde_json::json!(JOURNAL_SCHEMA_VERSION)
+    );
     assert_eq!(
         migrated_value["blocked_owner_unknown"],
         serde_json::json!(true)

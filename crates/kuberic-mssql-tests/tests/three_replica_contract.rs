@@ -9,9 +9,10 @@ use kuberic_mssql::SqlServerEulaAcknowledgement;
 use kuberic_mssql_tests::three_replica::{
     ACKNOWLEDGEMENT_SCHEMA_VERSION, CleanupError, CleanupReport, CombinedFixtureError,
     FailureCategory, FailureStage, FixtureConfig, FixtureConfigError, JOURNAL_SCHEMA_VERSION,
-    JournalError, KubericMember, LaunchAuthorization, OwnershipJournal, PINNED_SQL_SERVER_IMAGE,
-    ResourceBinding, ResourceKind, ResourcePolicy, ResourceRecord, ResourceState, RunState,
-    SanitizedFailure, SqlMember, StageDeadlines, TopologyRun, combine_with_cleanup,
+    JournalError, KubericMember, LaunchAuthorization, NativeTopologyPhase, OwnershipJournal,
+    PINNED_SQL_SERVER_IMAGE, ResourceBinding, ResourceKind, ResourcePolicy, ResourceRecord,
+    ResourceState, RunState, SanitizedFailure, SqlMember, StageDeadlines, TopologyRun,
+    combine_with_cleanup,
 };
 
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
@@ -295,12 +296,15 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         justfile
             .contains("test-live-three-replica-faults root=\"target/mssql-three-replica-faults\":")
     );
+    assert!(justfile.contains(
+        "test-live-three-replica-conflicts root=\"target/mssql-three-replica-conflicts\":"
+    ));
     assert_eq!(
         justfile
             .lines()
             .filter(|line| line.contains("env -u SQLSERVER_TEST_EULA_ACCEPTED"))
             .count(),
-        9
+        10
     );
     assert!(!justfile.contains("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT"));
     assert!(!justfile.contains("acknowledgement root="));
@@ -318,6 +322,12 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
     ));
     assert!(justfile.contains(
         "three_replica_sigterm_during_owned_launch_is_recoverable -- --ignored --exact --test-threads=1 --nocapture"
+    ));
+    assert!(justfile.contains(
+        "three_replica_mssql_bootstrap_fault_boundaries -- --ignored --exact --test-threads=1 --nocapture"
+    ));
+    assert!(justfile.contains(
+        "three_replica_mssql_native_conflict_matrix -- --ignored --exact --test-threads=1 --nocapture"
     ));
 
     for recipe in ["default: check", "check: fmt-check clippy test"] {
@@ -380,20 +390,27 @@ fn journal_round_trips_without_secret_values() {
 }
 
 #[test]
-fn schema_seven_serialized_shape_and_previous_schema_migration_remain_stable() {
-    let current_bytes = include_bytes!("../fixtures/ownership-journal-schema-7.json");
+fn schema_eight_serialized_shape_and_previous_schema_migration_remain_stable() {
+    let current_bytes = include_bytes!("../fixtures/ownership-journal-schema-8.json");
     let current = OwnershipJournal::from_json(current_bytes).unwrap();
     assert_eq!(current.schema_version, JOURNAL_SCHEMA_VERSION);
+    assert_eq!(current.native_phase, NativeTopologyPhase::Absent);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&current.to_json().unwrap()).unwrap(),
         serde_json::from_slice::<serde_json::Value>(current_bytes).unwrap()
     );
 
-    let previous = OwnershipJournal::from_json(include_bytes!(
+    let previous_seven = OwnershipJournal::from_json(include_bytes!(
+        "../fixtures/ownership-journal-schema-7.json"
+    ))
+    .unwrap();
+    assert_eq!(previous_seven, current);
+
+    let previous_six = OwnershipJournal::from_json(include_bytes!(
         "../fixtures/ownership-journal-schema-6.json"
     ))
     .unwrap();
-    assert_eq!(previous, current);
+    assert_eq!(previous_six, current);
 }
 
 #[test]
@@ -411,6 +428,29 @@ fn journal_rejects_unknown_or_unsupported_schemas() {
     value["unknown"] = serde_json::json!(true);
     assert_eq!(
         OwnershipJournal::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err(),
+        JournalError::Malformed
+    );
+
+    let mut missing_phase: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../fixtures/ownership-journal-schema-8.json"
+    ))
+    .unwrap();
+    missing_phase
+        .as_object_mut()
+        .unwrap()
+        .remove("native_phase");
+    assert_eq!(
+        OwnershipJournal::from_json(&serde_json::to_vec(&missing_phase).unwrap()).unwrap_err(),
+        JournalError::Malformed
+    );
+
+    let mut inconsistent_phase: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../fixtures/ownership-journal-schema-8.json"
+    ))
+    .unwrap();
+    inconsistent_phase["native_phase"] = serde_json::json!("converged");
+    assert_eq!(
+        OwnershipJournal::from_json(&serde_json::to_vec(&inconsistent_phase).unwrap()).unwrap_err(),
         JournalError::Malformed
     );
 }

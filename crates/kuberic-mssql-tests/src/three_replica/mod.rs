@@ -51,9 +51,9 @@ pub use member::{
 pub use model::{
     CombinedFixtureError, FailureCategory, FailureStage, IncarnationError, JOURNAL_SCHEMA_VERSION,
     JournalError, KubericMember, NativeMemberBinding, NativeMemberIntent, NativeTopologyBinding,
-    NativeTopologyIntent, OwnershipJournal, ProcessIncarnation, ResourceBinding, ResourceKind,
-    ResourceRecord, ResourceState, RunState, SanitizedFailure, SqlMember, SqlMemberIncarnation,
-    TopologyRun,
+    NativeTopologyIntent, NativeTopologyPhase, OwnershipJournal, ProcessIncarnation,
+    ResourceBinding, ResourceKind, ResourceRecord, ResourceState, RunState, SanitizedFailure,
+    SqlMember, SqlMemberIncarnation, TopologyRun,
 };
 pub use ownership::{
     AclController, AclEvidence, CommandAclController, DirectoryBinding, JournalDocument,
@@ -75,6 +75,9 @@ pub use process::{
     BoundedProcessRunner, ChildDisposition, CommandSpec, ProcessError, ProcessErrorKind,
     ProcessResult, ProcessRunner,
 };
-pub use public_kuberic_group::{PublicBuildCommand, PublicMssqlGroup, PublicMssqlPod};
+pub use public_kuberic_group::{
+    LicensedConflictScenario, PublicBuildCommand, PublicFaultInjection, PublicMssqlGroup,
+    PublicMssqlPod, PublicMutationFault,
+};
 pub use secrets::CredentialFiles;
 pub use tls::TlsAssets;

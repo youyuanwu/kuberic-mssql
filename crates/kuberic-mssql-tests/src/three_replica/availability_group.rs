@@ -26,7 +26,7 @@ use super::evidence::{
 use super::member::ReadyMember;
 use super::model::{
     IncarnationError, NativeMemberBinding, NativeMemberIntent, NativeTopologyBinding,
-    NativeTopologyIntent, OwnershipJournal, SqlMemberIncarnation, TopologyRun,
+    NativeTopologyIntent, NativeTopologyPhase, OwnershipJournal, SqlMemberIncarnation, TopologyRun,
 };
 use super::secrets::CredentialFiles;
 use super::tls::TlsAssets;
@@ -155,6 +155,11 @@ pub(crate) async fn prepare<R: ProcessRunner>(
         formation_deadline.into_std(),
         context.deadlines.docker_command,
     )?;
+    context.journal.native_phase = NativeTopologyPhase::Prepared;
+    context
+        .store
+        .save(context.journal)
+        .map_err(|_| AvailabilityGroupError::Journal)?;
     Ok(PreparedAvailabilityGroup { endpoint_evidence })
 }
 
@@ -286,6 +291,7 @@ async fn finalize_topology<R: ProcessRunner>(
         return Err(AvailabilityGroupError::Deadline);
     }
     context.journal.native_binding = Some(binding.clone());
+    context.journal.native_phase = NativeTopologyPhase::Converged;
     context
         .store
         .save(context.journal)
@@ -302,6 +308,7 @@ async fn prepare_endpoints_and_peers<R: ProcessRunner>(
         return Err(AvailabilityGroupError::Intent);
     }
     context.journal.native_intent = Some(intent);
+    context.journal.native_phase = NativeTopologyPhase::Preparing;
     context
         .store
         .save(context.journal)

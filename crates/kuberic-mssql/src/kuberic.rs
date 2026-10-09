@@ -776,6 +776,8 @@ struct SeedCoordinator {
     intent_gate: Mutex<Option<SeedGate>>,
     #[cfg(feature = "kuberic-testing")]
     compaction_gate: Mutex<Option<SeedGate>>,
+    #[cfg(feature = "kuberic-testing")]
+    completion_gate: Mutex<Option<SeedGate>>,
 }
 
 #[cfg(feature = "kuberic-testing")]
@@ -794,6 +796,8 @@ impl SeedCoordinator {
             intent_gate: Mutex::new(None),
             #[cfg(feature = "kuberic-testing")]
             compaction_gate: Mutex::new(None),
+            #[cfg(feature = "kuberic-testing")]
+            completion_gate: Mutex::new(None),
         }
     }
 
@@ -819,6 +823,11 @@ impl SeedCoordinator {
     #[cfg(feature = "kuberic-testing")]
     async fn pause_before_compaction_if_requested(&self) -> Result<(), KubericAdapterError> {
         self.pause_if_requested(&self.compaction_gate).await
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    async fn pause_before_completion_if_requested(&self) -> Result<(), KubericAdapterError> {
+        self.pause_if_requested(&self.completion_gate).await
     }
 
     #[cfg(feature = "kuberic-testing")]
@@ -897,6 +906,29 @@ impl SqlServerReplicator {
             .seed;
         let mut gate = seed
             .compaction_gate
+            .lock()
+            .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?;
+        if gate.is_some() {
+            return Err(KubericAdapterError::SeedState(SeedStateError::AlreadyOwned));
+        }
+        *gate = Some(SeedGate { entered, release });
+        Ok(())
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_gate_seed_completion(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), KubericAdapterError> {
+        let seed = &self
+            .bootstrap
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?
+            .seed;
+        let mut gate = seed
+            .completion_gate
             .lock()
             .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?;
         if gate.is_some() {
@@ -1793,6 +1825,11 @@ impl SqlServerReplicator {
                         &context.target_native_replica_id,
                     ) {
                         NativeConvergenceState::Complete => {
+                            #[cfg(feature = "kuberic-testing")]
+                            bootstrap
+                                .seed
+                                .pause_before_completion_if_requested()
+                                .await?;
                             drop(self.finish_operation(generation)?);
                             return Ok(());
                         }

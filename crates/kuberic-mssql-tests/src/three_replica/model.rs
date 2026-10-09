@@ -14,9 +14,19 @@ pub use crate::fixture::model::{
     ResourceBinding, ResourceKind, ResourceRecord, ResourceState, RunState, SanitizedFailure,
 };
 
-pub const JOURNAL_SCHEMA_VERSION: u32 = 7;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 8;
 const LEGACY_JOURNAL_SCHEMA_VERSION: u32 = 5;
-const PREVIOUS_JOURNAL_SCHEMA_VERSION: u32 = 6;
+const PREVIOUS_JOURNAL_SCHEMA_VERSIONS: [u32; 2] = [6, 7];
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeTopologyPhase {
+    #[default]
+    Absent,
+    Preparing,
+    Prepared,
+    Converged,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -161,6 +171,8 @@ pub struct OwnershipJournal {
     #[serde(default)]
     pub blocked_owner_unknown: bool,
     pub sql_member_incarnations: Option<[SqlMemberIncarnation; 3]>,
+    #[serde(default)]
+    pub native_phase: NativeTopologyPhase,
     pub native_intent: Option<NativeTopologyIntent>,
     pub native_binding: Option<NativeTopologyBinding>,
     pub resources: Vec<ResourceRecord>,
@@ -224,6 +236,7 @@ impl OwnershipJournal {
             blocked_owner: None,
             blocked_owner_unknown: false,
             sql_member_incarnations: None,
+            native_phase: NativeTopologyPhase::Absent,
             native_intent: None,
             native_binding: None,
             resources: Vec::new(),
@@ -231,21 +244,60 @@ impl OwnershipJournal {
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self, JournalError> {
+        let document: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|_| JournalError::Malformed)?;
+        if document
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(JOURNAL_SCHEMA_VERSION))
+            && document.get("native_phase").is_none()
+        {
+            return Err(JournalError::Malformed);
+        }
         let mut journal: Self =
             serde_json::from_slice(bytes).map_err(|_| JournalError::Malformed)?;
         if journal.schema_version == LEGACY_JOURNAL_SCHEMA_VERSION {
             journal.blocked_owner_unknown =
                 journal.state == RunState::Blocked && journal.blocked_owner.is_none();
             journal.schema_version = JOURNAL_SCHEMA_VERSION;
-        } else if journal.schema_version == PREVIOUS_JOURNAL_SCHEMA_VERSION {
+            journal.infer_legacy_native_phase();
+        } else if PREVIOUS_JOURNAL_SCHEMA_VERSIONS.contains(&journal.schema_version) {
             journal.schema_version = JOURNAL_SCHEMA_VERSION;
+            journal.infer_legacy_native_phase();
         } else if journal.schema_version != JOURNAL_SCHEMA_VERSION {
             return Err(JournalError::UnsupportedSchema(journal.schema_version));
         }
+        journal.validate_native_phase()?;
         Ok(journal)
     }
 
     pub fn to_json(&self) -> Result<Vec<u8>, JournalError> {
+        self.validate_native_phase()?;
         serde_json::to_vec_pretty(self).map_err(|_| JournalError::Malformed)
+    }
+
+    fn infer_legacy_native_phase(&mut self) {
+        self.native_phase = if self.native_binding.is_some() {
+            NativeTopologyPhase::Converged
+        } else if self.native_intent.is_some() {
+            NativeTopologyPhase::Preparing
+        } else {
+            NativeTopologyPhase::Absent
+        };
+    }
+
+    fn validate_native_phase(&self) -> Result<(), JournalError> {
+        let valid = match self.native_phase {
+            NativeTopologyPhase::Absent => {
+                self.native_intent.is_none() && self.native_binding.is_none()
+            }
+            NativeTopologyPhase::Preparing | NativeTopologyPhase::Prepared => {
+                self.native_intent.is_some() && self.native_binding.is_none()
+            }
+            NativeTopologyPhase::Converged => {
+                self.native_intent.is_some() && self.native_binding.is_some()
+            }
+        };
+        valid.then_some(()).ok_or(JournalError::Malformed)
     }
 }

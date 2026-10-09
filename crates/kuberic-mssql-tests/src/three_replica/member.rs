@@ -110,6 +110,27 @@ impl LaunchedMembers {
             .map_err(|_| NativeLaunchError::Journal)
     }
 
+    pub fn restart_sql_process_for_test(&self, index: usize) -> Result<(), NativeLaunchError> {
+        let member = self
+            .members
+            .get(index)
+            .ok_or(NativeLaunchError::Ownership)?;
+        let timeout = self
+            .context
+            .limit(self.context.config.deadlines().docker_command)?;
+        self.context
+            .docker
+            .stop_container(&member.container_id, timeout)
+            .map_err(NativeLaunchError::Docker)?;
+        let timeout = self
+            .context
+            .limit(self.context.config.deadlines().docker_command)?;
+        self.context
+            .docker
+            .start_container(&member.container_id, timeout)
+            .map_err(NativeLaunchError::Docker)
+    }
+
     pub async fn provision_native_topology(&mut self) -> Result<NativeDataProof, NativePhaseError> {
         let topology = self.provision_availability_group().await?;
         let marker = self
