@@ -369,6 +369,18 @@ group marker. The token binds resource/configuration identity, AG name and
 GUID, source database identity and lineage, source SQL incarnation, and both
 authorized target identities.
 
+The primary's remote DMV rows are dispatch-progress evidence only. Completing a
+target build requires a challenge-bound report produced by a fresh direct
+observation on that target host. The explicit test-host exchange authenticates
+the exact resource, accepted configuration, build ID, target Kuberic identity
+and current process session. The callback then validates the target native
+replica GUID, exact AG and group-database identities, family/recovery-fork
+lineage, local synchronized/healthy/online/not-suspended state, and the target
+SQL start identity frozen by the licensed fixture. A report created for an old
+challenge, build or process session is not reusable. This exchange exists only
+in reviewed bootstrap-testing construction and does not alter the pinned
+Kuberic protocol or ordinary read-only runtime.
+
 The file record binds exact authority and native identities and distinguishes
 `Intent`, `Submitting`, `Accepted`, genuinely `Ambiguous`, and
 `FailedRetryable`. `Submitting` alone never suppresses another attempt after a
@@ -500,9 +512,11 @@ replacement processes receive fresh sessions, stale-session commands are
 rejected, exact reports reconverge, and native marker continuity is retained.
 Fault, signal and recovery cases remain explicitly invoked, including failure
 after replacement-host startup followed by exact cleanup and retry. This does
-not advance the production delivery sequence: it does not test SQL Server
-process restart, write-lease expiry, old-primary fencing, switchover, failover,
-replica replacement, Kubernetes lifecycle, or client routing.
+not advance the production delivery sequence: licensed validation restarts a
+target SQL process only to prove build-evidence invalidation; it does not own or
+contain that process lifecycle. Write-lease expiry, old-primary fencing,
+switchover, failover, replica replacement, Kubernetes lifecycle, and client
+routing remain unimplemented.
 
 ## References
 

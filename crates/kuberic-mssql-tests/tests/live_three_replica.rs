@@ -66,6 +66,12 @@ fn three_replica_mssql_terminal_seed_conflicts() {
     run_phase4_test(Phase4LiveTest::TerminalSeedConflicts);
 }
 
+#[test]
+#[ignore = "exercises licensed target-local build evidence windows on a qualified local Docker host"]
+fn three_replica_mssql_target_host_evidence_faults() {
+    run_phase4_test(Phase4LiveTest::TargetHostEvidence);
+}
+
 fn run_three_replica_test(validate_restart: bool) {
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
@@ -89,6 +95,7 @@ enum Phase4LiveTest {
     SeedDispatchHandshake,
     ConflictMatrix,
     TerminalSeedConflicts,
+    TargetHostEvidence,
 }
 
 fn run_phase4_test(test: Phase4LiveTest) {
@@ -115,6 +122,9 @@ fn run_phase4_test(test: Phase4LiveTest) {
                         }
                         Phase4LiveTest::TerminalSeedConflicts => {
                             execute_terminal_seed_conflicts(&root).await
+                        }
+                        Phase4LiveTest::TargetHostEvidence => {
+                            execute_target_host_evidence_faults(&root).await
                         }
                     }
                     .expect("licensed Phase 4 lifecycle");
@@ -1226,6 +1236,7 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
 }
 
 async fn execute_phase4_fault_boundaries(base_root: &Path) -> Result<(), TestError> {
+    fs::create_dir_all(base_root)?;
     execute_configuration_faults(base_root).await?;
     execute_seed_dispatch_handshake_faults(&base_root.join("seed-dispatch-handshake")).await?;
     exercise_seed_faults(&base_root.join("seed-boundaries")).await?;
@@ -1332,6 +1343,7 @@ async fn exercise_terminal_seed_conflict(
 }
 
 async fn execute_configuration_faults(base_root: &Path) -> Result<(), TestError> {
+    let filter = std::env::var("KUBERIC_MSSQL_CONFIGURATION_FAULT_FILTER").ok();
     for (fault, label) in [
         (
             PublicMutationFault::SourceRecoveryCompletion,
@@ -1422,12 +1434,16 @@ async fn execute_configuration_faults(base_root: &Path) -> Result<(), TestError>
             "second-secondary-seeding-grant-evidence",
         ),
     ] {
+        if filter.as_deref().is_some_and(|filter| filter != label) {
+            continue;
+        }
         exercise_configuration_fault(base_root, fault, label).await?;
     }
     Ok(())
 }
 
 async fn execute_seed_dispatch_handshake_faults(base_root: &Path) -> Result<(), TestError> {
+    fs::create_dir_all(base_root)?;
     let filter = std::env::var("KUBERIC_MSSQL_SEED_FAULT_FILTER").ok();
     for (fault, label) in [
         (
@@ -1480,9 +1496,9 @@ async fn exercise_seed_submission_fault(
     let command =
         group.target_build_command(1, format!("{label}-build"), format!("{label}-build"))?;
     group
-        .testing_execute_kuberic_build_command(&command)
+        .testing_admit_target_build_authority_only(&command)
         .await
-        .map_err(|error| format!("{label} build admission failed: {error}"))?;
+        .map_err(|error| format!("{label} target authority admission failed: {error}"))?;
 
     group.testing_arm_mutation_fault(fault);
     let first = group.testing_execute_admitted_seed_callback(&command).await;
@@ -1528,6 +1544,10 @@ async fn exercise_seed_submission_fault(
         .finalize_prepared_availability_group(&prepared)
         .await?;
     let peer = group.target_build_command(2, format!("{label}-peer"), format!("{label}-peer"))?;
+    group
+        .testing_admit_target_build_authority_only(&peer)
+        .await
+        .map_err(|error| format!("{label} peer authority admission failed: {error}"))?;
     group
         .testing_execute_admitted_seed_callback_with_retry(&peer)
         .await
@@ -1633,6 +1653,10 @@ async fn converge_minimal_seeded_topology(
     let winner =
         group.target_build_command(1, format!("{label}-build-2"), format!("{label}-build-2"))?;
     group
+        .testing_admit_target_build_authority_only(&winner)
+        .await
+        .map_err(|error| format!("{label} winner authority admission failed: {error}"))?;
+    group
         .testing_execute_admitted_seed_callback_with_retry(&winner)
         .await
         .map_err(|error| format!("{label} same-root seed retry failed: {error}"))?;
@@ -1641,6 +1665,10 @@ async fn converge_minimal_seeded_topology(
         .await?;
     let peer =
         group.target_build_command(2, format!("{label}-build-3"), format!("{label}-build-3"))?;
+    group
+        .testing_admit_target_build_authority_only(&peer)
+        .await
+        .map_err(|error| format!("{label} peer authority admission failed: {error}"))?;
     group
         .testing_execute_admitted_seed_callback_with_retry(&peer)
         .await
@@ -1682,9 +1710,9 @@ async fn exercise_seed_faults(root: &Path) -> Result<(), TestError> {
     let command =
         group.target_build_command(1, "phase4-seed-boundaries", "phase4-seed-boundaries")?;
     group
-        .testing_execute_kuberic_build_command(&command)
+        .testing_admit_target_build_authority_only(&command)
         .await
-        .map_err(|error| format!("seed-boundary build admission failed: {error}"))?;
+        .map_err(|error| format!("seed-boundary target authority admission failed: {error}"))?;
 
     let (intent_entered_tx, intent_entered_rx) = tokio::sync::oneshot::channel();
     let (_intent_release_tx, intent_release_rx) = tokio::sync::oneshot::channel();
@@ -1726,13 +1754,36 @@ async fn exercise_seed_faults(root: &Path) -> Result<(), TestError> {
     let (completion_entered_tx, completion_entered_rx) = tokio::sync::oneshot::channel();
     let (_completion_release_tx, completion_release_rx) = tokio::sync::oneshot::channel();
     group.testing_gate_next_seed_completion(completion_entered_tx, completion_release_rx)?;
-    let mut completion_callback = group.testing_spawn_admitted_seed_callback(&command)?;
-    await_checkpoint(
-        completion_entered_rx,
-        &mut completion_callback,
-        "native completion",
-    )
-    .await?;
+    let mut completion_entered_rx = completion_entered_rx;
+    let completion_deadline = tokio::time::Instant::now() + launched.kuberic_convergence_timeout();
+    let mut completion_callback;
+    loop {
+        completion_callback = group.testing_spawn_admitted_seed_callback(&command)?;
+        tokio::select! {
+            entered = &mut completion_entered_rx => {
+                entered.map_err(|_| "native completion callback ended before its checkpoint")?;
+                break;
+            }
+            result = &mut completion_callback => {
+                let retryable = matches!(
+                    result,
+                    Ok(Err(ref status))
+                        if status.message().contains("observation is unavailable: Unsupported")
+                            || status.message().contains("observation is unavailable: Malformed")
+                );
+                if !retryable || tokio::time::Instant::now() >= completion_deadline {
+                    return Err(format!(
+                        "native completion callback completed before interruption: {result:?}"
+                    )
+                    .into());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            _ = tokio::time::sleep_until(completion_deadline) => {
+                return Err("native completion checkpoint exceeded its bounded wait".into());
+            }
+        }
+    }
     completion_callback.abort();
     let _ = completion_callback.await;
     group
@@ -1754,9 +1805,9 @@ async fn exercise_seed_faults(root: &Path) -> Result<(), TestError> {
 
     let peer = group.target_build_command(2, "phase4-seed-peer", "phase4-seed-peer")?;
     group
-        .testing_execute_kuberic_build_command(&peer)
+        .testing_admit_target_build_authority_only(&peer)
         .await
-        .map_err(|error| format!("seed-boundary peer admission failed: {error}"))?;
+        .map_err(|error| format!("seed-boundary peer authority admission failed: {error}"))?;
     group
         .testing_execute_admitted_seed_callback(&peer)
         .await
@@ -1916,7 +1967,167 @@ async fn await_checkpoint(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TargetEvidenceWindow {
+    PreAssociation,
+    InFlightSeeding,
+    PostNativePreReply,
+}
+
+impl TargetEvidenceWindow {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::PreAssociation => "pre-association",
+            Self::InFlightSeeding => "in-flight-seeding",
+            Self::PostNativePreReply => "post-native-pre-reply",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TargetEvidenceFault {
+    SqlProcessRestart,
+    LineageMismatch,
+}
+
+impl TargetEvidenceFault {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SqlProcessRestart => "sql-process-restart",
+            Self::LineageMismatch => "lineage-mismatch",
+        }
+    }
+}
+
+async fn execute_target_host_evidence_faults(base_root: &Path) -> Result<(), TestError> {
+    fs::create_dir_all(base_root)?;
+    for window in [
+        TargetEvidenceWindow::PreAssociation,
+        TargetEvidenceWindow::InFlightSeeding,
+        TargetEvidenceWindow::PostNativePreReply,
+    ] {
+        for fault in [
+            TargetEvidenceFault::SqlProcessRestart,
+            TargetEvidenceFault::LineageMismatch,
+        ] {
+            exercise_target_host_evidence_fault(base_root, window, fault).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn exercise_target_host_evidence_fault(
+    base_root: &Path,
+    window: TargetEvidenceWindow,
+    fault: TargetEvidenceFault,
+) -> Result<(), TestError> {
+    let label = format!("{}-{}", window.label(), fault.label());
+    let root = base_root.join(&label);
+    cleanup_three_replica_fixture(&root)?;
+    let config = FixtureConfig::for_test_fixture(&root)?;
+    let mut launched = launch_three_members(config).await?;
+    let prepared = launched.prepare_availability_group().await?;
+    let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let group = start_prepared_public_group_with_retry(
+        &root,
+        &launched.run,
+        &prepared,
+        &launched.members,
+        launched.kuberic_convergence_timeout(),
+        launched.complete_deadline(),
+        &cleanup,
+    )
+    .await?;
+    let sequence = group.bootstrap_configuration_sequence().await?;
+    wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout()).await?;
+    let command = group.target_build_command(
+        1,
+        format!("target-evidence-{label}"),
+        format!("target-evidence-{label}"),
+    )?;
+    group
+        .testing_admit_target_build_authority_only(&command)
+        .await
+        .map_err(|error| format!("{label} target authority admission failed: {error}"))?;
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    match window {
+        TargetEvidenceWindow::PreAssociation => {
+            group.testing_gate_next_seed_intent(entered_tx, release_rx)?;
+        }
+        TargetEvidenceWindow::InFlightSeeding => {
+            group.testing_gate_seed_after_request(entered_tx, release_rx)?;
+        }
+        TargetEvidenceWindow::PostNativePreReply => {
+            group.testing_gate_next_target_evidence(entered_tx, release_rx)?;
+        }
+    }
+    let mut callback = group.testing_spawn_admitted_seed_callback(&command)?;
+    await_checkpoint(entered_rx, &mut callback, &label).await?;
+
+    match fault {
+        TargetEvidenceFault::SqlProcessRestart => {
+            let frozen = group.testing_frozen_secondary_start_identity()?;
+            let host_port = launched.restart_sql_process_for_test(1)?;
+            let fresh = group
+                .testing_wait_for_fresh_secondary_observation(
+                    &frozen,
+                    host_port,
+                    launched.kuberic_convergence_timeout(),
+                )
+                .await?;
+            if fresh.instance.sqlserver_start_time == frozen {
+                return Err(
+                    format!("{label} did not replace the target SQL start identity").into(),
+                );
+            }
+        }
+        TargetEvidenceFault::LineageMismatch => {
+            group.testing_inject_target_lineage_mismatch()?;
+        }
+    }
+    release_tx
+        .send(())
+        .map_err(|_| format!("{label} checkpoint was not retained"))?;
+    let result = tokio::time::timeout(launched.kuberic_convergence_timeout(), callback)
+        .await
+        .map_err(|_| format!("{label} callback did not terminate within its deadline"))?
+        .map_err(|error| format!("{label} callback task failed: {error}"))?;
+    let error = result
+        .err()
+        .ok_or_else(|| format!("{label} completed without current target-local evidence"))?;
+    let diagnostic = error.to_string();
+    match fault {
+        TargetEvidenceFault::SqlProcessRestart
+            if !diagnostic.contains("unsafe")
+                && !diagnostic.contains("unavailable")
+                && !diagnostic.contains("failed") =>
+        {
+            return Err(format!("{label} returned an unexpected restart error: {error}").into());
+        }
+        TargetEvidenceFault::LineageMismatch if !diagnostic.contains("conflicts") => {
+            return Err(format!("{label} returned an unexpected lineage error: {error}").into());
+        }
+        _ => {}
+    }
+    group
+        .testing_assert_source_build_success_not_published(&command)
+        .await?;
+    group.shutdown_with_coordinator(&cleanup).await?;
+    let evidence = launched.cleanup_with_coordinator(&cleanup)?;
+    if evidence.removed_container_ids.len() != 3 || evidence.removed_network_id.is_empty() {
+        return Err(format!("{label} cleanup did not remove exact owned resources").into());
+    }
+    assert_removed(&root);
+    cleanup_three_replica_fixture(&root)?;
+    assert_removed(&root);
+    Ok(())
+}
+
 async fn execute_phase4_conflict_matrix(root: &Path) -> Result<(), TestError> {
+    fs::create_dir_all(root)?;
+    let filter = std::env::var("KUBERIC_MSSQL_CONFLICT_FILTER").ok();
     for (index, (scenario, label, expected)) in [
         (
             LicensedConflictScenario::AvailabilityGroupIdentityOrProfile,
@@ -1957,6 +2168,9 @@ async fn execute_phase4_conflict_matrix(root: &Path) -> Result<(), TestError> {
     .into_iter()
     .enumerate()
     {
+        if filter.as_deref().is_some_and(|filter| filter != label) {
+            continue;
+        }
         exercise_conflict_scenario(
             &root.join(format!("{index:02}-{label}")),
             scenario,
@@ -1995,6 +2209,10 @@ async fn exercise_conflict_scenario(
         format!("{label}-no-late-success"),
         format!("{label}-no-late-success"),
     )?;
+    group
+        .testing_admit_target_build_authority_only(&command)
+        .await
+        .map_err(|error| format!("{label} target authority admission failed: {error}"))?;
     group
         .testing_assert_source_build_success_not_published(&command)
         .await?;

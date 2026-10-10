@@ -224,6 +224,113 @@ pub trait ObservationClock: Send + Sync {
     fn now_unix_millis(&self) -> Result<u64, RuntimeError>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetHostEvidenceRequest {
+    resource_uid: String,
+    configuration_id: String,
+    build_id: String,
+    target_identity: KubericReplicaIdentity,
+    target_process_session_id: ProcessSessionId,
+    target_native_replica_id: Guid,
+    target_server_name: ServerName,
+    target_endpoint_url: String,
+    availability_group: AvailabilityGroupIdentity,
+    database: StandaloneDatabaseIdentity,
+    group_database_id: Guid,
+    requested_at_unix_millis: u64,
+    challenge: String,
+}
+
+impl TargetHostEvidenceRequest {
+    pub fn resource_uid(&self) -> &str {
+        &self.resource_uid
+    }
+
+    pub fn configuration_id(&self) -> &str {
+        &self.configuration_id
+    }
+
+    pub fn build_id(&self) -> &str {
+        &self.build_id
+    }
+
+    pub fn target_identity(&self) -> &KubericReplicaIdentity {
+        &self.target_identity
+    }
+
+    pub fn target_process_session_id(&self) -> &ProcessSessionId {
+        &self.target_process_session_id
+    }
+
+    pub fn target_native_replica_id(&self) -> &Guid {
+        &self.target_native_replica_id
+    }
+
+    pub fn requested_at_unix_millis(&self) -> u64 {
+        self.requested_at_unix_millis
+    }
+
+    pub fn challenge(&self) -> &str {
+        &self.challenge
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetHostEvidenceReport {
+    request: TargetHostEvidenceRequest,
+    frozen_sqlserver_start_time: SqlServerStartIncarnation,
+    snapshot: InstanceSnapshot,
+}
+
+impl TargetHostEvidenceReport {
+    pub fn new(
+        request: TargetHostEvidenceRequest,
+        frozen_sqlserver_start_time: SqlServerStartIncarnation,
+        snapshot: InstanceSnapshot,
+    ) -> Self {
+        Self {
+            request,
+            frozen_sqlserver_start_time,
+            snapshot,
+        }
+    }
+
+    pub fn request(&self) -> &TargetHostEvidenceRequest {
+        &self.request
+    }
+
+    pub fn frozen_sqlserver_start_time(&self) -> &SqlServerStartIncarnation {
+        &self.frozen_sqlserver_start_time
+    }
+
+    pub fn snapshot(&self) -> &InstanceSnapshot {
+        &self.snapshot
+    }
+}
+
+#[async_trait]
+pub trait TargetHostEvidenceExchange: Send + Sync {
+    async fn collect(
+        &self,
+        request: &TargetHostEvidenceRequest,
+    ) -> Result<TargetHostEvidenceReport, KubericAdapterError>;
+}
+
+#[derive(Debug, Default)]
+struct UnavailableTargetHostEvidenceExchange;
+
+#[async_trait]
+impl TargetHostEvidenceExchange for UnavailableTargetHostEvidenceExchange {
+    async fn collect(
+        &self,
+        _request: &TargetHostEvidenceRequest,
+    ) -> Result<TargetHostEvidenceReport, KubericAdapterError> {
+        Err(KubericAdapterError::NativeConvergenceUnsafe(
+            "target-host evidence exchange",
+        ))
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SystemObservationClock;
 
@@ -473,6 +580,7 @@ pub struct SqlServerService {
 struct BootstrapCapability {
     config: SqlServerBootstrapConfig,
     executor: Arc<dyn SqlMutationExecutor>,
+    target_evidence: Arc<dyn TargetHostEvidenceExchange>,
     seed_root: PathBuf,
 }
 
@@ -537,6 +645,29 @@ impl SqlServerService {
         executor: Arc<dyn SqlMutationExecutor>,
         seed_root: PathBuf,
     ) -> Result<Self, KubericAdapterError> {
+        Self::with_bootstrap_source_and_topology_and_target_evidence(
+            config,
+            source,
+            clock,
+            expectation,
+            bootstrap,
+            executor,
+            Arc::new(UnavailableTargetHostEvidenceExchange),
+            seed_root,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_bootstrap_source_and_topology_and_target_evidence(
+        config: SqlServerServiceConfig,
+        source: Arc<dyn SqlServerObservationSource>,
+        clock: Arc<dyn ObservationClock>,
+        expectation: SqlServerTopologyExpectation,
+        bootstrap: SqlServerBootstrapConfig,
+        executor: Arc<dyn SqlMutationExecutor>,
+        target_evidence: Arc<dyn TargetHostEvidenceExchange>,
+        seed_root: PathBuf,
+    ) -> Result<Self, KubericAdapterError> {
         validate_observer_expectation(source.observer_config(), &expectation)?;
         Ok(Self::with_optional_topology(
             config,
@@ -546,6 +677,7 @@ impl SqlServerService {
             Some(BootstrapCapability {
                 config: bootstrap,
                 executor,
+                target_evidence,
                 seed_root,
             }),
         ))
@@ -610,7 +742,7 @@ impl StatefulServiceReplica for SqlServerService {
         }
         let replicator = Arc::new(if let Some(expectation) = &self.expectation {
             if let Some(bootstrap) = &self.bootstrap {
-                SqlServerReplicator::new_bootstrap_with_topology(
+                SqlServerReplicator::new_bootstrap_with_topology_and_target_evidence(
                     self.config.clone(),
                     self.source.clone(),
                     self.clock.clone(),
@@ -618,6 +750,7 @@ impl StatefulServiceReplica for SqlServerService {
                     expectation.as_ref().clone(),
                     bootstrap.config.clone(),
                     bootstrap.executor.clone(),
+                    bootstrap.target_evidence.clone(),
                     bootstrap.seed_root.clone(),
                 )
                 .map_err(KubericRuntimeError::from)?
@@ -796,6 +929,7 @@ struct ReplicatorBootstrapCapability {
     resource_uid: ResourceUid,
     config: SqlServerBootstrapConfig,
     executor: Arc<dyn SqlMutationExecutor>,
+    target_evidence: Arc<dyn TargetHostEvidenceExchange>,
     seed: Arc<SeedCoordinator>,
 }
 
@@ -812,6 +946,7 @@ struct SeedCoordinator {
     compaction_gate: Mutex<Option<SeedGate>>,
     #[cfg(feature = "kuberic-testing")]
     completion_gate: Mutex<Option<SeedGate>>,
+    target_evidence_challenge: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "kuberic-testing")]
@@ -835,6 +970,7 @@ impl SeedCoordinator {
             compaction_gate: Mutex::new(None),
             #[cfg(feature = "kuberic-testing")]
             completion_gate: Mutex::new(None),
+            target_evidence_challenge: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -911,7 +1047,8 @@ struct SeedBuildContext {
     binding: Arc<HealthyTopologyBinding>,
     database: StandaloneDatabaseIdentity,
     record: SeedDispatchRecord,
-    target_native_replica_id: Guid,
+    target: HealthyTopologyMemberBinding,
+    build_id: String,
 }
 
 struct SeedDispatchAttempt {
@@ -1113,6 +1250,31 @@ impl SqlServerReplicator {
         executor: Arc<dyn SqlMutationExecutor>,
         seed_root: PathBuf,
     ) -> Result<Self, KubericAdapterError> {
+        Self::new_bootstrap_with_topology_and_target_evidence(
+            service_config,
+            source,
+            clock,
+            runtime_identity,
+            expectation,
+            bootstrap,
+            executor,
+            Arc::new(UnavailableTargetHostEvidenceExchange),
+            seed_root,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_bootstrap_with_topology_and_target_evidence(
+        service_config: SqlServerServiceConfig,
+        source: Arc<dyn SqlServerObservationSource>,
+        clock: Arc<dyn ObservationClock>,
+        runtime_identity: KubericReplicaIdentity,
+        expectation: SqlServerTopologyExpectation,
+        bootstrap: SqlServerBootstrapConfig,
+        executor: Arc<dyn SqlMutationExecutor>,
+        target_evidence: Arc<dyn TargetHostEvidenceExchange>,
+        seed_root: PathBuf,
+    ) -> Result<Self, KubericAdapterError> {
         if runtime_identity.replica_id != expectation.local_replica_id() {
             return Err(KubericAdapterError::InvalidConfiguration(
                 "runtime identity must match the local topology replica",
@@ -1129,6 +1291,7 @@ impl SqlServerReplicator {
                 resource_uid: service_config.resource_uid,
                 config: bootstrap,
                 executor,
+                target_evidence,
                 seed: Arc::new(SeedCoordinator::new(seed_root)),
             }),
         ))
@@ -2304,7 +2467,7 @@ impl SqlServerReplicator {
                 "both configured target sessions must be current before seed dispatch",
             ));
         }
-        let target_native_replica_id = target.native_replica_id.clone();
+        let target = target.clone();
         let record = SeedDispatchRecord::new(
             bootstrap.resource_uid.to_string(),
             binding.configuration.configuration_id.to_string(),
@@ -2325,8 +2488,65 @@ impl SqlServerReplicator {
             binding,
             database,
             record,
-            target_native_replica_id,
+            target,
+            build_id: replica.build_id.to_string(),
         })
+    }
+
+    async fn collect_target_host_evidence(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+        context: &SeedBuildContext,
+        database: &DatabaseIdentity,
+    ) -> Result<NativeConvergenceState, KubericAdapterError> {
+        let bootstrap = self
+            .bootstrap
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
+        let requested_at_unix_millis = self
+            .clock
+            .now_unix_millis()
+            .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))?;
+        let challenge_sequence = bootstrap
+            .seed
+            .target_evidence_challenge
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let request = TargetHostEvidenceRequest {
+            resource_uid: bootstrap.resource_uid.to_string(),
+            configuration_id: context.binding.configuration.configuration_id.to_string(),
+            build_id: context.build_id.clone(),
+            target_identity: context.target.kuberic_identity.clone(),
+            target_process_session_id: context.target.process_session_id.clone(),
+            target_native_replica_id: context.target.native_replica_id.clone(),
+            target_server_name: context.target.server_name().clone(),
+            target_endpoint_url: context.target.sql_endpoint_url().to_owned(),
+            availability_group: context.binding.availability_group.clone(),
+            database: context.database.clone(),
+            group_database_id: database.group_database_id.clone(),
+            requested_at_unix_millis,
+            challenge: format!(
+                "{}:{}:{challenge_sequence}",
+                context.build_id, context.target.process_session_id
+            ),
+        };
+        let report = tokio::time::timeout(
+            bootstrap_remaining(deadline)?,
+            bootstrap.target_evidence.collect(&request),
+        )
+        .await
+        .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)??;
+        drop(self.finish_operation(generation)?);
+        let now_unix_millis = self
+            .clock
+            .now_unix_millis()
+            .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))?;
+        validate_target_host_evidence(
+            &request,
+            &report,
+            now_unix_millis,
+            self.source.observer_config().max_age_millis(),
+        )
     }
 
     async fn observe_seed_group(
@@ -2756,9 +2976,32 @@ impl SqlServerReplicator {
                         &group,
                         &database,
                         &context.database,
-                        &context.target_native_replica_id,
+                        &context.target.native_replica_id,
                     ) {
                         NativeConvergenceState::Complete => {
+                            match self
+                                .collect_target_host_evidence(
+                                    generation, deadline, &context, &database,
+                                )
+                                .await?
+                            {
+                                NativeConvergenceState::Complete => {}
+                                NativeConvergenceState::Conflicting => {
+                                    return Err(KubericAdapterError::NativeConvergenceConflict(
+                                        "target-host seed evidence",
+                                    ));
+                                }
+                                NativeConvergenceState::Unsafe => {
+                                    return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                                        "target-host seed evidence",
+                                    ));
+                                }
+                                NativeConvergenceState::Absent
+                                | NativeConvergenceState::Incomplete => {
+                                    self.wait_for_bootstrap_retry(generation, deadline).await?;
+                                    continue;
+                                }
+                            }
                             #[cfg(feature = "kuberic-testing")]
                             bootstrap
                                 .seed
@@ -3509,6 +3752,174 @@ fn source_association(
         return Ok(SourceAssociation::Incomplete);
     }
     Ok(SourceAssociation::Exact(database.identity.clone()))
+}
+
+fn validate_target_host_evidence(
+    expected: &TargetHostEvidenceRequest,
+    report: &TargetHostEvidenceReport,
+    now_unix_millis: u64,
+    max_age_millis: u64,
+) -> Result<NativeConvergenceState, KubericAdapterError> {
+    if report.request() != expected {
+        return Err(KubericAdapterError::NativeConvergenceConflict(
+            "target-host evidence authority",
+        ));
+    }
+    let snapshot = report.snapshot();
+    if snapshot.observed_at_unix_millis < expected.requested_at_unix_millis {
+        return Err(KubericAdapterError::ObservationStale);
+    }
+    let age = now_unix_millis
+        .checked_sub(snapshot.observed_at_unix_millis)
+        .ok_or(KubericAdapterError::ObservationFromFuture)?;
+    if age > max_age_millis {
+        return Err(KubericAdapterError::ObservationStale);
+    }
+    if snapshot.instance.sqlserver_start_time != report.frozen_sqlserver_start_time().as_str() {
+        return Err(KubericAdapterError::NativeConvergenceUnsafe(
+            "target SQL Server start identity",
+        ));
+    }
+    if snapshot.instance.server_name != expected.target_server_name
+        || snapshot.instance.property_server_name != expected.target_server_name
+    {
+        return Err(KubericAdapterError::NativeConvergenceConflict(
+            "target SQL Server identity",
+        ));
+    }
+    let group = match &snapshot.availability_group {
+        Observation::Present {
+            value,
+            observed_at_unix_millis,
+        } if *observed_at_unix_millis == snapshot.observed_at_unix_millis => value,
+        Observation::Present { .. } => {
+            return Err(KubericAdapterError::ObservationInconsistent(
+                "target-host availability-group and instance timestamps differ",
+            ));
+        }
+        Observation::Absent { .. } => return Ok(NativeConvergenceState::Incomplete),
+        Observation::Failed(failure) => {
+            return Err(KubericAdapterError::ObservationUnavailable(failure.kind));
+        }
+    };
+    if group.identity != expected.availability_group {
+        return Err(KubericAdapterError::NativeConvergenceConflict(
+            "target availability-group identity",
+        ));
+    }
+    if group.local_replica.identity.native_replica_id() != Some(&expected.target_native_replica_id)
+        || group.local_replica.role != Some(NativeRole::Secondary)
+    {
+        return Err(KubericAdapterError::NativeConvergenceConflict(
+            "target native replica identity or role",
+        ));
+    }
+    if !group.local_replica.state_available {
+        return Ok(NativeConvergenceState::Incomplete);
+    }
+    let Some(replica) = group
+        .replicas
+        .iter()
+        .find(|replica| replica.replica_id == expected.target_native_replica_id)
+    else {
+        return Ok(NativeConvergenceState::Incomplete);
+    };
+    if replica.server_name != expected.target_server_name
+        || replica.endpoint_url.as_deref() != Some(expected.target_endpoint_url.as_str())
+        || replica.availability_mode != "SYNCHRONOUS_COMMIT"
+        || replica.failover_mode != "EXTERNAL"
+        || replica.seeding_mode != "AUTOMATIC"
+    {
+        return Err(KubericAdapterError::NativeConvergenceConflict(
+            "target native replica profile",
+        ));
+    }
+    let Some(replica_state) = replica.state.as_ref() else {
+        return Ok(NativeConvergenceState::Incomplete);
+    };
+    if replica_state.provenance != NativeProvenance::Local
+        || replica_state.role != Some(NativeRole::Secondary)
+        || replica_state.operational_state.as_deref() != Some("ONLINE")
+        || replica_state.connected_state.as_deref() != Some("CONNECTED")
+        || replica_state.synchronization_health.as_deref() != Some("HEALTHY")
+        || replica_state
+            .last_connect_error_number
+            .is_some_and(|value| value != 0)
+    {
+        return Ok(NativeConvergenceState::Incomplete);
+    }
+    let Some(database) = group
+        .databases
+        .iter()
+        .find(|database| database.identity.name == expected.database.name)
+    else {
+        return Ok(NativeConvergenceState::Incomplete);
+    };
+    if group.databases.len() != 1
+        || database.identity.group_database_id != expected.group_database_id
+    {
+        return Err(KubericAdapterError::NativeConvergenceConflict(
+            "target group-database identity",
+        ));
+    }
+    let Some(local) = database.local.as_ref() else {
+        return Ok(NativeConvergenceState::Incomplete);
+    };
+    if local.replica_id != expected.target_native_replica_id {
+        return Err(KubericAdapterError::NativeConvergenceConflict(
+            "target local database replica identity",
+        ));
+    }
+    let Some(recovery) = local.recovery.as_ref() else {
+        return Ok(NativeConvergenceState::Incomplete);
+    };
+    if recovery.family_guid.as_ref() != Some(&expected.database.family_guid)
+        || recovery.recovery_fork_guid.as_ref() != Some(&expected.database.recovery_fork_guid)
+    {
+        return Err(KubericAdapterError::NativeConvergenceConflict(
+            "target database family or recovery-fork lineage",
+        ));
+    }
+    if recovery.database_guid.is_none()
+        || local.state.as_deref() != Some("ONLINE")
+        || local.recovery_model.as_deref() != Some("FULL")
+    {
+        return Ok(NativeConvergenceState::Incomplete);
+    }
+    let Some(target) = database
+        .replicas
+        .iter()
+        .find(|state| state.replica_id == expected.target_native_replica_id)
+    else {
+        return Ok(NativeConvergenceState::Incomplete);
+    };
+    match &target.lineage {
+        RecoveryLineageObservation::Local { value }
+            if value.database != database.identity
+                || value.recovery_fork_id != expected.database.recovery_fork_guid =>
+        {
+            return Err(KubericAdapterError::NativeConvergenceConflict(
+                "target local database recovery lineage",
+            ));
+        }
+        RecoveryLineageObservation::Local { .. } => {}
+        RecoveryLineageObservation::LocalUnavailable
+        | RecoveryLineageObservation::RemoteUnavailable => {
+            return Ok(NativeConvergenceState::Incomplete);
+        }
+    }
+    if target.provenance != NativeProvenance::Local
+        || target.is_primary_replica != Some(false)
+        || target.synchronization_state.as_deref() != Some("SYNCHRONIZED")
+        || target.synchronization_health.as_deref() != Some("HEALTHY")
+        || target.database_state.as_deref() != Some("ONLINE")
+        || target.is_suspended != Some(false)
+        || target.suspend_reason.is_some()
+    {
+        Ok(NativeConvergenceState::Incomplete)
+    } else {
+        Ok(NativeConvergenceState::Complete)
+    }
 }
 
 fn classify_source_seed_completion(

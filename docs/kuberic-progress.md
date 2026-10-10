@@ -177,6 +177,18 @@ follows PostgreSQL v2's separation of Kuberic authority, application-native
 evidence and database state without copying PostgreSQL recovery mechanics or
 creating a generic operation ledger.
 
+Primary-side remote synchronization and seeding rows now advance dispatch
+progress only. Target build completion requires a fresh, challenge-bound direct
+observation from the target host. The explicit licensed test-host exchange
+authorizes the exact resource/configuration/build, target Kuberic identity and
+current process session; the callback independently revalidates native replica,
+AG/group-database identity, family/recovery-fork lineage,
+synchronized/healthy/online/not-suspended state, and the fixture-frozen target
+SQL start. Old sessions, superseded builds, replayed reports and a restarted
+target SQL process cannot satisfy the callback. The exchange is confined to
+bootstrap testing construction and leaves the pinned Kuberic protocol and
+ordinary runtime unchanged.
+
 Source creation, full-recovery configuration, ownership, marker schema, full
 backup, log-chain establishment, backup verification, AG intent/create/GUID
 binding, each local join, each local seeding grant, and its narrow SQL-owned
@@ -277,7 +289,10 @@ request submission, after request submission, after SQL acceptance with a lost
 reply, and after definite SQL rejection, native
 AG/replica/endpoint/database/lineage/incarnation conflicts through real
 callbacks, post-compaction association removal and AG recreation with zero
-redispatch, exact cleanup, and successful same-root retries.
+redispatch, and target-local evidence rejection at pre-association,
+in-flight-seeding and post-native/pre-reply windows. The latter uses real target
+SQL process restarts and target-local lineage mismatch reports. Every scenario
+performs exact cleanup.
 
 The workspace tracks Kuberic `main`, with `Cargo.lock` recording the exact
 revision used by locked builds. The current pin
@@ -325,6 +340,7 @@ just test-live-three-replica [root]
 just test-live-three-replica-restart [root]
 just test-live-three-replica-faults [root]
 just test-live-three-replica-conflicts [root]
+just test-live-three-replica-target-evidence [root]
 ```
 
 Recover the default or a selected journaled root:

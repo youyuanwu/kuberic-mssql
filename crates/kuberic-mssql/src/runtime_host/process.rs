@@ -20,14 +20,12 @@ use kuberic_runtime::protocol::types::{
 use kuberic_runtime::{Replicator, Result as KubericResult, RuntimeError as KubericRuntimeError};
 
 use crate::instance::SqlServerInstanceManager;
-#[cfg(feature = "kuberic-testing")]
-use crate::kuberic::SqlServerBootstrapConfig;
-#[cfg(feature = "kuberic-testing")]
-use crate::kuberic::SqlServerReplicator;
 use crate::kuberic::{
     ObservationClock, SqlServerObservationSource, SqlServerService, SqlServerServiceConfig,
     SystemObservationClock,
 };
+#[cfg(feature = "kuberic-testing")]
+use crate::kuberic::{SqlServerBootstrapConfig, SqlServerReplicator, TargetHostEvidenceExchange};
 #[cfg(feature = "kuberic-testing")]
 use crate::mutation::SqlMutationExecutor;
 use crate::tds::TdsExecutor;
@@ -325,6 +323,37 @@ impl RuntimeHostApplication {
                 config.topology().clone(),
                 bootstrap,
                 mutation,
+                binding.root().to_owned(),
+            )
+            .map_err(RuntimeProcessError::application)?,
+        );
+        Ok(Self { inner, binding })
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_with_bootstrap_sources_and_target_evidence(
+        config: &RuntimeHostConfig,
+        source: Arc<dyn SqlServerObservationSource>,
+        clock: Arc<dyn ObservationClock>,
+        bootstrap: SqlServerBootstrapConfig,
+        mutation: Arc<dyn SqlMutationExecutor>,
+        target_evidence: Arc<dyn TargetHostEvidenceExchange>,
+    ) -> Result<Self, RuntimeProcessError> {
+        let binding = RuntimeBindingStore::new(config).map_err(RuntimeProcessError::binding)?;
+        let inner = Arc::new(
+            SqlServerService::with_bootstrap_source_and_topology_and_target_evidence(
+                SqlServerServiceConfig::new(
+                    config.resource_uid().clone(),
+                    config.replication_endpoint(),
+                )
+                .map_err(RuntimeProcessError::application)?,
+                source,
+                clock,
+                config.topology().clone(),
+                bootstrap,
+                mutation,
+                target_evidence,
                 binding.root().to_owned(),
             )
             .map_err(RuntimeProcessError::application)?,

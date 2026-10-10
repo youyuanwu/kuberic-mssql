@@ -10,8 +10,9 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use kuberic_mssql::instance::SqlServerInstanceManager;
 use kuberic_mssql::kuberic::{
-    SqlServerBootstrapConfig, SqlServerObservationSource, SystemObservationClock,
-    TestingBootstrapObservation,
+    KubericAdapterError, SqlServerBootstrapConfig, SqlServerObservationSource,
+    SqlServerStartIncarnation, SystemObservationClock, TargetHostEvidenceExchange,
+    TargetHostEvidenceReport, TargetHostEvidenceRequest, TestingBootstrapObservation,
 };
 use kuberic_mssql::observation::InstanceSnapshot;
 use kuberic_mssql::runtime_config::ObserverConfig;
@@ -34,8 +35,9 @@ use kuberic_runtime::control::proto::{self as wire, agent_control_client::AgentC
 use kuberic_runtime::host::{HostError, ReplicaHost, RunningReplica};
 use kuberic_runtime::protocol::types::{
     BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor, ConfigurationMember,
-    EffectivePolicy, Epoch, OperationId, PodUid, PvcUid, ReplicaId, ReplicaIdentity,
-    ReplicaInstanceId, ReplicaRole, ResourceUid, derive_agent_generation, derive_initialization_id,
+    EffectivePolicy, Epoch, OperationId, PodUid, ProcessSessionId, PvcUid, ReplicaId,
+    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, derive_agent_generation,
+    derive_initialization_id,
 };
 use kuberic_runtime::replicator::{
     PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, Replicator,
@@ -79,6 +81,7 @@ pub struct PublicMssqlGroup {
     operation_timeout: Duration,
     complete_deadline: Instant,
     faults: PublicFaultInjection,
+    target_evidence: Arc<PublicTargetHostEvidenceExchange>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +115,299 @@ struct PublicMutationExecutor {
     seed_dispatches: AtomicUsize,
     faults: PublicFaultInjection,
     conflicts: PublicConflictInjection,
+}
+
+#[derive(Clone)]
+struct PublicTargetHostEvidenceExchange {
+    resource_uid: ResourceUid,
+    configuration_id: String,
+    identities: [ReplicaIdentity; 3],
+    frozen_sql_starts: [SqlServerStartIncarnation; 3],
+    sources: Arc<Mutex<Vec<Option<Source>>>>,
+    authorities: Arc<Mutex<Vec<Option<PublicTargetEvidenceAuthority>>>>,
+    injection: Arc<Mutex<Option<PublicTargetEvidenceInjection>>>,
+    gate: Arc<Mutex<Option<SeedGate>>>,
+}
+
+#[derive(Clone)]
+struct PublicTargetEvidenceAuthority {
+    build_id: String,
+    identity: ReplicaIdentity,
+    process_session_id: ProcessSessionId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicTargetEvidenceInjection {
+    IncompatibleLineage,
+}
+
+impl PublicTargetHostEvidenceExchange {
+    fn new(
+        resource_uid: ResourceUid,
+        configuration: &ConfigurationDescriptor,
+        identities: [ReplicaIdentity; 3],
+        members: &[ReadyMember; 3],
+    ) -> Result<Self, MssqlGroupError> {
+        let frozen_sql_starts = members
+            .iter()
+            .map(|member| SqlServerStartIncarnation::new(member.sql_start_time.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(display_error)?
+            .try_into()
+            .map_err(|_| MssqlGroupError::new("exactly three target SQL starts required"))?;
+        Ok(Self {
+            resource_uid,
+            configuration_id: configuration.configuration_id.to_string(),
+            identities,
+            frozen_sql_starts,
+            sources: Arc::new(Mutex::new(vec![None, None, None])),
+            authorities: Arc::new(Mutex::new(vec![None, None, None])),
+            injection: Arc::new(Mutex::new(None)),
+            gate: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    fn register_source(&self, index: usize, source: Source) -> Result<(), MssqlGroupError> {
+        let mut sources = self
+            .sources
+            .lock()
+            .map_err(|_| MssqlGroupError::new("target evidence source lock is poisoned"))?;
+        let slot = sources
+            .get_mut(index)
+            .ok_or_else(|| MssqlGroupError::new("target evidence source index is invalid"))?;
+        if slot.is_some() {
+            return Err(MssqlGroupError::new(
+                "target evidence source is already registered",
+            ));
+        }
+        *slot = Some(source);
+        Ok(())
+    }
+
+    fn replace_source(&self, index: usize, source: Source) -> Result<(), MssqlGroupError> {
+        let mut sources = self
+            .sources
+            .lock()
+            .map_err(|_| MssqlGroupError::new("target evidence source lock is poisoned"))?;
+        *sources
+            .get_mut(index)
+            .ok_or_else(|| MssqlGroupError::new("target evidence source index is invalid"))? =
+            Some(source);
+        Ok(())
+    }
+
+    fn arm_incompatible_lineage(&self) -> Result<(), MssqlGroupError> {
+        let mut injection = self
+            .injection
+            .lock()
+            .map_err(|_| MssqlGroupError::new("target evidence injection lock is poisoned"))?;
+        if injection.is_some() {
+            return Err(MssqlGroupError::new(
+                "target evidence injection is already armed",
+            ));
+        }
+        *injection = Some(PublicTargetEvidenceInjection::IncompatibleLineage);
+        Ok(())
+    }
+
+    fn gate_next(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), MssqlGroupError> {
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| MssqlGroupError::new("target evidence gate lock is poisoned"))?;
+        if gate.is_some() {
+            return Err(MssqlGroupError::new(
+                "target evidence gate is already armed",
+            ));
+        }
+        *gate = Some(SeedGate { entered, release });
+        Ok(())
+    }
+
+    fn authorize(
+        &self,
+        command: &PublicBuildCommand,
+        process_session_id: ProcessSessionId,
+    ) -> Result<(), MssqlGroupError> {
+        let index = self
+            .identities
+            .iter()
+            .position(|identity| identity == &command.target)
+            .ok_or_else(|| MssqlGroupError::new("target evidence identity is unknown"))?;
+        let mut authorities = self
+            .authorities
+            .lock()
+            .map_err(|_| MssqlGroupError::new("target evidence authority lock is poisoned"))?;
+        authorities[index] = Some(PublicTargetEvidenceAuthority {
+            build_id: command.build_id.to_string(),
+            identity: command.target.clone(),
+            process_session_id,
+        });
+        Ok(())
+    }
+
+    fn revoke(&self, command: &PublicBuildCommand) -> Result<(), MssqlGroupError> {
+        let Some(index) = self
+            .identities
+            .iter()
+            .position(|identity| identity == &command.target)
+        else {
+            return Ok(());
+        };
+        let mut authorities = self
+            .authorities
+            .lock()
+            .map_err(|_| MssqlGroupError::new("target evidence authority lock is poisoned"))?;
+        if authorities[index]
+            .as_ref()
+            .is_some_and(|authority| authority.build_id == command.build_id.as_str())
+        {
+            authorities[index] = None;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TargetHostEvidenceExchange for PublicTargetHostEvidenceExchange {
+    async fn collect(
+        &self,
+        request: &TargetHostEvidenceRequest,
+    ) -> Result<TargetHostEvidenceReport, KubericAdapterError> {
+        if request.resource_uid() != self.resource_uid.as_str()
+            || request.configuration_id() != self.configuration_id
+        {
+            return Err(KubericAdapterError::NativeConvergenceConflict(
+                "target-host test authority",
+            ));
+        }
+        let index = self
+            .identities
+            .iter()
+            .position(|identity| identity == request.target_identity())
+            .ok_or(KubericAdapterError::NativeConvergenceConflict(
+                "target-host test authority",
+            ))?;
+        let authority = self
+            .authorities
+            .lock()
+            .map_err(|_| {
+                KubericAdapterError::NativeConvergenceUnsafe("target-host test authority")
+            })?
+            .get(index)
+            .and_then(Clone::clone)
+            .ok_or(KubericAdapterError::NativeConvergenceUnsafe(
+                "target-host test authority",
+            ))?;
+        if authority.identity != *request.target_identity()
+            || authority.build_id != request.build_id()
+            || authority.process_session_id != *request.target_process_session_id()
+        {
+            return Err(KubericAdapterError::NativeConvergenceConflict(
+                "target-host test authority",
+            ));
+        }
+        let source = self
+            .sources
+            .lock()
+            .map_err(|_| {
+                KubericAdapterError::NativeConvergenceUnsafe("target-host evidence source")
+            })?
+            .get(index)
+            .and_then(Clone::clone)
+            .ok_or(KubericAdapterError::NativeConvergenceUnsafe(
+                "target-host evidence source",
+            ))?;
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| KubericAdapterError::NativeConvergenceUnsafe("target-host evidence gate"))?
+            .take();
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            gate.release.await.map_err(|_| {
+                KubericAdapterError::NativeConvergenceUnsafe("target-host evidence gate")
+            })?;
+        }
+        let mut snapshot = match source
+            .observe()
+            .await
+            .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))?
+        {
+            Observation::Present { value, .. } => value,
+            Observation::Absent { .. } => {
+                return Err(KubericAdapterError::AvailabilityGroupAbsent);
+            }
+            Observation::Failed(failure) => {
+                return Err(KubericAdapterError::ObservationUnavailable(failure.kind));
+            }
+        };
+        if self
+            .injection
+            .lock()
+            .map_err(|_| {
+                KubericAdapterError::NativeConvergenceUnsafe("target-host evidence injection")
+            })?
+            .take()
+            == Some(PublicTargetEvidenceInjection::IncompatibleLineage)
+        {
+            let alternate = alternate_guid(501).map_err(|_| {
+                KubericAdapterError::NativeConvergenceUnsafe("target-host evidence injection")
+            })?;
+            let group = match &mut snapshot.availability_group {
+                Observation::Present { value, .. } => value,
+                Observation::Absent { .. } | Observation::Failed(_) => {
+                    return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                        "target-host evidence injection",
+                    ));
+                }
+            };
+            let local_native = group
+                .local_replica
+                .identity
+                .native_replica_id()
+                .cloned()
+                .ok_or(KubericAdapterError::NativeConvergenceUnsafe(
+                    "target-host evidence injection",
+                ))?;
+            let database =
+                group
+                    .databases
+                    .first_mut()
+                    .ok_or(KubericAdapterError::NativeConvergenceUnsafe(
+                        "target-host evidence injection",
+                    ))?;
+            database
+                .local
+                .as_mut()
+                .and_then(|local| local.recovery.as_mut())
+                .ok_or(KubericAdapterError::NativeConvergenceUnsafe(
+                    "target-host evidence injection",
+                ))?
+                .recovery_fork_guid = Some(alternate.clone());
+            let local = database
+                .replicas
+                .iter_mut()
+                .find(|state| state.replica_id == local_native)
+                .ok_or(KubericAdapterError::NativeConvergenceUnsafe(
+                    "target-host evidence injection",
+                ))?;
+            if let kuberic_mssql::observation::RecoveryLineageObservation::Local { value } =
+                &mut local.lineage
+            {
+                value.recovery_fork_id = alternate;
+            }
+        }
+        Ok(TargetHostEvidenceReport::new(
+            request.clone(),
+            self.frozen_sql_starts[index].clone(),
+            snapshot,
+        ))
+    }
 }
 
 impl PublicMutationExecutor {
@@ -282,13 +578,14 @@ impl PublicMutationFault {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct PublicFaultState {
     armed: Mutex<Option<PublicMutationFault>>,
     hits: AtomicUsize,
+    seed_after_request_gate: Mutex<Option<SeedGate>>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct PublicFaultInjection {
     state: Arc<PublicFaultState>,
 }
@@ -310,6 +607,23 @@ impl PublicFaultInjection {
 
     pub fn hit_count(&self) -> usize {
         self.state.hits.load(Ordering::SeqCst)
+    }
+
+    pub fn gate_seed_after_request(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), MssqlGroupError> {
+        let mut gate = self
+            .state
+            .seed_after_request_gate
+            .lock()
+            .map_err(|_| MssqlGroupError::new("seed request gate lock is poisoned"))?;
+        if gate.is_some() {
+            return Err(MssqlGroupError::new("seed request gate is already armed"));
+        }
+        *gate = Some(SeedGate { entered, release });
+        Ok(())
     }
 
     fn take_if(&self, ordinal: u8, effect: &MutationEffect, before: bool) -> bool {
@@ -337,6 +651,18 @@ impl SeedSubmissionProbe for PublicFaultInjection {
         &self,
         checkpoint: SeedSubmissionCheckpoint,
     ) -> Result<SeedSubmissionAction, RuntimeError> {
+        if checkpoint == SeedSubmissionCheckpoint::AfterRequestSubmission {
+            let gate = self
+                .state
+                .seed_after_request_gate
+                .lock()
+                .map_err(|_| injected_fault())?
+                .take();
+            if let Some(gate) = gate {
+                let _ = gate.entered.send(());
+                gate.release.await.map_err(|_| injected_fault())?;
+            }
+        }
         let mut armed = self.state.armed.lock().map_err(|_| injected_fault())?;
         let matches = matches!(
             (*armed, checkpoint),
@@ -595,6 +921,12 @@ impl PublicMssqlGroup {
             .map_err(|_| MssqlGroupError::new("exactly three replication addresses required"))?;
         let operation_timeout =
             convergence_timeout.min(remaining(complete_deadline, "public Kuberic assembly")?);
+        let target_evidence = Arc::new(PublicTargetHostEvidenceExchange::new(
+            resource_uid.clone(),
+            &configuration,
+            identities.clone(),
+            members,
+        )?);
 
         let mut attempts = Vec::new();
         let mut pods = Vec::new();
@@ -652,6 +984,7 @@ impl PublicMssqlGroup {
                 TdsExecutor::new(observer.connection().clone()),
                 observer,
             )) as Source;
+            target_evidence.register_source(index, source.clone())?;
             let application = Arc::new(if native_binding.is_some() {
                 RuntimeHostApplication::with_observation_source(
                     &config,
@@ -660,7 +993,7 @@ impl PublicMssqlGroup {
                 )
                 .map_err(display_error)?
             } else {
-                RuntimeHostApplication::testing_with_bootstrap_sources(
+                RuntimeHostApplication::testing_with_bootstrap_sources_and_target_evidence(
                     &config,
                     source.clone(),
                     Arc::new(SystemObservationClock),
@@ -671,6 +1004,7 @@ impl PublicMssqlGroup {
                     mutation
                         .clone()
                         .expect("bootstrap construction requires a mutation executor"),
+                    target_evidence.clone(),
                 )
                 .map_err(display_error)?
             });
@@ -817,6 +1151,7 @@ impl PublicMssqlGroup {
             operation_timeout,
             complete_deadline,
             faults,
+            target_evidence,
         })
     }
 
@@ -1035,6 +1370,18 @@ impl PublicMssqlGroup {
             .map_err(|error| MssqlGroupError::new(error.to_string()))
     }
 
+    pub fn testing_gate_next_target_evidence(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), MssqlGroupError> {
+        self.target_evidence.gate_next(entered, release)
+    }
+
+    pub fn testing_inject_target_lineage_mismatch(&self) -> Result<(), MssqlGroupError> {
+        self.target_evidence.arm_incompatible_lineage()
+    }
+
     pub fn testing_seed_dispatch_count(&self) -> Result<usize, MssqlGroupError> {
         Ok(self.pods[0]
             .mutation
@@ -1046,6 +1393,14 @@ impl PublicMssqlGroup {
 
     pub fn testing_arm_mutation_fault(&self, fault: PublicMutationFault) {
         self.faults.arm(fault);
+    }
+
+    pub fn testing_gate_seed_after_request(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), MssqlGroupError> {
+        self.faults.gate_seed_after_request(entered, release)
     }
 
     pub fn testing_mutation_fault_hits(&self) -> usize {
@@ -1129,12 +1484,26 @@ impl PublicMssqlGroup {
         &self,
         command: &PublicBuildCommand,
     ) -> Result<(), tonic::Status> {
-        let timeout_duration = self.operation_timeout.min(
-            remaining(self.complete_deadline, "public target admission")
-                .map_err(|error| tonic::Status::deadline_exceeded(error.to_string()))?,
-        );
-        self.admit_target_build_authority(command, timeout_duration)
-            .await
+        let deadline = tokio::time::Instant::now() + self.operation_timeout;
+        loop {
+            let timeout_duration = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or_default()
+                .min(
+                    remaining(self.complete_deadline, "public target admission")
+                        .map_err(|error| tonic::Status::deadline_exceeded(error.to_string()))?,
+                );
+            let result = self
+                .admit_target_build_authority(command, timeout_duration)
+                .await;
+            if result.as_ref().is_err_and(retryable_public_build_error)
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            return result;
+        }
     }
 
     pub async fn testing_assert_build_success_not_published(
@@ -1306,10 +1675,10 @@ impl PublicMssqlGroup {
         let observer =
             ObserverConfig::from_json(&serde_json::to_vec(&document).map_err(display_error)?)
                 .map_err(display_error)?;
-        let source = SqlServerInstanceManager::new(
+        let source = Arc::new(SqlServerInstanceManager::new(
             TdsExecutor::new(observer.connection().clone()),
             observer,
-        );
+        )) as Source;
         let deadline = tokio::time::Instant::now() + timeout;
         let mut last_retryable = "no observation attempted".to_owned();
         loop {
@@ -1317,6 +1686,7 @@ impl PublicMssqlGroup {
                 Ok(Observation::Present { value, .. })
                     if value.instance.sqlserver_start_time != frozen =>
                 {
+                    self.target_evidence.replace_source(1, source.clone())?;
                     return Ok(value);
                 }
                 Ok(Observation::Present { .. }) if tokio::time::Instant::now() >= deadline => {
@@ -1451,6 +1821,9 @@ impl PublicMssqlGroup {
             .map_err(|_| tonic::Status::deadline_exceeded("public target build timed out"))?
             .map(|_| ())?;
         if command.retire {
+            self.target_evidence
+                .revoke(command)
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
             return Ok(());
         }
         Ok(())
@@ -1470,6 +1843,8 @@ impl PublicMssqlGroup {
         let (mut target_client, target_report) = status(target, timeout_duration)
             .await
             .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+        let target_process_session_id =
+            ProcessSessionId::new(target_report.process_session_id.clone());
         let authority = BuildAuthority {
             build_id: command.build_id.clone(),
             kind: BuildAuthorityKind::Failover,
@@ -1482,7 +1857,7 @@ impl PublicMssqlGroup {
             protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
             resource_uid: self.resource_uid.to_string(),
             target: Some(command.target.clone().into()),
-            expected_process_session_id: target_report.process_session_id,
+            expected_process_session_id: target_report.process_session_id.clone(),
             command: Some(wire::execute_command_request::Command::EnsureReplicaBuild(
                 wire::EnsureReplicaBuildCommand {
                     operation_id: command.operation_id.to_string(),
@@ -1499,6 +1874,9 @@ impl PublicMssqlGroup {
         tokio::time::timeout(timeout_duration, target_client.execute(target_request))
             .await
             .map_err(|_| tonic::Status::deadline_exceeded("public target admission timed out"))??;
+        self.target_evidence
+            .authorize(command, target_process_session_id)
+            .map_err(|error| tonic::Status::internal(error.to_string()))?;
         Ok(())
     }
 

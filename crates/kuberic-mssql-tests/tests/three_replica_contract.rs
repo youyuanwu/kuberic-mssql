@@ -302,12 +302,15 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
     assert!(justfile.contains(
         "test-live-three-replica-terminal-seed root=\"target/mssql-three-replica-terminal-seed\":"
     ));
+    assert!(justfile.contains(
+        "test-live-three-replica-target-evidence root=\"target/mssql-three-replica-target-evidence\":"
+    ));
     assert_eq!(
         justfile
             .lines()
             .filter(|line| line.contains("env -u SQLSERVER_TEST_EULA_ACCEPTED"))
             .count(),
-        11
+        12
     );
     assert!(!justfile.contains("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT"));
     assert!(!justfile.contains("acknowledgement root="));

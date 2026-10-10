@@ -301,6 +301,15 @@ configuration, AG GUID, source database identity/lineage, SQL incarnation and
 authorized targets. Once present, later association loss or database/AG
 recreation is terminal conflict/unsafe and can never trigger another
 `ADD DATABASE`.
+Build completion additionally requires a challenge-bound report made from a
+fresh direct observation on the target host. The test-host exchange admits only
+the exact current Kuberic resource, configuration, build, target identity and
+process session, and the primary callback revalidates the target native replica,
+AG/database identities, family/recovery-fork lineage, synchronized/healthy/
+online/not-suspended state, and the fixture-frozen target SQL start identity.
+Primary-side remote DMV rows may advance dispatch polling, but cannot complete
+a target build. The exchange is available only to explicit bootstrap testing
+construction; it adds no production controller or mutation transport.
 The existing
 canonical signatures and approval/fence bindings remain contracts for later
 command transport. Observation JSON is output, not an authenticated command
@@ -465,6 +474,7 @@ just test-live-three-replica-recovery target/my-mssql-three-replica-recovery
 just test-live-three-replica-faults target/my-mssql-three-replica-faults
 just test-live-three-replica-conflicts target/my-mssql-three-replica-conflicts
 just test-live-three-replica-terminal-seed target/my-mssql-three-replica-terminal-seed
+just test-live-three-replica-target-evidence target/my-mssql-three-replica-target-evidence
 ```
 
 Cleanup removes only exactly journaled resources. Foreign, replaced, or
@@ -481,7 +491,10 @@ through real callback validators sequentially. Every scenario performs exact,
 idempotent cleanup. The terminal-seed recipe removes a compacted source
 association and separately recreates the AG, then proves terminal
 conflict/unsafe classification, zero redispatch, no recreated temporary intent,
-and exact cleanup.
+and exact cleanup. The target-evidence recipe interrupts pre-association,
+in-flight-seeding, and post-native/pre-reply windows. At each window it proves
+that a real target SQL process restart or a target-local lineage mismatch
+cannot publish build completion, then performs exact cleanup.
 
 Direct test commands remain available:
 

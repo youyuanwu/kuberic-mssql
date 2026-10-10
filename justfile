@@ -107,6 +107,14 @@ test-live-three-replica-terminal-seed root="target/mssql-three-replica-terminal-
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
         three_replica_mssql_terminal_seed_conflicts -- --ignored --exact --test-threads=1 --nocapture
 
+# Revalidate target-local lineage and SQL process incarnation at every build window.
+test-live-three-replica-target-evidence root="target/mssql-three-replica-target-evidence":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
+        three_replica_mssql_target_host_evidence_faults -- --ignored --exact --test-threads=1 --nocapture
+
 # Recover and remove only the exactly journaled real three-member topology.
 cleanup-live-three-replica root="target/mssql-three-replica":
     env -u SQLSERVER_TEST_EULA_ACCEPTED CARGO_BUILD_JOBS=1 \

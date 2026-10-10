@@ -7,8 +7,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kuberic_mssql::kuberic::{
-    ObservationClock, SqlServerBootstrapConfig, SqlServerObservationSource, SqlServerReplicator,
-    SqlServerReplicatorFactory, SqlServerService, SqlServerServiceConfig,
+    KubericAdapterError, ObservationClock, SqlServerBootstrapConfig, SqlServerObservationSource,
+    SqlServerReplicator, SqlServerReplicatorFactory, SqlServerService, SqlServerServiceConfig,
+    SqlServerStartIncarnation, TargetHostEvidenceExchange, TargetHostEvidenceReport,
+    TargetHostEvidenceRequest,
 };
 use kuberic_mssql::observation::{
     AutomaticSeedingSnapshot, AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, DatabaseSnapshot,
@@ -158,6 +160,183 @@ struct TerminalSeedSource {
     config: ObserverConfig,
     associated: Arc<AtomicBool>,
     replaced_group: Arc<AtomicBool>,
+}
+
+struct SeedTargetEvidenceExchange {
+    complete: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ControlledTargetEvidenceMode {
+    Healthy,
+    ReplayPreviousAuthority,
+    Stale,
+    SqlRestarted,
+    LineageMismatch,
+}
+
+struct ControlledTargetEvidenceExchange {
+    modes: Mutex<VecDeque<ControlledTargetEvidenceMode>>,
+    previous_request: Mutex<Option<TargetHostEvidenceRequest>>,
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+impl ControlledTargetEvidenceExchange {
+    fn new(modes: impl IntoIterator<Item = ControlledTargetEvidenceMode>) -> Self {
+        Self {
+            modes: Mutex::new(modes.into_iter().collect()),
+            previous_request: Mutex::new(None),
+            entered: Mutex::new(None),
+            release: Mutex::new(None),
+        }
+    }
+
+    fn with_gate(
+        modes: impl IntoIterator<Item = ControlledTargetEvidenceMode>,
+        entered: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    ) -> Self {
+        Self {
+            modes: Mutex::new(modes.into_iter().collect()),
+            previous_request: Mutex::new(None),
+            entered: Mutex::new(Some(entered)),
+            release: Mutex::new(Some(release)),
+        }
+    }
+}
+
+#[async_trait]
+impl TargetHostEvidenceExchange for ControlledTargetEvidenceExchange {
+    async fn collect(
+        &self,
+        request: &TargetHostEvidenceRequest,
+    ) -> Result<TargetHostEvidenceReport, KubericAdapterError> {
+        let entered = self.entered.lock().unwrap().take();
+        let release = self.release.lock().unwrap().take();
+        if let Some(entered) = entered {
+            let _ = entered.send(());
+        }
+        if let Some(release) = release {
+            release.await.map_err(|_| KubericAdapterError::Closed)?;
+        }
+        let mode = self
+            .modes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(ControlledTargetEvidenceMode::Healthy);
+        let report_request =
+            if matches!(mode, ControlledTargetEvidenceMode::ReplayPreviousAuthority) {
+                self.previous_request.lock().unwrap().clone().ok_or(
+                    KubericAdapterError::NativeConvergenceUnsafe(
+                        "server-free prior target evidence",
+                    ),
+                )?
+            } else {
+                let current = request.clone();
+                *self.previous_request.lock().unwrap() = Some(current.clone());
+                current
+            };
+        let target_index = match request.target_identity().replica_id.value() {
+            2 => 1,
+            3 => 2,
+            _ => {
+                return Err(KubericAdapterError::NativeConvergenceConflict(
+                    "server-free target evidence identity",
+                ));
+            }
+        };
+        let mut snapshot = bound_snapshot_for(target_index);
+        let observed_at = if matches!(mode, ControlledTargetEvidenceMode::Stale) {
+            request.requested_at_unix_millis().saturating_sub(1)
+        } else {
+            request.requested_at_unix_millis()
+        };
+        snapshot.observed_at_unix_millis = observed_at;
+        if let Observation::Present {
+            value: group,
+            observed_at_unix_millis,
+        } = &mut snapshot.availability_group
+        {
+            *observed_at_unix_millis = observed_at;
+            if matches!(mode, ControlledTargetEvidenceMode::LineageMismatch) {
+                let alternate = guid("99999999-9999-4999-8999-999999999999");
+                let database = group.databases.first_mut().unwrap();
+                database
+                    .local
+                    .as_mut()
+                    .unwrap()
+                    .recovery
+                    .as_mut()
+                    .unwrap()
+                    .recovery_fork_guid = Some(alternate.clone());
+                let local_native = group
+                    .local_replica
+                    .identity
+                    .native_replica_id()
+                    .unwrap()
+                    .clone();
+                let local = database
+                    .replicas
+                    .iter_mut()
+                    .find(|state| state.replica_id == local_native)
+                    .unwrap();
+                if let RecoveryLineageObservation::Local { value } = &mut local.lineage {
+                    value.recovery_fork_id = alternate;
+                }
+            }
+        }
+        let frozen =
+            SqlServerStartIncarnation::new(snapshot.instance.sqlserver_start_time.clone()).unwrap();
+        if matches!(mode, ControlledTargetEvidenceMode::SqlRestarted) {
+            snapshot.instance.sqlserver_start_time = "2099-01-01T00:00:00".into();
+        }
+        Ok(TargetHostEvidenceReport::new(
+            report_request,
+            frozen,
+            snapshot,
+        ))
+    }
+}
+
+#[async_trait]
+impl TargetHostEvidenceExchange for SeedTargetEvidenceExchange {
+    async fn collect(
+        &self,
+        request: &TargetHostEvidenceRequest,
+    ) -> Result<TargetHostEvidenceReport, KubericAdapterError> {
+        if !self.complete.load(Ordering::SeqCst) {
+            return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                "server-free target evidence requested before native completion",
+            ));
+        }
+        let target_index = match request.target_identity().replica_id.value() {
+            2 => 1,
+            3 => 2,
+            _ => {
+                return Err(KubericAdapterError::NativeConvergenceConflict(
+                    "server-free target evidence identity",
+                ));
+            }
+        };
+        let mut snapshot = bound_snapshot_for(target_index);
+        snapshot.observed_at_unix_millis = request.requested_at_unix_millis();
+        if let Observation::Present {
+            observed_at_unix_millis,
+            ..
+        } = &mut snapshot.availability_group
+        {
+            *observed_at_unix_millis = request.requested_at_unix_millis();
+        }
+        let frozen =
+            SqlServerStartIncarnation::new(snapshot.instance.sqlserver_start_time.clone()).unwrap();
+        Ok(TargetHostEvidenceReport::new(
+            request.clone(),
+            frozen,
+            snapshot,
+        ))
+    }
 }
 
 fn seed_terminal_evidence(complete: &AtomicBool) -> SeedDispatchEvidence {
@@ -2476,13 +2655,27 @@ fn seed_replicator_with_executor(
     complete: Arc<AtomicBool>,
     executor: Arc<dyn SqlMutationExecutor>,
 ) -> Arc<SqlServerReplicator> {
+    seed_replicator_with_executor_and_target_evidence(
+        root,
+        complete.clone(),
+        executor,
+        Arc::new(SeedTargetEvidenceExchange { complete }),
+    )
+}
+
+fn seed_replicator_with_executor_and_target_evidence(
+    root: std::path::PathBuf,
+    complete: Arc<AtomicBool>,
+    executor: Arc<dyn SqlMutationExecutor>,
+    target_evidence: Arc<dyn TargetHostEvidenceExchange>,
+) -> Arc<SqlServerReplicator> {
     Arc::new(
-        SqlServerReplicator::new_bootstrap_with_topology(
+        SqlServerReplicator::new_bootstrap_with_topology_and_target_evidence(
             SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-1.example:5022")
                 .unwrap(),
             Arc::new(SeedSource {
                 config: observer_config(),
-                complete: complete.clone(),
+                complete,
             }),
             Arc::new(ScriptedClock {
                 times: Mutex::new(vec![OBSERVED_AT].into()),
@@ -2491,6 +2684,7 @@ fn seed_replicator_with_executor(
             topology_expectation(),
             SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
             executor,
+            target_evidence,
             root,
         )
         .unwrap(),
@@ -2514,7 +2708,7 @@ fn terminal_seed_replicator(
         executions: AtomicUsize::new(0),
     });
     let replicator = Arc::new(
-        SqlServerReplicator::new_bootstrap_with_topology(
+        SqlServerReplicator::new_bootstrap_with_topology_and_target_evidence(
             SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-1.example:5022")
                 .unwrap(),
             Arc::new(TerminalSeedSource {
@@ -2529,6 +2723,9 @@ fn terminal_seed_replicator(
             topology_expectation(),
             SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
             executor.clone(),
+            Arc::new(SeedTargetEvidenceExchange {
+                complete: associated.clone(),
+            }),
             root,
         )
         .unwrap(),
@@ -4068,6 +4265,110 @@ async fn concurrent_target_builds_select_one_dispatch_and_replay_from_native_evi
     replicator.build_replica(second).await.unwrap();
     assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
     assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn target_host_evidence_gates_completion_and_rejects_stale_build_session_replay() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let exchange = Arc::new(ControlledTargetEvidenceExchange::with_gate(
+        [
+            ControlledTargetEvidenceMode::Healthy,
+            ControlledTargetEvidenceMode::ReplayPreviousAuthority,
+        ],
+        entered_tx,
+        release_rx,
+    ));
+    let replicator = seed_replicator_with_executor_and_target_evidence(
+        root.path().to_owned(),
+        complete.clone(),
+        executor.clone(),
+        exchange.clone(),
+    );
+    admit_seed_replicator(&replicator).await;
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "evidence-gated-build"))
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    assert!(
+        !callback.is_finished(),
+        "primary-side native completion published before target-local evidence"
+    );
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    release_tx.send(()).unwrap();
+    callback.await.unwrap().unwrap();
+    drop(replicator);
+
+    let replacement_executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replacement = seed_replicator_with_executor_and_target_evidence(
+        root.path().to_owned(),
+        complete,
+        replacement_executor.clone(),
+        exchange,
+    );
+    admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
+    let message = application_error(
+        replacement
+            .build_replica(target_build_with_sessions(
+                1,
+                "replacement-build",
+                "replacement-session",
+            ))
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        message.contains("target-host evidence authority"),
+        "{message}"
+    );
+    assert_eq!(replacement_executor.executions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn target_host_evidence_rejects_stale_restart_and_lineage_reports() {
+    for (mode, expected) in [
+        (ControlledTargetEvidenceMode::Stale, "stale"),
+        (ControlledTargetEvidenceMode::SqlRestarted, "is unsafe"),
+        (ControlledTargetEvidenceMode::LineageMismatch, "conflicts"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let complete = Arc::new(AtomicBool::new(false));
+        let executor = Arc::new(SeedMutationExecutor {
+            complete: complete.clone(),
+            executions: AtomicUsize::new(0),
+        });
+        let replicator = seed_replicator_with_executor_and_target_evidence(
+            root.path().to_owned(),
+            complete,
+            executor.clone(),
+            Arc::new(ControlledTargetEvidenceExchange::new([mode])),
+        );
+        admit_seed_replicator(&replicator).await;
+        let message = application_error(
+            replicator
+                .build_replica(target_build(1, "invalid-target-evidence"))
+                .await
+                .unwrap_err(),
+        );
+        assert!(message.contains(expected), "{mode:?}: {message}");
+        assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[tokio::test]
