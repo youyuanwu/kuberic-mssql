@@ -481,20 +481,31 @@ Cleanup removes only exactly journaled resources. Foreign, replaced, or
 otherwise unverifiable resources remain untouched and block reuse. The signal
 recipe interrupts an owned launch with SIGTERM, recovers it, reruns the
 complete happy path, and verifies idempotent cleanup. The recovery recipe also
-executes real SIGINT and SIGKILL subprocess cases. The fault recipe loses the reply after each individual database, backup,
-AG-create/bind, local-join, and seeding-permission statement, replaces the
-hosts on the same roots, and also covers seed intent, dispatch, association,
-native-completion, and callback-publication boundaries. It verifies convergence
-without duplicate bootstrap work or seed dispatch. The conflict recipe drives
-AG, replica, endpoint, database, lineage and SQL process-incarnation conflicts
-through real callback validators sequentially. Every scenario performs exact,
-idempotent cleanup. The terminal-seed recipe removes a compacted source
-association and separately recreates the AG, then proves terminal
-conflict/unsafe classification, zero redispatch, no recreated temporary intent,
-and exact cleanup. The target-evidence recipe interrupts pre-association,
-in-flight-seeding, and post-native/pre-reply windows. At each window it proves
-that a real target SQL process restart or a target-local lineage mismatch
-cannot publish build completion, then performs exact cleanup.
+executes real SIGINT and SIGKILL subprocess cases.
+
+The fault recipe uses a test-only observation seam to lose the callback reply
+after each separately classified database, backup, AG-create/bind, local-join,
+and seeding-permission SQL step. The statements themselves execute through the
+normal TDS mutation path, and replacement hosts then reobserve their native
+results. Seed intent, submission, acceptance, association, native completion,
+and callback publication use explicit test-only gates/probes around real
+callbacks; they are not SQL Server process-crash tests.
+
+The conflict recipe separates three real SQL-native cases from callback-seam
+coverage. Through normal TDS observation it converges a source that inherits
+`SIMPLE` recovery, refuses an unowned same-name database, and refuses an
+unowned exact-profile same-name AG. The remaining AG, replica, endpoint,
+database-identity/recovery, and lineage cases inject decoded observations into
+the real production validators; the SQL-incarnation validator uses a real
+process restart plus a test gate.
+
+The terminal-seed recipe performs real SQL association removal and AG
+recreation, then proves terminal conflict/unsafe classification, zero
+redispatch, no recreated temporary intent, and exact cleanup. The
+target-evidence recipe uses real target SQL process restarts and test-injected
+target-local lineage mismatches at the pre-association, in-flight-seeding, and
+post-native/pre-reply windows. Every scenario performs exact, idempotent
+cleanup.
 
 Direct test commands remain available:
 

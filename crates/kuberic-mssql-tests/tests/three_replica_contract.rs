@@ -333,7 +333,7 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         "three_replica_mssql_bootstrap_fault_boundaries -- --ignored --exact --test-threads=1 --nocapture"
     ));
     assert!(justfile.contains(
-        "three_replica_mssql_native_conflict_matrix -- --ignored --exact --test-threads=1 --nocapture"
+        "three_replica_mssql_conflict_evidence -- --ignored --exact --test-threads=1 --nocapture"
     ));
     assert!(justfile.contains(
         "three_replica_mssql_terminal_seed_conflicts -- --ignored --exact --test-threads=1 --nocapture"

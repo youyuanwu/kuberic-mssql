@@ -55,9 +55,9 @@ fn three_replica_mssql_seed_dispatch_handshake_faults() {
 }
 
 #[test]
-#[ignore = "exercises licensed native conflict classifications sequentially on a qualified local Docker host"]
-fn three_replica_mssql_native_conflict_matrix() {
-    run_phase4_test(Phase4LiveTest::ConflictMatrix);
+#[ignore = "exercises isolated SQL-native cases and callback observation-seam conflicts sequentially on a qualified local Docker host"]
+fn three_replica_mssql_conflict_evidence() {
+    run_phase4_test(Phase4LiveTest::ConflictEvidence);
 }
 
 #[test]
@@ -93,7 +93,7 @@ fn run_three_replica_test(validate_restart: bool) {
 enum Phase4LiveTest {
     FaultBoundaries,
     SeedDispatchHandshake,
-    ConflictMatrix,
+    ConflictEvidence,
     TerminalSeedConflicts,
     TargetHostEvidence,
 }
@@ -117,9 +117,7 @@ fn run_phase4_test(test: Phase4LiveTest) {
                         Phase4LiveTest::SeedDispatchHandshake => {
                             execute_seed_dispatch_handshake_faults(&root).await
                         }
-                        Phase4LiveTest::ConflictMatrix => {
-                            execute_phase4_conflict_matrix(&root).await
-                        }
+                        Phase4LiveTest::ConflictEvidence => execute_conflict_evidence(&root).await,
                         Phase4LiveTest::TerminalSeedConflicts => {
                             execute_terminal_seed_conflicts(&root).await
                         }
@@ -2125,43 +2123,65 @@ async fn exercise_target_host_evidence_fault(
     Ok(())
 }
 
-async fn execute_phase4_conflict_matrix(root: &Path) -> Result<(), TestError> {
+async fn execute_conflict_evidence(root: &Path) -> Result<(), TestError> {
     fs::create_dir_all(root)?;
     let filter = std::env::var("KUBERIC_MSSQL_CONFLICT_FILTER").ok();
+    for label in [
+        "native-source-recovery-partial",
+        "native-unowned-source-database",
+        "native-unowned-availability-group",
+    ] {
+        if filter.as_deref().is_some_and(|filter| filter != label) {
+            continue;
+        }
+        match label {
+            "native-source-recovery-partial" => {
+                exercise_native_source_recovery_partial(&root.join(label), label).await?
+            }
+            "native-unowned-source-database" => {
+                exercise_native_sql_conflict(&root.join(label), label, false).await?
+            }
+            "native-unowned-availability-group" => {
+                exercise_native_sql_conflict(&root.join(label), label, true).await?
+            }
+            _ => unreachable!("native SQL case list is exhaustive"),
+        }
+    }
+
     for (index, (scenario, label, expected)) in [
         (
             LicensedConflictScenario::AvailabilityGroupIdentityOrProfile,
-            "availability-group-identity-profile",
+            "seam-availability-group-identity-profile",
             "conflicts with the requested bootstrap topology",
         ),
         (
             LicensedConflictScenario::LogicalReplicaNativeMismatch,
-            "logical-replica-native-identity",
+            "seam-logical-replica-native-identity",
             "conflicts with the requested bootstrap topology",
         ),
         (
             LicensedConflictScenario::EndpointOrMemberProfile,
-            "endpoint-member-profile",
+            "seam-endpoint-member-profile",
             "conflicts with the requested bootstrap topology",
         ),
         (
             LicensedConflictScenario::StandaloneDatabaseIdentityOrRecovery,
-            "standalone-database-identity-recovery",
+            "seam-standalone-database-identity-recovery",
             "conflicts with the requested bootstrap topology",
         ),
         (
             LicensedConflictScenario::AssociatedDatabaseIdentityOrRecovery,
-            "associated-database-identity-recovery",
+            "seam-associated-database-identity-recovery",
             "conflicts with the requested bootstrap topology",
         ),
         (
             LicensedConflictScenario::IncompatibleLineage,
-            "target-lineage",
+            "seam-target-lineage",
             "conflicts with the requested bootstrap topology",
         ),
         (
             LicensedConflictScenario::SqlProcessIncarnationReplacement,
-            "sql-process-incarnation",
+            "seam-sql-process-incarnation",
             "is unsafe to continue",
         ),
     ]
@@ -2179,6 +2199,103 @@ async fn execute_phase4_conflict_matrix(root: &Path) -> Result<(), TestError> {
         )
         .await?;
     }
+    Ok(())
+}
+
+async fn exercise_native_source_recovery_partial(
+    root: &Path,
+    label: &str,
+) -> Result<(), TestError> {
+    cleanup_three_replica_fixture(root)?;
+    let config = FixtureConfig::for_test_fixture(root)?;
+    let mut launched = launch_three_members(config).await?;
+    let prepared = launched.prepare_availability_group().await?;
+    launched
+        .testing_set_primary_model_recovery_simple()
+        .await
+        .map_err(|error| format!("{label} setup failed: {error}"))?;
+    let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let group = start_prepared_public_group_with_retry(
+        root,
+        &launched.run,
+        &prepared,
+        &launched.members,
+        launched.kuberic_convergence_timeout(),
+        launched.complete_deadline(),
+        &cleanup,
+    )
+    .await?;
+    if launched.testing_source_recovery_model().await? != "FULL" {
+        return Err(format!("{label} did not converge the SQL-native recovery step").into());
+    }
+    let sequence = group.bootstrap_configuration_sequence().await?;
+    wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout()).await?;
+    group.shutdown_with_coordinator(&cleanup).await?;
+    let evidence = launched.cleanup_with_coordinator(&cleanup)?;
+    if evidence.removed_container_ids.len() != 3 || evidence.removed_network_id.is_empty() {
+        return Err(format!("{label} cleanup did not remove exact owned resources").into());
+    }
+    assert_removed(root);
+    cleanup_three_replica_fixture(root)?;
+    assert_removed(root);
+    Ok(())
+}
+
+async fn exercise_native_sql_conflict(
+    root: &Path,
+    label: &str,
+    availability_group: bool,
+) -> Result<(), TestError> {
+    cleanup_three_replica_fixture(root)?;
+    let config = FixtureConfig::for_test_fixture(root)?;
+    let mut launched = launch_three_members(config).await?;
+    let prepared = launched.prepare_availability_group().await?;
+    if availability_group {
+        launched
+            .testing_create_unowned_availability_group()
+            .await
+            .map_err(|error| format!("{label} setup failed: {error}"))?;
+    } else {
+        launched
+            .testing_create_unowned_source_database()
+            .await
+            .map_err(|error| format!("{label} setup failed: {error}"))?;
+    }
+    let classification_cleanup =
+        CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let result = PublicMssqlGroup::from_prepared_with_coordinator(
+        root,
+        &launched.run,
+        &prepared,
+        &launched.members,
+        launched.kuberic_convergence_timeout(),
+        launched.complete_deadline(),
+        &classification_cleanup,
+    )
+    .await;
+    let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    match result {
+        Err(error)
+            if error
+                .to_string()
+                .contains("conflicts with the requested bootstrap") => {}
+        Err(error) => {
+            return Err(
+                format!("{label} returned the wrong native classification: {error}").into(),
+            );
+        }
+        Ok(group) => {
+            group.shutdown_with_coordinator(&cleanup).await?;
+            return Err(format!("{label} adopted an unowned SQL-native resource").into());
+        }
+    }
+    let evidence = launched.cleanup_with_coordinator(&cleanup)?;
+    if evidence.removed_container_ids.len() != 3 || evidence.removed_network_id.is_empty() {
+        return Err(format!("{label} cleanup did not remove exact owned resources").into());
+    }
+    assert_removed(root);
+    cleanup_three_replica_fixture(root)?;
+    assert_removed(root);
     Ok(())
 }
 

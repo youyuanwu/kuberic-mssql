@@ -281,18 +281,25 @@ fresh replacement sessions, stale-session rejection, restart-driven
 compaction, zero duplicate `ADD DATABASE`, exact report convergence and marker
 continuity. SQL Server processes are not restarted.
 
-The ignored live tests additionally prove handled-signal and SIGKILL recovery,
-lost replies plus same-root host replacement after every individual
-database/backup/AG/join/grant statement, every
-seed/callback-publication interruption boundary, exact TDS checkpoints before
-request submission, after request submission, after SQL acceptance with a lost
-reply, and after definite SQL rejection, native
-AG/replica/endpoint/database/lineage/incarnation conflicts through real
-callbacks, post-compaction association removal and AG recreation with zero
-redispatch, and target-local evidence rejection at pre-association,
-in-flight-seeding and post-native/pre-reply windows. The latter uses real target
-SQL process restarts and target-local lineage mismatch reports. Every scenario
-performs exact cleanup.
+The ignored live tests additionally prove handled-signal and SIGKILL recovery.
+The fault recipe uses test-only callback seams after each independently
+classified database/backup/AG/join/grant statement has executed through normal
+TDS, then replaces the hosts and reobserves native state. Seed submission and
+callback-publication windows use explicit test-only probes/gates around real
+callbacks, including before request submission, after submission, after SQL
+acceptance with a lost reply, and after definite SQL rejection.
+
+The conflict recipe has three isolated SQL-native cases observed through the
+normal TDS path: convergence from a source database that inherits `SIMPLE`
+recovery, refusal of an unowned same-name database, and refusal of an unowned
+exact-profile same-name AG. Its remaining AG/replica/endpoint/database/lineage
+cases are decoded-observation injections consumed by production validators; its
+SQL-incarnation validator uses a real process restart plus a test gate.
+Separate terminal-seed cases perform real post-compaction association removal
+and AG recreation with zero redispatch. Target-local evidence cases use real
+target SQL process restarts and test-injected lineage mismatches at
+pre-association, in-flight-seeding and post-native/pre-reply windows. Every
+scenario performs exact cleanup.
 
 The workspace tracks Kuberic `main`, with `Cargo.lock` recording the exact
 revision used by locked builds. The current pin

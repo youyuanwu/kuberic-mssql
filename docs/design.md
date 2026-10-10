@@ -457,9 +457,9 @@ bound-listener handoff from
    bootstrap-capable hosts: deterministic statement-level
    database/backup/AG/join/grant convergence, one build-authorized group seed
    dispatch, gap-driven seed metadata, exact native postconditions,
-   restart/cancellation/retry/lost-reply recovery, and licensed fault/conflict
-   validation. This stage adds neither certificate provisioning nor a
-   production mutation transport.
+   restart/cancellation/retry/lost-reply recovery, isolated licensed SQL-native
+   cases, and test-only callback observation-seam validation. This stage adds
+   neither certificate provisioning nor a production mutation transport.
 4. **Fencing, reseed, switchover, and failover** — establish verified target and
    old-primary fencing before destructive reseed or role movement, then add
    external lease handling, sequence arbitration, authenticated fence and

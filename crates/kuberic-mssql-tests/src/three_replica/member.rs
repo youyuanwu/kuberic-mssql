@@ -101,6 +101,65 @@ impl LaunchedMembers {
             .await
     }
 
+    pub async fn testing_create_unowned_source_database(&self) -> Result<(), AdminError> {
+        let database = database_name(&self.run);
+        validated_identifier(&database)?;
+        self.testing_admin_session(0)
+            .await?
+            .execute(&format!("CREATE DATABASE [{database}];"), &[])
+            .await
+    }
+
+    pub async fn testing_create_unowned_availability_group(&self) -> Result<(), AdminError> {
+        let group = availability_group_name(&self.run);
+        validated_identifier(&group)?;
+        let clauses = self
+            .run
+            .members
+            .iter()
+            .map(|member| {
+                format!(
+                    "N'{server}' WITH (ENDPOINT_URL = N'TCP://{server}:5022', \
+                     AVAILABILITY_MODE = SYNCHRONOUS_COMMIT, FAILOVER_MODE = EXTERNAL, \
+                     SEEDING_MODE = AUTOMATIC, SECONDARY_ROLE (ALLOW_CONNECTIONS = ALL))",
+                    server = member.server_name,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",\n");
+        self.testing_admin_session(0)
+            .await?
+            .execute(
+                &format!(
+                    "CREATE AVAILABILITY GROUP [{group}] \
+                     WITH (CLUSTER_TYPE = EXTERNAL, \
+                     REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 1) \
+                     FOR REPLICA ON {clauses};"
+                ),
+                &[],
+            )
+            .await
+    }
+
+    pub async fn testing_source_recovery_model(&self) -> Result<String, AdminError> {
+        let database = database_name(&self.run);
+        let mut session = self.testing_admin_session(0).await?;
+        let rows = session
+            .query_rows(
+                "SELECT CONVERT(nvarchar(60), recovery_model_desc) \
+                 FROM sys.databases WHERE name = @P1;",
+                &[&database],
+            )
+            .await?;
+        if rows.len() != 1 {
+            return Err(AdminError::MalformedResult);
+        }
+        rows[0]
+            .get::<&str, _>(0)
+            .map(str::to_owned)
+            .ok_or(AdminError::MalformedResult)
+    }
+
     async fn testing_admin_session(&self, index: usize) -> Result<AdminSession, AdminError> {
         let member = self.members.get(index).ok_or(AdminError::MalformedResult)?;
         let endpoint = AdminEndpoint {
