@@ -3,6 +3,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
+#[cfg(feature = "kuberic-testing")]
+use std::sync::Condvar;
+
 use async_trait::async_trait;
 use kuberic_runtime::application::{
     OpenContext, RoleChange, StateProvider, StatefulServiceReplica,
@@ -17,6 +20,7 @@ use kuberic_runtime::replicator::{
     ReplicatorSettings,
 };
 use kuberic_runtime::{Result as KubericResult, RuntimeError as KubericRuntimeError};
+use tokio_util::sync::CancellationToken;
 
 use crate::bootstrap::{
     AvailabilityGroupOwnership, BootstrapOwnership, NativeConvergenceState,
@@ -898,6 +902,7 @@ pub struct SqlServerReplicator {
     admitted_configuration: Mutex<Option<ReplicaSetConfiguration>>,
     admitted_bootstrap_database: Mutex<Option<StandaloneDatabaseIdentity>>,
     lifecycle: RwLock<ReplicatorLifecycle>,
+    lifecycle_cancel: CancellationToken,
     role: Mutex<Option<ReplicaRole>>,
     epoch: Mutex<Option<Epoch>>,
     #[cfg(feature = "kuberic-testing")]
@@ -937,6 +942,8 @@ struct SeedCoordinator {
     root: PathBuf,
     store: Mutex<Option<Arc<SeedDispatchStore>>>,
     arbiter: tokio::sync::Mutex<()>,
+    store_worker: Arc<tokio::sync::Mutex<()>>,
+    store_controls: Mutex<Vec<std::sync::Weak<SeedStoreWorkControl>>>,
     submission_active: std::sync::atomic::AtomicBool,
     #[cfg(feature = "kuberic-testing")]
     intent_gate: Mutex<Option<SeedGate>>,
@@ -946,6 +953,8 @@ struct SeedCoordinator {
     compaction_gate: Mutex<Option<SeedGate>>,
     #[cfg(feature = "kuberic-testing")]
     completion_gate: Mutex<Option<SeedGate>>,
+    #[cfg(feature = "kuberic-testing")]
+    store_gate: Mutex<Option<SeedStoreHook>>,
     target_evidence_challenge: std::sync::atomic::AtomicU64,
 }
 
@@ -955,12 +964,177 @@ struct SeedGate {
     release: tokio::sync::oneshot::Receiver<()>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedStoreOperation {
+    Open,
+    Load,
+    Create,
+    Replace,
+    Remove,
+}
+
+#[cfg(feature = "kuberic-testing")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum TestingSeedStoreOperation {
+    Open,
+    Load,
+    Create,
+    Replace,
+    Remove,
+}
+
+#[cfg(feature = "kuberic-testing")]
+impl From<TestingSeedStoreOperation> for SeedStoreOperation {
+    fn from(value: TestingSeedStoreOperation) -> Self {
+        match value {
+            TestingSeedStoreOperation::Open => Self::Open,
+            TestingSeedStoreOperation::Load => Self::Load,
+            TestingSeedStoreOperation::Create => Self::Create,
+            TestingSeedStoreOperation::Replace => Self::Replace,
+            TestingSeedStoreOperation::Remove => Self::Remove,
+        }
+    }
+}
+
+#[cfg(feature = "kuberic-testing")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum TestingSeedStoreStage {
+    BeforeStart,
+    Started,
+    Completed,
+}
+
+#[cfg(feature = "kuberic-testing")]
+struct SeedStoreGateState {
+    released: Mutex<bool>,
+    changed: Condvar,
+}
+
+#[cfg(feature = "kuberic-testing")]
+struct SeedStoreHook {
+    operation: SeedStoreOperation,
+    stage: TestingSeedStoreStage,
+    entered: Arc<tokio::sync::Notify>,
+    state: Arc<SeedStoreGateState>,
+}
+
+#[cfg(feature = "kuberic-testing")]
+impl SeedStoreHook {
+    fn checkpoint(&self, stage: TestingSeedStoreStage, control: &SeedStoreWorkControl) {
+        if self.stage != stage {
+            return;
+        }
+        self.entered.notify_one();
+        let mut released = self
+            .state
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*released
+            && (stage == TestingSeedStoreStage::Started
+                || !control
+                    .cancel_requested
+                    .load(std::sync::atomic::Ordering::Acquire))
+        {
+            released = self
+                .state
+                .changed
+                .wait(released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+#[cfg(feature = "kuberic-testing")]
+#[doc(hidden)]
+pub struct TestingSeedStoreGate {
+    pub entered: Arc<tokio::sync::Notify>,
+    state: Arc<SeedStoreGateState>,
+}
+
+#[cfg(feature = "kuberic-testing")]
+impl TestingSeedStoreGate {
+    pub fn release(&self) {
+        *self
+            .state
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.state.changed.notify_all();
+    }
+}
+
+#[cfg(feature = "kuberic-testing")]
+impl Drop for TestingSeedStoreGate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+struct SeedStoreWorkControl {
+    // Cancellation and a blocking filesystem operation arbitrate once:
+    // 0=pending, 1=started/non-cancellable, 2=cancelled.
+    phase: std::sync::atomic::AtomicU8,
+    cancel_requested: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "kuberic-testing")]
+    gate: Option<Arc<SeedStoreGateState>>,
+}
+
+impl SeedStoreWorkControl {
+    fn cancel(&self) {
+        self.cancel_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.phase.compare_exchange(
+            0,
+            2,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+        #[cfg(feature = "kuberic-testing")]
+        if let Some(gate) = &self.gate {
+            let _released = gate
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            gate.changed.notify_all();
+        }
+    }
+
+    fn begin(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+struct SeedStoreCancellation(Arc<SeedStoreWorkControl>);
+
+impl Drop for SeedStoreCancellation {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+enum SeedStoreWorkResult<T> {
+    Cancelled,
+    Complete(Result<T, SeedStateError>),
+}
+
 impl SeedCoordinator {
     fn new(root: PathBuf) -> Self {
         Self {
             root,
             store: Mutex::new(None),
             arbiter: tokio::sync::Mutex::new(()),
+            store_worker: Arc::new(tokio::sync::Mutex::new(())),
+            store_controls: Mutex::new(Vec::new()),
             submission_active: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "kuberic-testing")]
             intent_gate: Mutex::new(None),
@@ -970,22 +1144,37 @@ impl SeedCoordinator {
             compaction_gate: Mutex::new(None),
             #[cfg(feature = "kuberic-testing")]
             completion_gate: Mutex::new(None),
+            #[cfg(feature = "kuberic-testing")]
+            store_gate: Mutex::new(None),
             target_evidence_challenge: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
-    fn store(&self) -> Result<Arc<SeedDispatchStore>, KubericAdapterError> {
-        let mut slot = self
-            .store
+    fn register_store_control(
+        &self,
+        control: &Arc<SeedStoreWorkControl>,
+    ) -> Result<(), SeedStateError> {
+        let mut controls = self
+            .store_controls
             .lock()
-            .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?;
-        if let Some(store) = slot.as_ref() {
-            return Ok(store.clone());
-        }
-        let store =
-            Arc::new(SeedDispatchStore::open(&self.root).map_err(KubericAdapterError::SeedState)?);
-        *slot = Some(store.clone());
-        Ok(store)
+            .map_err(|_| SeedStateError::UnsafeState)?;
+        controls.retain(|control| control.strong_count() != 0);
+        controls.push(Arc::downgrade(control));
+        Ok(())
+    }
+
+    fn cancel_store_work(&self) {
+        let Ok(mut controls) = self.store_controls.lock() else {
+            return;
+        };
+        controls.retain(|control| {
+            if let Some(control) = control.upgrade() {
+                control.cancel();
+                true
+            } else {
+                false
+            }
+        });
     }
 
     #[cfg(feature = "kuberic-testing")]
@@ -1162,6 +1351,39 @@ impl SqlServerReplicator {
 
     #[cfg(feature = "kuberic-testing")]
     #[doc(hidden)]
+    pub fn testing_gate_seed_store(
+        &self,
+        operation: TestingSeedStoreOperation,
+        stage: TestingSeedStoreStage,
+    ) -> Result<TestingSeedStoreGate, KubericAdapterError> {
+        let seed = &self
+            .bootstrap
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?
+            .seed;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let state = Arc::new(SeedStoreGateState {
+            released: Mutex::new(false),
+            changed: Condvar::new(),
+        });
+        let mut slot = seed
+            .store_gate
+            .lock()
+            .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?;
+        if slot.is_some() {
+            return Err(KubericAdapterError::SeedState(SeedStateError::AlreadyOwned));
+        }
+        *slot = Some(SeedStoreHook {
+            operation: operation.into(),
+            stage,
+            entered: entered.clone(),
+            state: state.clone(),
+        });
+        Ok(TestingSeedStoreGate { entered, state })
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
     pub fn testing_inject_bootstrap_observation(
         &self,
         scenario: TestingBootstrapObservation,
@@ -1319,6 +1541,7 @@ impl SqlServerReplicator {
                 state: CREATED,
                 generation: 0,
             }),
+            lifecycle_cancel: CancellationToken::new(),
             role: Mutex::new(None),
             epoch: Mutex::new(None),
             #[cfg(feature = "kuberic-testing")]
@@ -1358,6 +1581,264 @@ impl SqlServerReplicator {
             return Err(KubericAdapterError::Closed);
         }
         Ok(lifecycle)
+    }
+
+    async fn seed_store_work<T, F>(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+        operation: SeedStoreOperation,
+        work: F,
+    ) -> Result<T, KubericAdapterError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, SeedStateError> + Send + 'static,
+    {
+        let seed = self
+            .bootstrap
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?
+            .seed
+            .clone();
+        #[cfg(not(feature = "kuberic-testing"))]
+        let _ = operation;
+        drop(self.finish_operation(generation)?);
+        let permit = tokio::select! {
+            biased;
+            _ = self.lifecycle_cancel.cancelled() => {
+                return Err(KubericAdapterError::Closed);
+            }
+            permit = tokio::time::timeout(
+                bootstrap_remaining(deadline)?,
+                seed.store_worker.clone().lock_owned(),
+            ) => permit.map_err(|_| KubericAdapterError::NativeConvergenceDeadline)?,
+        };
+        drop(self.finish_operation(generation)?);
+        bootstrap_remaining(deadline)?;
+
+        #[cfg(feature = "kuberic-testing")]
+        let hook = {
+            let mut pending = seed
+                .store_gate
+                .lock()
+                .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?;
+            if pending
+                .as_ref()
+                .is_some_and(|hook| hook.operation == operation)
+            {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        let control = Arc::new(SeedStoreWorkControl {
+            phase: std::sync::atomic::AtomicU8::new(0),
+            cancel_requested: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "kuberic-testing")]
+            gate: hook.as_ref().map(|hook| hook.state.clone()),
+        });
+        seed.register_store_control(&control)
+            .map_err(KubericAdapterError::SeedState)?;
+        if self.lifecycle_cancel.is_cancelled() {
+            control.cancel();
+        }
+        let cancellation = SeedStoreCancellation(control.clone());
+        let (completed, mut result) = tokio::sync::oneshot::channel();
+        let thread_control = control.clone();
+        std::thread::Builder::new()
+            .name("mssql-seed-store".into())
+            .spawn(move || {
+                let _permit = permit;
+                #[cfg(feature = "kuberic-testing")]
+                if let Some(hook) = &hook {
+                    hook.checkpoint(TestingSeedStoreStage::BeforeStart, &thread_control);
+                }
+                if !thread_control.begin() {
+                    let _ = completed.send(SeedStoreWorkResult::Cancelled);
+                    return;
+                }
+                #[cfg(feature = "kuberic-testing")]
+                if let Some(hook) = &hook {
+                    hook.checkpoint(TestingSeedStoreStage::Started, &thread_control);
+                }
+                let outcome = work();
+                #[cfg(feature = "kuberic-testing")]
+                if let Some(hook) = &hook {
+                    hook.checkpoint(TestingSeedStoreStage::Completed, &thread_control);
+                }
+                let _ = completed.send(SeedStoreWorkResult::Complete(outcome));
+            })
+            .map_err(|_| KubericAdapterError::SeedState(SeedStateError::Io))?;
+
+        enum Stop {
+            Deadline,
+            Closed,
+        }
+        let mut stop = None;
+        let outcome = match tokio::select! {
+            biased;
+            response = &mut result => Some(response),
+            _ = tokio::time::sleep_until(deadline) => {
+                stop = Some(Stop::Deadline);
+                None
+            }
+            _ = self.lifecycle_cancel.cancelled() => {
+                stop = Some(Stop::Closed);
+                None
+            }
+        } {
+            Some(response) => response,
+            None => {
+                control.cancel();
+                result.await
+            }
+        }
+        .map_err(|_| {
+            KubericAdapterError::NativeConvergenceUnsafe("seed dispatch store worker terminated")
+        })?;
+        drop(cancellation);
+
+        let value = match outcome {
+            SeedStoreWorkResult::Cancelled => {
+                return Err(match stop {
+                    Some(Stop::Closed) => KubericAdapterError::Closed,
+                    Some(Stop::Deadline) | None => KubericAdapterError::NativeConvergenceDeadline,
+                });
+            }
+            SeedStoreWorkResult::Complete(result) => {
+                result.map_err(KubericAdapterError::SeedState)?
+            }
+        };
+        if let Some(stop) = stop {
+            return Err(match stop {
+                Stop::Deadline => KubericAdapterError::NativeConvergenceDeadline,
+                Stop::Closed => KubericAdapterError::Closed,
+            });
+        }
+        drop(self.finish_operation(generation)?);
+        bootstrap_remaining(deadline)?;
+        Ok(value)
+    }
+
+    async fn seed_store(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<Arc<SeedDispatchStore>, KubericAdapterError> {
+        let seed = self
+            .bootstrap
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?
+            .seed
+            .clone();
+        if let Some(store) = seed
+            .store
+            .lock()
+            .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?
+            .as_ref()
+            .cloned()
+        {
+            return Ok(store);
+        }
+        let root = seed.root.clone();
+        let slot = seed.clone();
+        self.seed_store_work(generation, deadline, SeedStoreOperation::Open, move || {
+            if let Some(existing) = slot
+                .store
+                .lock()
+                .map_err(|_| SeedStateError::UnsafeState)?
+                .as_ref()
+                .cloned()
+            {
+                return Ok(existing);
+            }
+            let store = Arc::new(SeedDispatchStore::open(&root)?);
+            let mut current = slot.store.lock().map_err(|_| SeedStateError::UnsafeState)?;
+            if let Some(existing) = current.as_ref() {
+                return Ok(existing.clone());
+            }
+            *current = Some(store.clone());
+            Ok(store)
+        })
+        .await
+    }
+
+    async fn seed_store_load(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<SeedDispatchRecord>, KubericAdapterError> {
+        let store = self.seed_store(generation, deadline).await?;
+        self.seed_store_work(generation, deadline, SeedStoreOperation::Load, move || {
+            store.load()
+        })
+        .await
+    }
+
+    async fn seed_store_create(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+        record: SeedDispatchRecord,
+    ) -> Result<(), KubericAdapterError> {
+        let store = self.seed_store(generation, deadline).await?;
+        self.seed_store_work(
+            generation,
+            deadline,
+            SeedStoreOperation::Create,
+            move || store.create(&record),
+        )
+        .await
+    }
+
+    async fn seed_store_replace(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+        expected_revision: u64,
+        record: SeedDispatchRecord,
+    ) -> Result<SeedDispatchRecord, KubericAdapterError> {
+        let store = self.seed_store(generation, deadline).await?;
+        self.seed_store_work(
+            generation,
+            deadline,
+            SeedStoreOperation::Replace,
+            move || store.replace(expected_revision, record),
+        )
+        .await
+    }
+
+    async fn seed_store_replace_intent(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+        expected_revision: u64,
+        record: SeedDispatchRecord,
+    ) -> Result<SeedDispatchRecord, KubericAdapterError> {
+        let store = self.seed_store(generation, deadline).await?;
+        self.seed_store_work(
+            generation,
+            deadline,
+            SeedStoreOperation::Replace,
+            move || store.replace_intent(expected_revision, record),
+        )
+        .await
+    }
+
+    async fn seed_store_remove(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+        expected_revision: u64,
+    ) -> Result<(), KubericAdapterError> {
+        let store = self.seed_store(generation, deadline).await?;
+        self.seed_store_work(
+            generation,
+            deadline,
+            SeedStoreOperation::Remove,
+            move || store.remove(expected_revision),
+        )
+        .await
     }
 
     async fn observed_group(
@@ -2587,99 +3068,136 @@ impl SqlServerReplicator {
         }
     }
 
-    fn compact_seed_record(
+    async fn compact_seed_record(
         &self,
-        store: &SeedDispatchStore,
+        generation: u64,
+        deadline: tokio::time::Instant,
         mut record: SeedDispatchRecord,
         database: &DatabaseIdentity,
     ) -> Result<(), KubericAdapterError> {
-        if record.phase() != SeedDispatchPhase::Accepted {
-            return Err(KubericAdapterError::SeedState(
-                SeedStateError::InvalidTransition,
-            ));
+        loop {
+            if record.phase() != SeedDispatchPhase::Accepted {
+                return Err(KubericAdapterError::SeedState(
+                    SeedStateError::InvalidTransition,
+                ));
+            }
+            if record.group_database_id() != Some(database.group_database_id.as_str()) {
+                record
+                    .associate_group_database(database.group_database_id.as_str())
+                    .map_err(KubericAdapterError::SeedState)?;
+                let revision = record.revision();
+                match self
+                    .seed_store_replace(generation, deadline, revision, record)
+                    .await
+                {
+                    Ok(updated) => record = updated,
+                    Err(KubericAdapterError::SeedState(SeedStateError::RevisionMismatch)) => {
+                        let Some(current) = self.seed_store_load(generation, deadline).await?
+                        else {
+                            return Ok(());
+                        };
+                        record = current;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            match self
+                .seed_store_remove(generation, deadline, record.revision())
+                .await
+            {
+                Ok(()) | Err(KubericAdapterError::SeedState(SeedStateError::Missing)) => {
+                    return Ok(());
+                }
+                Err(KubericAdapterError::SeedState(SeedStateError::RevisionMismatch)) => {
+                    let Some(current) = self.seed_store_load(generation, deadline).await? else {
+                        return Ok(());
+                    };
+                    record = current;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        if record.group_database_id() != Some(database.group_database_id.as_str()) {
-            record
-                .associate_group_database(database.group_database_id.as_str())
-                .map_err(KubericAdapterError::SeedState)?;
-            record = store
-                .replace(record.revision(), record)
-                .map_err(KubericAdapterError::SeedState)?;
-        }
-        store
-            .remove(record.revision())
-            .map_err(KubericAdapterError::SeedState)
     }
 
-    fn persist_seed_dispatch_evidence(
+    async fn persist_seed_dispatch_evidence(
         &self,
-        store: &SeedDispatchStore,
+        generation: u64,
+        deadline: tokio::time::Instant,
         context: &SeedBuildContext,
         evidence: SeedDispatchEvidence,
     ) -> Result<SeedDispatchRecord, KubericAdapterError> {
-        let Some(mut record) = store.load().map_err(KubericAdapterError::SeedState)? else {
-            if matches!(
-                evidence,
-                SeedDispatchEvidence::Accepted | SeedDispatchEvidence::Terminal
-            ) {
-                let mut accepted = context.record.clone();
-                accepted
-                    .mark_accepted()
-                    .map_err(KubericAdapterError::SeedState)?;
-                return Ok(accepted);
-            }
-            return Err(KubericAdapterError::SeedState(SeedStateError::Missing));
-        };
-        self.validate_seed_record(&record, &context.record)?;
-        let previous_phase = record.phase();
-        match evidence {
-            SeedDispatchEvidence::Accepted | SeedDispatchEvidence::Terminal => {
-                if record.phase() != SeedDispatchPhase::Accepted {
-                    record
+        loop {
+            let Some(mut record) = self.seed_store_load(generation, deadline).await? else {
+                if matches!(
+                    evidence,
+                    SeedDispatchEvidence::Accepted | SeedDispatchEvidence::Terminal
+                ) {
+                    let mut accepted = context.record.clone();
+                    accepted
                         .mark_accepted()
                         .map_err(KubericAdapterError::SeedState)?;
+                    return Ok(accepted);
                 }
-            }
-            SeedDispatchEvidence::Submitting | SeedDispatchEvidence::Ambiguous => {
-                if record.phase() == SeedDispatchPhase::Submitting {
-                    record
-                        .mark_ambiguous()
-                        .map_err(KubericAdapterError::SeedState)?;
-                } else if record.phase() != SeedDispatchPhase::Ambiguous {
-                    return Err(KubericAdapterError::SeedState(
-                        SeedStateError::InvalidTransition,
-                    ));
+                return Err(KubericAdapterError::SeedState(SeedStateError::Missing));
+            };
+            self.validate_seed_record(&record, &context.record)?;
+            let previous_phase = record.phase();
+            match evidence {
+                SeedDispatchEvidence::Accepted | SeedDispatchEvidence::Terminal => {
+                    if record.phase() != SeedDispatchPhase::Accepted {
+                        record
+                            .mark_accepted()
+                            .map_err(KubericAdapterError::SeedState)?;
+                    }
                 }
-            }
-            SeedDispatchEvidence::Absent | SeedDispatchEvidence::FailedRetryable => {
-                if matches!(
-                    record.phase(),
-                    SeedDispatchPhase::Submitting | SeedDispatchPhase::Ambiguous
-                ) {
-                    record
-                        .mark_failed_retryable()
-                        .map_err(KubericAdapterError::SeedState)?;
-                } else if !matches!(
-                    record.phase(),
-                    SeedDispatchPhase::Intent | SeedDispatchPhase::FailedRetryable
-                ) {
+                SeedDispatchEvidence::Submitting | SeedDispatchEvidence::Ambiguous => {
+                    if record.phase() == SeedDispatchPhase::Submitting {
+                        record
+                            .mark_ambiguous()
+                            .map_err(KubericAdapterError::SeedState)?;
+                    } else if record.phase() != SeedDispatchPhase::Ambiguous {
+                        return Err(KubericAdapterError::SeedState(
+                            SeedStateError::InvalidTransition,
+                        ));
+                    }
+                }
+                SeedDispatchEvidence::Absent | SeedDispatchEvidence::FailedRetryable => {
+                    if matches!(
+                        record.phase(),
+                        SeedDispatchPhase::Submitting | SeedDispatchPhase::Ambiguous
+                    ) {
+                        record
+                            .mark_failed_retryable()
+                            .map_err(KubericAdapterError::SeedState)?;
+                    } else if !matches!(
+                        record.phase(),
+                        SeedDispatchPhase::Intent | SeedDispatchPhase::FailedRetryable
+                    ) {
+                        return Err(KubericAdapterError::NativeConvergenceConflict(
+                            "accepted seed dispatch SQL evidence",
+                        ));
+                    }
+                }
+                SeedDispatchEvidence::Conflict => {
                     return Err(KubericAdapterError::NativeConvergenceConflict(
-                        "accepted seed dispatch SQL evidence",
+                        "seed dispatch SQL metadata",
                     ));
                 }
             }
-            SeedDispatchEvidence::Conflict => {
-                return Err(KubericAdapterError::NativeConvergenceConflict(
-                    "seed dispatch SQL metadata",
-                ));
+            if record.phase() == previous_phase {
+                return Ok(record);
+            }
+            let revision = record.revision();
+            match self
+                .seed_store_replace(generation, deadline, revision, record)
+                .await
+            {
+                Ok(record) => return Ok(record),
+                Err(KubericAdapterError::SeedState(SeedStateError::RevisionMismatch)) => {}
+                Err(error) => return Err(error),
             }
         }
-        if record.phase() != previous_phase {
-            record = store
-                .replace(record.revision(), record)
-                .map_err(KubericAdapterError::SeedState)?;
-        }
-        Ok(record)
     }
 
     async fn reconcile_seed_dispatch_evidence(
@@ -2731,8 +3249,7 @@ impl SqlServerReplicator {
         ) {
             return Ok(SeedDispatchAction::ObserveAmbiguous);
         }
-        let store = bootstrap.seed.store()?;
-        let existing = store.load().map_err(KubericAdapterError::SeedState)?;
+        let existing = self.seed_store_load(generation, deadline).await?;
         let mut record = match existing {
             Some(record) => {
                 self.validate_seed_record(&record, &context.record)?;
@@ -2743,9 +3260,13 @@ impl SqlServerReplicator {
                     SeedDispatchPhase::Intent | SeedDispatchPhase::FailedRetryable
                         if !record.same_intent_owner(&context.record) =>
                     {
-                        store
-                            .replace_intent(record.revision(), context.record.clone())
-                            .map_err(KubericAdapterError::SeedState)?
+                        self.seed_store_replace_intent(
+                            generation,
+                            deadline,
+                            record.revision(),
+                            context.record.clone(),
+                        )
+                        .await?
                     }
                     SeedDispatchPhase::Intent
                     | SeedDispatchPhase::Submitting
@@ -2788,9 +3309,8 @@ impl SqlServerReplicator {
                         ));
                     }
                 }
-                store
-                    .create(&context.record)
-                    .map_err(KubericAdapterError::SeedState)?;
+                self.seed_store_create(generation, deadline, context.record.clone())
+                    .await?;
                 context.record.clone()
             }
         };
@@ -2815,12 +3335,9 @@ impl SqlServerReplicator {
         let evidence = self
             .reconcile_seed_dispatch_evidence(generation, deadline, &request)
             .await?;
-        if evidence == SeedDispatchEvidence::Terminal {
-            return Err(KubericAdapterError::NativeConvergenceConflict(
-                "terminal seed dispatch source association",
-            ));
-        }
-        record = self.persist_seed_dispatch_evidence(store.as_ref(), context, evidence)?;
+        record = self
+            .persist_seed_dispatch_evidence(generation, deadline, context, evidence)
+            .await?;
         match record.phase() {
             SeedDispatchPhase::Accepted | SeedDispatchPhase::Ambiguous => {
                 return Ok(SeedDispatchAction::ObserveAmbiguous);
@@ -2838,9 +3355,9 @@ impl SqlServerReplicator {
         record
             .mark_submitting()
             .map_err(KubericAdapterError::SeedState)?;
-        let record = store
-            .replace(record.revision(), record)
-            .map_err(KubericAdapterError::SeedState)?;
+        let record = self
+            .seed_store_replace(generation, deadline, record.revision(), record)
+            .await?;
         #[cfg(feature = "kuberic-testing")]
         bootstrap
             .seed
@@ -2879,6 +3396,7 @@ impl SqlServerReplicator {
         replica: &ReplicaInformation,
     ) -> Result<(), KubericAdapterError> {
         let context = self.seed_build_context(replica)?;
+        #[cfg(feature = "kuberic-testing")]
         let bootstrap = self
             .bootstrap
             .as_ref()
@@ -2907,8 +3425,7 @@ impl SqlServerReplicator {
                 Err(error) => return Err(error),
             };
             let association = source_association(&group, &context.database)?;
-            let store = bootstrap.seed.store()?;
-            let record = store.load().map_err(KubericAdapterError::SeedState)?;
+            let record = self.seed_store_load(generation, deadline).await?;
             if let Some(record) = record.as_ref() {
                 self.validate_seed_record(record, &context.record)?;
             }
@@ -2963,11 +3480,12 @@ impl SqlServerReplicator {
                             record
                                 .mark_accepted()
                                 .map_err(KubericAdapterError::SeedState)?;
-                            record = store
-                                .replace(record.revision(), record)
-                                .map_err(KubericAdapterError::SeedState)?;
+                            record = self
+                                .seed_store_replace(generation, deadline, record.revision(), record)
+                                .await?;
                         }
-                        self.compact_seed_record(store.as_ref(), record, &database)?;
+                        self.compact_seed_record(generation, deadline, record, &database)
+                            .await?;
                     }
                     match classify_source_seed_completion(
                         &group,
@@ -3098,14 +3616,13 @@ impl SqlServerReplicator {
                                 )
                             })?;
                             drop(self.finish_operation(generation)?);
-                            let store = bootstrap.seed.store()?;
                             match result {
                                 Ok(evidence) => {
-                                    let record = self.persist_seed_dispatch_evidence(
-                                        store.as_ref(),
-                                        &context,
-                                        evidence,
-                                    )?;
+                                    let record = self
+                                        .persist_seed_dispatch_evidence(
+                                            generation, deadline, &context, evidence,
+                                        )
+                                        .await?;
                                     if record.phase() == SeedDispatchPhase::FailedRetryable {
                                         return Err(KubericAdapterError::NativeMutationFailed {
                                             effect: "add database to availability group",
@@ -3122,11 +3639,11 @@ impl SqlServerReplicator {
                                             &dispatch.request,
                                         )
                                         .await?;
-                                    let record = self.persist_seed_dispatch_evidence(
-                                        store.as_ref(),
-                                        &context,
-                                        evidence,
-                                    )?;
+                                    let record = self
+                                        .persist_seed_dispatch_evidence(
+                                            generation, deadline, &context, evidence,
+                                        )
+                                        .await?;
                                     match record.phase() {
                                         SeedDispatchPhase::Accepted => {}
                                         SeedDispatchPhase::FailedRetryable
@@ -3278,6 +3795,10 @@ impl Replicator for SqlServerReplicator {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         lifecycle.state = CLOSED;
         lifecycle.generation = lifecycle.generation.wrapping_add(1);
+        self.lifecycle_cancel.cancel();
+        if let Some(bootstrap) = &self.bootstrap {
+            bootstrap.seed.cancel_store_work();
+        }
         Ok(())
     }
 
@@ -3288,6 +3809,10 @@ impl Replicator for SqlServerReplicator {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         lifecycle.state = ABORTED;
         lifecycle.generation = lifecycle.generation.wrapping_add(1);
+        self.lifecycle_cancel.cancel();
+        if let Some(bootstrap) = &self.bootstrap {
+            bootstrap.seed.cancel_store_work();
+        }
     }
 
     async fn current_progress(&self) -> KubericResult<i64> {

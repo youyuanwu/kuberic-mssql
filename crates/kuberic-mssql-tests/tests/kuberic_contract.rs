@@ -10,7 +10,7 @@ use kuberic_mssql::kuberic::{
     KubericAdapterError, ObservationClock, SqlServerBootstrapConfig, SqlServerObservationSource,
     SqlServerReplicator, SqlServerReplicatorFactory, SqlServerService, SqlServerServiceConfig,
     SqlServerStartIncarnation, TargetHostEvidenceExchange, TargetHostEvidenceReport,
-    TargetHostEvidenceRequest,
+    TargetHostEvidenceRequest, TestingSeedStoreOperation, TestingSeedStoreStage,
 };
 use kuberic_mssql::observation::{
     AutomaticSeedingSnapshot, AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, DatabaseSnapshot,
@@ -2884,14 +2884,27 @@ fn seed_replicator_with_executor_and_target_evidence(
     executor: Arc<dyn SqlMutationExecutor>,
     target_evidence: Arc<dyn TargetHostEvidenceExchange>,
 ) -> Arc<SqlServerReplicator> {
+    seed_replicator_with_config_and_target_evidence(
+        root,
+        complete,
+        executor,
+        target_evidence,
+        observer_config(),
+    )
+}
+
+fn seed_replicator_with_config_and_target_evidence(
+    root: std::path::PathBuf,
+    complete: Arc<AtomicBool>,
+    executor: Arc<dyn SqlMutationExecutor>,
+    target_evidence: Arc<dyn TargetHostEvidenceExchange>,
+    config: ObserverConfig,
+) -> Arc<SqlServerReplicator> {
     Arc::new(
         SqlServerReplicator::new_bootstrap_with_topology_and_target_evidence(
             SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-1.example:5022")
                 .unwrap(),
-            Arc::new(SeedSource {
-                config: observer_config(),
-                complete,
-            }),
+            Arc::new(SeedSource { config, complete }),
             Arc::new(ScriptedClock {
                 times: Mutex::new(vec![OBSERVED_AT].into()),
             }),
@@ -4482,7 +4495,318 @@ async fn concurrent_target_builds_select_one_dispatch_and_replay_from_native_evi
     assert!(!root.path().join("seed-dispatch-v1.json").exists());
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
+async fn slow_seed_store_open_and_read_never_block_async_runtime_workers() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+
+    let open_gate = replicator
+        .testing_gate_seed_store(
+            TestingSeedStoreOperation::Open,
+            TestingSeedStoreStage::Started,
+        )
+        .unwrap();
+    let first = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "slow-store-open"))
+                .await
+        }
+    });
+    open_gate.entered.notified().await;
+    let successor = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(2, "concurrent-slow-store-open"))
+                .await
+        }
+    });
+    let (responsive, response) = oneshot::channel();
+    tokio::spawn(async move {
+        responsive.send(()).unwrap();
+    });
+    response.await.unwrap();
+    assert!(!first.is_finished());
+    assert!(!successor.is_finished());
+    open_gate.release();
+    first.await.unwrap().unwrap();
+    successor.await.unwrap().unwrap();
+
+    let load_gate = replicator
+        .testing_gate_seed_store(
+            TestingSeedStoreOperation::Load,
+            TestingSeedStoreStage::Started,
+        )
+        .unwrap();
+    let replay = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(2, "slow-store-read"))
+                .await
+        }
+    });
+    load_gate.entered.notified().await;
+    let (responsive, response) = oneshot::channel();
+    tokio::spawn(async move {
+        responsive.send(()).unwrap();
+    });
+    response.await.unwrap();
+    assert!(!replay.is_finished());
+    load_gate.release();
+    replay.await.unwrap().unwrap();
+
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn seed_store_cancellation_before_commit_is_a_noop_and_successor_can_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+    let gate = replicator
+        .testing_gate_seed_store(
+            TestingSeedStoreOperation::Create,
+            TestingSeedStoreStage::BeforeStart,
+        )
+        .unwrap();
+    let cancelled = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "cancel-before-store-commit"))
+                .await
+        }
+    });
+    gate.entered.notified().await;
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+
+    replicator
+        .build_replica(target_build(2, "successor-after-cancelled-store-commit"))
+        .await
+        .unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn seed_store_cancellation_after_commit_start_joins_before_successor_mutates() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+    let gate = replicator
+        .testing_gate_seed_store(
+            TestingSeedStoreOperation::Create,
+            TestingSeedStoreStage::Started,
+        )
+        .unwrap();
+    let cancelled = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "cancel-after-store-commit-start"))
+                .await
+        }
+    });
+    gate.entered.notified().await;
+    let successor = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(2, "serialized-store-successor"))
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    assert!(!successor.is_finished());
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    let (responsive, response) = oneshot::channel();
+    tokio::spawn(async move {
+        responsive.send(()).unwrap();
+    });
+    response.await.unwrap();
+    assert!(!successor.is_finished());
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+
+    gate.release();
+    successor.await.unwrap().unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn lifecycle_cancellation_is_stateful_while_waiting_for_store_serialization() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+    let gate = replicator
+        .testing_gate_seed_store(
+            TestingSeedStoreOperation::Open,
+            TestingSeedStoreStage::Started,
+        )
+        .unwrap();
+    let first = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "store-owner-before-abort"))
+                .await
+        }
+    });
+    gate.entered.notified().await;
+    let waiting = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(2, "store-waiter-before-abort"))
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    replicator.abort();
+    assert!(matches!(
+        waiting.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    assert!(!first.is_finished());
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    gate.release();
+    assert!(matches!(
+        first.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn lifecycle_cancellation_before_store_commit_wins_without_durable_change() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+    let gate = replicator
+        .testing_gate_seed_store(
+            TestingSeedStoreOperation::Create,
+            TestingSeedStoreStage::BeforeStart,
+        )
+        .unwrap();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "lifecycle-cancel-before-commit"))
+                .await
+        }
+    });
+    gate.entered.notified().await;
+    replicator.abort();
+    assert!(matches!(
+        callback.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn seed_store_deadline_before_commit_is_a_noop() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replicator = seed_replicator_with_config_and_target_evidence(
+        root.path().to_owned(),
+        complete.clone(),
+        executor.clone() as Arc<dyn SqlMutationExecutor>,
+        Arc::new(SeedTargetEvidenceExchange { complete }),
+        observer_config_for_timeout(0, 250),
+    );
+    admit_seed_replicator(&replicator).await;
+    let gate = replicator
+        .testing_gate_seed_store(
+            TestingSeedStoreOperation::Create,
+            TestingSeedStoreStage::BeforeStart,
+        )
+        .unwrap();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "deadline-before-store-commit"))
+                .await
+        }
+    });
+    gate.entered.notified().await;
+    let message = application_error(callback.await.unwrap().unwrap_err());
+    assert!(message.contains("bounded callback budget"), "{message}");
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn seed_store_deadline_after_commit_classifies_durability_before_returning_no_success() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replicator = seed_replicator_with_config_and_target_evidence(
+        root.path().to_owned(),
+        complete.clone(),
+        executor.clone() as Arc<dyn SqlMutationExecutor>,
+        Arc::new(SeedTargetEvidenceExchange {
+            complete: complete.clone(),
+        }),
+        observer_config_for_timeout(0, 250),
+    );
+    admit_seed_replicator(&replicator).await;
+    let gate = replicator
+        .testing_gate_seed_store(
+            TestingSeedStoreOperation::Create,
+            TestingSeedStoreStage::Completed,
+        )
+        .unwrap();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "deadline-after-store-commit"))
+                .await
+        }
+    });
+    gate.entered.notified().await;
+    assert!(root.path().join("seed-dispatch-v1.json").exists());
+    let message = application_error(callback.await.unwrap().unwrap_err());
+    assert!(message.contains("bounded callback budget"), "{message}");
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    let retained: SeedDispatchRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(retained.phase(), SeedDispatchPhase::Intent);
+
+    replicator
+        .build_replica(target_build(2, "successor-after-store-deadline"))
+        .await
+        .unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
 async fn seed_convergence_waits_for_the_retry_floor_after_dispatch() {
     let root = tempfile::tempdir().unwrap();
     let (replicator, executor, complete) = seed_replicator(root.path().to_owned());
@@ -4497,22 +4821,24 @@ async fn seed_convergence_waits_for_the_retry_floor_after_dispatch() {
         }
     });
 
-    for _ in 0..10 {
-        if executor.executions.load(Ordering::SeqCst) == 1 {
-            break;
+    tokio::task::spawn_blocking({
+        let complete = complete.clone();
+        move || {
+            while !complete.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
         }
-        tokio::task::yield_now().await;
-    }
+    })
+    .await
+    .unwrap();
     assert!(complete.load(Ordering::SeqCst));
     assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
     assert!(!callback.is_finished());
 
-    tokio::time::advance(Duration::from_millis(99)).await;
-    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(99)).await;
     assert!(!callback.is_finished());
-    tokio::time::advance(Duration::from_millis(1)).await;
     callback.await.unwrap().unwrap();
-    assert_eq!(started.elapsed(), Duration::from_millis(100));
+    assert!(started.elapsed() >= Duration::from_millis(100));
     assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
 }
 
