@@ -25,6 +25,7 @@ pub enum SeedDispatchPhase {
     Accepted,
     Ambiguous,
     FailedRetryable,
+    LegacyAmbiguous,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +107,7 @@ pub struct SeedDispatchRecord {
     winning_target_replica_id: String,
     winning_build_id: String,
     sqlserver_start_time: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     operation_token: String,
     phase: SeedDispatchPhase,
     group_database_id: Option<String>,
@@ -258,20 +260,43 @@ impl SeedDispatchRecord {
         Ok(())
     }
 
+    pub fn associate_legacy_group_database(
+        &mut self,
+        group_database_id: impl Into<String>,
+    ) -> Result<(), SeedStateError> {
+        if self.phase != SeedDispatchPhase::LegacyAmbiguous {
+            return Err(SeedStateError::InvalidTransition);
+        }
+        let group_database_id = group_database_id.into();
+        validate_guid(&group_database_id)?;
+        if self
+            .group_database_id
+            .as_ref()
+            .is_some_and(|existing| existing != &group_database_id)
+        {
+            return Err(SeedStateError::IdentityMismatch);
+        }
+        self.group_database_id = Some(group_database_id);
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), SeedStateError> {
         if self.schema_version != SEED_DISPATCH_SCHEMA_VERSION {
             return Err(SeedStateError::UnsupportedSchema(self.schema_version));
         }
+        let legacy_ambiguous = self.phase == SeedDispatchPhase::LegacyAmbiguous;
         if self.revision == 0
             || (self.phase == SeedDispatchPhase::Intent && self.group_database_id.is_some())
             || (self.phase != SeedDispatchPhase::Intent && self.revision < 2)
-            || (self.group_database_id.is_some() && self.revision < 3)
-            || self.operation_token.len() != 64
-            || !self
-                .operation_token
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-            || self.operation_token != self.derive_operation_token()
+            || (self.group_database_id.is_some() && self.revision < 3 && !legacy_ambiguous)
+            || legacy_ambiguous && !self.operation_token.is_empty()
+            || !legacy_ambiguous
+                && (self.operation_token.len() != 64
+                    || !self
+                        .operation_token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+                    || self.operation_token != self.derive_operation_token())
         {
             return Err(SeedStateError::Malformed);
         }
@@ -392,6 +417,12 @@ impl SeedDispatchRecord {
             | (SeedDispatchPhase::Ambiguous, None, SeedDispatchPhase::Accepted, None)
             | (SeedDispatchPhase::Ambiguous, None, SeedDispatchPhase::FailedRetryable, None)
             | (SeedDispatchPhase::Accepted, None, SeedDispatchPhase::Accepted, Some(_)) => Ok(()),
+            (
+                SeedDispatchPhase::LegacyAmbiguous,
+                None,
+                SeedDispatchPhase::LegacyAmbiguous,
+                Some(_),
+            ) => Ok(()),
             (
                 SeedDispatchPhase::Accepted,
                 Some(current),
@@ -768,7 +799,7 @@ fn decode_record(bytes: &[u8]) -> Result<(SeedDispatchRecord, bool), SeedStateEr
             {
                 return Err(SeedStateError::Malformed);
             }
-            let mut record = SeedDispatchRecord {
+            let record = SeedDispatchRecord {
                 schema_version: SEED_DISPATCH_SCHEMA_VERSION,
                 revision: legacy.revision,
                 resource_uid: legacy.resource_uid,
@@ -787,17 +818,14 @@ fn decode_record(bytes: &[u8]) -> Result<(SeedDispatchRecord, bool), SeedStateEr
                 operation_token: String::new(),
                 phase: match legacy.phase {
                     LegacySeedDispatchPhase::Intent => SeedDispatchPhase::Intent,
-                    LegacySeedDispatchPhase::Dispatched => {
-                        if legacy.group_database_id.is_some() {
-                            SeedDispatchPhase::Accepted
-                        } else {
-                            SeedDispatchPhase::Ambiguous
-                        }
-                    }
+                    LegacySeedDispatchPhase::Dispatched => SeedDispatchPhase::LegacyAmbiguous,
                 },
                 group_database_id: legacy.group_database_id,
             };
-            record.operation_token = record.derive_operation_token();
+            let mut record = record;
+            if record.phase == SeedDispatchPhase::Intent {
+                record.operation_token = record.derive_operation_token();
+            }
             record.validate()?;
             Ok((record, true))
         }

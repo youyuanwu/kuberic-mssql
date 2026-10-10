@@ -153,7 +153,10 @@ remain the primary durable evidence. The application persists only the
 pre-association `Intent`/`Submitting`/`Accepted`/`Ambiguous`/
 `FailedRetryable` handshake under its existing application root; exact source
 association plus the exact terminal SQL marker removes that temporary record. A
-schema-v1 `Dispatched` record is migrated conservatively to `Ambiguous`.
+schema-v1 `Dispatched` record instead migrates to tokenless
+`LegacyAmbiguous`: exact native association may compact its group-database
+identity into a retained tombstone, while absent, incomplete, or conflicting
+association fails closed and cannot redispatch.
 
 The owned source database retains one matching singleton dispatch row with a
 derived operation token, exact AG/database identities, and SQL-owned phase. A

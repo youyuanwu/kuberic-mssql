@@ -810,7 +810,7 @@ async fn intent_and_definite_failure_can_be_released_but_submitting_cannot() {
 }
 
 #[tokio::test]
-async fn legacy_dispatched_seed_state_migrates_to_ambiguous_without_claiming_acceptance() {
+async fn legacy_dispatched_seed_state_migrates_to_non_redispatchable_ambiguity_without_a_token() {
     let temporary = tempfile::tempdir().unwrap();
     let runtime_config = config(temporary.path()).await;
     let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
@@ -825,12 +825,13 @@ async fn legacy_dispatched_seed_state_migrates_to_ambiguous_without_claiming_acc
 
     let store = SeedDispatchStore::open(binding.root()).unwrap();
     let migrated = store.load().unwrap().unwrap();
-    assert_eq!(migrated.phase(), SeedDispatchPhase::Ambiguous);
+    assert_eq!(migrated.phase(), SeedDispatchPhase::LegacyAmbiguous);
     assert_eq!(migrated.revision(), 2);
-    assert_eq!(migrated.operation_token().len(), 64);
+    assert_eq!(migrated.operation_token(), "");
     let persisted: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     assert_eq!(persisted["schema_version"], serde_json::json!(2));
-    assert_eq!(persisted["phase"], serde_json::json!("ambiguous"));
+    assert_eq!(persisted["phase"], serde_json::json!("legacy_ambiguous"));
+    assert!(persisted.get("operation_token").is_none());
 }
 
 #[tokio::test]

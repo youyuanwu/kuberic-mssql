@@ -391,8 +391,15 @@ that lock. Recovery can acquire the same lock to prove the old submitting
 session is gone: exact native association or an accepted row can establish the
 terminal marker without redispatch, a held lock is ambiguous, and an absent
 effect after lock acquisition is definitely retryable.
-Schema-v1 file records migrate conservatively: old `Dispatched` becomes
-`Ambiguous`, never accepted by assertion.
+
+Schema-v1 file records migrate fail closed. Old `Dispatched` becomes the
+dedicated, tokenless `LegacyAmbiguous` phase because schema v1 had no SQL-owned
+row, application-lock handshake, or terminal marker. It can compact only when
+the record's exact native source association already exists; compaction records
+the exact group-database identity and retains the tokenless legacy tombstone so
+later restarts remain fenced. Missing or incomplete association requires
+explicit operator recovery and can never become `FailedRetryable`, a new
+`Intent`, or another submission.
 
 Current configuration replay, secondary join, and seed build require native
 markers to match the resource, accepted configuration, AG name, and observed

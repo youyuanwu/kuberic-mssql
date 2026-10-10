@@ -3120,6 +3120,44 @@ impl SqlServerReplicator {
         }
     }
 
+    async fn compact_legacy_seed_record(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+        mut record: SeedDispatchRecord,
+        database: &DatabaseIdentity,
+    ) -> Result<(), KubericAdapterError> {
+        loop {
+            if record.phase() != SeedDispatchPhase::LegacyAmbiguous {
+                return Err(KubericAdapterError::SeedState(
+                    SeedStateError::InvalidTransition,
+                ));
+            }
+            if record.group_database_id() == Some(database.group_database_id.as_str()) {
+                return Ok(());
+            }
+            record
+                .associate_legacy_group_database(database.group_database_id.as_str())
+                .map_err(KubericAdapterError::SeedState)?;
+            let revision = record.revision();
+            match self
+                .seed_store_replace(generation, deadline, revision, record)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(KubericAdapterError::SeedState(SeedStateError::RevisionMismatch)) => {
+                    let current = self.seed_store_load(generation, deadline).await?.ok_or(
+                        KubericAdapterError::NativeConvergenceUnsafe(
+                            "legacy seed dispatch evidence disappeared during compaction",
+                        ),
+                    )?;
+                    record = current;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     async fn persist_seed_dispatch_evidence(
         &self,
         generation: u64,
@@ -3273,6 +3311,11 @@ impl SqlServerReplicator {
                     | SeedDispatchPhase::Accepted
                     | SeedDispatchPhase::Ambiguous
                     | SeedDispatchPhase::FailedRetryable => record,
+                    SeedDispatchPhase::LegacyAmbiguous => {
+                        return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                            "legacy seed dispatch recovery requires exact native association; operator recovery is required",
+                        ));
+                    }
                 }
             }
             None => {
@@ -3348,6 +3391,11 @@ impl SqlServerReplicator {
                 ));
             }
             SeedDispatchPhase::Intent | SeedDispatchPhase::FailedRetryable => {}
+            SeedDispatchPhase::LegacyAmbiguous => {
+                return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                    "legacy seed dispatch recovery requires exact native association; operator recovery is required",
+                ));
+            }
         }
         #[cfg(feature = "kuberic-testing")]
         bootstrap.seed.pause_after_intent_if_requested().await?;
@@ -3424,68 +3472,86 @@ impl SqlServerReplicator {
                 }
                 Err(error) => return Err(error),
             };
-            let association = source_association(&group, &context.database)?;
             let record = self.seed_store_load(generation, deadline).await?;
             if let Some(record) = record.as_ref() {
                 self.validate_seed_record(record, &context.record)?;
             }
+            let association = source_association(&group, &context.database)?;
             match association {
                 SourceAssociation::Exact(database) => {
-                    let operation_token = record.as_ref().map_or(
-                        context.record.operation_token(),
-                        SeedDispatchRecord::operation_token,
-                    );
-                    let request = SeedDispatchRequest::new(
-                        context.binding.availability_group.name.clone(),
-                        context.binding.availability_group.group_id.clone(),
-                        context.database.name.clone(),
-                        context.database.database_guid.clone(),
-                        operation_token,
-                    )
-                    .map_err(|_| {
-                        KubericAdapterError::NativeConvergenceUnsafe(
-                            "seed dispatch operation token",
-                        )
-                    })?;
-                    match self
-                        .reconcile_seed_dispatch_evidence(generation, deadline, &request)
-                        .await?
+                    if let Some(legacy) = record
+                        .as_ref()
+                        .filter(|record| record.phase() == SeedDispatchPhase::LegacyAmbiguous)
                     {
-                        SeedDispatchEvidence::Terminal => {}
-                        SeedDispatchEvidence::Conflict => {
-                            return Err(KubericAdapterError::NativeConvergenceConflict(
-                                "terminal seed dispatch SQL metadata",
-                            ));
+                        self.compact_legacy_seed_record(
+                            generation,
+                            deadline,
+                            legacy.clone(),
+                            &database,
+                        )
+                        .await?;
+                    } else {
+                        let operation_token = record.as_ref().map_or(
+                            context.record.operation_token(),
+                            SeedDispatchRecord::operation_token,
+                        );
+                        let request = SeedDispatchRequest::new(
+                            context.binding.availability_group.name.clone(),
+                            context.binding.availability_group.group_id.clone(),
+                            context.database.name.clone(),
+                            context.database.database_guid.clone(),
+                            operation_token,
+                        )
+                        .map_err(|_| {
+                            KubericAdapterError::NativeConvergenceUnsafe(
+                                "seed dispatch operation token",
+                            )
+                        })?;
+                        match self
+                            .reconcile_seed_dispatch_evidence(generation, deadline, &request)
+                            .await?
+                        {
+                            SeedDispatchEvidence::Terminal => {}
+                            SeedDispatchEvidence::Conflict => {
+                                return Err(KubericAdapterError::NativeConvergenceConflict(
+                                    "terminal seed dispatch SQL metadata",
+                                ));
+                            }
+                            SeedDispatchEvidence::Absent
+                            | SeedDispatchEvidence::Submitting
+                            | SeedDispatchEvidence::Accepted
+                            | SeedDispatchEvidence::Ambiguous
+                            | SeedDispatchEvidence::FailedRetryable => {
+                                return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                                    "terminal seed dispatch marker is not proven",
+                                ));
+                            }
                         }
-                        SeedDispatchEvidence::Absent
-                        | SeedDispatchEvidence::Submitting
-                        | SeedDispatchEvidence::Accepted
-                        | SeedDispatchEvidence::Ambiguous
-                        | SeedDispatchEvidence::FailedRetryable => {
-                            return Err(KubericAdapterError::NativeConvergenceUnsafe(
-                                "terminal seed dispatch marker is not proven",
-                            ));
+                        #[cfg(feature = "kuberic-testing")]
+                        if record.is_some() {
+                            bootstrap
+                                .seed
+                                .pause_before_compaction_if_requested()
+                                .await?;
+                            drop(self.finish_operation(generation)?);
                         }
-                    }
-                    #[cfg(feature = "kuberic-testing")]
-                    if record.is_some() {
-                        bootstrap
-                            .seed
-                            .pause_before_compaction_if_requested()
-                            .await?;
-                        drop(self.finish_operation(generation)?);
-                    }
-                    if let Some(mut record) = record {
-                        if record.phase() != SeedDispatchPhase::Accepted {
-                            record
-                                .mark_accepted()
-                                .map_err(KubericAdapterError::SeedState)?;
-                            record = self
-                                .seed_store_replace(generation, deadline, record.revision(), record)
+                        if let Some(mut record) = record {
+                            if record.phase() != SeedDispatchPhase::Accepted {
+                                record
+                                    .mark_accepted()
+                                    .map_err(KubericAdapterError::SeedState)?;
+                                record = self
+                                    .seed_store_replace(
+                                        generation,
+                                        deadline,
+                                        record.revision(),
+                                        record,
+                                    )
+                                    .await?;
+                            }
+                            self.compact_seed_record(generation, deadline, record, &database)
                                 .await?;
                         }
-                        self.compact_seed_record(generation, deadline, record, &database)
-                            .await?;
                     }
                     match classify_source_seed_completion(
                         &group,
@@ -3541,6 +3607,14 @@ impl SqlServerReplicator {
                 SourceAssociation::Incomplete => {
                     if record
                         .as_ref()
+                        .is_some_and(|record| record.phase() == SeedDispatchPhase::LegacyAmbiguous)
+                    {
+                        return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                            "legacy seed dispatch recovery requires exact native association; operator recovery is required",
+                        ));
+                    }
+                    if record
+                        .as_ref()
                         .is_none_or(|record| record.phase() == SeedDispatchPhase::Accepted)
                     {
                         let operation_token = record.as_ref().map_or(
@@ -3586,6 +3660,14 @@ impl SqlServerReplicator {
                     }
                 }
                 SourceAssociation::Absent => {
+                    if record
+                        .as_ref()
+                        .is_some_and(|record| record.phase() == SeedDispatchPhase::LegacyAmbiguous)
+                    {
+                        return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                            "legacy seed dispatch recovery requires exact native association; operator recovery is required",
+                        ));
+                    }
                     let dispatch = match self
                         .arbitrate_seed_dispatch(generation, deadline, &context)
                         .await
@@ -3661,6 +3743,13 @@ impl SqlServerReplicator {
                                             return Err(
                                                 KubericAdapterError::NativeMutationAmbiguous(
                                                     "add database to availability group",
+                                                ),
+                                            );
+                                        }
+                                        SeedDispatchPhase::LegacyAmbiguous => {
+                                            return Err(
+                                                KubericAdapterError::NativeConvergenceUnsafe(
+                                                    "legacy seed dispatch recovery requires exact native association; operator recovery is required",
                                                 ),
                                             );
                                         }
