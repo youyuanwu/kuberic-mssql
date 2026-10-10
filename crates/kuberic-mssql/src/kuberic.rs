@@ -1953,6 +1953,7 @@ impl SqlServerReplicator {
                                 effect,
                             )
                             .await?;
+                            self.wait_for_bootstrap_retry(generation, deadline).await?;
                             continue;
                         }
                         NativeConvergenceState::Incomplete => {
@@ -1986,6 +1987,7 @@ impl SqlServerReplicator {
                                     &remove_database_creation_intent,
                                 )
                                 .await?;
+                                self.wait_for_bootstrap_retry(generation, deadline).await?;
                                 continue;
                             }
                             let effect = if snapshot.recovery_model != "FULL" {
@@ -2012,6 +2014,7 @@ impl SqlServerReplicator {
                                 effect,
                             )
                             .await?;
+                            self.wait_for_bootstrap_retry(generation, deadline).await?;
                             continue;
                         }
                         NativeConvergenceState::Complete => {}
@@ -2065,6 +2068,7 @@ impl SqlServerReplicator {
                                     &remove_group_creation_intent,
                                 )
                                 .await?;
+                                self.wait_for_bootstrap_retry(generation, deadline).await?;
                                 continue;
                             }
                             if !self
@@ -2090,6 +2094,7 @@ impl SqlServerReplicator {
                                     &retain_create_any_database_evidence,
                                 )
                                 .await?;
+                                self.wait_for_bootstrap_retry(generation, deadline).await?;
                                 continue;
                             }
                             let group = group.expect("complete classifier requires a group");
@@ -2105,6 +2110,7 @@ impl SqlServerReplicator {
                                 &retain_group_intent,
                             )
                             .await?;
+                            self.wait_for_bootstrap_retry(generation, deadline).await?;
                             continue;
                         }
                         NativeConvergenceState::Incomplete if group.is_none() => {
@@ -2128,6 +2134,7 @@ impl SqlServerReplicator {
                                 effect,
                             )
                             .await?;
+                            self.wait_for_bootstrap_retry(generation, deadline).await?;
                             continue;
                         }
                         NativeConvergenceState::Incomplete
@@ -2146,6 +2153,7 @@ impl SqlServerReplicator {
                                 &bind_group,
                             )
                             .await?;
+                            self.wait_for_bootstrap_retry(generation, deadline).await?;
                             continue;
                         }
                         NativeConvergenceState::Incomplete | NativeConvergenceState::Complete => {}
@@ -2230,17 +2238,13 @@ impl SqlServerReplicator {
                     };
                     let Some(group) = group else {
                         if join_absence_observed {
-                            let dispatched = self
-                                .execute_bootstrap_effect(
-                                    generation,
-                                    deadline,
-                                    bootstrap.executor.as_ref(),
-                                    &join_group,
-                                )
-                                .await?;
-                            if dispatched {
-                                continue;
-                            }
+                            self.execute_bootstrap_effect(
+                                generation,
+                                deadline,
+                                bootstrap.executor.as_ref(),
+                                &join_group,
+                            )
+                            .await?;
                         } else {
                             join_absence_observed = true;
                         }
@@ -2317,6 +2321,7 @@ impl SqlServerReplicator {
                                     &retain_create_any_database_evidence,
                                 )
                                 .await?;
+                                self.wait_for_bootstrap_retry(generation, deadline).await?;
                                 continue;
                             }
                             drop(self.finish_operation(generation)?);
@@ -2324,17 +2329,14 @@ impl SqlServerReplicator {
                             return Ok((instance, group, observed_at, database_identity, deadline));
                         }
                         NativeConvergenceState::Absent | NativeConvergenceState::Incomplete => {
-                            let dispatched = self
-                                .execute_bootstrap_effect(
-                                    generation,
-                                    deadline,
-                                    bootstrap.executor.as_ref(),
-                                    &join_group,
-                                )
-                                .await?;
-                            if !dispatched {
-                                self.wait_for_bootstrap_retry(generation, deadline).await?;
-                            }
+                            self.execute_bootstrap_effect(
+                                generation,
+                                deadline,
+                                bootstrap.executor.as_ref(),
+                                &join_group,
+                            )
+                            .await?;
+                            self.wait_for_bootstrap_retry(generation, deadline).await?;
                             continue;
                         }
                         NativeConvergenceState::Complete => {}
@@ -2361,18 +2363,13 @@ impl SqlServerReplicator {
         deadline: tokio::time::Instant,
     ) -> Result<(), KubericAdapterError> {
         let remaining = bootstrap_remaining(deadline)?;
-        tokio::time::timeout(
-            remaining,
-            tokio::time::sleep(
-                self.source
-                    .observer_config()
-                    .poll_interval()
-                    .min(Duration::from_millis(100))
-                    .min(remaining),
-            ),
-        )
-        .await
-        .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)?;
+        let retry_delay = self
+            .source
+            .observer_config()
+            .poll_interval()
+            .max(Duration::from_millis(100))
+            .min(remaining);
+        tokio::time::sleep(retry_delay).await;
         drop(self.finish_operation(generation)?);
         bootstrap_remaining(deadline)?;
         Ok(())
@@ -3083,9 +3080,7 @@ impl SqlServerReplicator {
                         Err(error) => return Err(error),
                     };
                     match dispatch {
-                        SeedDispatchAction::ObserveAmbiguous => {
-                            self.wait_for_bootstrap_retry(generation, deadline).await?;
-                        }
+                        SeedDispatchAction::ObserveAmbiguous => {}
                         SeedDispatchAction::Submitted(mut dispatch) => {
                             let result = tokio::time::timeout(
                                 bootstrap_remaining(deadline)?,
@@ -3157,6 +3152,7 @@ impl SqlServerReplicator {
                             }
                         }
                     }
+                    self.wait_for_bootstrap_retry(generation, deadline).await?;
                     continue;
                 }
             }

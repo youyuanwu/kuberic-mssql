@@ -827,6 +827,14 @@ fn observer_config_for(index: usize) -> ObserverConfig {
 }
 
 fn observer_config_for_timeout(index: usize, sample_timeout_ms: u64) -> ObserverConfig {
+    observer_config_for_timing(index, sample_timeout_ms, 1)
+}
+
+fn observer_config_for_timing(
+    index: usize,
+    sample_timeout_ms: u64,
+    poll_interval_ms: u64,
+) -> ObserverConfig {
     ObserverConfig::from_json(
         format!(
             r#"{{
@@ -841,7 +849,7 @@ fn observer_config_for_timeout(index: usize, sample_timeout_ms: u64) -> Observer
                 "sample_timeout_ms":{sample_timeout_ms},
                 "connect_timeout_ms":{sample_timeout_ms},
                 "query_timeout_ms":{sample_timeout_ms},
-                "poll_interval_ms":1,
+                "poll_interval_ms":{poll_interval_ms},
                 "max_age_ms":{MAX_AGE}
             }}"#
         )
@@ -1959,7 +1967,7 @@ fn pending_secondary_join_snapshot(local_index: usize) -> InstanceSnapshot {
     sample
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn secondary_waits_for_primary_group_and_retries_only_expected_join_propagation() {
     let executor = Arc::new(ScriptedMutationExecutor {
         databases: Mutex::new(
@@ -1976,21 +1984,25 @@ async fn secondary_waits_for_primary_group_and_retries_only_expected_join_propag
         effects: Mutex::new(Vec::new()),
         executions: Mutex::new(vec![Err(mutation_error(35250))].into()),
     });
+    let source = Arc::new(CountingSource {
+        inner: ScriptedSource {
+            config: observer_config_for_timing(1, 5_000, 2_000),
+            samples: Mutex::new(
+                vec![
+                    Ok(present(bootstrap_absent_snapshot(1))),
+                    Ok(present(bootstrap_absent_snapshot(1))),
+                    Ok(present(bootstrap_membership_snapshot(1))),
+                ]
+                .into(),
+            ),
+        },
+        observations: AtomicUsize::new(0),
+    });
     let replicator = Arc::new(
         SqlServerReplicator::new_bootstrap_with_topology(
             SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-2.example:5022")
                 .unwrap(),
-            Arc::new(ScriptedSource {
-                config: observer_config_for(1),
-                samples: Mutex::new(
-                    vec![
-                        Ok(present(bootstrap_absent_snapshot(1))),
-                        Ok(present(bootstrap_absent_snapshot(1))),
-                        Ok(present(bootstrap_membership_snapshot(1))),
-                    ]
-                    .into(),
-                ),
-            }),
+            source.clone(),
             Arc::new(ScriptedClock {
                 times: Mutex::new(vec![OBSERVED_AT].into()),
             }),
@@ -2003,14 +2015,40 @@ async fn secondary_waits_for_primary_group_and_retries_only_expected_join_propag
         .unwrap(),
     );
     replicator.open().await.unwrap();
-    replicator
-        .update_current_replica_set_configuration(bound_replica_set())
-        .await
-        .unwrap();
+    let started = tokio::time::Instant::now();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    assert!(executor.effects.lock().unwrap().is_empty());
+    tokio::time::advance(Duration::from_millis(1_999)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    assert!(executor.effects.lock().unwrap().is_empty());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 2);
     assert_eq!(
         *executor.effects.lock().unwrap(),
         vec!["join availability group"]
     );
+    tokio::time::advance(Duration::from_millis(1_999)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 2);
+    assert!(!callback.is_finished());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    callback.await.unwrap().unwrap();
+    assert_eq!(source.observations.load(Ordering::SeqCst), 3);
+    assert_eq!(started.elapsed(), Duration::from_secs(4));
     assert!(replicator.admitted_topology().is_some());
 }
 
@@ -2160,6 +2198,160 @@ async fn bootstrap_retries_only_inconsistent_observation_propagation() {
     assert!(application_error(error).contains("Unreachable"));
     assert!(mutation.effects.lock().unwrap().is_empty());
     assert!(replicator.admitted_topology().is_none());
+}
+
+fn inconsistent_bootstrap_observation() -> RuntimeError {
+    RuntimeError::new(
+        ObservationFailureKind::Inconsistent,
+        "scripted observation",
+        "native state changed during the observation bracket",
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn bootstrap_retry_honors_configured_poll_interval_and_exact_success_is_immediate() {
+    let (replicator, _, source) = counted_bootstrap_replicator_for(
+        0,
+        vec![
+            Err(inconsistent_bootstrap_observation()),
+            Err(inconsistent_bootstrap_observation()),
+            Ok(present(bootstrap_membership_snapshot(0))),
+        ],
+        vec![
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
+        ],
+        observer_config_for_timing(0, 5_000, 2_000),
+    );
+    replicator.open().await.unwrap();
+    let started = tokio::time::Instant::now();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    assert!(!callback.is_finished());
+    tokio::time::advance(Duration::from_millis(1_999)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    assert!(!callback.is_finished());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 2);
+    assert!(!callback.is_finished());
+    tokio::time::advance(Duration::from_millis(1_999)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 2);
+    assert!(!callback.is_finished());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    callback.await.unwrap().unwrap();
+    assert_eq!(source.observations.load(Ordering::SeqCst), 3);
+    assert_eq!(started.elapsed(), Duration::from_secs(4));
+}
+
+#[tokio::test(start_paused = true)]
+async fn bootstrap_retry_applies_the_minimum_poll_floor() {
+    let (replicator, _, source) = counted_bootstrap_replicator_for(
+        0,
+        vec![
+            Err(inconsistent_bootstrap_observation()),
+            Ok(present(bootstrap_membership_snapshot(0))),
+        ],
+        vec![
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
+        ],
+        observer_config_for_timing(0, 1_000, 1),
+    );
+    replicator.open().await.unwrap();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_millis(99)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    assert!(!callback.is_finished());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    callback.await.unwrap().unwrap();
+    assert_eq!(source.observations.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_a_bootstrap_retry_does_not_wait_for_the_poll_interval() {
+    let (replicator, _, source) = counted_bootstrap_replicator_for(
+        0,
+        vec![Err(inconsistent_bootstrap_observation())],
+        vec![Ok(Some(owned_standalone_database()))],
+        observer_config_for_timing(0, 5_000, 2_000),
+    );
+    replicator.open().await.unwrap();
+    let started = tokio::time::Instant::now();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    assert!(!callback.is_finished());
+    callback.abort();
+    assert!(callback.await.unwrap_err().is_cancelled());
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn bootstrap_retry_stops_at_the_exact_callback_deadline() {
+    let (replicator, _, source) = counted_bootstrap_replicator_for(
+        0,
+        vec![Err(inconsistent_bootstrap_observation())],
+        vec![Ok(Some(owned_standalone_database()))],
+        observer_config_for_timing(0, 250, 2_000),
+    );
+    replicator.open().await.unwrap();
+    let started = tokio::time::Instant::now();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_millis(249)).await;
+    tokio::task::yield_now().await;
+    assert!(!callback.is_finished());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let error = callback.await.unwrap().unwrap_err();
+    assert!(application_error(error).contains("bounded callback budget"));
+    assert_eq!(started.elapsed(), Duration::from_millis(250));
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -2599,10 +2791,36 @@ fn bootstrap_replicator_for(
     samples: Vec<Result<Observation<InstanceSnapshot>, RuntimeError>>,
     databases: Vec<Result<Option<StandaloneDatabaseSnapshot>, RuntimeError>>,
 ) -> (Arc<SqlServerReplicator>, Arc<ScriptedMutationExecutor>) {
+    let (replicator, executor, _) = counted_bootstrap_replicator_for(
+        local_index,
+        samples,
+        databases,
+        observer_config_for(local_index),
+    );
+    (replicator, executor)
+}
+
+fn counted_bootstrap_replicator_for(
+    local_index: usize,
+    samples: Vec<Result<Observation<InstanceSnapshot>, RuntimeError>>,
+    databases: Vec<Result<Option<StandaloneDatabaseSnapshot>, RuntimeError>>,
+    config: ObserverConfig,
+) -> (
+    Arc<SqlServerReplicator>,
+    Arc<ScriptedMutationExecutor>,
+    Arc<CountingSource>,
+) {
     let executor = Arc::new(ScriptedMutationExecutor {
         databases: Mutex::new(databases.into()),
         effects: Mutex::new(Vec::new()),
         executions: Mutex::new(VecDeque::new()),
+    });
+    let source = Arc::new(CountingSource {
+        inner: ScriptedSource {
+            config,
+            samples: Mutex::new(samples.into()),
+        },
+        observations: AtomicUsize::new(0),
     });
     let replicator = Arc::new(
         SqlServerReplicator::new_bootstrap_with_topology(
@@ -2611,10 +2829,7 @@ fn bootstrap_replicator_for(
                 format!("replica-{}.example:5022", local_index + 1),
             )
             .unwrap(),
-            Arc::new(ScriptedSource {
-                config: observer_config_for(local_index),
-                samples: Mutex::new(samples.into()),
-            }),
+            source.clone(),
             Arc::new(ScriptedClock {
                 times: Mutex::new(vec![OBSERVED_AT].into()),
             }),
@@ -2626,7 +2841,7 @@ fn bootstrap_replicator_for(
         )
         .unwrap(),
     );
-    (replicator, executor)
+    (replicator, executor, source)
 }
 
 fn seed_replicator(
@@ -4265,6 +4480,40 @@ async fn concurrent_target_builds_select_one_dispatch_and_replay_from_native_evi
     replicator.build_replica(second).await.unwrap();
     assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
     assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test(start_paused = true)]
+async fn seed_convergence_waits_for_the_retry_floor_after_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, complete) = seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+    let started = tokio::time::Instant::now();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "paced-seed-build"))
+                .await
+        }
+    });
+
+    for _ in 0..10 {
+        if executor.executions.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(complete.load(Ordering::SeqCst));
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!callback.is_finished());
+
+    tokio::time::advance(Duration::from_millis(99)).await;
+    tokio::task::yield_now().await;
+    assert!(!callback.is_finished());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    callback.await.unwrap().unwrap();
+    assert_eq!(started.elapsed(), Duration::from_millis(100));
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
