@@ -60,6 +60,12 @@ fn three_replica_mssql_native_conflict_matrix() {
     run_phase4_test(Phase4LiveTest::ConflictMatrix);
 }
 
+#[test]
+#[ignore = "exercises licensed post-compaction terminal seed conflicts on a qualified local Docker host"]
+fn three_replica_mssql_terminal_seed_conflicts() {
+    run_phase4_test(Phase4LiveTest::TerminalSeedConflicts);
+}
+
 fn run_three_replica_test(validate_restart: bool) {
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
@@ -82,6 +88,7 @@ enum Phase4LiveTest {
     FaultBoundaries,
     SeedDispatchHandshake,
     ConflictMatrix,
+    TerminalSeedConflicts,
 }
 
 fn run_phase4_test(test: Phase4LiveTest) {
@@ -105,6 +112,9 @@ fn run_phase4_test(test: Phase4LiveTest) {
                         }
                         Phase4LiveTest::ConflictMatrix => {
                             execute_phase4_conflict_matrix(&root).await
+                        }
+                        Phase4LiveTest::TerminalSeedConflicts => {
+                            execute_terminal_seed_conflicts(&root).await
                         }
                     }
                     .expect("licensed Phase 4 lifecycle");
@@ -1220,6 +1230,105 @@ async fn execute_phase4_fault_boundaries(base_root: &Path) -> Result<(), TestErr
     execute_seed_dispatch_handshake_faults(&base_root.join("seed-dispatch-handshake")).await?;
     exercise_seed_faults(&base_root.join("seed-boundaries")).await?;
     exercise_post_native_success_replay(&base_root.join("post-native-success")).await
+}
+
+async fn execute_terminal_seed_conflicts(base_root: &Path) -> Result<(), TestError> {
+    fs::create_dir_all(base_root)?;
+    exercise_terminal_seed_conflict(
+        &base_root.join("terminal-association-removal"),
+        false,
+        "terminal-association-removal",
+    )
+    .await?;
+    exercise_terminal_seed_conflict(
+        &base_root.join("terminal-ag-recreation"),
+        true,
+        "terminal-ag-recreation",
+    )
+    .await?;
+    Ok(())
+}
+
+async fn exercise_terminal_seed_conflict(
+    root: &Path,
+    recreate_group: bool,
+    label: &str,
+) -> Result<(), TestError> {
+    cleanup_three_replica_fixture(root)?;
+    let config = FixtureConfig::for_test_fixture(root)?;
+    let mut launched = launch_three_members(config).await?;
+    let prepared = launched.prepare_availability_group().await?;
+    let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let group = start_prepared_public_group_with_retry(
+        root,
+        &launched.run,
+        &prepared,
+        &launched.members,
+        launched.kuberic_convergence_timeout(),
+        launched.complete_deadline(),
+        &cleanup,
+    )
+    .await?;
+    let sequence = group.bootstrap_configuration_sequence().await?;
+    wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout()).await?;
+    let owner =
+        group.target_build_command(1, format!("{label}-owner"), format!("{label}-owner"))?;
+    group
+        .testing_admit_target_build_authority_only(&owner)
+        .await
+        .map_err(|error| format!("{label} seed authority admission failed: {error}"))?;
+    group
+        .testing_execute_admitted_seed_callback_with_retry(&owner)
+        .await
+        .map_err(|error| format!("{label} seed owner callback failed: {error}"))?;
+    let dispatches = group.testing_seed_dispatch_count()?;
+    let retained = group.testing_seed_dispatch_record()?;
+    if dispatches != 1 || retained.is_some() {
+        return Err(format!(
+            "{label} did not compact exactly one accepted dispatch: \
+             dispatches={dispatches}, retained={}",
+            retained.is_some()
+        )
+        .into());
+    }
+
+    launched
+        .testing_remove_managed_database_association()
+        .await?;
+    if recreate_group {
+        launched
+            .testing_recreate_availability_group_without_database()
+            .await?;
+    }
+    let error = group
+        .testing_execute_admitted_seed_callback(&owner)
+        .await
+        .expect_err("post-compaction topology loss must be terminal");
+    let expected = if recreate_group {
+        error.message().contains("availability group differs")
+            || error.message().contains("availability-group")
+    } else {
+        error
+            .message()
+            .contains("terminal seed dispatch source association")
+    };
+    if !expected {
+        return Err(format!("{label} returned an unexpected classification: {error}").into());
+    }
+    if group.testing_seed_dispatch_count()? != 1 || group.testing_seed_dispatch_record()?.is_some()
+    {
+        return Err(format!("{label} redispatched or recreated temporary seed state").into());
+    }
+
+    group.shutdown_with_coordinator(&cleanup).await?;
+    let evidence = launched.cleanup_with_coordinator(&cleanup)?;
+    if evidence.removed_container_ids.len() != 3 || evidence.removed_network_id.is_empty() {
+        return Err(format!("{label} cleanup did not remove the exact owned topology").into());
+    }
+    assert_removed(root);
+    cleanup_three_replica_fixture(root)?;
+    assert_removed(root);
+    Ok(())
 }
 
 async fn execute_configuration_faults(base_root: &Path) -> Result<(), TestError> {

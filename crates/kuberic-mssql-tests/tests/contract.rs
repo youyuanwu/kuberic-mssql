@@ -344,8 +344,17 @@ fn mutation_surface_is_typed_and_contains_only_approved_stage_three_effects() {
     assert!(submit.contains("phase=N'submitting'"));
     assert!(submit.contains("phase=N'accepted'"));
     assert!(submit.contains("phase=N'failed_retryable'"));
+    assert!(submit.contains("master.sys.sp_addextendedproperty"));
+    assert!(submit.contains("N'terminal'"));
     assert!(submit.contains("ALTER AVAILABILITY GROUP [kuberic-ag] ADD DATABASE [application]"));
     assert!(submit.find("phase=N'submitting'").unwrap() < submit.find("ADD DATABASE").unwrap());
+    let (terminal_name, terminal_value) = dispatch.testing_terminal_marker();
+    assert!(terminal_name.starts_with("kuberic_seed_terminal_v1_"));
+    assert!(terminal_name.len() <= 128);
+    assert_eq!(terminal_value, format!("v1:{}", "a".repeat(64)));
+    assert!(terminal_value.len() <= 128);
+    assert!(submit.contains(&terminal_name));
+    assert!(submit.contains(&terminal_value));
     let reject = dispatch.testing_submission_statement(true);
     assert!(reject.contains("THROW 51001"));
     assert!(reject.find("THROW 51001").unwrap() < reject.find("ADD DATABASE").unwrap());
@@ -353,6 +362,8 @@ fn mutation_surface_is_typed_and_contains_only_approved_stage_three_effects() {
     assert!(reconcile.contains("@LockTimeout=0"));
     assert!(reconcile.contains("N'ambiguous' AS dispatch_phase"));
     assert!(reconcile.contains("phase=N'failed_retryable'"));
+    assert!(reconcile.contains("master.sys.extended_properties"));
+    assert!(reconcile.contains("N'terminal'"));
 }
 
 #[test]

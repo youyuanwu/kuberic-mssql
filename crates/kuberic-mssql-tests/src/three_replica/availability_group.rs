@@ -915,11 +915,11 @@ async fn readiness_admin<R: ProcessRunner>(
     .map_err(AvailabilityGroupError::Admin)
 }
 
-fn availability_group_name(run: &TopologyRun) -> String {
+pub(crate) fn availability_group_name(run: &TopologyRun) -> String {
     format!("km_ag_{}", run.run_id)
 }
 
-fn database_name(run: &TopologyRun) -> String {
+pub(crate) fn database_name(run: &TopologyRun) -> String {
     format!("km_db_{}", run.run_id)
 }
 

@@ -2401,7 +2401,10 @@ impl SqlServerReplicator {
         evidence: SeedDispatchEvidence,
     ) -> Result<SeedDispatchRecord, KubericAdapterError> {
         let Some(mut record) = store.load().map_err(KubericAdapterError::SeedState)? else {
-            if evidence == SeedDispatchEvidence::Accepted {
+            if matches!(
+                evidence,
+                SeedDispatchEvidence::Accepted | SeedDispatchEvidence::Terminal
+            ) {
                 let mut accepted = context.record.clone();
                 accepted
                     .mark_accepted()
@@ -2413,7 +2416,7 @@ impl SqlServerReplicator {
         self.validate_seed_record(&record, &context.record)?;
         let previous_phase = record.phase();
         match evidence {
-            SeedDispatchEvidence::Accepted => {
+            SeedDispatchEvidence::Accepted | SeedDispatchEvidence::Terminal => {
                 if record.phase() != SeedDispatchPhase::Accepted {
                     record
                         .mark_accepted()
@@ -2535,6 +2538,39 @@ impl SqlServerReplicator {
                 }
             }
             None => {
+                let request = SeedDispatchRequest::new(
+                    context.binding.availability_group.name.clone(),
+                    context.binding.availability_group.group_id.clone(),
+                    context.database.name.clone(),
+                    context.database.database_guid.clone(),
+                    context.record.operation_token(),
+                )
+                .map_err(|_| {
+                    KubericAdapterError::NativeConvergenceUnsafe("seed dispatch operation token")
+                })?;
+                match self
+                    .reconcile_seed_dispatch_evidence(generation, deadline, &request)
+                    .await?
+                {
+                    SeedDispatchEvidence::Absent => {}
+                    SeedDispatchEvidence::Accepted | SeedDispatchEvidence::Terminal => {
+                        return Err(KubericAdapterError::NativeConvergenceConflict(
+                            "terminal seed dispatch source association",
+                        ));
+                    }
+                    SeedDispatchEvidence::Conflict => {
+                        return Err(KubericAdapterError::NativeConvergenceConflict(
+                            "seed dispatch SQL metadata",
+                        ));
+                    }
+                    SeedDispatchEvidence::Submitting
+                    | SeedDispatchEvidence::Ambiguous
+                    | SeedDispatchEvidence::FailedRetryable => {
+                        return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                            "seed dispatch SQL metadata exists without temporary application state",
+                        ));
+                    }
+                }
                 store
                     .create(&context.record)
                     .map_err(KubericAdapterError::SeedState)?;
@@ -2562,6 +2598,11 @@ impl SqlServerReplicator {
         let evidence = self
             .reconcile_seed_dispatch_evidence(generation, deadline, &request)
             .await?;
+        if evidence == SeedDispatchEvidence::Terminal {
+            return Err(KubericAdapterError::NativeConvergenceConflict(
+                "terminal seed dispatch source association",
+            ));
+        }
         record = self.persist_seed_dispatch_evidence(store.as_ref(), context, evidence)?;
         match record.phase() {
             SeedDispatchPhase::Accepted | SeedDispatchPhase::Ambiguous => {
@@ -2656,6 +2697,42 @@ impl SqlServerReplicator {
             }
             match association {
                 SourceAssociation::Exact(database) => {
+                    let operation_token = record.as_ref().map_or(
+                        context.record.operation_token(),
+                        SeedDispatchRecord::operation_token,
+                    );
+                    let request = SeedDispatchRequest::new(
+                        context.binding.availability_group.name.clone(),
+                        context.binding.availability_group.group_id.clone(),
+                        context.database.name.clone(),
+                        context.database.database_guid.clone(),
+                        operation_token,
+                    )
+                    .map_err(|_| {
+                        KubericAdapterError::NativeConvergenceUnsafe(
+                            "seed dispatch operation token",
+                        )
+                    })?;
+                    match self
+                        .reconcile_seed_dispatch_evidence(generation, deadline, &request)
+                        .await?
+                    {
+                        SeedDispatchEvidence::Terminal => {}
+                        SeedDispatchEvidence::Conflict => {
+                            return Err(KubericAdapterError::NativeConvergenceConflict(
+                                "terminal seed dispatch SQL metadata",
+                            ));
+                        }
+                        SeedDispatchEvidence::Absent
+                        | SeedDispatchEvidence::Submitting
+                        | SeedDispatchEvidence::Accepted
+                        | SeedDispatchEvidence::Ambiguous
+                        | SeedDispatchEvidence::FailedRetryable => {
+                            return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                                "terminal seed dispatch marker is not proven",
+                            ));
+                        }
+                    }
                     #[cfg(feature = "kuberic-testing")]
                     if record.is_some() {
                         bootstrap
@@ -2703,7 +2780,53 @@ impl SqlServerReplicator {
                         NativeConvergenceState::Absent | NativeConvergenceState::Incomplete => {}
                     }
                 }
-                SourceAssociation::Incomplete => {}
+                SourceAssociation::Incomplete => {
+                    if record
+                        .as_ref()
+                        .is_none_or(|record| record.phase() == SeedDispatchPhase::Accepted)
+                    {
+                        let operation_token = record.as_ref().map_or(
+                            context.record.operation_token(),
+                            SeedDispatchRecord::operation_token,
+                        );
+                        let request = SeedDispatchRequest::new(
+                            context.binding.availability_group.name.clone(),
+                            context.binding.availability_group.group_id.clone(),
+                            context.database.name.clone(),
+                            context.database.database_guid.clone(),
+                            operation_token,
+                        )
+                        .map_err(|_| {
+                            KubericAdapterError::NativeConvergenceUnsafe(
+                                "seed dispatch operation token",
+                            )
+                        })?;
+                        match self
+                            .reconcile_seed_dispatch_evidence(generation, deadline, &request)
+                            .await?
+                        {
+                            SeedDispatchEvidence::Accepted | SeedDispatchEvidence::Terminal => {
+                                return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                                    "terminal seed dispatch source association is incomplete",
+                                ));
+                            }
+                            SeedDispatchEvidence::Conflict => {
+                                return Err(KubericAdapterError::NativeConvergenceConflict(
+                                    "terminal seed dispatch SQL metadata",
+                                ));
+                            }
+                            SeedDispatchEvidence::Absent if record.is_none() => {}
+                            SeedDispatchEvidence::Absent
+                            | SeedDispatchEvidence::Submitting
+                            | SeedDispatchEvidence::Ambiguous
+                            | SeedDispatchEvidence::FailedRetryable => {
+                                return Err(KubericAdapterError::NativeConvergenceUnsafe(
+                                    "seed dispatch SQL metadata differs from temporary application state",
+                                ));
+                            }
+                        }
+                    }
+                }
                 SourceAssociation::Absent => {
                     let dispatch = match self
                         .arbitrate_seed_dispatch(generation, deadline, &context)

@@ -13,13 +13,15 @@ use kuberic_mssql::runtime_config::ObserverConfig;
 
 use super::availability_group::{
     AvailabilityGroupError, FrozenMemberVerifier, PreparedAvailabilityGroup, ProvisionContext,
-    ProvisionedAvailabilityGroup, finalize_prepared, prepare, provision,
+    ProvisionedAvailabilityGroup, availability_group_name, database_name, finalize_prepared,
+    prepare, provision,
 };
 use super::data::{
     DataContext, DataError, MarkerEvidence, prove_replicated_marker, verify_replicated_marker,
 };
 use crate::fixture::admin::{
     AdminDeadlines, AdminEndpoint, AdminError, AdminSession, LoginFiles, MemberReadinessEvidence,
+    validated_identifier,
 };
 use crate::fixture::cleanup::{
     CLEANUP_BUDGET, CleanupBackend, CleanupClock, CleanupCoordinator, CleanupError, CleanupReport,
@@ -93,7 +95,14 @@ impl LaunchedMembers {
     }
 
     pub async fn testing_set_primary_model_recovery_simple(&self) -> Result<(), AdminError> {
-        let member = &self.members[0];
+        let mut session = self.testing_admin_session(0).await?;
+        session
+            .execute("ALTER DATABASE [model] SET RECOVERY SIMPLE;", &[])
+            .await
+    }
+
+    async fn testing_admin_session(&self, index: usize) -> Result<AdminSession, AdminError> {
+        let member = self.members.get(index).ok_or(AdminError::MalformedResult)?;
         let endpoint = AdminEndpoint {
             tcp_host: "127.0.0.1".to_owned(),
             tls_hostname: "localhost".to_owned(),
@@ -108,11 +117,80 @@ impl LaunchedMembers {
             connect: self.context.config.deadlines().sql_connect,
             query: self.context.config.deadlines().sql_batch,
         };
-        let mut session =
-            AdminSession::connect_database(&endpoint, &login, deadlines, "master", false).await?;
-        session
-            .execute("ALTER DATABASE [model] SET RECOVERY SIMPLE;", &[])
+        AdminSession::connect_database(&endpoint, &login, deadlines, "master", false).await
+    }
+
+    pub async fn testing_remove_managed_database_association(&self) -> Result<(), AdminError> {
+        let group = availability_group_name(&self.run);
+        let database = database_name(&self.run);
+        validated_identifier(&group)?;
+        validated_identifier(&database)?;
+        self.testing_admin_session(0)
+            .await?
+            .execute(
+                &format!("ALTER AVAILABILITY GROUP [{group}] REMOVE DATABASE [{database}];"),
+                &[],
+            )
             .await
+    }
+
+    pub async fn testing_recreate_availability_group_without_database(
+        &self,
+    ) -> Result<(), AdminError> {
+        let group = availability_group_name(&self.run);
+        validated_identifier(&group)?;
+        for index in 1..3 {
+            self.testing_admin_session(index)
+                .await?
+                .execute(&format!("DROP AVAILABILITY GROUP [{group}];"), &[])
+                .await?;
+        }
+        self.testing_admin_session(0)
+            .await?
+            .execute(&format!("DROP AVAILABILITY GROUP [{group}];"), &[])
+            .await?;
+
+        let clauses = self
+            .run
+            .members
+            .iter()
+            .map(|member| {
+                format!(
+                    "N'{server}' WITH (ENDPOINT_URL = N'TCP://{server}:5022', \
+                     AVAILABILITY_MODE = SYNCHRONOUS_COMMIT, FAILOVER_MODE = EXTERNAL, \
+                     SEEDING_MODE = AUTOMATIC, SECONDARY_ROLE (ALLOW_CONNECTIONS = ALL))",
+                    server = member.server_name,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",\n");
+        self.testing_admin_session(0)
+            .await?
+            .execute(
+                &format!(
+                    "CREATE AVAILABILITY GROUP [{group}] \
+                     WITH (CLUSTER_TYPE = EXTERNAL, \
+                     REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 1) \
+                     FOR REPLICA ON {clauses}; \
+                     ALTER AVAILABILITY GROUP [{group}] GRANT CREATE ANY DATABASE;"
+                ),
+                &[],
+            )
+            .await?;
+        for index in 1..3 {
+            self.testing_admin_session(index)
+                .await?
+                .execute(
+                    &format!(
+                        "ALTER AVAILABILITY GROUP [{group}] \
+                         JOIN WITH (CLUSTER_TYPE = EXTERNAL); \
+                         ALTER AVAILABILITY GROUP [{group}] GRANT CREATE ANY DATABASE;"
+                    ),
+                    &[],
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     pub fn cleanup(mut self) -> Result<CleanupEvidence, CombinedFixtureError> {

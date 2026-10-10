@@ -530,6 +530,7 @@ async fn read_seed_dispatch_evidence(
                 "absent" => SeedDispatchEvidence::Absent,
                 "submitting" => SeedDispatchEvidence::Submitting,
                 "accepted" => SeedDispatchEvidence::Accepted,
+                "terminal" => SeedDispatchEvidence::Terminal,
                 "ambiguous" => SeedDispatchEvidence::Ambiguous,
                 "failed_retryable" => SeedDispatchEvidence::FailedRetryable,
                 "conflict" => SeedDispatchEvidence::Conflict,

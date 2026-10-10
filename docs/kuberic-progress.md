@@ -152,15 +152,20 @@ Kuberic's command/effect/build receipts and exact SQL Server postconditions
 remain the primary durable evidence. The application persists only the
 pre-association `Intent`/`Submitting`/`Accepted`/`Ambiguous`/
 `FailedRetryable` handshake under its existing application root; exact source
-association removes that temporary record. A schema-v1 `Dispatched` record is
-migrated conservatively to `Ambiguous`.
+association plus the exact terminal SQL marker removes that temporary record. A
+schema-v1 `Dispatched` record is migrated conservatively to `Ambiguous`.
 
 The owned source database retains one matching singleton dispatch row with a
 derived operation token, exact AG/database identities, and SQL-owned phase. A
-token-scoped SQL application lock distinguishes an active/ambiguous submission
-from a session that ended before any native effect. Accepted token or exact
-association evidence suppresses redispatch; proven pre-effect or definite SQL
-rejection becomes retryable instead of degrading into a later deadline. The
+group-scope SQL application lock distinguishes an active/ambiguous submission
+from a session that ended before any native effect. An accepted row or exact
+association evidence establishes one bounded terminal `master` extended
+property before file compaction. Its exact `v1:<operation-token>` value binds
+resource/configuration, AG GUID, source identity/lineage and SQL incarnation,
+and both authorized targets. Healthy replay is native-only; later association
+loss or database/AG recreation is terminal conflict/unsafe and cannot create a
+new intent or issue another `ADD DATABASE`. Proven pre-effect or definite SQL
+rejection remains retryable instead of degrading into a later deadline. The
 native bootstrap path also retains narrow database and AG creation
 handshakes. A deterministic scoped DDL trigger is persisted before each
 irreversible create; only the exact token-bearing typed statement can
@@ -271,7 +276,8 @@ seed/callback-publication interruption boundary, exact TDS checkpoints before
 request submission, after request submission, after SQL acceptance with a lost
 reply, and after definite SQL rejection, native
 AG/replica/endpoint/database/lineage/incarnation conflicts through real
-callbacks, exact cleanup, and successful same-root retries.
+callbacks, post-compaction association removal and AG recreation with zero
+redispatch, exact cleanup, and successful same-root retries.
 
 The workspace tracks Kuberic `main`, with `Cargo.lock` recording the exact
 revision used by locked builds. The current pin

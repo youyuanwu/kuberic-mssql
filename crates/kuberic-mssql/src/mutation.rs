@@ -116,6 +116,7 @@ pub enum SeedDispatchEvidence {
     Absent,
     Submitting,
     Accepted,
+    Terminal,
     Ambiguous,
     FailedRetryable,
     Conflict,
@@ -173,14 +174,55 @@ impl SeedDispatchRequest {
         self.submission_statement(inject_definite_rejection)
     }
 
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_terminal_marker(&self) -> (String, String) {
+        (self.terminal_marker_name(), self.terminal_marker_value())
+    }
+
     pub(crate) fn reconciliation_statement(&self) -> String {
         let table = format!("{}.dbo.kuberic_seed_dispatch", self.database.quoted());
         let token = sql_literal(&self.operation_token);
-        let lock = sql_literal(&format!("kuberic-seed-{}", self.operation_token));
+        let marker_name = sql_literal(&self.terminal_marker_name());
+        let marker_value = sql_literal(&self.terminal_marker_value());
+        let lock = sql_literal(&self.terminal_lock_name());
         let association = self.exact_association_predicate();
         format!(
-            "IF OBJECT_ID(N'{table}', N'U') IS NULL\n\
+            "DECLARE @terminal_value nvarchar(128) = (SELECT CONVERT(nvarchar(128), value) \
+             FROM master.sys.extended_properties WHERE class=0 AND name=N'{marker_name}');\n\
+             IF @terminal_value IS NOT NULL\n\
              BEGIN\n\
+             SELECT CASE WHEN @terminal_value=N'{marker_value}' \
+             THEN N'terminal' ELSE N'conflict' END AS dispatch_phase;\n\
+             RETURN;\n\
+             END;\n\
+             IF OBJECT_ID(N'{table}', N'U') IS NULL\n\
+             BEGIN\n\
+             IF {association}\n\
+             BEGIN\n\
+             DECLARE @missing_lock_result int;\n\
+             EXEC @missing_lock_result = sys.sp_getapplock @Resource=N'{lock}', \
+             @LockMode=N'Exclusive', @LockOwner=N'Session', @LockTimeout=0;\n\
+             IF @missing_lock_result < 0\n\
+             BEGIN\n\
+             SELECT N'ambiguous' AS dispatch_phase;\n\
+             RETURN;\n\
+             END;\n\
+             IF EXISTS (SELECT 1 FROM master.sys.extended_properties WHERE class=0 \
+             AND name=N'{marker_name}' AND CONVERT(nvarchar(128), value)<>N'{marker_value}')\n\
+             BEGIN\n\
+             EXEC sys.sp_releaseapplock @Resource=N'{lock}', @LockOwner=N'Session';\n\
+             SELECT N'conflict' AS dispatch_phase;\n\
+             RETURN;\n\
+             END;\n\
+             IF NOT EXISTS (SELECT 1 FROM master.sys.extended_properties \
+             WHERE class=0 AND name=N'{marker_name}')\n\
+             EXEC master.sys.sp_addextendedproperty \
+             @name=N'{marker_name}', @value=N'{marker_value}';\n\
+             EXEC sys.sp_releaseapplock @Resource=N'{lock}', @LockOwner=N'Session';\n\
+             SELECT N'terminal' AS dispatch_phase;\n\
+             RETURN;\n\
+             END;\n\
              SELECT N'absent' AS dispatch_phase;\n\
              RETURN;\n\
              END;\n\
@@ -203,11 +245,6 @@ impl SeedDispatchRequest {
              RETURN;\n\
              END;\n\
              DECLARE @phase nvarchar(32) = (SELECT phase FROM {table} WHERE singleton = 1);\n\
-             IF @phase = N'accepted'\n\
-             BEGIN\n\
-             SELECT N'accepted' AS dispatch_phase;\n\
-             RETURN;\n\
-             END;\n\
              DECLARE @lock_result int;\n\
              EXEC @lock_result = sys.sp_getapplock @Resource=N'{lock}', \
              @LockMode=N'Exclusive', @LockOwner=N'Session', @LockTimeout=0;\n\
@@ -216,10 +253,21 @@ impl SeedDispatchRequest {
              SELECT N'ambiguous' AS dispatch_phase;\n\
              RETURN;\n\
              END;\n\
-             IF {association}\n\
+             SET @terminal_value = (SELECT CONVERT(nvarchar(128), value) \
+             FROM master.sys.extended_properties WHERE class=0 AND name=N'{marker_name}');\n\
+             IF @terminal_value IS NOT NULL AND @terminal_value<>N'{marker_value}'\n\
              BEGIN\n\
+             EXEC sys.sp_releaseapplock @Resource=N'{lock}', @LockOwner=N'Session';\n\
+             SELECT N'conflict' AS dispatch_phase;\n\
+             RETURN;\n\
+             END;\n\
+             IF {association} OR @phase=N'accepted'\n\
+             BEGIN\n\
+             IF @terminal_value IS NULL\n\
+             EXEC master.sys.sp_addextendedproperty \
+             @name=N'{marker_name}', @value=N'{marker_value}';\n\
              UPDATE {table} SET phase=N'accepted', error_code=NULL WHERE singleton=1;\n\
-             SET @phase=N'accepted';\n\
+             SET @phase=N'terminal';\n\
              END\n\
              ELSE IF @phase IN (N'intent', N'submitting', N'ambiguous')\n\
              BEGIN\n\
@@ -236,7 +284,9 @@ impl SeedDispatchRequest {
     pub(crate) fn submission_statement(&self, inject_definite_rejection: bool) -> String {
         let table = format!("{}.dbo.kuberic_seed_dispatch", self.database.quoted());
         let token = sql_literal(&self.operation_token);
-        let lock = sql_literal(&format!("kuberic-seed-{}", self.operation_token));
+        let marker_name = sql_literal(&self.terminal_marker_name());
+        let marker_value = sql_literal(&self.terminal_marker_value());
+        let lock = sql_literal(&self.terminal_lock_name());
         let association = self.exact_association_predicate();
         let rejection = if inject_definite_rejection {
             "THROW 51001, N'injected definite seed dispatch rejection', 1;"
@@ -244,7 +294,15 @@ impl SeedDispatchRequest {
             ""
         };
         format!(
-            "IF OBJECT_ID(N'{table}', N'U') IS NULL\n\
+            "DECLARE @terminal_value nvarchar(128) = (SELECT CONVERT(nvarchar(128), value) \
+             FROM master.sys.extended_properties WHERE class=0 AND name=N'{marker_name}');\n\
+             IF @terminal_value IS NOT NULL\n\
+             BEGIN\n\
+             SELECT CASE WHEN @terminal_value=N'{marker_value}' \
+             THEN N'terminal' ELSE N'conflict' END AS dispatch_phase;\n\
+             RETURN;\n\
+             END;\n\
+             IF OBJECT_ID(N'{table}', N'U') IS NULL\n\
              BEGIN\n\
              CREATE TABLE {table}(\
              singleton tinyint NOT NULL CONSTRAINT PK_kuberic_seed_dispatch PRIMARY KEY \
@@ -270,10 +328,21 @@ impl SeedDispatchRequest {
              EXEC @lock_result = sys.sp_getapplock @Resource=N'{lock}', \
              @LockMode=N'Exclusive', @LockOwner=N'Session', @LockTimeout=0;\n\
              IF @lock_result < 0 THROW 51000, N'seed dispatch operation is already submitting', 1;\n\
-             IF EXISTS (SELECT 1 FROM {table} WHERE singleton=1 AND phase=N'accepted')\n\
+             SET @terminal_value = (SELECT CONVERT(nvarchar(128), value) \
+             FROM master.sys.extended_properties WHERE class=0 AND name=N'{marker_name}');\n\
+             IF @terminal_value IS NOT NULL\n\
              BEGIN\n\
              EXEC sys.sp_releaseapplock @Resource=N'{lock}', @LockOwner=N'Session';\n\
-             SELECT N'accepted' AS dispatch_phase;\n\
+             SELECT CASE WHEN @terminal_value=N'{marker_value}' \
+             THEN N'terminal' ELSE N'conflict' END AS dispatch_phase;\n\
+             RETURN;\n\
+             END;\n\
+             IF EXISTS (SELECT 1 FROM {table} WHERE singleton=1 AND phase=N'accepted')\n\
+             BEGIN\n\
+             EXEC master.sys.sp_addextendedproperty \
+             @name=N'{marker_name}', @value=N'{marker_value}';\n\
+             EXEC sys.sp_releaseapplock @Resource=N'{lock}', @LockOwner=N'Session';\n\
+             SELECT N'terminal' AS dispatch_phase;\n\
              RETURN;\n\
              END;\n\
              UPDATE {table} SET phase=N'submitting', error_code=NULL WHERE singleton=1;\n\
@@ -281,14 +350,22 @@ impl SeedDispatchRequest {
              BEGIN TRY\n\
              {rejection}\n\
              ALTER AVAILABILITY GROUP {availability_group} ADD DATABASE {database};\n\
+             EXEC master.sys.sp_addextendedproperty \
+             @name=N'{marker_name}', @value=N'{marker_value}';\n\
              UPDATE {table} SET phase=N'accepted', error_code=NULL WHERE singleton=1;\n\
              EXEC sys.sp_releaseapplock @Resource=N'{lock}', @LockOwner=N'Session';\n\
-             SELECT N'accepted' AS dispatch_phase;\n\
+             SELECT N'terminal' AS dispatch_phase;\n\
              END TRY\n\
              BEGIN CATCH\n\
              DECLARE @error_number int = ERROR_NUMBER();\n\
              IF {association}\n\
+             BEGIN\n\
+             IF NOT EXISTS (SELECT 1 FROM master.sys.extended_properties \
+             WHERE class=0 AND name=N'{marker_name}')\n\
+             EXEC master.sys.sp_addextendedproperty \
+             @name=N'{marker_name}', @value=N'{marker_value}';\n\
              UPDATE {table} SET phase=N'accepted', error_code=NULL WHERE singleton=1;\n\
+             END\n\
              ELSE\n\
              UPDATE {table} SET phase=N'failed_retryable', error_code=@error_number WHERE singleton=1;\n\
              EXEC sys.sp_releaseapplock @Resource=N'{lock}', @LockOwner=N'Session';\n\
@@ -299,6 +376,31 @@ impl SeedDispatchRequest {
             availability_group = self.availability_group.quoted(),
             database = self.database.quoted(),
         )
+    }
+
+    fn terminal_marker_name(&self) -> String {
+        format!("kuberic_seed_terminal_v1_{}", self.terminal_scope_digest())
+    }
+
+    fn terminal_marker_value(&self) -> String {
+        format!("v1:{}", self.operation_token)
+    }
+
+    fn terminal_lock_name(&self) -> String {
+        format!("kuberic-seed-terminal-{}", self.terminal_scope_digest())
+    }
+
+    fn terminal_scope_digest(&self) -> String {
+        let mut digest = Sha256::new();
+        for value in [
+            "kuberic-mssql-seed-terminal-scope-v1",
+            self.availability_group.as_str(),
+            self.database.as_str(),
+        ] {
+            digest.update(value.as_bytes());
+            digest.update(b"\0");
+        }
+        hex(&digest.finalize())
     }
 
     fn exact_association_predicate(&self) -> String {

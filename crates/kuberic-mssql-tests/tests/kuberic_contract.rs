@@ -148,6 +148,89 @@ struct RejectOnceSeedExecutor {
     executions: AtomicUsize,
 }
 
+struct TerminalSeedMutationExecutor {
+    associated: Arc<AtomicBool>,
+    terminal: Arc<AtomicBool>,
+    executions: AtomicUsize,
+}
+
+struct TerminalSeedSource {
+    config: ObserverConfig,
+    associated: Arc<AtomicBool>,
+    replaced_group: Arc<AtomicBool>,
+}
+
+fn seed_terminal_evidence(complete: &AtomicBool) -> SeedDispatchEvidence {
+    if complete.load(Ordering::SeqCst) {
+        SeedDispatchEvidence::Terminal
+    } else {
+        SeedDispatchEvidence::Absent
+    }
+}
+
+#[async_trait]
+impl SqlMutationExecutor for TerminalSeedMutationExecutor {
+    async fn observe_standalone_database(
+        &self,
+        _database: &SqlIdentifier,
+    ) -> Result<Option<StandaloneDatabaseSnapshot>, RuntimeError> {
+        Ok(Some(owned_standalone_database()))
+    }
+
+    async fn reconcile_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        Ok(if self.terminal.load(Ordering::SeqCst) {
+            SeedDispatchEvidence::Terminal
+        } else {
+            SeedDispatchEvidence::Absent
+        })
+    }
+
+    async fn submit_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        self.terminal.store(true, Ordering::SeqCst);
+        self.associated.store(true, Ordering::SeqCst);
+        Ok(SeedDispatchEvidence::Terminal)
+    }
+
+    async fn execute(&self, _effect: &MutationEffect) -> Result<(), RuntimeError> {
+        unreachable!("terminal seed executor uses submit_seed_dispatch")
+    }
+
+    async fn observe_effect_completion(
+        &self,
+        effect: &MutationEffect,
+    ) -> Result<bool, RuntimeError> {
+        Ok(effect.label() == "grant create any database")
+    }
+}
+
+#[async_trait]
+impl SqlServerObservationSource for TerminalSeedSource {
+    fn observer_config(&self) -> &ObserverConfig {
+        &self.config
+    }
+
+    async fn observe(&self) -> Result<Observation<InstanceSnapshot>, RuntimeError> {
+        let mut snapshot = if self.associated.load(Ordering::SeqCst) {
+            seeded_source_snapshot()
+        } else {
+            bootstrap_membership_snapshot(0)
+        };
+        if self.replaced_group.load(Ordering::SeqCst)
+            && let Observation::Present { value: group, .. } = &mut snapshot.availability_group
+        {
+            group.identity.group_id = guid("99999999-9999-4999-8999-999999999999");
+        }
+        Ok(present(snapshot))
+    }
+}
+
 #[async_trait]
 impl SqlMutationExecutor for GatedSeedMutationExecutor {
     async fn observe_standalone_database(
@@ -185,6 +268,13 @@ impl SqlMutationExecutor for GatedSeedMutationExecutor {
         effect: &MutationEffect,
     ) -> Result<bool, RuntimeError> {
         Ok(effect.label() == "grant create any database")
+    }
+
+    async fn reconcile_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        Ok(seed_terminal_evidence(&self.complete))
     }
 }
 
@@ -256,6 +346,13 @@ impl SqlMutationExecutor for AcceptedReplyLostSeedExecutor {
         unreachable!("seed protocol executor uses submit_seed_dispatch")
     }
 
+    async fn reconcile_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        Ok(seed_terminal_evidence(&self.complete))
+    }
+
     async fn observe_effect_completion(
         &self,
         effect: &MutationEffect,
@@ -288,8 +385,15 @@ impl SqlMutationExecutor for RejectOnceSeedExecutor {
             Err(error)
         } else {
             self.complete.store(true, Ordering::SeqCst);
-            Ok(SeedDispatchEvidence::Accepted)
+            Ok(SeedDispatchEvidence::Terminal)
         }
+    }
+
+    async fn reconcile_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        Ok(seed_terminal_evidence(&self.complete))
     }
 
     async fn execute(&self, _effect: &MutationEffect) -> Result<(), RuntimeError> {
@@ -325,6 +429,13 @@ impl SqlMutationExecutor for SeedMutationExecutor {
         effect: &MutationEffect,
     ) -> Result<bool, RuntimeError> {
         Ok(effect.label() == "grant create any database")
+    }
+
+    async fn reconcile_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        Ok(seed_terminal_evidence(&self.complete))
     }
 }
 
@@ -397,6 +508,13 @@ impl SqlMutationExecutor for ScriptedMutationExecutor {
         effect: &MutationEffect,
     ) -> Result<bool, RuntimeError> {
         Ok(effect.label() == "grant create any database")
+    }
+
+    async fn reconcile_seed_dispatch(
+        &self,
+        _request: &SeedDispatchRequest,
+    ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        Ok(SeedDispatchEvidence::Terminal)
     }
 }
 
@@ -2379,6 +2497,45 @@ fn seed_replicator_with_executor(
     )
 }
 
+fn terminal_seed_replicator(
+    root: std::path::PathBuf,
+) -> (
+    Arc<SqlServerReplicator>,
+    Arc<TerminalSeedMutationExecutor>,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+) {
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let associated = Arc::new(AtomicBool::new(false));
+    let replaced_group = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(TerminalSeedMutationExecutor {
+        associated: associated.clone(),
+        terminal: Arc::new(AtomicBool::new(false)),
+        executions: AtomicUsize::new(0),
+    });
+    let replicator = Arc::new(
+        SqlServerReplicator::new_bootstrap_with_topology(
+            SqlServerServiceConfig::new(ResourceUid::new("resource-a"), "replica-1.example:5022")
+                .unwrap(),
+            Arc::new(TerminalSeedSource {
+                config: observer_config(),
+                associated: associated.clone(),
+                replaced_group: replaced_group.clone(),
+            }),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+            kuberic_identity(1),
+            topology_expectation(),
+            SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
+            executor.clone(),
+            root,
+        )
+        .unwrap(),
+    );
+    (replicator, executor, associated, replaced_group)
+}
+
 async fn admit_seed_replicator(replicator: &SqlServerReplicator) {
     admit_seed_replicator_with_sessions(replicator, "session").await;
 }
@@ -4164,10 +4321,10 @@ async fn accepted_sql_with_lost_reply_replays_from_native_evidence_without_redis
         executor.clone() as Arc<dyn SqlMutationExecutor>,
     );
     admit_seed_replicator(&replicator).await;
-    let first = replicator
+    replicator
         .build_replica(target_build(1, "accepted-reply-lost"))
-        .await;
-    assert!(first.is_err());
+        .await
+        .unwrap();
     replicator
         .build_replica(target_build(1, "accepted-reply-lost"))
         .await
@@ -4342,6 +4499,63 @@ async fn compaction_checkpoint_fences_stale_callback_and_replacement_redispatch(
 }
 
 #[tokio::test]
+async fn terminal_marker_rejects_post_compaction_source_association_loss_without_redispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, associated, _) = terminal_seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+    replicator
+        .build_replica(target_build(1, "terminal-association-owner"))
+        .await
+        .unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+
+    associated.store(false, Ordering::SeqCst);
+    let message = application_error(
+        replicator
+            .build_replica(target_build(2, "terminal-association-lost"))
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        message.contains("terminal seed dispatch source association"),
+        "{message}"
+    );
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn terminal_marker_rejects_post_compaction_availability_group_recreation_without_redispatch()
+{
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, _, replaced_group) =
+        terminal_seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+    replicator
+        .build_replica(target_build(1, "terminal-group-owner"))
+        .await
+        .unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+
+    replaced_group.store(true, Ordering::SeqCst);
+    let message = application_error(
+        replicator
+            .build_replica(target_build(2, "terminal-group-recreated"))
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        message.contains("availability group differs")
+            || message.contains("availability-group ownership"),
+        "{message}"
+    );
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
 async fn restart_compacts_a_dispatch_crashed_after_source_association_before_removal() {
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -4381,7 +4595,7 @@ async fn restart_compacts_a_dispatch_crashed_after_source_association_before_rem
 }
 
 #[tokio::test]
-async fn later_incomplete_target_with_no_record_waits_without_redispatch() {
+async fn later_incomplete_target_with_terminal_marker_waits_without_redispatch() {
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut partial = seeded_source_snapshot();

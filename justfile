@@ -99,6 +99,14 @@ test-live-three-replica-conflicts root="target/mssql-three-replica-conflicts":
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
         three_replica_mssql_native_conflict_matrix -- --ignored --exact --test-threads=1 --nocapture
 
+# Reject post-compaction association removal and AG recreation without redispatch.
+test-live-three-replica-terminal-seed root="target/mssql-three-replica-terminal-seed":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
+        three_replica_mssql_terminal_seed_conflicts -- --ignored --exact --test-threads=1 --nocapture
+
 # Recover and remove only the exactly journaled real three-member topology.
 cleanup-live-three-replica root="target/mssql-three-replica":
     env -u SQLSERVER_TEST_EULA_ACCEPTED CARGO_BUILD_JOBS=1 \

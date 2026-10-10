@@ -299,12 +299,15 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
     assert!(justfile.contains(
         "test-live-three-replica-conflicts root=\"target/mssql-three-replica-conflicts\":"
     ));
+    assert!(justfile.contains(
+        "test-live-three-replica-terminal-seed root=\"target/mssql-three-replica-terminal-seed\":"
+    ));
     assert_eq!(
         justfile
             .lines()
             .filter(|line| line.contains("env -u SQLSERVER_TEST_EULA_ACCEPTED"))
             .count(),
-        10
+        11
     );
     assert!(!justfile.contains("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT"));
     assert!(!justfile.contains("acknowledgement root="));
@@ -328,6 +331,9 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
     ));
     assert!(justfile.contains(
         "three_replica_mssql_native_conflict_matrix -- --ignored --exact --test-threads=1 --nocapture"
+    ));
+    assert!(justfile.contains(
+        "three_replica_mssql_terminal_seed_conflicts -- --ignored --exact --test-threads=1 --nocapture"
     ));
 
     for recipe in ["default: check", "check: fmt-check clippy test"] {

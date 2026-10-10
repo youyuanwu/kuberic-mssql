@@ -292,9 +292,15 @@ journal. Callback-visible authority and Kuberic's retained command/build
 evidence are reconciled with exact native SQL postconditions; only the bounded
 pre-association seed-dispatch ambiguity uses application metadata. Its durable
 file phases distinguish intent, submitting, accepted/ambiguous, and definite
-retryable failure. A matching singleton SQL-owned token row and token-scoped
+retryable failure. A matching singleton SQL-owned token row and group-scoped
 application lock prove acceptance, active ambiguity, or a safe pre-effect
 retry; a local `Submitting` phase never claims that SQL accepted the request.
+Before temporary file compaction, SQL also retains one scope-named terminal
+extended property in `master`. Its exact token binds the resource,
+configuration, AG GUID, source database identity/lineage, SQL incarnation and
+authorized targets. Once present, later association loss or database/AG
+recreation is terminal conflict/unsafe and can never trigger another
+`ADD DATABASE`.
 The existing
 canonical signatures and approval/fence bindings remain contracts for later
 command transport. Observation JSON is output, not an authenticated command
@@ -458,6 +464,7 @@ just test-live-three-replica-signal target/my-mssql-three-replica-signal
 just test-live-three-replica-recovery target/my-mssql-three-replica-recovery
 just test-live-three-replica-faults target/my-mssql-three-replica-faults
 just test-live-three-replica-conflicts target/my-mssql-three-replica-conflicts
+just test-live-three-replica-terminal-seed target/my-mssql-three-replica-terminal-seed
 ```
 
 Cleanup removes only exactly journaled resources. Foreign, replaced, or
@@ -471,7 +478,10 @@ native-completion, and callback-publication boundaries. It verifies convergence
 without duplicate bootstrap work or seed dispatch. The conflict recipe drives
 AG, replica, endpoint, database, lineage and SQL process-incarnation conflicts
 through real callback validators sequentially. Every scenario performs exact,
-idempotent cleanup.
+idempotent cleanup. The terminal-seed recipe removes a compacted source
+association and separately recreates the AG, then proves terminal
+conflict/unsafe classification, zero redispatch, no recreated temporary intent,
+and exact cleanup.
 
 Direct test commands remain available:
 

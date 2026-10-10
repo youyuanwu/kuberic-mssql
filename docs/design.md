@@ -363,17 +363,22 @@ properties for AG creation intent and the exact SQL-generated AG GUID. It also
 retains one singleton `dbo.kuberic_seed_dispatch` row containing a derived
 64-character operation token, the exact AG/database identities, and the native
 submission phase. This is bounded operation metadata, not a general command or
-result ledger.
+result ledger. After SQL accepts the group dispatch, one scope-named
+`master` extended property retains `v1:<operation-token>` as the terminal
+group marker. The token binds resource/configuration identity, AG name and
+GUID, source database identity and lineage, source SQL incarnation, and both
+authorized target identities.
 
 The file record binds exact authority and native identities and distinguishes
 `Intent`, `Submitting`, `Accepted`, genuinely `Ambiguous`, and
 `FailedRetryable`. `Submitting` alone never suppresses another attempt after a
-restart. The SQL batch takes a token-scoped session application lock, publishes
+restart. The SQL batch takes a group-scope session application lock, publishes
 `submitting` before `ALTER AVAILABILITY GROUP ... ADD DATABASE`, and writes
-`accepted` or `failed_retryable` before releasing that lock. Recovery can
-acquire the same lock to prove the old submitting session is gone: exact native
-association or an accepted token suppresses redispatch, a held lock is
-ambiguous, and an absent effect after lock acquisition is definitely retryable.
+the terminal marker plus `accepted`, or `failed_retryable`, before releasing
+that lock. Recovery can acquire the same lock to prove the old submitting
+session is gone: exact native association or an accepted row can establish the
+terminal marker without redispatch, a held lock is ambiguous, and an absent
+effect after lock acquisition is definitely retryable.
 Schema-v1 file records migrate conservatively: old `Dispatched` becomes
 `Ambiguous`, never accepted by assertion.
 
@@ -382,7 +387,11 @@ markers to match the resource, accepted configuration, AG name, and observed
 GUID; an unmarked same-name AG or a same-name replacement with another GUID is
 a terminal conflict rather than an adoption candidate. The temporary file
 record is removed as soon as exact source database-to-AG association proves the
-accepted operation. Previous/current
+terminal marker and accepted operation. Healthy later builds replay from the
+terminal marker and exact native state only. Once terminal, absent or incomplete
+source association, source database identity/lineage replacement, or AG GUID
+replacement is conflicting or unsafe and cannot create another intent or issue
+another `ADD DATABASE`. Previous/current
 transitions, catch-up quorum, removal, data loss, destructive recovery, failover
 and lease behavior remain explicit unsupported errors.
 
@@ -399,10 +408,11 @@ application-owned checksummed metadata, and PGDATA. MSSQL applies the same
 ownership discipline with Kuberic authority, native SQL state, the immutable
 runtime binding, the AG identity marker in the owned source database, and one
 bounded seed-dispatch file under the existing application root plus one
-singleton SQL-owned dispatch row. Those records exist only for the demonstrated
-pre-association ambiguity; the AG marker only binds creation ownership and
-native identity. No general second operation database or result ledger was
-added.
+singleton SQL-owned dispatch row. The file is temporary ambiguity state; one
+bounded terminal extended property remains in `master` after compaction so
+loss or recreation of the source database or AG cannot reopen dispatch. The AG
+marker only binds creation ownership and native identity. No general second
+operation database or result ledger was added.
 
 Bootstrap SQL is level-triggered at statement granularity. Scoped native DDL
 triggers persist the exact resource/configuration-derived creation intent before
