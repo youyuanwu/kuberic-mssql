@@ -4051,7 +4051,7 @@ impl PrimaryReplicator for SqlServerReplicator {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if admitted.as_ref().is_some_and(configuration_is_complete) {
-                    validate_current_configuration(&binding, &current)?;
+                    validate_bootstrap_configuration_replay(&binding, &current)?;
                     true
                 } else {
                     false
@@ -5143,6 +5143,21 @@ fn validate_current_configuration(
     binding: &HealthyTopologyBinding,
     current: &ReplicaSetConfiguration,
 ) -> Result<(), KubericAdapterError> {
+    validate_configuration_replay(binding, current, false)
+}
+
+fn validate_bootstrap_configuration_replay(
+    binding: &HealthyTopologyBinding,
+    current: &ReplicaSetConfiguration,
+) -> Result<(), KubericAdapterError> {
+    validate_configuration_replay(binding, current, true)
+}
+
+fn validate_configuration_replay(
+    binding: &HealthyTopologyBinding,
+    current: &ReplicaSetConfiguration,
+    allow_remote_omissions: bool,
+) -> Result<(), KubericAdapterError> {
     if current.configuration != binding.configuration {
         return Err(KubericAdapterError::TopologyBindingMismatch(
             "current descriptor differs from the frozen descriptor",
@@ -5165,8 +5180,12 @@ fn validate_current_configuration(
             ));
         }
         let replica = matching[0];
-        if replica.process_session_id != member.process_session_id
-            || replica.replication_address != member.replication_address
+        let remote_omission =
+            allow_remote_omissions && member.kuberic_identity != binding.local_identity;
+        if (replica.process_session_id != member.process_session_id
+            && !(remote_omission && replica.process_session_id.is_empty()))
+            || (replica.replication_address != member.replication_address
+                && !(remote_omission && replica.replication_address.is_empty()))
             || (!matches!(replica.role, ReplicaRole::None) && replica.role != member.stable_role)
         {
             return Err(KubericAdapterError::TopologyBindingMismatch(
@@ -5279,7 +5298,7 @@ fn build_enriched_configuration(
             "build-enriched current configuration contains an unknown replica",
         ));
     }
-    validate_current_configuration(
+    validate_bootstrap_configuration_replay(
         binding,
         &ReplicaSetConfiguration {
             configuration: current.configuration.clone(),

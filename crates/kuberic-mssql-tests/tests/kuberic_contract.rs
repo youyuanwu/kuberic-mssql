@@ -1719,11 +1719,19 @@ async fn explicit_bootstrap_path_assigns_exact_effect_ownership_and_replays_from
             Ok(present(bootstrap_membership_snapshot_with_sequence(
                 0, "43",
             ))),
+            Ok(present(bootstrap_membership_snapshot_with_sequence(
+                0, "43",
+            ))),
+            Ok(present(bootstrap_membership_snapshot_with_sequence(
+                0, "43",
+            ))),
         ],
         vec![
             Ok(None),
             Ok(Some(owned_standalone_database_without_group_intent())),
             Ok(Some(owned_standalone_database_with_group_intent())),
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
             Ok(Some(owned_standalone_database())),
             Ok(Some(owned_standalone_database())),
             Ok(Some(owned_standalone_database())),
@@ -1734,6 +1742,20 @@ async fn explicit_bootstrap_path_assigns_exact_effect_ownership_and_replays_from
         .update_current_replica_set_configuration(bound_replica_set())
         .await
         .unwrap();
+    let mut omitted_remote_transport = bound_replica_set();
+    for replica in &mut omitted_remote_transport.replicas[1..] {
+        replica.process_session_id = ProcessSessionId::default();
+        replica.replication_address.clear();
+        replica.role = ReplicaRole::None;
+    }
+    primary
+        .update_current_replica_set_configuration(omitted_remote_transport)
+        .await
+        .unwrap();
+    let admitted = primary.admitted_topology().unwrap();
+    assert!(admitted.members()[1..].iter().all(|member| {
+        !member.process_session_id().is_empty() && !member.replication_address().is_empty()
+    }));
     primary
         .update_current_replica_set_configuration(bound_replica_set())
         .await

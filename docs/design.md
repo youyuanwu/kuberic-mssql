@@ -351,8 +351,9 @@ numbers to SQL Server names and AG endpoint URLs. The current-configuration
 callback supplies dynamic full identities, roles, sessions and addresses.
 Fresh SQL evidence freezes native replica GUIDs, AG/database lineage and the
 local SQL process start. Bootstrap callbacks may omit remote transport
-descriptions; those fields permit only one-way completion, followed by exact
-replay.
+descriptions. Complete values freeze the binding. Later callbacks may omit
+remote session or address projections, but cannot clear the frozen values; any
+supplied value must still match exactly.
 
 The application persists a schema-versioned non-secret runtime binding and,
 only while native SQL cannot prove whether group seeding was dispatched, one

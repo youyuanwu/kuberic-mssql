@@ -99,10 +99,11 @@ and the callback's full identities, roles, process sessions and replication
 addresses.
 
 Kuberic can deliver the bootstrap callback before remote sessions are known.
-Empty remote descriptions may be completed in one direction; after completion,
-replay is value-identical. SQL Server process incarnation is local evidence:
-each runtime freezes and revalidates its own start identity, while the
-three-member validation proves all members collectively.
+Complete remote descriptions freeze the binding. Later callbacks may omit a
+remote session or address projection without clearing that binding, while every
+supplied value must still match exactly. SQL Server process incarnation is
+local evidence: each runtime freezes and revalidates its own start identity,
+while the three-member validation proves all members collectively.
 
 `catch_up_capability` is reported as a fresh configuration sequence equal to
 current progress after native topology admission. It does not depend on remote
