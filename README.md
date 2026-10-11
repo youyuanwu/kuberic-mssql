@@ -351,6 +351,19 @@ just check
 Builds default to one job; an explicitly supplied `CARGO_BUILD_JOBS` is
 preserved. Licensed live tests remain ignored during ordinary Cargo execution.
 
+Future Kuberic candidates have a separate server-free readiness group and a
+versioned intake-record validator:
+
+```bash
+just test-kuberic-readiness
+just validate-kuberic-release-intake /absolute/path/to/intake.json
+```
+
+See [Kuberic release intake](docs/kuberic-release-intake.md). A current-pin
+baseline can be confirmed without licensed fixtures, but a candidate cannot be
+ready to pin while any candidate-required live or target-contract gate remains
+pending.
+
 ```bash
 cargo fmt --all -- --check
 cargo test --locked --workspace --all-features

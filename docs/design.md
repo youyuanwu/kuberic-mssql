@@ -247,6 +247,13 @@ includes both the database GUID and recovery-fork GUID. A safe upstream
 external-native progress contract is a prerequisite before MSSQL can participate
 in controller operations that compare first/last progress.
 
+The production crate now exposes repository-owned native history positions for
+future adapter integration. A position binds one exact decimal value to one
+field and one database/recovery lineage. Comparison returns ordering only when
+both positions have the same field and exact lineage. Missing positions remain
+unavailable; missing or different lineage and cross-field comparisons are
+non-orderable. These types never convert native positions into Kuberic progress.
+
 ## Command Contract
 
 Each SQL Server operation is bound to:
@@ -379,6 +386,21 @@ contract. MSSQL's initial declaration will keep catch-up-specific quorum
 unsupported and will use `ReplaceOnAmbiguity` for data-loss replay. Stage 3
 behavior under the current pin remains unchanged until upstream Kuberic
 implements the aligned contract.
+
+Current-pin DTO interpretation is contained in a compatibility component under
+the Kuberic adapter. It owns validation, normalization, local bootstrap
+ownership, desired SQL descriptors, replay/enrichment, topology admission, and
+build-target facts. SQL-native convergence classifiers no longer import or
+interpret Kuberic replica-set DTOs. This changes reachability, not semantics:
+the existing callbacks, errors, mutation order, seed record/token, target
+evidence, and persisted formats remain unchanged.
+
+The unpublished test crate owns a versioned release-intake profile and CLI. It
+separates executable current evidence, adapter-owned neutral facts, current-pin
+gaps, and release-blocked target gates. In particular, role before primary
+configuration and a newer same-role secondary epoch remain release-blocked
+under the current pin rather than being reported as present conformance. See
+[Kuberic release intake](kuberic-release-intake.md).
 
 The application persists a schema-versioned non-secret runtime binding and,
 only while native SQL cannot prove whether group seeding was dispatched, one

@@ -151,6 +151,32 @@ licensed-validation-only and is not that production transport. The eventual
 cutover must start from fresh public-only protocol state rather than reusing
 retained Stage 3 bootstrap callback state as the future mutation protocol.
 
+Current-pin configuration and build DTO interpretation is now localized under
+the Kuberic adapter. That compatibility component produces the existing local
+ownership, member, descriptor, topology-binding, and build-target facts before
+SQL-native classification. Native bootstrap classifiers do not consume
+Kuberic replica-set DTOs. Current callback behavior, errors, effects, seed
+record/token, target evidence, and persisted schemas are unchanged.
+
+The native evidence model also exposes lineage- and field-scoped history
+positions. Exact decimal values can be ordered only when both positions name
+the same native field, database identity, and recovery fork. Missing positions
+are unavailable; missing/different lineage and cross-field comparisons are
+non-orderable. This remains native evidence, not generic Kuberic progress.
+
+Server-free readiness tests distinguish:
+
+- executable current evidence such as cancellation and stale-completion
+  fencing;
+- adapter-owned local, active-peer, and build-target facts;
+- current-pin gaps, including role-before-primary-configuration and newer
+  same-role secondary epochs; and
+- target gates that remain pending until a concrete release exists.
+
+The canonical version-1 intake profile and CLI are documented in
+[Kuberic release intake](kuberic-release-intake.md). They belong to the
+unpublished test crate and add no production mutation or protocol state.
+
 Unbound and ordinary adapters reject bootstrap mutation and build operations.
 Only explicitly bootstrap-capable adapters accept initial current-configuration
 effects and target builds. Previous/current transitions, catch-up configuration
@@ -364,6 +390,14 @@ Build or test the adapter through the feature:
 cargo test --locked -p kuberic-mssql-tests --test kuberic_contract
 cargo build --locked -p kuberic-mssql --features kuberic \
   --bin kuberic-mssql-runtime
+```
+
+Run only the server-free future-readiness group or validate one complete intake
+record:
+
+```bash
+just test-kuberic-readiness
+just validate-kuberic-release-intake /absolute/path/to/intake.json
 ```
 
 Run the complete server-free and Rust-owned live gates:
