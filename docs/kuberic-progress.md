@@ -3,9 +3,11 @@
 ## Purpose
 
 The optional Kuberic integration exposes SQL Server availability-group progress
-through Kuberic's fixed Service Fabric-compatible `Replicator` contract. It does
-not change Kuberic's API and does not convert SQL Server database log positions
-into a generic scalar.
+through the currently pinned pre-alignment Kuberic `Replicator` contract. Under
+that public API, the adapter publishes only validated AG configuration
+authority; it does not claim target Service Fabric
+application-history progress and does not convert SQL Server database log
+positions into a generic scalar.
 
 Ordinary construction is deliberately observe-only. It can open as a Kuberic
 application, validate a requested native role, and report current progress. An
@@ -15,6 +17,10 @@ one build-authorized automatic-seeding dispatch. Neither construction can
 remove/reseed replicas, grant write access, renew a lease, switch over, fail
 over, or handle data loss.
 
+This document records current pinned behavior and the remaining public-contract
+gap; it does not announce new production mutation support in this repository
+today.
+
 ## Two Progress Domains
 
 SQL Server exposes two different categories of progress.
@@ -23,11 +29,15 @@ SQL Server exposes two different categories of progress.
 
 `sys.availability_groups.sequence_number` is a nonnegative SQL `bigint`. SQL
 Server increments it when the primary updates availability-group configuration.
-The adapter represents it as `ConfigurationSequence` and returns its exact
-signed 64-bit value from Kuberic `current_progress`.
+The adapter represents it as `ConfigurationSequence` and, under the current
+pin, returns its exact signed 64-bit value from Kuberic `current_progress`;
+admitted topologies currently report the same value from
+`catch_up_capability`.
 
-This is configuration and promotion-authority progress. It is not evidence that
-an arbitrary customer transaction has been hardened or redone.
+This is the current pinned-contract behavior: configuration and promotion-
+authority progress. It is not target Service Fabric application-history
+progress, and it is not evidence that an arbitrary customer transaction has
+been hardened or redone.
 
 Microsoft's public `mssql-server-ha` agent uses the same sequence:
 
@@ -39,16 +49,18 @@ Microsoft's public `mssql-server-ha` agent uses the same sequence:
 - promotion then renews the external write lease and invokes SQL Server's
   external-cluster failover path.
 
-The current adapter implements only local sequence publication. It does not
-implement the quorum, lease, or promotion steps.
+The current adapter implements only pinned-contract local sequence
+publication. It does not implement the quorum, lease, or promotion steps. A
+safe upstream external-native progress contract remains required before MSSQL
+can participate in controller operations that compare first/last progress.
 
 ### Database-native positions
 
 `sys.dm_hadr_database_replica_states` exposes hardened, redone, and committed
-positions as `numeric(25,0)`. Hardened and related values can be padded log-block
-identifiers rather than record LSNs; redone and committed positions have
-different meanings. The values are scoped to a database identity and recovery
-fork and may exceed the signed 64-bit domain.
+positions as lineage-scoped `numeric(25,0)` values. Hardened and related values
+can be padded log-block identifiers rather than record LSNs; redone and
+committed positions have different meanings. The values are scoped to a
+database identity and recovery fork and may exceed the signed 64-bit domain.
 
 The observer retains these fields independently as exact decimal values:
 
@@ -56,9 +68,12 @@ The observer retains these fields independently as exact decimal values:
 - `redone_record`;
 - `committed_record`.
 
-They are never cast, truncated, saturated, hashed, or substituted for Kuberic
-progress. Future build, catch-up, handoff, and recovery operations must validate
-the appropriate native field and lineage explicitly.
+They are never cast, truncated, narrowed, saturated, hashed, or substituted
+for Kuberic progress or Kuberic's signed 64-bit LSN slot. Future build, catch-
+up, handoff, and recovery operations must validate the appropriate native field
+and lineage explicitly. Without a safe upstream external-native progress
+contract, MSSQL remains ineligible for controller operations that require
+comparable first/last progress.
 
 ## Adapter Boundary
 
@@ -98,6 +113,13 @@ configuration callback combines those associations with fresh native evidence
 and the callback's full identities, roles, process sessions and replication
 addresses.
 
+The current pin uses that full-topology bootstrap/current-configuration
+callback only as a licensed validation seam. It is not the future AG manifest.
+The aligned Service Fabric target configuration should contain only remote
+active members. The local replica and idle or in-build targets stay out of that
+remote set, `must_catchup` identifies the successor, and build targets use
+invalid/unknown progress rather than synthesized comparable history.
+
 Kuberic can deliver the bootstrap callback before remote sessions are known.
 Complete remote descriptions freeze the binding. Later callbacks may omit a
 remote session or address projection without clearing that binding, while every
@@ -105,10 +127,11 @@ supplied value must still match exactly. SQL Server process incarnation is
 local evidence: each runtime freezes and revalidates its own start identity,
 while the three-member validation proves all members collectively.
 
-`catch_up_capability` is reported as a fresh configuration sequence equal to
-current progress after native topology admission. It does not depend on remote
-transport-session readiness. Identity, completed-session, address, epoch, role,
-health, synchronization, lineage, incarnation or freshness drift fails closed.
+`catch_up_capability` is reported under the current pin as a fresh
+configuration sequence equal to current progress after native topology
+admission. It does not depend on remote transport-session readiness. Identity,
+completed-session, address, epoch, role, health, synchronization, lineage,
+incarnation or freshness drift fails closed.
 
 This is a conservative current-only capability: the adapter claims no earlier
 retained configuration history. It is not a database LSN and does not imply
@@ -116,6 +139,17 @@ replica build, repair, catch-up, data-loss recovery, lease, or failover support.
 The locked controller comparison treats a member at the current sequence or one
 behind as not requiring full repair, and a member two or more behind as
 requiring it. Contract tests preserve that exact boundary.
+
+Future public alignment also requires immutable `ReplicatorCapabilities`.
+MSSQL's initial declaration will keep catch-up-specific quorum unsupported and
+will use `ReplaceOnAmbiguity` for data-loss replay. Future build and peer-
+session entry points also require signed `BuildAuthorization` and
+`PeerSessionAuthorization`. SQL Server HADR cannot carry Kuberic tokens, so
+production mutation needs an authenticated replica-local adapter/control
+channel above HADR. The existing challenge-bound test-host exchange remains
+licensed-validation-only and is not that production transport. The eventual
+cutover must start from fresh public-only protocol state rather than reusing
+retained Stage 3 bootstrap callback state as the future mutation protocol.
 
 Unbound and ordinary adapters reject bootstrap mutation and build operations.
 Only explicitly bootstrap-capable adapters accept initial current-configuration
@@ -153,11 +187,14 @@ Kuberic's command/effect/build receipts and exact SQL Server postconditions
 remain the primary durable evidence. The application persists only the
 pre-association `Intent`/`Submitting`/`Accepted`/`Ambiguous`/
 `FailedRetryable` handshake under its existing application root; exact source
-association plus the exact terminal SQL marker removes that temporary record. A
-schema-v1 `Dispatched` record instead migrates to tokenless
-`LegacyAmbiguous`: exact native association may compact its group-database
-identity into a retained tombstone, while absent, incomplete, or conflicting
-association fails closed and cannot redispatch.
+association plus the exact terminal SQL marker removes that temporary record.
+This bounded file/SQL marker exists only to reconcile the external-effect
+ambiguity around `ADD DATABASE`; Kuberic's stateless default-replicator design
+does not require deleting that reconciliation seam. A schema-v1 `Dispatched`
+record instead migrates to tokenless `LegacyAmbiguous`: exact native
+association may compact its group-database identity into a retained tombstone,
+while absent, incomplete, or conflicting association fails closed and cannot
+redispatch.
 
 The owned source database retains one matching singleton dispatch row with a
 derived operation token, exact AG/database identities, and SQL-owned phase. A

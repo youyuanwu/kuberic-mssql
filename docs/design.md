@@ -78,8 +78,9 @@ validation:
 - exact SQL Server `numeric(25,0)` database progress values without narrowing
   them to Kuberic progress;
 - a dedicated signed `ConfigurationSequence` and optional observe-only Kuberic
-  adapter that publishes validated AG configuration authority as current
-  progress;
+  adapter that, under the currently pinned pre-alignment Kuberic contract,
+  publishes validated AG configuration authority as current progress rather than
+  target Service Fabric application-history progress;
 - observations that distinguish present, absent, stale, and failed evidence;
 - versioned operation envelopes with canonical SHA-256 input signatures;
 - explicit destructive approvals and fence references;
@@ -239,9 +240,12 @@ snapshot.
 SQL Server exposes multiple progress concepts. Hardened-block, redone-record,
 and committed-record positions remain distinct exact decimal values. They
 cannot be truncated into the former classic runtime's scalar `i64`, compared across
-different databases, or compared across incompatible recovery histories.
-Every progress-bearing transition therefore includes both the database GUID
-and recovery-fork GUID.
+different databases, or compared across incompatible recovery histories. They
+also cannot be safely narrowed, hashed, saturated, or substituted into
+Kuberic's signed 64-bit LSN slot. Every progress-bearing transition therefore
+includes both the database GUID and recovery-fork GUID. A safe upstream
+external-native progress contract is a prerequisite before MSSQL can participate
+in controller operations that compare first/last progress.
 
 ## Command Contract
 
@@ -307,6 +311,13 @@ There are three separate trust boundaries:
 3. Authenticated command authority between the future operator and replica
    agent.
 
+Future build and peer-mutation entry points also require signed
+`BuildAuthorization` and `PeerSessionAuthorization`. SQL Server HADR cannot
+carry Kuberic tokens, so production authority-changing work needs an
+authenticated replica-local adapter/control channel above HADR. The existing
+challenge-bound fixture exchange is a licensed validation seam only; it is not
+the production mutation transport.
+
 Only Kubernetes Secret references belong in desired state. Passwords,
 certificate private keys, connection strings containing credentials, and SQL
 batches containing secrets must not be stored in CRD status, operation
@@ -355,6 +366,20 @@ descriptions. Complete values freeze the binding. Later callbacks may omit
 remote session or address projections, but cannot clear the frozen values; any
 supplied value must still match exactly.
 
+The current Kuberic pin still exercises a full-topology bootstrap/current-
+configuration callback in licensed validation, but that seam is not the future
+AG manifest. The aligned Service Fabric target configuration should contain only
+remote active members; the local replica and idle or in-build targets stay out
+of the remote set, `must_catchup` identifies the chosen successor, and build
+targets carry invalid/unknown progress rather than synthesized comparable
+history.
+
+Future immutable `ReplicatorCapabilities` must describe that narrower public
+contract. MSSQL's initial declaration will keep catch-up-specific quorum
+unsupported and will use `ReplaceOnAmbiguity` for data-loss replay. Stage 3
+behavior under the current pin remains unchanged until upstream Kuberic
+implements the aligned contract.
+
 The application persists a schema-versioned non-secret runtime binding and,
 only while native SQL cannot prove whether group seeding was dispatched, one
 bounded `seed-dispatch-v1.json` record under the same authorized application
@@ -368,7 +393,9 @@ result ledger. After SQL accepts the group dispatch, one scope-named
 `master` extended property retains `v1:<operation-token>` as the terminal
 group marker. The token binds resource/configuration identity, AG name and
 GUID, source database identity and lineage, source SQL incarnation, and both
-authorized target identities.
+authorized target identities. This bounded file/SQL marker exists only to
+reconcile the external-effect ambiguity around `ADD DATABASE`; Kuberic's
+stateless default-replicator design does not require removing it.
 
 The primary's remote DMV rows are dispatch-progress evidence only. Completing a
 target build requires a challenge-bound report produced by a fresh direct
@@ -468,20 +495,32 @@ bound-listener handoff from
    restart/cancellation/retry/lost-reply recovery, isolated licensed SQL-native
    cases, and test-only callback observation-seam validation. This stage adds
    neither certificate provisioning nor a production mutation transport.
-4. **Fencing, reseed, switchover, and failover** — establish verified target and
-   old-primary fencing before destructive reseed or role movement, then add
-   external lease handling, sequence arbitration, authenticated fence and
-   approval receipts, explicit data-loss recovery, and live fault tests.
-   Automatic failover remains disabled until every safety gate passes.
-5. **Controller integration** — Pod/PVC/Secret/Service convergence through the
-   implemented Kuberic command/evidence boundary.
-6. **Kubernetes E2E and operations** — pinned licensed test environment,
+4. **SF contract-gap resolution** — upstream external-native progress,
+   remote-active target-configuration shape, immutable capabilities, and signed
+   build/peer-session authorizations for replica-local mutation transport.
+5. **Public-contract adapter migration after Kuberic Phase 4/5** — move from
+   the current pin's configuration-sequence publication and licensed validation
+   seam to the aligned public contract, while preserving the implemented Stage 3
+   native bootstrap evidence.
+6. **SQL-native fencing, reseed, switchover, and failover** — establish
+   verified target and old-primary fencing before destructive reseed or role
+   movement, then add external lease handling, sequence arbitration,
+   authenticated fence and approval receipts, explicit data-loss recovery, and
+   live fault tests. Automatic failover remains disabled until every safety gate
+   passes.
+7. **Controller integration after public-only cutover/fresh protocol state** —
+   Pod/PVC/Secret/Service convergence through the public-only contract once
+   fresh protocol state replaces the pinned validation seam.
+8. **Kubernetes E2E and operations** — pinned licensed test environment,
    three-replica failures, process/operator restarts, client reconnection,
    upgrades, and runbooks.
 
-Stages 1-4 do not require operator2. Stages 5-6 require the minimum
-youyuanwu/kuberic#79 vertical slice, but do not need to wait for every
-youyuanwu/kuberic#79 operation to be complete.
+Stages 1-3 remain valid under the current Kuberic pin. No dependency pin update
+happens until Stage 4's upstream contract work is implemented. Stages 1-3 do
+not require operator2. Stage 4 is upstream Kuberic work; Stages 5-8 depend on
+that public-only contract and the minimum youyuanwu/kuberic#79 vertical slice,
+but do not need to wait for every youyuanwu/kuberic#79 operation to be
+complete.
 
 ## Test Gates
 

@@ -12,13 +12,17 @@ authentication and administrative credentials; the three standalone
 secondaries and perform one build-authorized automatic-seeding dispatch. This
 path is not exposed by the production CLI or runtime configuration.
 
-The library is compatible with the observation side of the level-triggered
-contract. Its optional Kuberic runtime publishes validated AG configuration
-sequence through the fixed Service Fabric-compatible progress API and hosts the
-application through Kuberic's public `ReplicaHost`; it is not wired into the
-level-triggered controller. This is not a complete Kubernetes HA integration
-or an automatic failover implementation. See the
-[progress integration guide](docs/kuberic-progress.md); the
+The library is compatible with the observation side of the currently pinned
+pre-alignment Kuberic contract. Its optional Kuberic runtime publishes
+validated AG configuration sequence through the current public `Replicator`
+progress API and hosts the application through Kuberic's public `ReplicaHost`;
+today that publication describes configuration and promotion authority, not
+target Service Fabric application-history progress. The adapter therefore
+remains ineligible for controller operations that require comparable first/last
+progress until Kuberic grows a safe external-native progress contract for SQL
+Server. It is not wired into the level-triggered controller. This is not a
+complete Kubernetes HA integration or an automatic failover implementation. See
+the [progress integration guide](docs/kuberic-progress.md); the
 [support and safety design](docs/design.md) remains authoritative.
 Role validation never publishes a client service address; the configured
 replication address is returned only by the custom replicator's open callback.
@@ -104,6 +108,14 @@ authority can initially arrive before remote peer sessions; missing peer
 descriptions may only be completed once, after which replay is exact. Role and
 progress callbacks still reobserve SQL Server, and no client SQL listener or
 service address is published.
+
+The current dependency pin also retains the full-topology bootstrap/current-
+configuration callback only as a licensed validation seam. It is not the future
+AG manifest: the aligned Service Fabric target configuration is expected to
+contain only remote active members, exclude the local replica and idle or
+in-build targets, identify the successor with `must_catchup`, and represent
+build targets with invalid/unknown progress rather than fabricated comparable
+history.
 
 With empty authorized roots, startup initializes Kuberic metadata and writes
 the application binding. Reusing those roots reopens established state only
@@ -216,8 +228,14 @@ sync/connection health and seeding facts. Native GUIDs identify catalog and
 DMV relationships. Hardened-block, redone-record, and committed-record
 positions remain separate, exact decimal strings in JSON, including values
 larger than `i64` or JavaScript's safe integer range. They are not a generic
-scalar election score. Local recovery lineage is not assigned to remote DMV
-rows; reports about remote replicas are not that replica's self-observation.
+scalar election score. Because these lineage-scoped fields have different
+meanings and can exceed the signed 64-bit domain used by Kuberic's current
+pinned progress API, they cannot be safely narrowed, hashed, saturated, or
+substituted into that LSN slot. MSSQL remains ineligible for controller
+operations that require comparable first/last progress until upstream defines a
+safe external-native progress contract. Local recovery lineage is not assigned
+to remote DMV rows; reports about remote replicas are not that replica's self-
+observation.
 Automatic-seeding history is scoped to the current native database and replica
 GUIDs. Physical-seeding rows require an already-associated local database GUID;
 pre-join destination processes may be unavailable. Empty seeding lists are not
@@ -290,7 +308,10 @@ types are not part of the application API.
 Stage 3 did not select operation-envelope serialization or a generic result
 journal. Callback-visible authority and Kuberic's retained command/build
 evidence are reconciled with exact native SQL postconditions; only the bounded
-pre-association seed-dispatch ambiguity uses application metadata. Its durable
+pre-association seed-dispatch ambiguity uses application metadata because that
+is the one external-effect boundary native SQL cannot classify alone across a
+callback crash or lost reply. Kuberic's stateless default-replicator style does
+not require deleting that bounded file/SQL reconciliation seam. Its durable
 file phases distinguish intent, submitting, accepted/ambiguous, and definite
 retryable failure. A matching singleton SQL-owned token row and group-scoped
 application lock prove acceptance, active ambiguity, or a safe pre-effect
