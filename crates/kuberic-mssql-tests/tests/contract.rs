@@ -3,14 +3,14 @@ use kuberic_mssql::{
     ClusterType, ConfigurationSequence, ContractError, DatabaseIdentity, DatabaseLineage,
     DecimalProgress, DestructiveApproval, Edition, Endpoint, EngineArtifact, FailoverMode,
     FenceReference, Guid, MutationContractError, MutationEffect, MutationMode,
-    NativeConvergenceState, NativeRole, OPERATION_CONTRACT_VERSION, Observation,
-    ObservationFailure, ObservationFailureKind, OperationEnvelope, OperationPayload,
-    OperationRecord, OperationRequest, PinnedImage, PinnedPackage, ReplayDisposition,
-    ReplicaDescriptor, ReplicaIdentity, SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT,
-    SecretRef, SeedDispatchRequest, SeedingMode, ServerName, SqlIdentifier, SqlMutationExecutor,
-    SqlServerEulaAcknowledgement, SqlServerSupportConfig, StandaloneDatabaseIdentity,
-    StandaloneDatabaseOwnership, StandaloneDatabaseSnapshot, classify_standalone_database,
-    source_database_creation_token,
+    NativeConvergenceState, NativeHistoryComparison, NativeHistoryPosition, NativeProgressField,
+    NativeRole, OPERATION_CONTRACT_VERSION, Observation, ObservationFailure,
+    ObservationFailureKind, OperationEnvelope, OperationPayload, OperationRecord, OperationRequest,
+    PinnedImage, PinnedPackage, ReplayDisposition, ReplicaDescriptor, ReplicaIdentity,
+    SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT, SecretRef, SeedDispatchRequest,
+    SeedingMode, ServerName, SqlIdentifier, SqlMutationExecutor, SqlServerEulaAcknowledgement,
+    SqlServerSupportConfig, StandaloneDatabaseIdentity, StandaloneDatabaseOwnership,
+    StandaloneDatabaseSnapshot, classify_standalone_database, source_database_creation_token,
 };
 
 use async_trait::async_trait;
@@ -834,6 +834,95 @@ fn native_progress_preserves_values_larger_than_i64() {
     assert_eq!(
         DecimalProgress::parse("-1"),
         Err(ContractError::InvalidProgress)
+    );
+}
+
+#[test]
+fn native_history_comparison_requires_exact_lineage_field_and_available_values() {
+    let database = DatabaseIdentity {
+        name: SqlIdentifier::new("app").unwrap(),
+        group_database_id: guid(100),
+    };
+    let lineage = DatabaseLineage {
+        database: database.clone(),
+        recovery_fork_id: guid(101),
+    };
+    let earlier = NativeHistoryPosition::available(
+        lineage.clone(),
+        NativeProgressField::CommittedRecord,
+        Some(DecimalProgress::parse("9223372036854775808").unwrap()),
+    );
+    let equal = NativeHistoryPosition::available(
+        lineage.clone(),
+        NativeProgressField::CommittedRecord,
+        Some(DecimalProgress::parse("9223372036854775808").unwrap()),
+    );
+    let later = NativeHistoryPosition::available(
+        lineage.clone(),
+        NativeProgressField::CommittedRecord,
+        Some(DecimalProgress::parse("9999999999999999999999999").unwrap()),
+    );
+    assert_eq!(earlier.compare(&equal), NativeHistoryComparison::Equal);
+    assert_eq!(earlier.compare(&later), NativeHistoryComparison::Earlier);
+    assert_eq!(later.compare(&earlier), NativeHistoryComparison::Later);
+
+    let different_database = NativeHistoryPosition::available(
+        DatabaseLineage {
+            database: DatabaseIdentity {
+                name: database.name.clone(),
+                group_database_id: guid(102),
+            },
+            recovery_fork_id: lineage.recovery_fork_id.clone(),
+        },
+        NativeProgressField::CommittedRecord,
+        equal.value(),
+    );
+    assert_eq!(
+        equal.compare(&different_database),
+        NativeHistoryComparison::NonOrderable
+    );
+
+    let different_fork = NativeHistoryPosition::available(
+        DatabaseLineage {
+            database,
+            recovery_fork_id: guid(103),
+        },
+        NativeProgressField::CommittedRecord,
+        equal.value(),
+    );
+    assert_eq!(
+        equal.compare(&different_fork),
+        NativeHistoryComparison::NonOrderable
+    );
+
+    let different_field = NativeHistoryPosition::available(
+        lineage.clone(),
+        NativeProgressField::RedoneRecord,
+        equal.value(),
+    );
+    assert_eq!(
+        equal.compare(&different_field),
+        NativeHistoryComparison::NonOrderable
+    );
+
+    let missing =
+        NativeHistoryPosition::available(lineage, NativeProgressField::CommittedRecord, None);
+    assert_eq!(
+        equal.compare(&missing),
+        NativeHistoryComparison::Unavailable
+    );
+
+    let unavailable_lineage = NativeHistoryPosition::lineage_unavailable(
+        NativeProgressField::CommittedRecord,
+        equal.value(),
+    );
+    assert_eq!(
+        equal.compare(&unavailable_lineage),
+        NativeHistoryComparison::NonOrderable
+    );
+    assert_eq!(
+        unavailable_lineage.compare(&unavailable_lineage),
+        NativeHistoryComparison::NonOrderable
     );
 }
 

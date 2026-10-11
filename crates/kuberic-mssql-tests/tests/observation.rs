@@ -9,8 +9,9 @@ use kuberic_mssql::observation::{
 use kuberic_mssql::query::ReadQuery;
 use kuberic_mssql::runtime_error::RuntimeError;
 use kuberic_mssql::{
-    AvailabilityGroupName, NativeRole, Observation, ObservationFailureKind, ReplicaIdentity,
-    STANDALONE_DATABASE_QUERY, ServerName,
+    AvailabilityGroupName, NativeHistoryComparison, NativeHistoryPosition, NativeProgressField,
+    NativeRole, Observation, ObservationFailureKind, ReplicaIdentity, STANDALONE_DATABASE_QUERY,
+    ServerName,
 };
 use serde_json::Value;
 
@@ -793,6 +794,20 @@ async fn local_and_primary_remote_progress_have_distinct_provenance_and_lineage(
         RecoveryLineageObservation::Local { value } => {
             assert_eq!(value.database.group_database_id.as_str(), DATABASE);
             assert_eq!(value.recovery_fork_id.as_str(), FORK);
+            let local = NativeHistoryPosition::available(
+                value.clone(),
+                NativeProgressField::CommittedRecord,
+                states[0].progress.committed_record,
+            );
+            assert_eq!(local.compare(&local), NativeHistoryComparison::Equal);
+            let remote = NativeHistoryPosition::lineage_unavailable(
+                NativeProgressField::CommittedRecord,
+                states[1].progress.committed_record,
+            );
+            assert_eq!(
+                local.compare(&remote),
+                NativeHistoryComparison::NonOrderable
+            );
         }
         other => panic!("expected locally read lineage, got {other:?}"),
     }
@@ -843,6 +858,11 @@ async fn missing_local_fork_is_explicit_and_never_replaced_with_a_remote_or_fabr
             database.replicas[1].lineage,
             RecoveryLineageObservation::RemoteUnavailable
         );
+        let local = NativeHistoryPosition::lineage_unavailable(
+            NativeProgressField::HardenedBlock,
+            database.replicas[0].progress.hardened_block,
+        );
+        assert_eq!(local.compare(&local), NativeHistoryComparison::NonOrderable);
     }
 }
 

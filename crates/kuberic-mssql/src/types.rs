@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::fmt;
 
 use serde::{Serialize, Serializer};
@@ -519,6 +520,103 @@ pub struct NativeProgress {
     pub hardened_block: Option<DecimalProgress>,
     pub redone_record: Option<DecimalProgress>,
     pub committed_record: Option<DecimalProgress>,
+}
+
+impl NativeProgress {
+    pub fn position(&self, field: NativeProgressField) -> Option<DecimalProgress> {
+        match field {
+            NativeProgressField::HardenedBlock => self.hardened_block,
+            NativeProgressField::RedoneRecord => self.redone_record,
+            NativeProgressField::CommittedRecord => self.committed_record,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeProgressField {
+    HardenedBlock,
+    RedoneRecord,
+    CommittedRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", content = "value", rename_all = "snake_case")]
+pub enum NativeHistoryLineage {
+    Available(DatabaseLineage),
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NativeHistoryPosition {
+    lineage: NativeHistoryLineage,
+    field: NativeProgressField,
+    value: Option<DecimalProgress>,
+}
+
+impl NativeHistoryPosition {
+    pub fn available(
+        lineage: DatabaseLineage,
+        field: NativeProgressField,
+        value: Option<DecimalProgress>,
+    ) -> Self {
+        Self {
+            lineage: NativeHistoryLineage::Available(lineage),
+            field,
+            value,
+        }
+    }
+
+    pub fn lineage_unavailable(field: NativeProgressField, value: Option<DecimalProgress>) -> Self {
+        Self {
+            lineage: NativeHistoryLineage::Unavailable,
+            field,
+            value,
+        }
+    }
+
+    pub fn lineage(&self) -> &NativeHistoryLineage {
+        &self.lineage
+    }
+
+    pub fn field(&self) -> NativeProgressField {
+        self.field
+    }
+
+    pub fn value(&self) -> Option<DecimalProgress> {
+        self.value
+    }
+
+    pub fn compare(&self, other: &Self) -> NativeHistoryComparison {
+        let (
+            NativeHistoryLineage::Available(left_lineage),
+            NativeHistoryLineage::Available(right_lineage),
+        ) = (&self.lineage, &other.lineage)
+        else {
+            return NativeHistoryComparison::NonOrderable;
+        };
+        if self.field != other.field || left_lineage != right_lineage {
+            return NativeHistoryComparison::NonOrderable;
+        }
+        let (Some(left), Some(right)) = (self.value, other.value) else {
+            return NativeHistoryComparison::Unavailable;
+        };
+        match left.cmp(&right) {
+            Ordering::Less => NativeHistoryComparison::Earlier,
+            Ordering::Equal => NativeHistoryComparison::Equal,
+            Ordering::Greater => NativeHistoryComparison::Later,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeHistoryComparison {
+    Earlier,
+    Equal,
+    Later,
+    Unavailable,
+    NonOrderable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

@@ -57,7 +57,8 @@ pub use topology_config::{
 };
 pub use types::{
     AvailabilityGroupIdentity, AvailabilityGroupName, ConfigurationSequence, DatabaseIdentity,
-    DatabaseLineage, DecimalProgress, Endpoint, EngineArtifact, Guid, NativeProgress, NativeRole,
+    DatabaseLineage, DecimalProgress, Endpoint, EngineArtifact, Guid, NativeHistoryComparison,
+    NativeHistoryLineage, NativeHistoryPosition, NativeProgress, NativeProgressField, NativeRole,
     Observation, ObservationFailure, ObservationFailureKind, OpaqueId, PinnedImage, PinnedPackage,
     ReplicaDescriptor, ReplicaIdentity, SecretRef, ServerName, SqlIdentifier,
 };
