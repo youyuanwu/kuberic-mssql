@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 pub(crate) mod fixture;
 pub mod one_replica;
+pub mod release_intake;
 pub mod tds;
 pub mod three_replica;
 

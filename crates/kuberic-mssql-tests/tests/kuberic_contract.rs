@@ -66,6 +66,9 @@ const DATABASE_GUID: &str = "66666666-6666-4666-8666-666666666666";
 const FAMILY_GUID: &str = "77777777-7777-4777-8777-777777777777";
 const FORK_ID: &str = "88888888-8888-4888-8888-888888888888";
 
+#[path = "kuberic_contract/readiness.rs"]
+mod readiness;
+
 fn run_runtime_effect_test<F>(future: F)
 where
     F: Future<Output = ()> + Send + 'static,

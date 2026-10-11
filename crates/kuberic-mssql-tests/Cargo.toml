@@ -28,6 +28,11 @@ name = "kuberic-mssql-runtime-test"
 path = "src/bin/kuberic-mssql-runtime.rs"
 test = false
 
+[[bin]]
+name = "kuberic-release-intake"
+path = "src/bin/kuberic-release-intake.rs"
+test = false
+
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true

@@ -33,6 +33,14 @@ clippy:
 test:
     cargo test --locked --workspace --all-features -- --test-threads=1
 
+# Run the server-free future-readiness group without changing the pinned contract.
+test-kuberic-readiness:
+    cargo test --locked -p kuberic-mssql-tests --test kuberic_contract readiness:: -- --test-threads=1
+
+# Validate one versioned Kuberic release-intake record.
+validate-kuberic-release-intake record:
+    cargo run --locked -p kuberic-mssql-tests --bin kuberic-release-intake -- {{quote(record)}}
+
 # Launch one owned SQL Server member, validate unique observer/CLI behavior, and clean up.
 test-live-one-replica root="target/mssql-one-replica":
     env -u SQLSERVER_TEST_EULA_ACCEPTED \
