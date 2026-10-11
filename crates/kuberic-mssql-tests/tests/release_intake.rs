@@ -8,15 +8,18 @@ use kuberic_mssql_tests::release_intake::{
     validate_record,
 };
 
+const CURRENT_DEPENDENCY: &str = "kuberic-runtime@09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f";
+const CANDIDATE_DEPENDENCY: &str = "kuberic-runtime@1111111111111111111111111111111111111111";
+
 fn record(mode: ReleaseIntakeMode, status: GateStatus) -> ReleaseIntakeRecord {
     let reviewed_dependency_identity = match mode {
-        ReleaseIntakeMode::Baseline => "kuberic-runtime@current",
-        ReleaseIntakeMode::Candidate => "kuberic-runtime@candidate",
+        ReleaseIntakeMode::Baseline => CURRENT_DEPENDENCY,
+        ReleaseIntakeMode::Candidate => CANDIDATE_DEPENDENCY,
     };
     ReleaseIntakeRecord {
         profile_version: PROFILE_VERSION,
         mode,
-        current_dependency_identity: "kuberic-runtime@current".into(),
+        current_dependency_identity: CURRENT_DEPENDENCY.into(),
         reviewed_dependency_identity: reviewed_dependency_identity.into(),
         semantic_contract_finding: "semantic contract reviewed".into(),
         persistence_contract_finding: "persistence contract reviewed".into(),
@@ -264,9 +267,30 @@ fn missing_identities_are_invalid() {
 }
 
 #[test]
+fn dependency_identities_require_canonical_package_and_lowercase_git_revision() {
+    for identity in [
+        "kuberic-runtime@09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f ",
+        " kuberic-runtime@09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f",
+        "kuberic-runtime@09CE0A7BA9FDD9D6DCD207606FD0C9496A58C47F",
+        "kuberic_runtime@09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f",
+        "kuberic-runtime@09ce0a7b",
+        "kuberic-runtime@09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47g",
+    ] {
+        let mut record = record(ReleaseIntakeMode::Candidate, GateStatus::Passed);
+        record.reviewed_dependency_identity = identity.into();
+        assert_eq!(
+            validate_record(&record),
+            Err(IntakeError::InvalidDependencyIdentity(
+                "reviewed_dependency_identity"
+            ))
+        );
+    }
+}
+
+#[test]
 fn baseline_reviewed_identity_mismatch_fails_dependency_identity_and_blocks() {
     let mut record = record(ReleaseIntakeMode::Baseline, GateStatus::Passed);
-    record.reviewed_dependency_identity = "kuberic-runtime@different".into();
+    record.reviewed_dependency_identity = CANDIDATE_DEPENDENCY.into();
     record.outcome = IntakeOutcome::Blocked;
     let validated = validate_record(&record).unwrap();
     assert_eq!(validated.outcome(), IntakeOutcome::Blocked);
@@ -287,6 +311,19 @@ fn candidate_current_identity_match_fails_dependency_identity_and_blocks() {
         validated.effective_status(GateId::DependencyIdentity),
         GateStatus::Failed
     );
+}
+
+#[test]
+fn checked_in_current_pin_baseline_record_is_complete_and_valid() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/kuberic-release-intake-baseline.json");
+    let input = std::fs::read(path).unwrap();
+    let (record, validated) = parse_and_validate_json(&input).unwrap();
+    assert_eq!(record.mode, ReleaseIntakeMode::Baseline);
+    assert_eq!(record.current_dependency_identity, CURRENT_DEPENDENCY);
+    assert_eq!(record.reviewed_dependency_identity, CURRENT_DEPENDENCY);
+    assert_eq!(record.gates.len(), PROFILE_V1.len());
+    assert_eq!(validated.outcome(), IntakeOutcome::BaselineConfirmed);
 }
 
 #[test]

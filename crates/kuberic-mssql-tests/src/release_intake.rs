@@ -217,6 +217,7 @@ pub enum IntakeError {
     Malformed(String),
     UnknownProfileVersion(u32),
     MissingValue(&'static str),
+    InvalidDependencyIdentity(&'static str),
     EmptyGateEvidence(GateId),
     DuplicateGate(GateId),
     MissingGate(GateId),
@@ -234,6 +235,9 @@ impl fmt::Display for IntakeError {
                 write!(formatter, "unknown intake profile version {version}")
             }
             Self::MissingValue(field) => write!(formatter, "missing required value {field}"),
+            Self::InvalidDependencyIdentity(field) => {
+                write!(formatter, "invalid canonical dependency identity {field}")
+            }
             Self::EmptyGateEvidence(gate) => {
                 write!(formatter, "gate {gate} has empty evidence")
             }
@@ -278,11 +282,11 @@ pub fn validate_record(record: &ReleaseIntakeRecord) -> Result<ValidatedIntake, 
     if record.profile_version != PROFILE_VERSION {
         return Err(IntakeError::UnknownProfileVersion(record.profile_version));
     }
-    require_value(
+    require_dependency_identity(
         &record.current_dependency_identity,
         "current_dependency_identity",
     )?;
-    require_value(
+    require_dependency_identity(
         &record.reviewed_dependency_identity,
         "reviewed_dependency_identity",
     )?;
@@ -365,6 +369,28 @@ fn require_value(value: &str, field: &'static str) -> Result<(), IntakeError> {
     } else {
         Ok(())
     }
+}
+
+fn require_dependency_identity(value: &str, field: &'static str) -> Result<(), IntakeError> {
+    require_value(value, field)?;
+    if value.trim() != value || value.chars().any(char::is_control) {
+        return Err(IntakeError::InvalidDependencyIdentity(field));
+    }
+    let Some((package, revision)) = value.split_once('@') else {
+        return Err(IntakeError::InvalidDependencyIdentity(field));
+    };
+    if package.is_empty()
+        || package
+            .bytes()
+            .any(|byte| !byte.is_ascii_lowercase() && !byte.is_ascii_digit() && byte != b'-')
+        || revision.len() != 40
+        || revision
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err(IntakeError::InvalidDependencyIdentity(field));
+    }
+    Ok(())
 }
 
 pub fn render_summary(record: &ReleaseIntakeRecord, validated: &ValidatedIntake) -> String {

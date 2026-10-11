@@ -77,7 +77,9 @@ conformance.
 
 1. Record the current locked Kuberic revision and the exact reviewed candidate.
    Baseline mode requires the same identity; candidate mode requires different
-   identities.
+   identities. Identity syntax is canonical
+   `<lowercase-package-name>@<40-lowercase-hex-git-revision>` with no
+   surrounding whitespace or control characters.
 2. Compare protected lifecycle ordering, configuration/build values, progress
    meanings, capabilities, signed authorization, reporting, and error
    semantics against the target Kuberic contract.
@@ -126,8 +128,8 @@ conformance.
 {
   "profile_version": 1,
   "mode": "candidate",
-  "current_dependency_identity": "kuberic-runtime@CURRENT_COMMIT",
-  "reviewed_dependency_identity": "kuberic-runtime@CANDIDATE_COMMIT",
+  "current_dependency_identity": "kuberic-runtime@0000000000000000000000000000000000000000",
+  "reviewed_dependency_identity": "kuberic-runtime@1111111111111111111111111111111111111111",
   "semantic_contract_finding": "reviewed public lifecycle and value semantics",
   "persistence_contract_finding": "reviewed schemas and migration/cutover rules",
   "fresh_state_finding": "reviewed fresh-state activation requirements",
@@ -151,6 +153,16 @@ complete the record; requiredness and applicability are not JSON fields.
 
 The readiness implementation was exercised against locked Kuberic revision
 `09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f`.
+
+The complete machine-readable record is
+[kuberic-release-intake-baseline.json](kuberic-release-intake-baseline.json).
+It is validated by the release-intake integration tests and can also be
+inspected directly:
+
+```bash
+just validate-kuberic-release-intake \
+  docs/kuberic-release-intake-baseline.json
+```
 
 | Evidence | Status |
 |---|---|
