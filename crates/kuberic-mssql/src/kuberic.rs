@@ -6,6 +6,8 @@ use std::time::Duration;
 #[cfg(feature = "kuberic-testing")]
 use std::sync::Condvar;
 
+mod compatibility;
+
 use async_trait::async_trait;
 use kuberic_runtime::application::{
     OpenContext, RoleChange, StateProvider, StatefulServiceReplica,
@@ -23,9 +25,9 @@ use kuberic_runtime::{Result as KubericResult, RuntimeError as KubericRuntimeErr
 use tokio_util::sync::CancellationToken;
 
 use crate::bootstrap::{
-    AvailabilityGroupOwnership, BootstrapOwnership, NativeConvergenceState,
-    StandaloneDatabaseIdentity, StandaloneDatabaseOwnership, classify_bootstrap_ownership,
-    classify_owned_availability_group, classify_replica_join, classify_standalone_database,
+    AvailabilityGroupOwnership, NativeConvergenceState, StandaloneDatabaseIdentity,
+    StandaloneDatabaseOwnership, classify_owned_availability_group, classify_replica_join,
+    classify_standalone_database,
 };
 use crate::executor::SqlExecutor;
 use crate::instance::{SqlServerInstanceManager, unix_millis};
@@ -39,14 +41,29 @@ use crate::observation::{
 use crate::runtime_config::ObserverConfig;
 use crate::runtime_error::RuntimeError;
 use crate::runtime_host::seed_state::{
-    SeedDispatchPhase, SeedDispatchRecord, SeedDispatchStore, SeedDispatchTarget, SeedStateError,
+    SeedDispatchPhase, SeedDispatchRecord, SeedDispatchStore, SeedStateError,
 };
 use crate::topology_config::SqlServerTopologyExpectation;
 use crate::{
-    AvailabilityGroupIdentity, ConfigurationSequence, DatabaseIdentity, DatabaseLineage, Endpoint,
-    Guid, NativeRole, Observation, ObservationFailureKind, ReplicaDescriptor,
+    AvailabilityGroupIdentity, ConfigurationSequence, DatabaseIdentity, DatabaseLineage, Guid,
+    NativeRole, Observation, ObservationFailureKind, ReplicaDescriptor,
     ReplicaIdentity as SqlReplicaIdentity, SUPPORTED_DATABASE_COUNT, SUPPORTED_ENGINE_MAJOR,
     SUPPORTED_REPLICA_COUNT, SUPPORTED_REQUIRED_SECONDARIES, ServerName, SqlIdentifier,
+};
+
+use compatibility::{
+    CurrentBuildFacts, CurrentTopologyFacts, build_enriched_configuration, configuration_enriches,
+    configuration_is_complete, normalize_bootstrap_configuration, topology_enriches,
+    validate_admitted_build_configuration, validate_bootstrap_configuration_replay,
+    validate_build_id, validate_incomplete_bootstrap_configuration, validate_replication_address,
+};
+
+#[cfg(not(feature = "kuberic-testing"))]
+use compatibility::BootstrapOwnership;
+#[cfg(feature = "kuberic-testing")]
+pub use compatibility::{
+    BootstrapOwnership, BootstrapOwnershipError, classify_bootstrap_ownership,
+    testing_current_pin_bootstrap_descriptors,
 };
 
 const CREATED: u8 = 0;
@@ -2214,21 +2231,23 @@ impl SqlServerReplicator {
             .bootstrap
             .as_ref()
             .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
-        validate_configuration_shape(
+        let compatibility = CurrentTopologyFacts::translate(
             runtime_identity,
             expectation,
             &self.replication_address,
             current,
         )?;
-        let ownership = classify_bootstrap_ownership(runtime_identity, current).map_err(|_| {
-            KubericAdapterError::TopologyBindingMismatch(
-                "local bootstrap ownership is not represented by the current configuration",
-            )
-        })?;
-        let descriptors = bootstrap_descriptors(expectation, current)?;
+        let ownership = compatibility
+            .bootstrap_ownership(runtime_identity)
+            .map_err(|_| {
+                KubericAdapterError::TopologyBindingMismatch(
+                    "local bootstrap ownership is not represented by the current configuration",
+                )
+            })?;
+        let descriptors = compatibility.bootstrap_descriptors(expectation)?;
         let expected_ownership = StandaloneDatabaseOwnership {
             resource_id: bootstrap.resource_uid.to_string(),
-            configuration_id: current.configuration.configuration_id.to_string(),
+            configuration_id: compatibility.configuration.configuration_id.to_string(),
         };
         let expected_group_ownership = AvailabilityGroupOwnership {
             resource_id: expected_ownership.resource_id.clone(),
@@ -2866,11 +2885,7 @@ impl SqlServerReplicator {
                 .ok_or(KubericAdapterError::UnsupportedOperation(
                     ObserveOnlyOperation::BuildReplica,
                 ))?;
-        if replica.build_id.is_empty() {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "target build identity is empty",
-            ));
-        }
+        validate_build_id(replica)?;
         let binding = self
             .admitted_topology()
             .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
@@ -2880,72 +2895,18 @@ impl SqlServerReplicator {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
-        if admitted_configuration.configuration != binding.configuration {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "admitted build configuration differs from the topology binding",
-            ));
-        }
+        validate_admitted_build_configuration(&binding, &admitted_configuration)?;
         let database = self
             .admitted_bootstrap_database
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
-        let source = binding.local_member();
-        if source.kuberic_identity.replica_id != binding.configuration.primary_id
-            || source.stable_role != ReplicaRole::Primary
-            || *self
-                .role
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                != Some(ReplicaRole::Primary)
-        {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "build-owned seeding requires the exact configured primary",
-            ));
-        }
-        let target = binding
-            .members
-            .iter()
-            .find(|member| member.kuberic_identity == replica.identity)
-            .ok_or(KubericAdapterError::TopologyBindingMismatch(
-                "target build identity is not admitted",
-            ))?;
-        if target.stable_role != ReplicaRole::ActiveSecondary
-            || target.process_session_id.is_empty()
-            || replica.process_session_id != target.process_session_id
-            || replica.replication_address != target.replication_address
-            || !matches!(
-                replica.role,
-                ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
-            )
-        {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "target build session, address, or role differs from the admitted configuration",
-            ));
-        }
-        let source_record = seed_member(source)?;
-        let targets: [SeedDispatchTarget; 2] = binding
-            .members
-            .iter()
-            .filter(|member| member.stable_role == ReplicaRole::ActiveSecondary)
-            .map(seed_member)
-            .collect::<Result<Vec<_>, _>>()?
-            .try_into()
-            .map_err(|_| {
-                KubericAdapterError::TopologyBindingMismatch(
-                    "seed dispatch requires exactly two configured targets",
-                )
-            })?;
-        if targets
-            .iter()
-            .any(|target| target.process_session_id().is_empty())
-        {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "both configured target sessions must be current before seed dispatch",
-            ));
-        }
-        let target = target.clone();
+        let published_role = *self
+            .role
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let compatibility = CurrentBuildFacts::translate(&binding, replica, published_role)?;
         let record = SeedDispatchRecord::new(
             bootstrap.resource_uid.to_string(),
             binding.configuration.configuration_id.to_string(),
@@ -2955,10 +2916,10 @@ impl SqlServerReplicator {
             database.database_guid.as_str(),
             database.family_guid.as_str(),
             database.recovery_fork_guid.as_str(),
-            source_record,
-            targets,
-            replica.identity.replica_id.to_string(),
-            replica.build_id.to_string(),
+            compatibility.source,
+            compatibility.targets,
+            compatibility.winning_target_replica_id,
+            compatibility.build_id.clone(),
             binding.local_sql_server_start_incarnation.as_str(),
         )
         .map_err(KubericAdapterError::SeedState)?;
@@ -2966,8 +2927,8 @@ impl SqlServerReplicator {
             binding,
             database,
             record,
-            target,
-            build_id: replica.build_id.to_string(),
+            target: compatibility.target,
+            build_id: compatibility.build_id,
         })
     }
 
@@ -4008,35 +3969,14 @@ impl PrimaryReplicator for SqlServerReplicator {
             current
         };
         let generation = self.begin_operation()?;
-        if self.bootstrap.is_some() && current.replicas.len() < usize::from(SUPPORTED_REPLICA_COUNT)
-        {
-            let mut normalized = current.clone();
-            for member in &current.configuration.members {
-                if normalized
-                    .replicas
-                    .iter()
-                    .any(|replica| replica.identity == member.identity)
-                {
-                    continue;
-                }
-                let mut replica = ReplicaInformation::new(
-                    kuberic_runtime::protocol::types::OperationId::default(),
-                    member.identity.clone(),
-                    if member.identity == *runtime_identity {
-                        self.replication_address.clone()
-                    } else {
-                        String::new()
-                    },
-                );
-                replica.role = member.role;
-                normalized.replicas.push(replica);
-            }
-            validate_configuration_shape(
+        if self.bootstrap.is_some()
+            && validate_incomplete_bootstrap_configuration(
                 runtime_identity,
                 expectation,
                 &self.replication_address,
-                &normalized,
-            )?;
+                &current,
+            )?
+        {
             drop(self.finish_operation(generation)?);
             return Ok(());
         }
@@ -4099,13 +4039,18 @@ impl PrimaryReplicator for SqlServerReplicator {
                 )
             };
         validate_eligible_snapshot(self.source.observer_config(), &instance, &group, false)?;
-        let candidate = admit_topology(
+        let compatibility = CurrentTopologyFacts::translate(
             runtime_identity,
             expectation,
             &self.replication_address,
+            &current,
+        )?;
+        let candidate = admit_topology(
+            runtime_identity,
+            expectation,
             &instance,
             &group,
-            &current,
+            &compatibility,
             TopologyAdmissionOptions {
                 observer_config: self.source.observer_config(),
                 allow_unassociated_database: self.bootstrap.is_some(),
@@ -4179,19 +4124,6 @@ impl PrimaryReplicator for SqlServerReplicator {
     async fn remove_replica(&self, _replica_id: ReplicaId) -> KubericResult<()> {
         self.unsupported(ObserveOnlyOperation::RemoveReplica)
     }
-}
-
-fn seed_member(
-    member: &HealthyTopologyMemberBinding,
-) -> Result<SeedDispatchTarget, KubericAdapterError> {
-    SeedDispatchTarget::new(
-        member.kuberic_identity.replica_id.to_string(),
-        member.kuberic_identity.instance_id.to_string(),
-        member.kuberic_identity.agent_generation.to_string(),
-        member.process_session_id.to_string(),
-        member.native_replica_id.as_str(),
-    )
-    .map_err(KubericAdapterError::SeedState)
 }
 
 #[cfg(feature = "kuberic-testing")]
@@ -4596,19 +4528,6 @@ fn classify_source_seed_completion(
     }
 }
 
-fn validate_replication_address(address: &str) -> Result<(), KubericAdapterError> {
-    if address.is_empty()
-        || address.len() > 1024
-        || address.chars().any(char::is_control)
-        || address.trim() != address
-    {
-        return Err(KubericAdapterError::InvalidConfiguration(
-            "replication address must be nonempty, bounded, and contain no control or surrounding whitespace",
-        ));
-    }
-    Ok(())
-}
-
 fn present_snapshot(
     observation: Observation<InstanceSnapshot>,
 ) -> Result<(InstanceSnapshot, u64), KubericAdapterError> {
@@ -4685,13 +4604,11 @@ struct TopologyAdmissionOptions<'a> {
 fn admit_topology(
     runtime_identity: &KubericReplicaIdentity,
     expectation: &SqlServerTopologyExpectation,
-    replication_address: &str,
     instance: &crate::observation::InstanceMetadata,
     group: &AvailabilityGroupSnapshot,
-    current: &ReplicaSetConfiguration,
+    current: &CurrentTopologyFacts,
     options: TopologyAdmissionOptions<'_>,
 ) -> Result<HealthyTopologyBinding, KubericAdapterError> {
-    validate_configuration_shape(runtime_identity, expectation, replication_address, current)?;
     if !options.allow_unassociated_database
         && group.configuration_sequence.value() != current.configuration.epoch.configuration_number
     {
@@ -4777,22 +4694,12 @@ fn admit_topology(
     };
 
     let mut members = Vec::with_capacity(usize::from(SUPPORTED_REPLICA_COUNT));
-    for configuration_member in &current.configuration.members {
+    for configuration_member in &current.members {
         let expected = expectation
             .member(configuration_member.identity.replica_id)
             .ok_or(KubericAdapterError::TopologyBindingMismatch(
                 "current member has no SQL topology association",
             ))?;
-        let descriptions = current
-            .replicas
-            .iter()
-            .filter(|replica| replica.identity == configuration_member.identity)
-            .collect::<Vec<_>>();
-        if descriptions.len() != 1 {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "current replica identities differ from the current descriptor",
-            ));
-        }
         let native = group
             .replicas
             .iter()
@@ -4808,8 +4715,8 @@ fn admit_topology(
         }
         members.push(HealthyTopologyMemberBinding {
             kuberic_identity: configuration_member.identity.clone(),
-            process_session_id: descriptions[0].process_session_id.clone(),
-            replication_address: descriptions[0].replication_address.clone(),
+            process_session_id: configuration_member.process_session_id.clone(),
+            replication_address: configuration_member.replication_address.clone(),
             native_replica_id: native[0].replica_id.clone(),
             sql_endpoint: SqlServerMemberEndpoint::new(
                 expected.server_name().clone(),
@@ -4853,143 +4760,9 @@ fn admit_topology(
             "local SQL association differs from the observed native replica",
         ));
     }
-    validate_current_configuration(&candidate, current)?;
+    current.validate_binding(&candidate)?;
     validate_bound_evidence(&candidate, options.observer_config, instance, group, None)?;
     Ok(candidate)
-}
-
-fn validate_configuration_shape(
-    runtime_identity: &KubericReplicaIdentity,
-    expectation: &SqlServerTopologyExpectation,
-    replication_address: &str,
-    current: &ReplicaSetConfiguration,
-) -> Result<(), KubericAdapterError> {
-    let configuration = &current.configuration;
-    if configuration.configuration_id != configuration.expected_id()
-        || configuration.members.len() != usize::from(SUPPORTED_REPLICA_COUNT)
-        || current.replicas.len() != usize::from(SUPPORTED_REPLICA_COUNT)
-        || configuration.write_quorum != 2
-    {
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "current configuration requires exactly three members and quorum two",
-        ));
-    }
-    let primary_count = configuration
-        .members
-        .iter()
-        .filter(|member| member.role == ReplicaRole::Primary)
-        .count();
-    let secondary_count = configuration
-        .members
-        .iter()
-        .filter(|member| member.role == ReplicaRole::ActiveSecondary)
-        .count();
-    if primary_count != 1
-        || secondary_count != 2
-        || configuration.members.iter().any(|member| {
-            !matches!(
-                member.role,
-                ReplicaRole::Primary | ReplicaRole::ActiveSecondary
-            )
-        })
-        || configuration
-            .members
-            .iter()
-            .find(|member| member.role == ReplicaRole::Primary)
-            .is_none_or(|member| member.identity.replica_id != configuration.primary_id)
-    {
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "current configuration requires one Primary and two ActiveSecondary members",
-        ));
-    }
-    if configuration
-        .members
-        .iter()
-        .enumerate()
-        .any(|(index, member)| {
-            configuration.members[..index].iter().any(|other| {
-                other.identity == member.identity
-                    || other.identity.replica_id == member.identity.replica_id
-            })
-        })
-        || expectation.members().iter().any(|expected| {
-            !configuration
-                .members
-                .iter()
-                .any(|member| member.identity.replica_id == expected.replica_id())
-        })
-    {
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "current member identities differ from the topology expectation",
-        ));
-    }
-    let local = configuration
-        .members
-        .iter()
-        .find(|member| member.identity == *runtime_identity)
-        .ok_or(KubericAdapterError::TopologyBindingMismatch(
-            "current configuration does not include the runtime identity",
-        ))?;
-    if local.identity.replica_id != expectation.local_replica_id() {
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "runtime identity differs from the local topology association",
-        ));
-    }
-
-    for configuration_member in &configuration.members {
-        if configuration_member.identity.instance_id.is_empty()
-            || configuration_member.identity.agent_generation.is_empty()
-        {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "current member identities must be complete",
-            ));
-        }
-        let descriptions = current
-            .replicas
-            .iter()
-            .filter(|replica| replica.identity == configuration_member.identity)
-            .collect::<Vec<_>>();
-        if descriptions.len() != 1 {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "current replica identity differs from the descriptor",
-            ));
-        }
-        if !descriptions[0].replication_address.is_empty()
-            && validate_replication_address(&descriptions[0].replication_address).is_err()
-        {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "current replica address is invalid",
-            ));
-        }
-        if !matches!(descriptions[0].role, ReplicaRole::None)
-            && descriptions[0].role != configuration_member.role
-        {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "current replica role differs from the descriptor",
-            ));
-        }
-        if configuration_member.identity == *runtime_identity
-            && descriptions[0].replication_address != replication_address
-        {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "local replication address differs from the runtime",
-            ));
-        }
-    }
-    if current.replicas.iter().enumerate().any(|(index, replica)| {
-        current.replicas[..index].iter().any(|other| {
-            other.identity == replica.identity
-                || (!replica.process_session_id.is_empty()
-                    && other.process_session_id == replica.process_session_id)
-                || (!replica.replication_address.is_empty()
-                    && other.replication_address == replica.replication_address)
-        })
-    }) {
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "current identities, sessions, and addresses must be unique",
-        ));
-    }
-    Ok(())
 }
 
 fn validate_observer_expectation(
@@ -5005,65 +4778,6 @@ fn validate_observer_expectation(
     } else {
         Ok(())
     }
-}
-
-fn bootstrap_descriptors(
-    expectation: &SqlServerTopologyExpectation,
-    current: &ReplicaSetConfiguration,
-) -> Result<Vec<ReplicaDescriptor>, KubericAdapterError> {
-    expectation
-        .members()
-        .iter()
-        .map(|member| {
-            let configured = current
-                .configuration
-                .members
-                .iter()
-                .find(|configured| configured.identity.replica_id == member.replica_id())
-                .ok_or(KubericAdapterError::TopologyBindingMismatch(
-                    "bootstrap member has no current configuration identity",
-                ))?;
-            let endpoint = member
-                .endpoint_url()
-                .get(6..)
-                .and_then(|value| value.rsplit_once(':'))
-                .ok_or(KubericAdapterError::InvalidConfiguration(
-                    "bootstrap SQL endpoint is invalid",
-                ))?;
-            if !member.endpoint_url()[..6].eq_ignore_ascii_case("tcp://")
-                || !endpoint
-                    .0
-                    .eq_ignore_ascii_case(member.server_name().as_str())
-            {
-                return Err(KubericAdapterError::InvalidConfiguration(
-                    "bootstrap SQL endpoint must name the configured SQL member",
-                ));
-            }
-            let port = endpoint
-                .1
-                .parse::<u16>()
-                .ok()
-                .filter(|port| *port != 0)
-                .ok_or(KubericAdapterError::InvalidConfiguration(
-                    "bootstrap SQL endpoint port is invalid",
-                ))?;
-            Ok(ReplicaDescriptor {
-                identity: SqlReplicaIdentity::desired(
-                    configured.identity.replica_id.to_string(),
-                    configured.identity.agent_generation.to_string(),
-                )
-                .map_err(|_| {
-                    KubericAdapterError::InvalidConfiguration(
-                        "bootstrap SQL replica identity is invalid",
-                    )
-                })?,
-                server_name: member.server_name().clone(),
-                endpoint: Endpoint::new(member.server_name().as_str(), port).map_err(|_| {
-                    KubericAdapterError::InvalidConfiguration("bootstrap SQL endpoint is invalid")
-                })?,
-            })
-        })
-        .collect()
 }
 
 fn bootstrap_membership_ready(
@@ -5137,277 +4851,6 @@ fn validate_bootstrap_instance(
         ));
     }
     validate_supported_instance(instance)
-}
-
-fn validate_current_configuration(
-    binding: &HealthyTopologyBinding,
-    current: &ReplicaSetConfiguration,
-) -> Result<(), KubericAdapterError> {
-    validate_configuration_replay(binding, current, false)
-}
-
-fn validate_bootstrap_configuration_replay(
-    binding: &HealthyTopologyBinding,
-    current: &ReplicaSetConfiguration,
-) -> Result<(), KubericAdapterError> {
-    validate_configuration_replay(binding, current, true)
-}
-
-fn validate_configuration_replay(
-    binding: &HealthyTopologyBinding,
-    current: &ReplicaSetConfiguration,
-    allow_remote_omissions: bool,
-) -> Result<(), KubericAdapterError> {
-    if current.configuration != binding.configuration {
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "current descriptor differs from the frozen descriptor",
-        ));
-    }
-    if current.replicas.len() != binding.members.len() {
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "current replica descriptions are incomplete",
-        ));
-    }
-    for member in &binding.members {
-        let matching = current
-            .replicas
-            .iter()
-            .filter(|replica| replica.identity == member.kuberic_identity)
-            .collect::<Vec<_>>();
-        if matching.len() != 1 {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "current replica identities differ from the frozen members",
-            ));
-        }
-        let replica = matching[0];
-        let remote_omission =
-            allow_remote_omissions && member.kuberic_identity != binding.local_identity;
-        if (replica.process_session_id != member.process_session_id
-            && !(remote_omission && replica.process_session_id.is_empty()))
-            || (replica.replication_address != member.replication_address
-                && !(remote_omission && replica.replication_address.is_empty()))
-            || (!matches!(replica.role, ReplicaRole::None) && replica.role != member.stable_role)
-        {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "current replica session, address, or role differs from the frozen member",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn normalize_bootstrap_configuration(
-    current: ReplicaSetConfiguration,
-) -> Result<ReplicaSetConfiguration, KubericAdapterError> {
-    if current.replicas.len() <= usize::from(SUPPORTED_REPLICA_COUNT) {
-        return Ok(current);
-    }
-    let mut base = Vec::with_capacity(current.configuration.members.len());
-    let mut described = 0;
-    for member in &current.configuration.members {
-        let matches = current
-            .replicas
-            .iter()
-            .filter(|replica| replica.identity == member.identity)
-            .collect::<Vec<_>>();
-        described += matches.len();
-        let base_descriptions = matches
-            .iter()
-            .filter(|replica| replica.build_id.is_empty())
-            .collect::<Vec<_>>();
-        if base_descriptions.len() != 1
-            || matches.iter().any(|replica| {
-                !replica.build_id.is_empty()
-                    && (member.role != ReplicaRole::ActiveSecondary
-                        || !matches!(
-                            replica.role,
-                            ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
-                        ))
-            })
-        {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "bootstrap build-enriched configuration is ambiguous",
-            ));
-        }
-        base.push((**base_descriptions.first().expect("one base description")).clone());
-    }
-    if described != current.replicas.len()
-        || current.replicas.len() > current.configuration.members.len() + 2
-    {
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "bootstrap build-enriched configuration has unknown descriptions",
-        ));
-    }
-    Ok(ReplicaSetConfiguration {
-        configuration: current.configuration,
-        replicas: base,
-    })
-}
-
-fn build_enriched_configuration(
-    binding: &HealthyTopologyBinding,
-    current: &ReplicaSetConfiguration,
-) -> Result<bool, KubericAdapterError> {
-    if current.configuration != binding.configuration {
-        return Ok(false);
-    }
-    if current.replicas.len() <= binding.members.len() {
-        return Ok(false);
-    }
-    if current.replicas.len() > binding.members.len() + 2 {
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "build-enriched current configuration has an invalid description count",
-        ));
-    }
-    let mut base = Vec::with_capacity(binding.members.len());
-    let mut builds = Vec::new();
-    for member in &binding.members {
-        let matches = current
-            .replicas
-            .iter()
-            .filter(|replica| replica.identity == member.kuberic_identity)
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [only] => base.push((*only).clone()),
-            [first, second] => {
-                let (base_replica, build) =
-                    match (first.build_id.is_empty(), second.build_id.is_empty()) {
-                        (true, false) => (*first, *second),
-                        (false, true) => (*second, *first),
-                        _ => {
-                            return Err(KubericAdapterError::TopologyBindingMismatch(
-                                "build-enriched target descriptions are ambiguous",
-                            ));
-                        }
-                    };
-                base.push(base_replica.clone());
-                builds.push(build.clone());
-            }
-            _ => {
-                return Err(KubericAdapterError::TopologyBindingMismatch(
-                    "build-enriched current configuration has invalid member descriptions",
-                ));
-            }
-        }
-    }
-    if builds.is_empty() {
-        return Ok(false);
-    }
-    if base.len() + builds.len() != current.replicas.len() {
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "build-enriched current configuration contains an unknown replica",
-        ));
-    }
-    validate_bootstrap_configuration_replay(
-        binding,
-        &ReplicaSetConfiguration {
-            configuration: current.configuration.clone(),
-            replicas: base,
-        },
-    )?;
-    for build in builds {
-        let target = binding
-            .members
-            .iter()
-            .find(|member| member.kuberic_identity == build.identity)
-            .ok_or(KubericAdapterError::TopologyBindingMismatch(
-                "build-enriched current configuration has an unknown target",
-            ))?;
-        if target.stable_role != ReplicaRole::ActiveSecondary
-            || build.process_session_id != target.process_session_id
-            || (!build.replication_address.is_empty()
-                && build.replication_address != target.replication_address)
-            || !matches!(
-                build.role,
-                ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
-            )
-            || build.current_progress < 0
-            || build.catch_up_capability < 0
-        {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "build-enriched current configuration differs from the admitted target",
-            ));
-        }
-    }
-    Ok(true)
-}
-
-fn configuration_enriches(
-    previous: &ReplicaSetConfiguration,
-    current: &ReplicaSetConfiguration,
-) -> bool {
-    if previous.configuration != current.configuration
-        || previous.replicas.len() != current.replicas.len()
-    {
-        return false;
-    }
-
-    previous.replicas.iter().all(|old| {
-        let matching = current
-            .replicas
-            .iter()
-            .filter(|new| new.identity == old.identity)
-            .collect::<Vec<_>>();
-        if matching.len() != 1 {
-            return false;
-        }
-        let new = matching[0];
-        (old.process_session_id.is_empty() || old.process_session_id == new.process_session_id)
-            && (old.replication_address.is_empty()
-                || old.replication_address == new.replication_address)
-            && (matches!(old.role, ReplicaRole::None) || old.role == new.role)
-            && old.current_progress == new.current_progress
-            && old.catch_up_capability == new.catch_up_capability
-    })
-}
-
-fn configuration_is_complete(configuration: &ReplicaSetConfiguration) -> bool {
-    configuration.replicas.iter().all(|replica| {
-        !replica.process_session_id.is_empty()
-            && validate_replication_address(&replica.replication_address).is_ok()
-            && !matches!(replica.role, ReplicaRole::None)
-    })
-}
-
-fn topology_enriches(previous: &HealthyTopologyBinding, current: &HealthyTopologyBinding) -> bool {
-    if previous.local_identity != current.local_identity
-        || previous.configuration != current.configuration
-        || (previous.database_lineage.is_some()
-            && previous.native_configuration_sequence != current.native_configuration_sequence)
-        || previous.availability_group != current.availability_group
-        || previous
-            .database_lineage
-            .as_ref()
-            .is_some_and(|lineage| current.database_lineage.as_ref() != Some(lineage))
-        || previous.bootstrap_database_name != current.bootstrap_database_name
-        || previous
-            .bootstrap_database
-            .as_ref()
-            .is_some_and(|database| current.bootstrap_database.as_ref() != Some(database))
-        || previous.local_sql_replica_identity != current.local_sql_replica_identity
-        || previous.local_sql_server_start_incarnation != current.local_sql_server_start_incarnation
-        || previous.members.len() != current.members.len()
-    {
-        return false;
-    }
-    previous.members.iter().all(|old| {
-        let matching = current
-            .members
-            .iter()
-            .filter(|new| new.kuberic_identity == old.kuberic_identity)
-            .collect::<Vec<_>>();
-        if matching.len() != 1 {
-            return false;
-        }
-        let new = matching[0];
-        old.native_replica_id == new.native_replica_id
-            && old.sql_endpoint == new.sql_endpoint
-            && old.stable_role == new.stable_role
-            && (old.process_session_id.is_empty()
-                || old.process_session_id == new.process_session_id)
-            && (old.replication_address.is_empty()
-                || old.replication_address == new.replication_address)
-    })
 }
 
 fn validate_bound_evidence(

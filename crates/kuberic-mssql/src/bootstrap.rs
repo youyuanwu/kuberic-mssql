@@ -6,11 +6,6 @@ use crate::{
     NativeRole, ReplicaDescriptor, ReplicaIdentity, ServerName, SqlIdentifier,
 };
 
-#[cfg(feature = "kuberic")]
-use kuberic_runtime::protocol::types::{ReplicaIdentity as KubericReplicaIdentity, ReplicaRole};
-#[cfg(feature = "kuberic")]
-use kuberic_runtime::replicator::ReplicaSetConfiguration;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeConvergenceState {
     Absent,
@@ -383,40 +378,4 @@ pub fn classify_replica_seed(
     } else {
         NativeConvergenceState::Complete
     }
-}
-
-#[cfg(feature = "kuberic")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BootstrapOwnership {
-    PrimaryTopology,
-    LocalJoin,
-}
-
-#[cfg(feature = "kuberic")]
-pub fn classify_bootstrap_ownership(
-    local: &KubericReplicaIdentity,
-    configuration: &ReplicaSetConfiguration,
-) -> Result<BootstrapOwnership, BootstrapOwnershipError> {
-    let member = configuration
-        .configuration
-        .members
-        .iter()
-        .find(|member| member.identity == *local)
-        .ok_or(BootstrapOwnershipError::LocalMemberMissing)?;
-    if member.identity.replica_id == configuration.configuration.primary_id
-        && member.role == ReplicaRole::Primary
-    {
-        return Ok(BootstrapOwnership::PrimaryTopology);
-    }
-    if member.role == ReplicaRole::ActiveSecondary {
-        return Ok(BootstrapOwnership::LocalJoin);
-    }
-    Err(BootstrapOwnershipError::UnsupportedRole)
-}
-
-#[cfg(feature = "kuberic")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BootstrapOwnershipError {
-    LocalMemberMissing,
-    UnsupportedRole,
 }

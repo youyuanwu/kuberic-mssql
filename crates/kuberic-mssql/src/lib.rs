@@ -28,8 +28,6 @@ pub use bootstrap::{
     classify_owned_availability_group, classify_replica_join, classify_replica_seed,
     classify_standalone_database, source_database_creation_token,
 };
-#[cfg(feature = "kuberic-testing")]
-pub use bootstrap::{BootstrapOwnership, BootstrapOwnershipError, classify_bootstrap_ownership};
 pub use config::{
     AvailabilityMode, ClusterType, Edition, FailoverMode, MutationMode, SUPPORTED_DATABASE_COUNT,
     SUPPORTED_ENGINE_MAJOR, SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT,
@@ -37,6 +35,11 @@ pub use config::{
     SqlServerSupportConfig,
 };
 pub use error::ContractError;
+#[cfg(feature = "kuberic-testing")]
+pub use kuberic::{
+    BootstrapOwnership, BootstrapOwnershipError, classify_bootstrap_ownership,
+    testing_current_pin_bootstrap_descriptors,
+};
 #[cfg(feature = "kuberic")]
 pub use kuberic::{
     HealthyTopologyBinding, HealthyTopologyMemberBinding, SqlServerStartIncarnation,
