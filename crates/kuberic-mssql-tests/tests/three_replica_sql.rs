@@ -710,6 +710,31 @@ fn native_evidence_accepts_only_fresh_exact_healthy_three_member_topology() {
 }
 
 #[test]
+fn native_evidence_accepts_historical_failure_after_exact_success() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut evidence = healthy_native_evidence();
+    evidence[0].automatic_seeding.push(SeedingEvidence {
+        group_database_id: guid(20),
+        remote_replica_id: guid(2),
+        operation_id: guid(99),
+        is_source: true,
+        current_state: Some("FAILED".to_owned()),
+        performed_seeding: Some(false),
+        failure_state: Some(106),
+        error_code: Some(35250),
+        completion_time: Some("2026-10-06T22:59:59".to_owned()),
+    });
+
+    validate_native_evidence(
+        &native_run(directory.path()),
+        evidence,
+        10_001,
+        Duration::from_secs(30),
+    )
+    .unwrap();
+}
+
+#[test]
 fn native_evidence_rejects_stale_mismatch_wrong_ids_profiles_and_roles() {
     let directory = tempfile::tempdir().unwrap();
     let run = native_run(directory.path());

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
@@ -124,7 +125,7 @@ struct PublicTargetHostEvidenceExchange {
     identities: [ReplicaIdentity; 3],
     frozen_sql_starts: [SqlServerStartIncarnation; 3],
     sources: Arc<Mutex<Vec<Option<Source>>>>,
-    authorities: Arc<Mutex<Vec<Option<PublicTargetEvidenceAuthority>>>>,
+    authorities: Arc<Mutex<Vec<BTreeMap<String, PublicTargetEvidenceAuthority>>>>,
     injection: Arc<Mutex<Option<PublicTargetEvidenceInjection>>>,
     gate: Arc<Mutex<Option<SeedGate>>>,
 }
@@ -161,7 +162,11 @@ impl PublicTargetHostEvidenceExchange {
             identities,
             frozen_sql_starts,
             sources: Arc::new(Mutex::new(vec![None, None, None])),
-            authorities: Arc::new(Mutex::new(vec![None, None, None])),
+            authorities: Arc::new(Mutex::new(vec![
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ])),
             injection: Arc::new(Mutex::new(None)),
             gate: Arc::new(Mutex::new(None)),
         })
@@ -242,11 +247,14 @@ impl PublicTargetHostEvidenceExchange {
             .authorities
             .lock()
             .map_err(|_| MssqlGroupError::new("target evidence authority lock is poisoned"))?;
-        authorities[index] = Some(PublicTargetEvidenceAuthority {
-            build_id: command.build_id.to_string(),
-            identity: command.target.clone(),
-            process_session_id,
-        });
+        authorities[index].insert(
+            command.build_id.to_string(),
+            PublicTargetEvidenceAuthority {
+                build_id: command.build_id.to_string(),
+                identity: command.target.clone(),
+                process_session_id,
+            },
+        );
         Ok(())
     }
 
@@ -262,12 +270,7 @@ impl PublicTargetHostEvidenceExchange {
             .authorities
             .lock()
             .map_err(|_| MssqlGroupError::new("target evidence authority lock is poisoned"))?;
-        if authorities[index]
-            .as_ref()
-            .is_some_and(|authority| authority.build_id == command.build_id.as_str())
-        {
-            authorities[index] = None;
-        }
+        authorities[index].remove(command.build_id.as_str());
         Ok(())
     }
 }
@@ -299,7 +302,8 @@ impl TargetHostEvidenceExchange for PublicTargetHostEvidenceExchange {
                 KubericAdapterError::NativeConvergenceUnsafe("target-host test authority")
             })?
             .get(index)
-            .and_then(Clone::clone)
+            .and_then(|authorities| authorities.get(request.build_id()))
+            .cloned()
             .ok_or(KubericAdapterError::NativeConvergenceUnsafe(
                 "target-host test authority",
             ))?;

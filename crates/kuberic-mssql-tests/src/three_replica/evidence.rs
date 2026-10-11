@@ -111,11 +111,7 @@ impl EvidenceError {
     pub fn retryable(self) -> bool {
         !matches!(
             self,
-            Self::Deadline
-                | Self::IdentityMismatch
-                | Self::ProfileMismatch
-                | Self::LineageMismatch
-                | Self::SeedingFailed
+            Self::Deadline | Self::IdentityMismatch | Self::ProfileMismatch | Self::LineageMismatch
         )
     }
 }
@@ -341,15 +337,6 @@ pub fn validate_native_evidence(
         .filter(|member| member.local_role == "SECONDARY")
         .map(|member| member.local_replica_id.as_str())
         .collect::<BTreeSet<_>>();
-    if primary.automatic_seeding.iter().any(|seed| {
-        secondary_ids.contains(seed.remote_replica_id.as_str())
-            && (seed.current_state.as_deref() == Some("FAILED")
-                || seed.performed_seeding == Some(false)
-                || seed.failure_state.is_some_and(|value| value != 0)
-                || seed.error_code.is_some_and(|value| value != 0))
-    }) {
-        return Err(EvidenceError::SeedingFailed);
-    }
     let successful_seeds = primary
         .automatic_seeding
         .iter()
@@ -364,6 +351,22 @@ pub fn validate_native_evidence(
                 && seed.completion_time.is_some()
         })
         .collect::<Vec<_>>();
+    let successful_targets = successful_seeds
+        .iter()
+        .map(|seed| seed.remote_replica_id.as_str())
+        .collect::<BTreeSet<_>>();
+    // The DMV retains one row per seeding process. Historical failed
+    // processes do not invalidate a later exact completed process.
+    if primary.automatic_seeding.iter().any(|seed| {
+        secondary_ids.contains(seed.remote_replica_id.as_str())
+            && !successful_targets.contains(seed.remote_replica_id.as_str())
+            && (seed.current_state.as_deref() == Some("FAILED")
+                || seed.performed_seeding == Some(false)
+                || seed.failure_state.is_some_and(|value| value != 0)
+                || seed.error_code.is_some_and(|value| value != 0))
+    }) {
+        return Err(EvidenceError::SeedingFailed);
+    }
     if successful_seeds.len() != 2
         || successful_seeds
             .iter()

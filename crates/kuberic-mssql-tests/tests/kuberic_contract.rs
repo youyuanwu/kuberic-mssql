@@ -1336,8 +1336,8 @@ fn native_bootstrap_classifiers_cover_every_operation_state() {
         ),
         NativeConvergenceState::Conflicting
     );
-    let mut seed_unsafe = secondary_group.clone();
-    seed_unsafe
+    let mut seed_failed_then_completed = secondary_group.clone();
+    seed_failed_then_completed
         .automatic_seeding
         .push(AutomaticSeedingSnapshot {
             group_database_id: lineage.database.group_database_id.clone(),
@@ -1354,14 +1354,14 @@ fn native_bootstrap_classifiers_cover_every_operation_state() {
         });
     assert_eq!(
         classify_replica_seed(
-            Some(&seed_unsafe),
+            Some(&seed_failed_then_completed),
             &complete_group.identity,
             &lineage.database,
             &lineage,
             &guid(SECOND_ID),
             false,
         ),
-        NativeConvergenceState::Unsafe
+        NativeConvergenceState::Complete
     );
     for wrong_group in [
         AvailabilityGroupIdentity {

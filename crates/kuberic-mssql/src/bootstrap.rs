@@ -343,16 +343,6 @@ pub fn classify_replica_seed(
     if group.identity != *availability_group {
         return NativeConvergenceState::Conflicting;
     }
-    if group.automatic_seeding.iter().any(|seed| {
-        seed.group_database_id == database.group_database_id
-            && seed.remote_replica_id == *target_replica_id
-            && (seed.current_state.as_deref() == Some("FAILED")
-                || seed.performed_seeding == Some(false)
-                || seed.failure_state.is_some_and(|value| value != 0)
-                || seed.error_code.is_some_and(|value| value != 0))
-    }) {
-        return NativeConvergenceState::Unsafe;
-    }
     let Some(database_snapshot) = group
         .databases
         .iter()
@@ -380,6 +370,9 @@ pub fn classify_replica_seed(
             return NativeConvergenceState::Incomplete;
         }
     }
+    // Automatic-seeding DMV rows describe individual processes. A failed
+    // process can precede a later retry, while this target-local native state
+    // is the terminal postcondition for the exact database and lineage.
     if target.provenance != NativeProvenance::Local
         || target.database_state.as_deref() != Some("ONLINE")
         || target.synchronization_state.as_deref() != Some("SYNCHRONIZED")

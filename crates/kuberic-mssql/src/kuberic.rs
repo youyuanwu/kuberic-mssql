@@ -4538,16 +4538,6 @@ fn classify_source_seed_completion(
     source: &StandaloneDatabaseIdentity,
     target_replica_id: &Guid,
 ) -> NativeConvergenceState {
-    if group.automatic_seeding.iter().any(|seed| {
-        seed.group_database_id == database.group_database_id
-            && seed.remote_replica_id == *target_replica_id
-            && (seed.current_state.as_deref() == Some("FAILED")
-                || seed.performed_seeding == Some(false)
-                || seed.failure_state.is_some_and(|value| value != 0)
-                || seed.error_code.is_some_and(|value| value != 0))
-    }) {
-        return NativeConvergenceState::Unsafe;
-    }
     let Some(snapshot) = group
         .databases
         .iter()
@@ -4575,6 +4565,9 @@ fn classify_source_seed_completion(
             return NativeConvergenceState::Incomplete;
         }
     }
+    // A failed DMV process is not terminal because SQL Server may retry it.
+    // Completion requires a successful process plus the current native target
+    // postcondition, so historical failures cannot create false success.
     let successful_dispatch = group.automatic_seeding.iter().any(|seed| {
         seed.group_database_id == database.group_database_id
             && seed.remote_replica_id == *target_replica_id
