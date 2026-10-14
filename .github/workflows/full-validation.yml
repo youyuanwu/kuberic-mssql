@@ -1,0 +1,54 @@
+name: Full SQL Server validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      resume_after:
+        description: "Previously completed live test; earlier cases are reported as prior-run results"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-mssql-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          components: rustfmt, clippy
+          build-warnings: ""
+      - name: Bootstrap shared tools
+        id: setup
+        run: bash crates/kuberic-mssql-tests/scripts/setup_environment.sh
+      - name: Check full-validation prerequisites
+        run: |
+          if ! command -v setfacl || ! command -v getfacl || ! command -v setcap; then
+            sudo -n apt-get update -qq
+            sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq acl libcap2-bin
+          fi
+          command -v setfacl
+          command -v getfacl
+          command -v setcap
+          test "$(id -u)" != 0
+          docker version
+      - name: Run all server-free and live tests
+        id: validation
+        env:
+          CARGO_BUILD_JOBS: "1"
+          FULL_VALIDATION_RESUME_AFTER: ${{ inputs.resume_after }}
+        run: python3 crates/kuberic-mssql-tests/scripts/run_all_tests.py
+      - name: Preserve sanitized results
+        if: always() && steps.setup.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-mssql-validation-${{ github.sha }}
+          path: target/full-validation-results
+          if-no-files-found: error

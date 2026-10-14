@@ -2019,6 +2019,13 @@ fn alternate_guid(index: u16) -> Result<Guid, MssqlGroupError> {
     .map_err(display_error)
 }
 
+fn changing_public_observation(error: &tonic::Status) -> bool {
+    error.code() == tonic::Code::Internal
+        && error
+            .message()
+            .contains("SQL Server observation is unavailable: Inconsistent")
+}
+
 fn retryable_public_build_error(error: &tonic::Status) -> bool {
     error.code() == tonic::Code::Cancelled
         || (error.code() == tonic::Code::Unavailable
@@ -2031,6 +2038,7 @@ fn retryable_public_build_error(error: &tonic::Status) -> bool {
             && error
                 .message()
                 .contains("SQL Server observation is unavailable: Unsupported"))
+        || changing_public_observation(error)
         || (error.code() == tonic::Code::Internal
             && error
                 .message()
@@ -2396,7 +2404,9 @@ async fn ensure_configuration(
         let fatal = results
             .iter()
             .filter_map(|result| result.as_ref().err())
-            .filter(|error| error.code() != tonic::Code::Cancelled)
+            .filter(|error| {
+                error.code() != tonic::Code::Cancelled && !changing_public_observation(error)
+            })
             .map(ToString::to_string)
             .collect::<Vec<_>>();
         if !fatal.is_empty() {
@@ -2761,6 +2771,24 @@ fn display_error(error: impl std::fmt::Display) -> MssqlGroupError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_build_reobserves_rejected_changing_samples_not_identity_conflicts() {
+        let changing = tonic::Status::internal(
+            "application error: SQL Server observation is unavailable: Inconsistent",
+        );
+        assert!(retryable_public_build_error(&changing));
+        assert!(changing_public_observation(&changing));
+        for error in [
+            tonic::Status::permission_denied("SQL Server observation is unavailable: Inconsistent"),
+            tonic::Status::internal("native database identity or recovery lineage differs"),
+            tonic::Status::internal("native availability-group identity differs"),
+            tonic::Status::failed_precondition("target SQL process incarnation changed"),
+        ] {
+            assert!(!retryable_public_build_error(&error), "{error}");
+            assert!(!changing_public_observation(&error), "{error}");
+        }
+    }
 
     #[tokio::test]
     async fn stalled_public_control_connection_is_deadline_bounded() {

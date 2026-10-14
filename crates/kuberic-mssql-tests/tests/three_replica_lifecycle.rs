@@ -710,14 +710,48 @@ fn container_request_freezes_limits_mount_labels_and_acceptance() {
         .verify_inspection(&inspection, "image-id", false)
         .unwrap();
 
-    let mut wrong = inspection;
+    let mut wrong = inspection.clone();
     wrong.limits.memory_swap_bytes += 1;
     assert_eq!(
         request
             .verify_inspection(&wrong, "image-id", false)
             .unwrap_err(),
-        DockerError::OwnershipMismatch
+        DockerError::ContainerInspectionMismatch("resource limits")
     );
+
+    let mut running = inspection;
+    running.running = true;
+    request
+        .verify_inspection(&running, "image-id", true)
+        .unwrap();
+    let mut stopped = running.clone();
+    stopped.running = false;
+    assert_eq!(
+        request
+            .verify_frozen_running_inspection(&stopped, &running, "image-id")
+            .unwrap_err(),
+        DockerError::ContainerInspectionMismatch("running state")
+    );
+    let mut replaced = running.clone();
+    replaced.id = "foreign-container-id".to_owned();
+    assert_eq!(
+        request
+            .verify_frozen_running_inspection(&replaced, &running, "image-id")
+            .unwrap_err(),
+        DockerError::ContainerInspectionMismatch("frozen container ID")
+    );
+    let mut changed = running.clone();
+    changed
+        .environment
+        .push("SECRET_VALUE=must-not-be-logged".to_owned());
+    let error = request
+        .verify_frozen_running_inspection(&changed, &running, "image-id")
+        .unwrap_err();
+    assert_eq!(
+        error,
+        DockerError::ContainerInspectionMismatch("frozen environment")
+    );
+    assert!(!format!("{error:?} {error}").contains("must-not-be-logged"));
 }
 
 #[test]

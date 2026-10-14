@@ -250,6 +250,8 @@ impl JournalStore {
 
     fn openat(&self, name: &str, flags: i32, mode: libc::mode_t) -> io::Result<File> {
         let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        #[cfg(target_vendor = "apple")]
+        let mode = libc::c_uint::from(mode);
         let descriptor =
             unsafe { libc::openat(self.root_directory.as_raw_fd(), name.as_ptr(), flags, mode) };
         if descriptor < 0 {

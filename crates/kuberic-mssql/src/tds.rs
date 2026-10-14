@@ -99,9 +99,40 @@ pub trait SeedSubmissionProbe: Send + Sync {
     ) -> Result<SeedSubmissionAction, RuntimeError>;
 }
 
-struct TdsSession {
+pub(crate) struct TdsSession {
     client: Option<Client<Compat<TcpStream>>>,
     query_timeout: Duration,
+}
+
+#[cfg(feature = "ag-convergence")]
+#[derive(Clone, Copy)]
+pub(crate) enum TdsPurpose {
+    Observer,
+    Mutation,
+}
+
+#[cfg(feature = "ag-convergence")]
+pub(crate) async fn connect_session(
+    settings: &ConnectionSettings,
+    purpose: TdsPurpose,
+) -> Result<TdsSession, RuntimeError> {
+    let (application, username, password) = match purpose {
+        TdsPurpose::Observer => (
+            "kuberic-sqlserver-observer",
+            "observer username",
+            "observer password",
+        ),
+        TdsPurpose::Mutation => (
+            "kuberic-sqlserver-ag-adapter",
+            "mutation username",
+            "mutation password",
+        ),
+    };
+    let client = connect_client(settings, application, username, password, None).await?;
+    Ok(TdsSession {
+        client: Some(client),
+        query_timeout: settings.query_timeout,
+    })
 }
 
 #[async_trait]
@@ -688,55 +719,68 @@ impl SqlSession for TdsSession {
         query: ReadQuery,
         availability_group: &AvailabilityGroupName,
     ) -> Result<Vec<QueryRow>, RuntimeError> {
+        self.query_text(
+            query.sql(),
+            availability_group.as_str(),
+            query.columns(),
+            query.label(),
+        )
+        .await
+    }
+}
+
+impl TdsSession {
+    pub(crate) async fn query_text(
+        &mut self,
+        sql: &str,
+        parameter: &str,
+        columns: &[&str],
+        stage: &'static str,
+    ) -> Result<Vec<QueryRow>, RuntimeError> {
         // The future owns the client, so an error, panic, or cancellation cannot
         // leave a partially decoded session available for another query.
-        let mut client = self.client.take().ok_or_else(|| {
-            malformed(
-                query.label(),
-                "TDS session is closed; reconnect before observing",
-            )
-        })?;
+        let mut client = self
+            .client
+            .take()
+            .ok_or_else(|| malformed(stage, "TDS session is closed; reconnect before observing"))?;
         let (client, rows) = timeout(
             self.query_timeout,
-            panic_boundary::contain(query.label(), async move {
-                let name = availability_group.as_str();
+            panic_boundary::contain(stage, async move {
+                let name = parameter;
                 let mut stream = client
-                    .query(query.sql(), &[&name])
+                    .query(sql, &[&name])
                     .await
-                    .map_err(|error| driver_error(query.label(), error))?;
+                    .map_err(|error| driver_error(stage, error))?;
                 let mut rows = Vec::new();
                 let mut result_sets = 0;
                 while let Some(item) = stream
                     .try_next()
                     .await
-                    .map_err(|error| driver_error(query.label(), error))?
+                    .map_err(|error| driver_error(stage, error))?
                 {
                     match item {
                         QueryItem::Metadata(metadata) => {
                             result_sets += 1;
                             if result_sets != 1 {
-                                return Err(malformed(
-                                    query.label(),
-                                    "unexpected multiple result sets",
-                                ));
+                                return Err(malformed(stage, "unexpected multiple result sets"));
                             }
-                            validate_columns(query, metadata.columns())?;
+                            validate_result_columns(columns, metadata.columns(), stage)?;
                         }
                         QueryItem::Row(row) => {
                             if rows.len() == MAX_QUERY_ROWS {
                                 return Err(malformed(
-                                    query.label(),
+                                    stage,
                                     "query exceeds the 4096-row observation limit",
                                 ));
                             }
                             let mut values = QueryRow::new();
                             for (index, column) in row.columns().iter().enumerate() {
                                 let value = row.try_get::<&str, _>(index).map_err(|_| {
-                                    malformed(query.label(), "expected a text or NULL DMV column")
+                                    malformed(stage, "expected a text or NULL DMV column")
                                 })?;
                                 if value.is_some_and(|text| text.len() > MAX_CELL_BYTES) {
                                     return Err(malformed(
-                                        query.label(),
+                                        stage,
                                         "DMV column exceeds the size limit",
                                     ));
                                 }
@@ -744,10 +788,7 @@ impl SqlSession for TdsSession {
                                     .insert(column.name().to_owned(), value.map(str::to_owned))
                                     .is_some()
                                 {
-                                    return Err(malformed(
-                                        query.label(),
-                                        "duplicate DMV column name",
-                                    ));
+                                    return Err(malformed(stage, "duplicate DMV column name"));
                                 }
                             }
                             rows.push(values);
@@ -755,37 +796,67 @@ impl SqlSession for TdsSession {
                     }
                 }
                 if result_sets != 1 {
-                    return Err(malformed(query.label(), "missing DMV result set"));
+                    return Err(malformed(stage, "missing DMV result set"));
                 }
                 drop(stream);
                 Ok((client, rows))
             }),
         )
         .await
-        .map_err(|_| timed_out(query.label()))??;
+        .map_err(|_| timed_out(stage))??;
         self.client = Some(client);
         Ok(rows)
     }
+
+    #[cfg(feature = "ag-convergence")]
+    pub(crate) async fn execute_mutation(mut self, sql: &str) -> Result<(), RuntimeError> {
+        let mut client = self.client.take().ok_or_else(|| {
+            malformed(
+                "native mutation",
+                "TDS session is closed; reconnect before executing",
+            )
+        })?;
+        panic_boundary::contain("native mutation", async move {
+            client
+                .execute(sql, &[])
+                .await
+                .map_err(|error| driver_error("native mutation", error))?;
+            Ok(())
+        })
+        .await
+    }
 }
 
-fn validate_columns(query: ReadQuery, columns: &[Column]) -> Result<(), RuntimeError> {
-    if columns.len() != query.columns().len()
+fn validate_result_columns(
+    expected_columns: &[&str],
+    columns: &[Column],
+    stage: &'static str,
+) -> Result<(), RuntimeError> {
+    if columns.len() != expected_columns.len()
         || columns
             .iter()
-            .zip(query.columns())
+            .zip(expected_columns)
             .any(|(actual, expected)| {
                 actual.name() != *expected || actual.column_type() != ColumnType::NVarchar
             })
     {
         return Err(malformed(
-            query.label(),
+            stage,
             "DMV result schema does not match the predefined query",
         ));
     }
     Ok(())
 }
 
-async fn read_secret(path: &Path, stage: &'static str) -> Result<Zeroizing<String>, RuntimeError> {
+#[cfg(test)]
+fn validate_columns(query: ReadQuery, columns: &[Column]) -> Result<(), RuntimeError> {
+    validate_result_columns(query.columns(), columns, query.label())
+}
+
+pub(crate) async fn read_secret(
+    path: &Path,
+    stage: &'static str,
+) -> Result<Zeroizing<String>, RuntimeError> {
     let bytes = Zeroizing::new(read_bounded(path, MAX_SECRET_BYTES, stage).await?);
     let text =
         std::str::from_utf8(&bytes).map_err(|_| malformed(stage, "Secret must be UTF-8 text"))?;

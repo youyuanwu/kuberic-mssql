@@ -4859,6 +4859,8 @@ async fn seed_store_deadline_after_commit_classifies_durability_before_returning
         complete: complete.clone(),
         executions: AtomicUsize::new(0),
     });
+    let config = observer_config();
+    let callback_budget = config.sample_timeout();
     let replicator = seed_replicator_with_config_and_target_evidence(
         root.path().to_owned(),
         complete.clone(),
@@ -4866,7 +4868,7 @@ async fn seed_store_deadline_after_commit_classifies_durability_before_returning
         Arc::new(SeedTargetEvidenceExchange {
             complete: complete.clone(),
         }),
-        observer_config_for_timeout(0, 250),
+        config,
     );
     admit_seed_replicator(&replicator).await;
     let gate = replicator
@@ -4885,7 +4887,11 @@ async fn seed_store_deadline_after_commit_classifies_durability_before_returning
     });
     gate.entered.notified().await;
     assert!(root.path().join("seed-dispatch-v1.json").exists());
+    assert!(!callback.is_finished());
+    tokio::time::pause();
+    tokio::time::advance(callback_budget).await;
     let message = application_error(callback.await.unwrap().unwrap_err());
+    tokio::time::resume();
     assert!(message.contains("bounded callback budget"), "{message}");
     assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
     let retained: SeedDispatchRecord =

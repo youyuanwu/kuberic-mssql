@@ -482,6 +482,73 @@ fn group(snapshot: &InstanceSnapshot) -> &AvailabilityGroupSnapshot {
 }
 
 #[tokio::test]
+async fn ordinary_observer_rejects_paired_manual_secondary_seeding() {
+    let mut script = present_script();
+    let remote = &mut rows_mut(&mut script, ReadQuery::Replicas, 0)[1];
+    set(remote, "seeding_mode", Some("1"));
+    set(remote, "seeding_mode_desc", Some("MANUAL"));
+    failure(script, ObservationFailureKind::Unsupported).await;
+}
+
+#[cfg(feature = "ag-convergence")]
+async fn convergence_observation(script: Vec<Step>) -> Result<InstanceSnapshot, RuntimeError> {
+    let target = target();
+    let mut session = ScriptedSession {
+        steps: script.into(),
+        seen: Vec::new(),
+        expected_group: target.availability_group.clone(),
+    };
+    let result =
+        kuberic_mssql::ag_convergence::observe_session(&mut session, &target, OBSERVED_AT).await;
+    if result.is_ok() {
+        assert!(
+            session.steps.is_empty(),
+            "closing brackets must still be read"
+        );
+    }
+    result
+}
+
+#[cfg(feature = "ag-convergence")]
+#[tokio::test]
+async fn convergence_observer_accepts_only_paired_manual_secondary_transition() {
+    let mut script = present_script();
+    let remote = &mut rows_mut(&mut script, ReadQuery::Replicas, 0)[1];
+    set(remote, "seeding_mode", Some("1"));
+    set(remote, "seeding_mode_desc", Some("MANUAL"));
+    let snapshot = convergence_observation(script).await.unwrap();
+    assert!(
+        group(&snapshot).replicas.iter().any(
+            |replica| replica.replica_id.as_str() == REMOTE && replica.seeding_mode == "MANUAL"
+        )
+    );
+
+    for (numeric, descriptor) in [("0", "MANUAL"), ("1", "AUTOMATIC")] {
+        let mut script = present_script();
+        let remote = &mut rows_mut(&mut script, ReadQuery::Replicas, 0)[1];
+        set(remote, "seeding_mode", Some(numeric));
+        set(remote, "seeding_mode_desc", Some(descriptor));
+        assert_eq!(
+            convergence_observation(script).await.unwrap_err().kind,
+            ObservationFailureKind::Unsupported,
+        );
+    }
+}
+
+#[cfg(feature = "ag-convergence")]
+#[tokio::test]
+async fn convergence_observer_still_rejects_manual_primary() {
+    let mut script = present_script();
+    let local = &mut rows_mut(&mut script, ReadQuery::Replicas, 0)[0];
+    set(local, "seeding_mode", Some("1"));
+    set(local, "seeding_mode_desc", Some("MANUAL"));
+    assert_eq!(
+        convergence_observation(script).await.unwrap_err().kind,
+        ObservationFailureKind::Unsupported,
+    );
+}
+
+#[tokio::test]
 async fn observes_supported_instance_native_identities_and_unhealthy_replica_facts() {
     let snapshot = success(present_script()).await;
     assert_eq!(snapshot.instance.server_name.as_str(), "sql-0");

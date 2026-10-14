@@ -33,6 +33,10 @@ clippy:
 test:
     cargo test --locked --workspace --all-features -- --test-threads=1
 
+# Run every target, including owned live fixtures, on a qualified Linux runner.
+test-all:
+    python3 crates/kuberic-mssql-tests/scripts/run_all_tests.py
+
 # Run the server-free future-readiness group without changing the pinned contract.
 test-kuberic-readiness:
     cargo test --locked -p kuberic-mssql-tests --test kuberic_contract readiness:: -- --test-threads=1

@@ -10,7 +10,8 @@ publish.workspace = true
 
 [features]
 default = []
-kuberic = ["dep:kuberic-runtime", "kuberic-runtime/host"]
+ag-convergence = ["dep:fs2", "dep:rusqlite"]
+kuberic = ["dep:kuberic-runtime", "kuberic-runtime/host", "dep:rustix"]
 kuberic-testing = ["kuberic", "kuberic-runtime/testing"]
 
 [[bin]]
@@ -26,8 +27,11 @@ required-features = ["kuberic"]
 async-trait.workspace = true
 clap.workspace = true
 futures.workspace = true
+fs2 = { workspace = true, optional = true }
 kuberic-runtime = { workspace = true, optional = true }
 libc.workspace = true
+rusqlite = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -35,3 +39,6 @@ tiberius.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["compat", "rt"] }
 zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

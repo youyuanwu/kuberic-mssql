@@ -2,6 +2,7 @@ use std::ffi::CString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -316,6 +317,8 @@ impl BoundRoot {
     ) -> std::io::Result<File> {
         let name = CString::new(name)
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        #[cfg(target_vendor = "apple")]
+        let mode = libc::c_uint::from(mode);
         let descriptor = unsafe { libc::openat(self.file.as_raw_fd(), name.as_ptr(), flags, mode) };
         if descriptor < 0 {
             Err(std::io::Error::last_os_error())
@@ -325,9 +328,17 @@ impl BoundRoot {
     }
 
     fn entries(&self) -> Result<Vec<std::ffi::OsString>, RuntimeBindingError> {
-        fs::read_dir(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+        rustix::fs::Dir::read_from(&self.file)
             .map_err(|_| RuntimeBindingError::Io)?
-            .map(|entry| entry.map(|entry| entry.file_name()))
+            .filter_map(|entry| match entry {
+                Ok(entry) if matches!(entry.file_name().to_bytes(), b"." | b"..") => None,
+                other => Some(other),
+            })
+            .map(|entry| {
+                entry.map(|entry| {
+                    std::ffi::OsString::from_vec(entry.file_name().to_bytes().to_vec())
+                })
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| RuntimeBindingError::Io)
     }

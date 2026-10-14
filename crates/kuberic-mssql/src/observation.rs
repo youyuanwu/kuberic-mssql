@@ -210,6 +210,24 @@ pub async fn observe_session(
     target: &ObservationTarget,
     observed_at_unix_millis: u64,
 ) -> Result<InstanceSnapshot, RuntimeError> {
+    observe_with_seeding_transition(session, target, observed_at_unix_millis, false).await
+}
+
+#[cfg(feature = "ag-convergence")]
+pub(crate) async fn observe_convergence_session(
+    session: &mut dyn SqlSession,
+    target: &ObservationTarget,
+    observed_at_unix_millis: u64,
+) -> Result<InstanceSnapshot, RuntimeError> {
+    observe_with_seeding_transition(session, target, observed_at_unix_millis, true).await
+}
+
+async fn observe_with_seeding_transition(
+    session: &mut dyn SqlSession,
+    target: &ObservationTarget,
+    observed_at_unix_millis: u64,
+    allow_manual_secondary: bool,
+) -> Result<InstanceSnapshot, RuntimeError> {
     check_permissions(
         &session
             .query(ReadQuery::Permissions, &target.availability_group)
@@ -229,6 +247,7 @@ pub async fn observe_session(
                 .await?,
             &before,
             group,
+            allow_manual_secondary,
         )?;
         let mut databases = parse_databases(
             &session
@@ -599,6 +618,7 @@ fn parse_replicas(
     rows: &[QueryRow],
     anchor: &Anchor,
     group: &GroupAnchor,
+    allow_manual_secondary: bool,
 ) -> Result<BTreeMap<Guid, ReplicaSnapshot>, RuntimeError> {
     let mut replicas = BTreeMap::new();
     let mut servers = BTreeSet::new();
@@ -632,7 +652,9 @@ fn parse_replicas(
                 "only EXTERNAL replica failover mode is supported",
             ));
         }
-        if row.unsigned::<u8>("seeding_mode")? != 0 || seeding_mode != "AUTOMATIC" {
+        let automatic = row.unsigned::<u8>("seeding_mode")? == 0 && seeding_mode == "AUTOMATIC";
+        let manual = row.unsigned::<u8>("seeding_mode")? == 1 && seeding_mode == "MANUAL";
+        if !automatic && !(allow_manual_secondary && manual) {
             return Err(unsupported(
                 row.stage,
                 "only automatic seeding configuration is supported",
@@ -687,6 +709,16 @@ fn parse_replicas(
             }
             _ => return Err(malformed(row.stage, "partial replica state identity")),
         };
+        if manual
+            && state
+                .as_ref()
+                .is_some_and(|state| state.role == Some(NativeRole::Primary))
+        {
+            return Err(unsupported(
+                row.stage,
+                "the native primary must use automatic seeding mode",
+            ));
+        }
         replicas.insert(
             replica_id.clone(),
             ReplicaSnapshot {

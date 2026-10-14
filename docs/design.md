@@ -9,6 +9,13 @@
 > **Support level:** Experimental. This is not a Microsoft-supported Kubernetes
 > high-availability solution.
 
+The optional `ag-convergence` feature separately ports the legacy guarded
+operation-envelope adapter from ericshape/kuberic#11. Its version-2 codec and
+SQLite operation journal live under `ag_convergence`; they do not change the
+current public version-1 contract or Kuberic host callbacks. See the
+[convergence boundary and migration guide](convergence.md). Production
+construction and the default feature set remain unchanged.
+
 ## Decision
 
 Kuberic will treat SQL Server as an external replication engine. SQL Server
@@ -135,8 +142,9 @@ permissions, output semantics, and tests.
 Two capabilities named in this design are defined but not yet enforceable, and
 each is assigned to a later stage rather than half-built now:
 
-- **Encoding and decoding.** The canonical writer produces the bytes that the
-  input signature covers, but there is no operation-envelope reader or `serde`
+- **Encoding and decoding of the current public contract.** The canonical writer
+  produces the bytes that the input signature covers, but there is no version-1
+  operation-envelope reader or `serde`
   support, so an envelope cannot yet be sent between processes. Stage 3 did not
   select operation envelopes for its callback boundary, so no decoder was
   added.

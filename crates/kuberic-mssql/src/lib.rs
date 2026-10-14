@@ -1,3 +1,5 @@
+#[cfg(feature = "ag-convergence")]
+pub mod ag_convergence;
 mod bootstrap;
 pub mod config;
 pub mod error;

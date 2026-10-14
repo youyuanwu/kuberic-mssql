@@ -12,6 +12,16 @@ authentication and administrative credentials; the three standalone
 secondaries and perform one build-authorized automatic-seeding dispatch. This
 path is not exposed by the production CLI or runtime configuration.
 
+The default-disabled `ag-convergence` feature provides a separate
+[operation-envelope adapter](docs/convergence.md), migrated from
+[ericshape/kuberic#11](https://github.com/ericshape/kuberic/pull/11). It uses
+SQL Server 2025 observations, a version-2 codec and a private SQLite journal,
+and retains explicit authority, approval and fence verification boundaries.
+It does not replace the existing Kuberic bootstrap path or integrate its journal
+with Kuberic command/effect/build receipts. Enabling the feature does not enable
+mutations: the adapter defaults to observe-only with a denying verifier, and
+neither production binary exposes it.
+
 The library is compatible with the observation side of the currently pinned
 pre-alignment Kuberic contract. Its optional Kuberic runtime publishes
 validated AG configuration sequence through the current public `Replicator`
@@ -350,6 +360,8 @@ just check
 `just check` runs formatting, strict Clippy and locked all-feature Rust tests.
 Builds default to one job; an explicitly supplied `CARGO_BUILD_JOBS` is
 preserved. Licensed live tests remain ignored during ordinary Cargo execution.
+The post-commit seed-store deadline test advances Tokio time only after its
+durable-completion gate; recovery uses the normal contract-test callback budget.
 
 Future Kuberic candidates have a separate server-free readiness group and a
 versioned intake-record validator:
@@ -495,6 +507,9 @@ records intent before each resource create and binds exact container, network,
 path, native SQL, and process-incarnation evidence. Normal completion, setup
 failure, panic, SIGINT, and SIGTERM attempt bounded cleanup; an uncatchable
 termination is recovered from that journal on the next command.
+Container inspection failures identify the changed field without exposing
+environment values or credentials. Frozen running state, loopback ports and
+immutable ownership are checked again before member initialization.
 
 Use the actual recovery recipes rather than deleting Docker resources or the
 journal manually:
@@ -516,6 +531,9 @@ otherwise unverifiable resources remain untouched and block reuse. The signal
 recipe interrupts an owned launch with SIGTERM, recovers it, reruns the
 complete happy path, and verifies idempotent cleanup. The recovery recipe also
 executes real SIGINT and SIGKILL subprocess cases.
+The post-AG/report fault-checkpoint test also injects an explicit failure after
+replacement-host startup on the current bootstrap-restart path, then proves
+separate-process cleanup and a successful same-root retry.
 
 The fault recipe uses a test-only observation seam to lose the callback reply
 after each separately classified database, backup, AG-create/bind, local-join,
@@ -524,6 +542,11 @@ normal TDS mutation path, and replacement hosts then reobserve their native
 results. Seed intent, submission, acceptance, association, native completion,
 and callback publication use explicit test-only gates/probes around real
 callbacks; they are not SQL Server process-crash tests.
+Public configuration, build-authority admission and callback retries also
+reobserve a rejected `Inconsistent` sample within their existing operation
+deadline. This is confined
+to the licensed test harness; native identity conflicts and permanent refusals
+are not converted to successful admission.
 
 The conflict recipe separates three real SQL-native cases from callback-seam
 coverage. Through normal TDS observation it converges a source that inherits

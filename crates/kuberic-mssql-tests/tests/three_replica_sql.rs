@@ -134,7 +134,7 @@ fn duplicate_or_changed_controlled_environment_is_rejected() {
         request
             .verify_inspection(&duplicate, "sha256:image", false)
             .unwrap_err(),
-        DockerError::OwnershipMismatch
+        DockerError::ContainerInspectionMismatch("environment")
     );
 
     let mut wrong = inspection(&request);
@@ -147,7 +147,7 @@ fn duplicate_or_changed_controlled_environment_is_rejected() {
         request
             .verify_inspection(&wrong, "sha256:image", false)
             .unwrap_err(),
-        DockerError::OwnershipMismatch
+        DockerError::ContainerInspectionMismatch("environment")
     );
 }
 
@@ -238,7 +238,7 @@ fn frozen_running_inspection_rejects_exact_port_binding_drift() {
         request
             .verify_frozen_running_inspection(&changed, &frozen, "sha256:image")
             .unwrap_err(),
-        DockerError::OwnershipMismatch
+        DockerError::ContainerInspectionMismatch("frozen TDS port")
     );
 }
 

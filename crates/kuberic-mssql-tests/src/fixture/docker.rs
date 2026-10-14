@@ -414,18 +414,24 @@ impl ContainerRequest {
         expected_image_id: &str,
         expected_running: bool,
     ) -> Result<(), DockerError> {
-        if inspection.name != self.name
-            || inspection.hostname != self.hostname
-            || inspection.image_id != expected_image_id
-            || !self.labels.matches(&inspection.labels)
-            || inspection.user != "mssql"
-            || inspection.running != expected_running
-            || inspection.restart_policy != "no"
-            || inspection.network_mode != self.network_name
-            || inspection.network_names.as_slice() != [self.network_name.as_str()]
-            || inspection.limits != self.limits
-        {
-            return Err(DockerError::OwnershipMismatch);
+        for (matches, field) in [
+            (inspection.name == self.name, "container name"),
+            (inspection.hostname == self.hostname, "hostname"),
+            (inspection.image_id == expected_image_id, "pinned image"),
+            (self.labels.matches(&inspection.labels), "ownership labels"),
+            (inspection.user == "mssql", "container user"),
+            (inspection.running == expected_running, "running state"),
+            (inspection.restart_policy == "no", "restart policy"),
+            (inspection.network_mode == self.network_name, "network mode"),
+            (
+                inspection.network_names.as_slice() == [self.network_name.as_str()],
+                "network attachment",
+            ),
+            (inspection.limits == self.limits, "resource limits"),
+        ] {
+            if !matches {
+                return Err(DockerError::ContainerInspectionMismatch(field));
+            }
         }
         let expected_mount = ContainerMount {
             source: self.data_directory.clone(),
@@ -433,7 +439,7 @@ impl ContainerRequest {
             read_only: false,
         };
         if inspection.mounts.as_slice() != [expected_mount] {
-            return Err(DockerError::OwnershipMismatch);
+            return Err(DockerError::ContainerInspectionMismatch("data mount"));
         }
         for expected in &self.environment {
             if inspection
@@ -443,7 +449,7 @@ impl ContainerRequest {
                 .count()
                 != 1
             {
-                return Err(DockerError::OwnershipMismatch);
+                return Err(DockerError::ContainerInspectionMismatch("environment"));
             }
             if inspection
                 .environment
@@ -453,7 +459,7 @@ impl ContainerRequest {
                 .count()
                 != 1
             {
-                return Err(DockerError::OwnershipMismatch);
+                return Err(DockerError::ContainerInspectionMismatch("environment keys"));
             }
         }
         if inspection.ports.len() != 1
@@ -461,7 +467,9 @@ impl ContainerRequest {
             || inspection.ports[0].host_ip != "127.0.0.1"
             || (expected_running && inspection.ports[0].host_port == 0)
         {
-            return Err(DockerError::OwnershipMismatch);
+            return Err(DockerError::ContainerInspectionMismatch(
+                "loopback TDS port",
+            ));
         }
         Ok(())
     }
@@ -514,8 +522,37 @@ impl ContainerRequest {
         expected_image_id: &str,
     ) -> Result<(), DockerError> {
         self.verify_inspection(inspection, expected_image_id, true)?;
-        if inspection != frozen {
-            return Err(DockerError::OwnershipMismatch);
+        for (matches, field) in [
+            (inspection.id == frozen.id, "frozen container ID"),
+            (inspection.name == frozen.name, "frozen container name"),
+            (inspection.hostname == frozen.hostname, "frozen hostname"),
+            (inspection.image_id == frozen.image_id, "frozen image"),
+            (inspection.labels == frozen.labels, "frozen labels"),
+            (
+                inspection.environment == frozen.environment,
+                "frozen environment",
+            ),
+            (inspection.user == frozen.user, "frozen user"),
+            (inspection.running == frozen.running, "frozen running state"),
+            (
+                inspection.restart_policy == frozen.restart_policy,
+                "frozen restart policy",
+            ),
+            (
+                inspection.network_mode == frozen.network_mode,
+                "frozen network mode",
+            ),
+            (
+                inspection.network_names == frozen.network_names,
+                "frozen network attachment",
+            ),
+            (inspection.mounts == frozen.mounts, "frozen data mount"),
+            (inspection.ports == frozen.ports, "frozen TDS port"),
+            (inspection.limits == frozen.limits, "frozen resource limits"),
+        ] {
+            if !matches {
+                return Err(DockerError::ContainerInspectionMismatch(field));
+            }
         }
         Ok(())
     }
@@ -527,6 +564,7 @@ pub enum DockerError {
     MalformedInspection,
     ImageMismatch,
     OwnershipMismatch,
+    ContainerInspectionMismatch(&'static str),
     NotFound,
     InvalidRequest,
 }
@@ -540,6 +578,9 @@ impl fmt::Display for DockerError {
                 "Docker image identity does not match the pinned SQL Server image"
             }
             Self::OwnershipMismatch => "Docker resource ownership does not match",
+            Self::ContainerInspectionMismatch(field) => {
+                return write!(formatter, "Docker container inspection differs: {field}");
+            }
             Self::NotFound => "Docker resource was not found",
             Self::InvalidRequest => "Docker launch request is invalid",
         })

@@ -1177,6 +1177,28 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
     replacement
         .assert_superseded_sessions_rejected(&first_sessions)
         .await?;
+    if fault_checkpoint("fail-after-agent-restart") {
+        let primary: TestError = "injected failure after replacement agent startup".into();
+        if let Err(shutdown) = replacement
+            .shutdown_with_coordinator(&replacement_cleanup)
+            .await
+        {
+            let diagnostic = format!("{primary}; replacement shutdown failed: {shutdown}");
+            if let Err(block) = launched.block_cleanup() {
+                return Err(format!(
+                    "{diagnostic}; ownership journal blocking also failed: {block}"
+                )
+                .into());
+            }
+            return Err(diagnostic.into());
+        }
+        return finish_runtime_outcome(
+            root,
+            launched,
+            RuntimeOutcome::Completed(Ok(Err(primary))),
+            &replacement_cleanup,
+        );
+    }
     if replacement.resource_uid != stable_resource
         || replacement.effective_policy != stable_policy
         || replacement.configuration != stable_configuration

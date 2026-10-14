@@ -110,6 +110,30 @@ impl LaunchedMembers {
             .await
     }
 
+    #[cfg(feature = "ag-convergence")]
+    pub async fn testing_prepare_operation_convergence_database(&self) -> Result<(), AdminError> {
+        let mut session = self.testing_admin_session(0).await?;
+        session
+            .execute(
+                "CREATE DATABASE [ag_convergence_data]; \
+                 ALTER DATABASE [ag_convergence_data] SET RECOVERY FULL;",
+                &[],
+            )
+            .await?;
+        session
+            .execute(
+                "CREATE TABLE [ag_convergence_data].dbo.port_marker \
+                 (id int NOT NULL PRIMARY KEY, marker nvarchar(64) NOT NULL); \
+                 INSERT [ag_convergence_data].dbo.port_marker VALUES (1, N'owned-ag-convergence'); \
+                 BACKUP DATABASE [ag_convergence_data] \
+                 TO DISK=N'/var/opt/mssql/data/ag_convergence_full.bak' WITH INIT, CHECKSUM; \
+                 BACKUP LOG [ag_convergence_data] \
+                 TO DISK=N'/var/opt/mssql/data/ag_convergence_log.bak' WITH INIT, CHECKSUM;",
+                &[],
+            )
+            .await
+    }
+
     pub async fn testing_create_unowned_availability_group(&self) -> Result<(), AdminError> {
         let group = availability_group_name(&self.run);
         validated_identifier(&group)?;
@@ -1184,7 +1208,10 @@ impl LaunchContext {
             self.containers[index]
                 .request
                 .verify_inspection(&inspection, &self.image_id, true)
-                .map_err(NativeLaunchError::Docker)?;
+                .map_err(|error| NativeLaunchError::ContainerInspection {
+                    member: run.members[index].ordinal,
+                    error,
+                })?;
             self.containers[index].frozen_running_inspection = Some(inspection);
         }
         self.verify_network_attachments(true)?;
@@ -1207,7 +1234,10 @@ impl LaunchContext {
                         .ok_or(NativeLaunchError::Ownership)?,
                     &self.image_id,
                 )
-                .map_err(NativeLaunchError::Docker)?;
+                .map_err(|error| NativeLaunchError::ContainerInspection {
+                    member: run.members[index].ordinal,
+                    error,
+                })?;
             let port = inspection
                 .ports
                 .first()
@@ -2477,6 +2507,7 @@ pub enum NativeLaunchError {
     Secret(SecretError),
     Tls(TlsError),
     Docker(DockerError),
+    ContainerInspection { member: u8, error: DockerError },
     Admin(AdminError),
     Ownership,
     Readiness,
@@ -2510,6 +2541,12 @@ impl fmt::Display for NativeLaunchError {
             Self::Docker(error) => {
                 return write!(formatter, "three-replica Docker operation failed: {error}");
             }
+            Self::ContainerInspection { member, error } => {
+                return write!(
+                    formatter,
+                    "three-replica member {member} inspection failed: {error}"
+                );
+            }
             Self::Admin(error) => {
                 return write!(
                     formatter,
@@ -2532,6 +2569,7 @@ impl std::error::Error for NativeLaunchError {
             Self::Secret(error) => Some(error),
             Self::Tls(error) => Some(error),
             Self::Docker(error) => Some(error),
+            Self::ContainerInspection { error, .. } => Some(error),
             Self::Admin(error) => Some(error),
             _ => None,
         }
@@ -2543,6 +2581,11 @@ impl NativeLaunchError {
         let category = match self {
             Self::Preflight(_) => FailureCategory::Preflight,
             Self::Docker(_) => FailureCategory::ContainerCreation,
+            Self::ContainerInspection {
+                error: DockerError::ContainerInspectionMismatch("running state"),
+                ..
+            } => FailureCategory::SqlUnavailable,
+            Self::ContainerInspection { .. } => FailureCategory::OwnershipMismatch,
             Self::Admin(_) | Self::Readiness => FailureCategory::SqlUnavailable,
             Self::Deadline => FailureCategory::DeadlineExceeded,
             Self::Journal => FailureCategory::Journal,
