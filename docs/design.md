@@ -522,8 +522,8 @@ the candidate reaches `ready_to_pin`.
    on the candidate feature branch: Public V1 host/callback translation,
    activation-bound application/seed/SQL ownership, observe-only ordinary
    construction, and version-2 release intake. Exact implementation commit
-   `830da0ff5943aaec19633579866c9fd2134129a8` (tree
-   `99d586d9474cb1df8eb2401400e16da0427b2399`) has checked-in licensed evidence
+   `105c56a29ccb30682decca7d06e55714d6a17391` (tree
+   `854919021f7653fc5c50188d8b73d6e50ec4930e`) has checked-in licensed evidence
    and the candidate record computes `ready_to_pin`; accepted pin adoption
    remains a separate repository decision.
 6. **SQL-native fencing, reseed, switchover, and failover** — establish

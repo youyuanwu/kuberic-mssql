@@ -371,8 +371,8 @@ The feature branch evaluates exact Public V1 candidate
 `ceec5887ad97d71222117610428ce715b782777e`. Release-intake records retain
 `09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f` as the accepted current identity
 while comparing the reviewed candidate. Exact implementation commit
-`830da0ff5943aaec19633579866c9fd2134129a8` (tree
-`99d586d9474cb1df8eb2401400e16da0427b2399`) passed licensed one-replica,
+`105c56a29ccb30682decca7d06e55714d6a17391` (tree
+`854919021f7653fc5c50188d8b73d6e50ec4930e`) passed licensed one-replica,
 three-replica, and same-root restart validation. The checked-in evidence
 summary and hashed logs retain those runs, and the candidate outcome is
 `ready_to_pin`.

@@ -1,5 +1,5 @@
-commit=830da0ff5943aaec19633579866c9fd2134129a8
-started_at=2026-10-16T10:13:11Z
+commit=105c56a29ccb30682decca7d06e55714d6a17391
+started_at=2026-10-16T11:54:15Z
 command=CARGO_BUILD_JOBS=1 just test-live-three-replica-restart
 env -u SQLSERVER_TEST_EULA_ACCEPTED KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m 'target/mssql-three-replica-restart')" CARGO_BUILD_JOBS=1 cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_same_root_restart -- --ignored --exact --test-threads=1 --nocapture
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
@@ -8,7 +8,7 @@ env -u SQLSERVER_TEST_EULA_ACCEPTED KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath
 running 1 test
 test three_replica_mssql_same_root_restart ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 156.02s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 150.84s
 
-finished_at=2026-10-16T10:15:47Z
+finished_at=2026-10-16T11:56:46Z
 exit_status=0

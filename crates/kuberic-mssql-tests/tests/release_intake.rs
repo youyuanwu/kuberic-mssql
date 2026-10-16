@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 const CURRENT_DEPENDENCY: &str = "kuberic-runtime@09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f";
 const CANDIDATE_DEPENDENCY: &str = "kuberic-runtime@1111111111111111111111111111111111111111";
 const PUBLIC_V1_DEPENDENCY: &str = "kuberic-runtime@ceec5887ad97d71222117610428ce715b782777e";
-const PUBLIC_V1_IMPLEMENTATION_COMMIT: &str = "830da0ff5943aaec19633579866c9fd2134129a8";
-const PUBLIC_V1_IMPLEMENTATION_TREE: &str = "99d586d9474cb1df8eb2401400e16da0427b2399";
+const PUBLIC_V1_IMPLEMENTATION_COMMIT: &str = "105c56a29ccb30682decca7d06e55714d6a17391";
+const PUBLIC_V1_IMPLEMENTATION_TREE: &str = "854919021f7653fc5c50188d8b73d6e50ec4930e";
 
 fn record(mode: ReleaseIntakeMode, status: GateStatus) -> ReleaseIntakeRecord {
     record_for(PROFILE_VERSION, mode, status)
@@ -446,17 +446,17 @@ fn checked_in_public_v1_evidence_summary_binds_exact_runs_and_log_hashes() {
         (
             "live_one_replica",
             "evidence/public-v1/live-one-replica.log",
-            "10f2803bad22b5d509fb3b34e13e8352861fb5e80631910b1b30290278baed56",
+            "a77c9fe981bb1d78791f2f014fa38cd8a0757abd83529476a3536908ddabbe5e",
         ),
         (
             "live_three_replica",
             "evidence/public-v1/live-three-replica.log",
-            "80c7c1e5bfba7ad8775a133207bb416691ac2d6f16bee84c51cbbf5ae6e9d9f9",
+            "21ff5911c22b1d33fe4bb2fc78bd202cc541ea6f4c40f1c7f6a41090171c2629",
         ),
         (
             "live_three_replica_restart",
             "evidence/public-v1/live-three-replica-restart.log",
-            "5c661bf68f2a4355f70ab7a33e8c672f9c71266aa0e80da13ccffe9d61de00b0",
+            "304788ab76f946e9f8e9f55f753c099422904347329c856bc229833b2ef646ab",
         ),
     ];
     let runs = summary["runs"].as_array().unwrap();
