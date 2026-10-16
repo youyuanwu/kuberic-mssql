@@ -45,6 +45,7 @@ use kuberic_runtime::replicator::{
     PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode,
     Replicator,
 };
+use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 const OBSERVED_AT: u64 = 1_000;
@@ -923,6 +924,25 @@ fn kuberic_identity(id: i64) -> KubericReplicaIdentity {
     }
 }
 
+fn activation_id(identity: &KubericReplicaIdentity) -> String {
+    let mut digest = Sha256::new();
+    let replica_id = identity.replica_id.to_string();
+    for value in [
+        "kuberic-mssql-public-v1-activation",
+        replica_id.as_str(),
+        identity.instance_id.as_str(),
+        identity.agent_generation.as_str(),
+    ] {
+        digest.update(value.as_bytes());
+        digest.update(b"\0");
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn sql_identity(index: usize) -> ReplicaIdentity {
     let native = [LOCAL_ID, SECOND_ID, THIRD_ID][index];
     ReplicaIdentity::observed(
@@ -1608,6 +1628,7 @@ fn owned_standalone_database() -> StandaloneDatabaseSnapshot {
     let ownership = StandaloneDatabaseOwnership {
         resource_id: "resource-a".into(),
         configuration_id: configuration().configuration_id.to_string(),
+        activation_id: activation_id(&kuberic_identity(1)),
     };
     StandaloneDatabaseSnapshot {
         identity: Some(identity.clone()),
@@ -1616,6 +1637,7 @@ fn owned_standalone_database() -> StandaloneDatabaseSnapshot {
         availability_group_ownership: Some(AvailabilityGroupOwnership {
             resource_id: "resource-a".into(),
             configuration_id: configuration().configuration_id.to_string(),
+            activation_id: activation_id(&kuberic_identity(1)),
             name: AvailabilityGroupName::new("test-ag").unwrap(),
             creation_group_id: Some(guid(AG_ID)),
             group_id: Some(guid(AG_ID)),
@@ -1659,6 +1681,7 @@ fn availability_group_ownership_classifier_rejects_unmarked_recreated_and_second
     let expected_group_ownership = AvailabilityGroupOwnership {
         resource_id: "resource-a".into(),
         configuration_id: configuration().configuration_id.to_string(),
+        activation_id: activation_id(&kuberic_identity(1)),
         name: AvailabilityGroupName::new("test-ag").unwrap(),
         creation_group_id: None,
         group_id: None,
@@ -1684,6 +1707,7 @@ fn availability_group_ownership_classifier_rejects_unmarked_recreated_and_second
     let intent = AvailabilityGroupOwnership {
         resource_id: "resource-a".into(),
         configuration_id: configuration().configuration_id.to_string(),
+        activation_id: activation_id(&kuberic_identity(1)),
         name: AvailabilityGroupName::new("test-ag").unwrap(),
         creation_group_id: None,
         group_id: None,
@@ -1845,6 +1869,7 @@ async fn bootstrap_path_fails_closed_on_foreign_standalone_database() {
     foreign.ownership = Some(StandaloneDatabaseOwnership {
         resource_id: "foreign-resource".into(),
         configuration_id: configuration().configuration_id.to_string(),
+        activation_id: activation_id(&kuberic_identity(1)),
     });
     let (replicator, mutation) = bootstrap_replicator_for(0, Vec::new(), vec![Ok(Some(foreign))]);
     replicator.open().await.unwrap();
@@ -1891,6 +1916,27 @@ async fn bootstrap_restart_requires_the_frozen_availability_group_marker() {
         .update_current_replica_set_configuration(bound_replica_set())
         .await
         .unwrap_err();
+    assert!(application_error(error).contains("conflicts"));
+    assert!(mutation.effects.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn bootstrap_rejects_pre_public_v1_native_ownership_without_mutation() {
+    let mut legacy = owned_standalone_database();
+    legacy.ownership.as_mut().unwrap().activation_id = "legacy-stage-3".into();
+    legacy
+        .availability_group_ownership
+        .as_mut()
+        .unwrap()
+        .activation_id = "legacy-stage-3".into();
+    let (replicator, mutation) = bootstrap_replicator_for(0, Vec::new(), vec![Ok(Some(legacy))]);
+    replicator.open().await.unwrap();
+
+    let error = replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap_err();
+
     assert!(application_error(error).contains("conflicts"));
     assert!(mutation.effects.lock().unwrap().is_empty());
 }

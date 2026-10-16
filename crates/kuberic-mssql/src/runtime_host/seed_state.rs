@@ -12,7 +12,7 @@ use kuberic_runtime::protocol::types::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::binding::{BoundRoot, process_is_gone, temporary_file_pid};
+use super::binding::BoundRoot;
 
 pub const SEED_DISPATCH_SCHEMA_VERSION: u32 = 3;
 pub(super) const SEED_STATE_FILE: &str = "seed-dispatch-v1.json";
@@ -742,22 +742,6 @@ pub(super) fn validate_seed_entry(root: &BoundRoot, name: &str) -> Result<(), Se
         record.validate()?;
     }
     Ok(())
-}
-
-pub(super) fn recover_seed_temporary(root: &BoundRoot, name: &str) -> Result<bool, SeedStateError> {
-    let Some(pid) = temporary_file_pid(name, SEED_STATE_FILE) else {
-        return Ok(false);
-    };
-    if !process_is_gone(pid).map_err(SeedStateError::from)? {
-        return Err(SeedStateError::UnsafeState);
-    }
-    let temporary = root
-        .openat(name, libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0)
-        .map_err(|_| SeedStateError::UnsafeState)?;
-    verify_private_file(&temporary, MAX_SEED_STATE_BYTES)?;
-    drop(temporary);
-    root.unlinkat(name).map_err(SeedStateError::from)?;
-    Ok(true)
 }
 
 fn verify_private_file(file: &File, max_bytes: u64) -> Result<(), SeedStateError> {

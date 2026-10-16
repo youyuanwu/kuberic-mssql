@@ -11,9 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::config::RuntimeHostConfig;
-use super::seed_state::{
-    SEED_OWNER_FILE, SEED_STATE_FILE, recover_seed_temporary, validate_seed_entry,
-};
+use super::seed_state::{SEED_OWNER_FILE, SEED_STATE_FILE, validate_seed_entry};
 
 pub const RUNTIME_BINDING_SCHEMA_VERSION: u32 = 2;
 const BINDING_FILE: &str = "runtime-binding.json";
@@ -158,8 +156,7 @@ impl RuntimeBindingStore {
             Err(_) => return Err(RuntimeBindingError::Io),
         };
         root.verify_path()?;
-        let mut entries = root.entries()?;
-        let mut recovered = false;
+        let entries = root.entries()?;
         for entry in &entries {
             let Some(name) = entry.to_str() else {
                 return Err(RuntimeBindingError::UnsafeState);
@@ -169,21 +166,8 @@ impl RuntimeBindingStore {
                 SEED_STATE_FILE | SEED_OWNER_FILE => {
                     validate_seed_entry(&root, name).map_err(map_seed_error)?;
                 }
-                _ => {
-                    if recover_temporary(&root, name, BINDING_FILE)?
-                        || recover_seed_temporary(&root, name).map_err(map_seed_error)?
-                    {
-                        recovered = true;
-                    } else {
-                        return Err(RuntimeBindingError::UnsafeState);
-                    }
-                }
+                _ => return Err(RuntimeBindingError::UnsafeState),
             }
-        }
-        if recovered {
-            root.file.sync_all().map_err(|_| RuntimeBindingError::Io)?;
-            root.verify_path()?;
-            entries = root.entries()?;
         }
         if entries.is_empty() {
             return Ok(ApplicationStorageState::FreshEmpty);
@@ -409,54 +393,6 @@ impl BoundRoot {
             Err(RuntimeBindingError::Io)
         }
     }
-}
-
-pub(super) fn temporary_file_pid(name: &str, file_name: &str) -> Option<libc::pid_t> {
-    let prefix = format!(".{file_name}.");
-    name.strip_prefix(&prefix)?
-        .strip_suffix(".new")?
-        .parse::<libc::pid_t>()
-        .ok()
-        .filter(|pid| *pid > 0)
-}
-
-pub(super) fn process_is_gone(pid: libc::pid_t) -> Result<bool, RuntimeBindingError> {
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return Ok(false);
-    }
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(libc::ESRCH) => Ok(true),
-        Some(libc::EPERM) => Ok(false),
-        _ => Err(RuntimeBindingError::Io),
-    }
-}
-
-fn recover_temporary(
-    root: &BoundRoot,
-    name: &str,
-    file_name: &str,
-) -> Result<bool, RuntimeBindingError> {
-    let Some(pid) = temporary_file_pid(name, file_name) else {
-        return Ok(false);
-    };
-    if !process_is_gone(pid)? {
-        return Err(RuntimeBindingError::UnsafeState);
-    }
-    let temporary = root
-        .openat(name, libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0)
-        .map_err(|_| RuntimeBindingError::UnsafeState)?;
-    let metadata = temporary
-        .metadata()
-        .map_err(|_| RuntimeBindingError::UnsafeState)?;
-    if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err(RuntimeBindingError::UnsafeState);
-    }
-    drop(temporary);
-    root.unlinkat(name)?;
-    Ok(true)
 }
 
 fn map_seed_error(error: super::seed_state::SeedStateError) -> RuntimeBindingError {

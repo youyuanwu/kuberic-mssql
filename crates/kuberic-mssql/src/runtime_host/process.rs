@@ -392,9 +392,7 @@ impl StatefulServiceReplica for RuntimeHostApplication {
                         .map_err(binding_error)?;
                 }
                 ApplicationStorageState::Established => {
-                    self.binding
-                        .validate(&context.identity)
-                        .map_err(binding_error)?;
+                    return Err(binding_error(RuntimeBindingError::AlreadyInitialized));
                 }
             },
             OpenMode::Existing => self

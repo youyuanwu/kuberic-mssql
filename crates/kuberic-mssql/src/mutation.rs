@@ -76,9 +76,11 @@ pub(crate) const DATABASE_OWNERSHIP_QUERY: &str = r#"
 SELECT
     CONVERT(nvarchar(512), ep_resource.value) AS kuberic_resource_id,
     CONVERT(nvarchar(512), ep_configuration.value) AS kuberic_configuration_id,
+    CONVERT(nvarchar(512), ep_activation.value) AS kuberic_activation_id,
     CONVERT(nvarchar(128), ep_creation.value) AS kuberic_creation_token,
     CONVERT(nvarchar(512), ep_ag_resource.value) AS kuberic_ag_resource_id,
     CONVERT(nvarchar(512), ep_ag_configuration.value) AS kuberic_ag_configuration_id,
+    CONVERT(nvarchar(512), ep_ag_activation.value) AS kuberic_ag_activation_id,
     CONVERT(nvarchar(128), ep_ag_name.value) AS kuberic_ag_name,
     CONVERT(nvarchar(36), ep_ag_created_id.value) AS kuberic_ag_created_id,
     CONVERT(nvarchar(36), ep_ag_id.value) AS kuberic_ag_id
@@ -90,6 +92,9 @@ OUTER APPLY sys.fn_listextendedproperty(
     N'kuberic_configuration_id', DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT
 ) AS ep_configuration
 OUTER APPLY sys.fn_listextendedproperty(
+    N'kuberic_activation_id', DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT
+) AS ep_activation
+OUTER APPLY sys.fn_listextendedproperty(
     N'kuberic_creation_token', DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT
 ) AS ep_creation
 OUTER APPLY sys.fn_listextendedproperty(
@@ -98,6 +103,9 @@ OUTER APPLY sys.fn_listextendedproperty(
 OUTER APPLY sys.fn_listextendedproperty(
     N'kuberic_ag_configuration_id', DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT
 ) AS ep_ag_configuration
+OUTER APPLY sys.fn_listextendedproperty(
+    N'kuberic_ag_activation_id', DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT
+) AS ep_ag_activation
 OUTER APPLY sys.fn_listextendedproperty(
     N'kuberic_ag_name', DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT
 ) AS ep_ag_name
@@ -441,6 +449,7 @@ enum MutationKind {
         database: SqlIdentifier,
         resource_id: String,
         configuration_id: String,
+        activation_id: String,
     },
     CreateSourceMarkerTable {
         database: SqlIdentifier,
@@ -459,6 +468,7 @@ enum MutationKind {
         availability_group: AvailabilityGroupName,
         resource_id: String,
         configuration_id: String,
+        activation_id: String,
     },
     RetainAvailabilityGroupCreationIntent {
         database: SqlIdentifier,
@@ -499,6 +509,10 @@ pub struct BootstrapMutationPlan {
 
 impl BootstrapMutationPlan {
     pub fn from_operation(request: &OperationRequest) -> Result<Self, MutationContractError> {
+        // This legacy typed-operation seam is deliberately fenced away from
+        // Public V1 activation identity. Its markers can never be adopted by
+        // the runtime-host bootstrap path.
+        let activation_id = hex(&Sha256::digest(request.canonical_input()));
         let effects = match request.payload() {
             OperationPayload::EnsureAvailabilityGroup {
                 name,
@@ -510,17 +524,20 @@ impl BootstrapMutationPlan {
                     database_name.clone(),
                     request.resource_id(),
                     request.source_configuration_id(),
+                    &activation_id,
                 )?,
                 MutationEffect::create_source_database(
                     database_name.clone(),
                     request.resource_id(),
                     request.source_configuration_id(),
+                    &activation_id,
                 )?,
                 MutationEffect::configure_source_database_recovery(database_name.clone()),
                 MutationEffect::retain_source_database_ownership(
                     database_name.clone(),
                     request.resource_id(),
                     request.source_configuration_id(),
+                    &activation_id,
                 )?,
                 MutationEffect::create_source_marker_table(database_name.clone()),
                 MutationEffect::backup_source_database(database_name.clone()),
@@ -531,17 +548,20 @@ impl BootstrapMutationPlan {
                     name.clone(),
                     request.resource_id(),
                     request.source_configuration_id(),
+                    &activation_id,
                 )?,
                 MutationEffect::retain_availability_group_creation_intent(
                     database_name.clone(),
                     name.clone(),
                     request.resource_id(),
                     request.source_configuration_id(),
+                    &activation_id,
                 )?,
                 MutationEffect::create_availability_group(
                     name.clone(),
                     request.resource_id(),
                     request.source_configuration_id(),
+                    &activation_id,
                     replicas.clone(),
                 )?,
                 MutationEffect::bind_availability_group_ownership(
@@ -583,11 +603,13 @@ impl MutationEffect {
         database: SqlIdentifier,
         resource_id: &str,
         configuration_id: &str,
+        activation_id: &str,
     ) -> Result<Self, MutationContractError> {
         let token = creation_token(
             b"kuberic-mssql-source-database-v1",
             resource_id,
             configuration_id,
+            activation_id,
             database.as_str(),
         )?;
         Ok(Self(MutationKind::RetainSourceDatabaseCreationIntent {
@@ -600,11 +622,13 @@ impl MutationEffect {
         database: SqlIdentifier,
         resource_id: &str,
         configuration_id: &str,
+        activation_id: &str,
     ) -> Result<Self, MutationContractError> {
         let token = creation_token(
             b"kuberic-mssql-source-database-v1",
             resource_id,
             configuration_id,
+            activation_id,
             database.as_str(),
         )?;
         Ok(Self(MutationKind::CreateSourceDatabase { database, token }))
@@ -614,11 +638,13 @@ impl MutationEffect {
         database: &SqlIdentifier,
         resource_id: &str,
         configuration_id: &str,
+        activation_id: &str,
     ) -> Result<Self, MutationContractError> {
         let token = creation_token(
             b"kuberic-mssql-source-database-v1",
             resource_id,
             configuration_id,
+            activation_id,
             database.as_str(),
         )?;
         Ok(Self(MutationKind::RemoveSourceDatabaseCreationIntent {
@@ -634,13 +660,16 @@ impl MutationEffect {
         database: SqlIdentifier,
         resource_id: &str,
         configuration_id: &str,
+        activation_id: &str,
     ) -> Result<Self, MutationContractError> {
         validate_marker_value(resource_id)?;
         validate_marker_value(configuration_id)?;
+        validate_marker_value(activation_id)?;
         Ok(Self(MutationKind::RetainSourceDatabaseOwnership {
             database,
             resource_id: resource_id.to_owned(),
             configuration_id: configuration_id.to_owned(),
+            activation_id: activation_id.to_owned(),
         }))
     }
 
@@ -664,12 +693,14 @@ impl MutationEffect {
         availability_group: AvailabilityGroupName,
         resource_id: &str,
         configuration_id: &str,
+        activation_id: &str,
         replicas: Vec<ReplicaDescriptor>,
     ) -> Result<Self, MutationContractError> {
         let token = creation_token(
             b"kuberic-mssql-availability-group-v1",
             resource_id,
             configuration_id,
+            activation_id,
             availability_group.as_str(),
         )?;
         if replicas.len() != usize::from(SUPPORTED_REPLICA_COUNT) {
@@ -707,11 +738,13 @@ impl MutationEffect {
         availability_group: AvailabilityGroupName,
         resource_id: &str,
         configuration_id: &str,
+        activation_id: &str,
     ) -> Result<Self, MutationContractError> {
         let token = creation_token(
             b"kuberic-mssql-availability-group-v1",
             resource_id,
             configuration_id,
+            activation_id,
             availability_group.as_str(),
         )?;
         Ok(Self(MutationKind::RetainAvailabilityGroupCreationIntent {
@@ -735,11 +768,13 @@ impl MutationEffect {
         availability_group: &AvailabilityGroupName,
         resource_id: &str,
         configuration_id: &str,
+        activation_id: &str,
     ) -> Result<Self, MutationContractError> {
         let token = creation_token(
             b"kuberic-mssql-availability-group-v1",
             resource_id,
             configuration_id,
+            activation_id,
             availability_group.as_str(),
         )?;
         Ok(Self(MutationKind::RemoveAvailabilityGroupCreationIntent {
@@ -752,14 +787,17 @@ impl MutationEffect {
         availability_group: AvailabilityGroupName,
         resource_id: &str,
         configuration_id: &str,
+        activation_id: &str,
     ) -> Result<Self, MutationContractError> {
         validate_marker_value(resource_id)?;
         validate_marker_value(configuration_id)?;
+        validate_marker_value(activation_id)?;
         Ok(Self(MutationKind::RetainAvailabilityGroupIntent {
             database,
             availability_group,
             resource_id: resource_id.to_owned(),
             configuration_id: configuration_id.to_owned(),
+            activation_id: activation_id.to_owned(),
         }))
     }
 
@@ -909,10 +947,12 @@ impl MutationEffect {
                 database,
                 resource_id,
                 configuration_id,
+                activation_id,
             } => {
                 let database = database.quoted();
                 let resource_id = sql_literal(resource_id);
                 let configuration_id = sql_literal(configuration_id);
+                let activation_id = sql_literal(activation_id);
                 format!(
                     "BEGIN TRANSACTION;\n\
                      BEGIN TRY\n\
@@ -920,6 +960,8 @@ impl MutationEffect {
                      @name=N'kuberic_resource_id', @value=N'{resource_id}';\n\
                      EXEC {database}.sys.sp_addextendedproperty \
                      @name=N'kuberic_configuration_id', @value=N'{configuration_id}';\n\
+                     EXEC {database}.sys.sp_addextendedproperty \
+                     @name=N'kuberic_activation_id', @value=N'{activation_id}';\n\
                      COMMIT TRANSACTION;\n\
                      END TRY\n\
                      BEGIN CATCH\n\
@@ -958,10 +1000,12 @@ impl MutationEffect {
                 availability_group,
                 resource_id,
                 configuration_id,
+                activation_id,
             } => {
                 let database = database.quoted();
                 let resource_id = sql_literal(resource_id);
                 let configuration_id = sql_literal(configuration_id);
+                let activation_id = sql_literal(activation_id);
                 let availability_group = sql_literal(availability_group.as_str());
                 format!(
                     "IF NOT EXISTS (SELECT 1 FROM {database}.sys.extended_properties \
@@ -970,10 +1014,14 @@ impl MutationEffect {
                      OR NOT EXISTS (SELECT 1 FROM {database}.sys.extended_properties \
                      WHERE class = 0 AND name = N'kuberic_configuration_id' \
                      AND CONVERT(nvarchar(512), value) = N'{configuration_id}') \
+                     OR NOT EXISTS (SELECT 1 FROM {database}.sys.extended_properties \
+                     WHERE class = 0 AND name = N'kuberic_activation_id' \
+                     AND CONVERT(nvarchar(512), value) = N'{activation_id}') \
                      THROW 51000, N'source database ownership is not exact', 1;\n\
                      IF EXISTS (SELECT 1 FROM {database}.sys.extended_properties \
                      WHERE class = 0 AND name IN (N'kuberic_ag_resource_id', \
-                     N'kuberic_ag_configuration_id', N'kuberic_ag_name', N'kuberic_ag_id')) \
+                     N'kuberic_ag_configuration_id', N'kuberic_ag_activation_id', \
+                     N'kuberic_ag_name', N'kuberic_ag_id')) \
                      THROW 51000, N'availability-group ownership marker already exists', 1;\n\
                      BEGIN TRANSACTION;\n\
                      BEGIN TRY\n\
@@ -981,6 +1029,8 @@ impl MutationEffect {
                      @name=N'kuberic_ag_resource_id', @value=N'{resource_id}';\n\
                      EXEC {database}.sys.sp_addextendedproperty \
                      @name=N'kuberic_ag_configuration_id', @value=N'{configuration_id}';\n\
+                     EXEC {database}.sys.sp_addextendedproperty \
+                     @name=N'kuberic_ag_activation_id', @value=N'{activation_id}';\n\
                      EXEC {database}.sys.sp_addextendedproperty \
                      @name=N'kuberic_ag_name', @value=N'{availability_group}';\n\
                      COMMIT TRANSACTION;\n\
@@ -1209,16 +1259,20 @@ fn creation_token(
     domain: &[u8],
     resource_id: &str,
     configuration_id: &str,
+    activation_id: &str,
     native_name: &str,
 ) -> Result<String, MutationContractError> {
     validate_marker_value(resource_id)?;
     validate_marker_value(configuration_id)?;
+    validate_marker_value(activation_id)?;
     let mut digest = Sha256::new();
     digest.update(domain);
     digest.update(b"\0");
     digest.update(resource_id.as_bytes());
     digest.update(b"\0");
     digest.update(configuration_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(activation_id.as_bytes());
     digest.update(b"\0");
     digest.update(native_name.as_bytes());
     Ok(hex(&digest.finalize()))

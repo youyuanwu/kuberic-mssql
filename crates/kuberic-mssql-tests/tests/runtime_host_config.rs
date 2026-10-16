@@ -379,6 +379,10 @@ async fn runtime_binding_is_durable_secret_free_and_rejects_identity_drift() {
         store.storage_state().unwrap(),
         ApplicationStorageState::FreshEmpty
     );
+    assert_eq!(
+        store.validate(&activation_identity(1)),
+        Err(RuntimeBindingError::NotInitialized)
+    );
     assert!(!store.root().exists());
     assert_eq!(
         store.initialize(&activation_identity(2)),
@@ -559,6 +563,10 @@ async fn runtime_binding_rejects_extra_malformed_unsupported_and_symlinked_state
 
     fs::set_permissions(store.path(), fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(store.storage_state(), Err(RuntimeBindingError::UnsafeState));
+    assert_eq!(
+        store.validate(&activation_identity(1)),
+        Err(RuntimeBindingError::UnsafeState)
+    );
     fs::set_permissions(store.path(), fs::Permissions::from_mode(0o600)).unwrap();
 
     fs::write(store.root().join("foreign"), "foreign").unwrap();
@@ -570,6 +578,15 @@ async fn runtime_binding_rejects_extra_malformed_unsupported_and_symlinked_state
     assert_eq!(store.storage_state(), Err(RuntimeBindingError::Malformed));
 
     let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    value["schema_version"] = serde_json::json!(1);
+    let schema_v1 = serde_json::to_vec(&value).unwrap();
+    fs::write(store.path(), &schema_v1).unwrap();
+    assert_eq!(
+        store.storage_state(),
+        Err(RuntimeBindingError::UnsupportedSchema(1))
+    );
+    assert_eq!(fs::read(store.path()).unwrap(), schema_v1);
+
     value["schema_version"] = serde_json::json!(99);
     fs::write(store.path(), serde_json::to_vec(&value).unwrap()).unwrap();
     assert_eq!(
@@ -608,7 +625,7 @@ async fn runtime_binding_rejects_extra_malformed_unsupported_and_symlinked_state
 }
 
 #[tokio::test]
-async fn runtime_binding_recovers_only_stale_private_initialization_files() {
+async fn runtime_binding_rejects_partial_initialization_files_without_mutation() {
     let temporary = tempfile::tempdir().unwrap();
     let runtime_config = config(temporary.path()).await;
     let store = RuntimeBindingStore::new(&runtime_config).unwrap();
@@ -617,11 +634,19 @@ async fn runtime_binding_recovers_only_stale_private_initialization_files() {
 
     let stale = store.root().join(".runtime-binding.json.2147483647.new");
     write_private(&stale, "incomplete");
+    let stale_bytes = fs::read(&stale).unwrap();
+    assert_eq!(store.storage_state(), Err(RuntimeBindingError::UnsafeState));
     assert_eq!(
-        store.storage_state().unwrap(),
-        ApplicationStorageState::FreshEmpty
+        store.validate(&activation_identity(1)),
+        Err(RuntimeBindingError::UnsafeState)
     );
-    assert!(!stale.exists());
+    assert_eq!(fs::read(&stale).unwrap(), stale_bytes);
+    assert_eq!(
+        store.initialize(&activation_identity(1)),
+        Err(RuntimeBindingError::UnsafeState)
+    );
+    assert_eq!(fs::read(&stale).unwrap(), stale_bytes);
+    fs::remove_file(&stale).unwrap();
     store.initialize(&activation_identity(1)).unwrap();
 
     fs::remove_file(store.path()).unwrap();
@@ -883,11 +908,13 @@ async fn seed_dispatch_state_rejects_unknown_corrupt_and_active_temporary_files(
 
     let stale = binding.root().join(".seed-dispatch-v1.json.2147483647.new");
     write_private(&stale, "incomplete");
+    let stale_bytes = fs::read(&stale).unwrap();
     assert_eq!(
-        binding.storage_state().unwrap(),
-        ApplicationStorageState::Established
+        binding.storage_state(),
+        Err(RuntimeBindingError::UnsafeState)
     );
-    assert!(!stale.exists());
+    assert_eq!(fs::read(&stale).unwrap(), stale_bytes);
+    fs::remove_file(stale).unwrap();
 
     fs::write(binding.root().join("foreign"), "foreign").unwrap();
     assert_eq!(

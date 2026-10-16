@@ -22,6 +22,7 @@ use kuberic_runtime::replicator::{
     ReplicatorInterfaces, ReplicatorSettings,
 };
 use kuberic_runtime::{Result as KubericResult, RuntimeError as KubericRuntimeError};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::bootstrap::{
@@ -1626,6 +1627,36 @@ impl SqlServerReplicator {
             ))
     }
 
+    fn activation_id(
+        &self,
+        configuration: &ConfigurationDescriptor,
+    ) -> Result<String, KubericAdapterError> {
+        let identity = configuration
+            .members
+            .iter()
+            .find(|member| member.identity.replica_id == configuration.primary_id)
+            .map(|member| &member.identity)
+            .ok_or(KubericAdapterError::TopologyBindingMismatch(
+                "configuration primary identity is unavailable",
+            ))?;
+        let mut digest = Sha256::new();
+        let replica_id = identity.replica_id.to_string();
+        for value in [
+            "kuberic-mssql-public-v1-activation",
+            replica_id.as_str(),
+            identity.instance_id.as_str(),
+            identity.agent_generation.as_str(),
+        ] {
+            digest.update(value.as_bytes());
+            digest.update(b"\0");
+        }
+        Ok(digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
     fn begin_operation(&self) -> Result<u64, KubericAdapterError> {
         let lifecycle = self
             .lifecycle
@@ -2210,6 +2241,12 @@ impl SqlServerReplicator {
         let expected_database_ownership = StandaloneDatabaseOwnership {
             resource_id: bootstrap.resource_uid.to_string(),
             configuration_id: configuration_id.to_owned(),
+            activation_id: self.activation_id(
+                &self
+                    .admitted_topology()
+                    .ok_or(KubericAdapterError::TopologyNotAdmitted)?
+                    .configuration,
+            )?,
         };
         let snapshot = self
             .observe_availability_group_ownership(
@@ -2242,6 +2279,7 @@ impl SqlServerReplicator {
         let expected_marker = AvailabilityGroupOwnership {
             resource_id: expected_database_ownership.resource_id,
             configuration_id: expected_database_ownership.configuration_id,
+            activation_id: expected_database_ownership.activation_id,
             name: expected_group.name.clone(),
             creation_group_id: Some(expected_group.group_id.clone()),
             group_id: Some(expected_group.group_id.clone()),
@@ -2302,10 +2340,12 @@ impl SqlServerReplicator {
         let expected_ownership = StandaloneDatabaseOwnership {
             resource_id: bootstrap.resource_uid.to_string(),
             configuration_id: compatibility.configuration.configuration_id.to_string(),
+            activation_id: self.activation_id(&compatibility.configuration)?,
         };
         let expected_group_ownership = AvailabilityGroupOwnership {
             resource_id: expected_ownership.resource_id.clone(),
             configuration_id: expected_ownership.configuration_id.clone(),
+            activation_id: expected_ownership.activation_id.clone(),
             name: self
                 .source
                 .observer_config()
@@ -2320,6 +2360,7 @@ impl SqlServerReplicator {
                 bootstrap.config.database.clone(),
                 &expected_ownership.resource_id,
                 &expected_ownership.configuration_id,
+                &expected_ownership.activation_id,
             )
             .map_err(|_| {
                 KubericAdapterError::InvalidConfiguration(
@@ -2330,6 +2371,7 @@ impl SqlServerReplicator {
             bootstrap.config.database.clone(),
             &expected_ownership.resource_id,
             &expected_ownership.configuration_id,
+            &expected_ownership.activation_id,
         )
         .map_err(|_| {
             KubericAdapterError::InvalidConfiguration(
@@ -2341,6 +2383,7 @@ impl SqlServerReplicator {
                 bootstrap.config.database(),
                 &expected_ownership.resource_id,
                 &expected_ownership.configuration_id,
+                &expected_ownership.activation_id,
             )
             .map_err(|_| {
                 KubericAdapterError::InvalidConfiguration(
@@ -2353,6 +2396,7 @@ impl SqlServerReplicator {
             bootstrap.config.database.clone(),
             &expected_ownership.resource_id,
             &expected_ownership.configuration_id,
+            &expected_ownership.activation_id,
         )
         .map_err(|_| {
             KubericAdapterError::InvalidConfiguration(
@@ -2374,6 +2418,7 @@ impl SqlServerReplicator {
                 .clone(),
             &expected_ownership.resource_id,
             &expected_ownership.configuration_id,
+            &expected_ownership.activation_id,
         )
         .map_err(|_| {
             KubericAdapterError::InvalidConfiguration(
@@ -2388,6 +2433,7 @@ impl SqlServerReplicator {
                 .clone(),
             &expected_ownership.resource_id,
             &expected_ownership.configuration_id,
+            &expected_ownership.activation_id,
             descriptors.clone(),
         )
         .map_err(|_| {
@@ -2403,6 +2449,7 @@ impl SqlServerReplicator {
                     .clone(),
                 &expected_ownership.resource_id,
                 &expected_ownership.configuration_id,
+                &expected_ownership.activation_id,
             )
             .map_err(|_| {
                 KubericAdapterError::InvalidConfiguration(
@@ -2422,6 +2469,7 @@ impl SqlServerReplicator {
                 &self.source.observer_config().target().availability_group,
                 &expected_ownership.resource_id,
                 &expected_ownership.configuration_id,
+                &expected_ownership.activation_id,
             )
             .map_err(|_| {
                 KubericAdapterError::InvalidConfiguration(
@@ -2719,6 +2767,9 @@ impl SqlServerReplicator {
                                         configuration_id: expected_group_ownership
                                             .configuration_id
                                             .clone(),
+                                        activation_id: expected_group_ownership
+                                            .activation_id
+                                            .clone(),
                                         name: expected_group_ownership.name.clone(),
                                         creation_group_id: Some(group.identity.group_id.clone()),
                                         group_id: Some(group.identity.group_id.clone()),
@@ -2766,11 +2817,13 @@ impl SqlServerReplicator {
                         Some(AvailabilityGroupOwnership {
                             resource_id,
                             configuration_id,
+                            activation_id,
                             name,
                             creation_group_id: Some(creation_group_id),
                             group_id: Some(group_id),
                         }) if resource_id == &expected_ownership.resource_id
                             && configuration_id == &expected_ownership.configuration_id
+                            && activation_id == &expected_ownership.activation_id
                             && creation_group_id == group_id
                             && name
                                 == &self.source.observer_config().target().availability_group =>
@@ -2821,6 +2874,7 @@ impl SqlServerReplicator {
                                     configuration_id: expected_group_ownership
                                         .configuration_id
                                         .clone(),
+                                    activation_id: expected_group_ownership.activation_id.clone(),
                                     name: expected_group_ownership.name.clone(),
                                     creation_group_id: Some(group.identity.group_id.clone()),
                                     group_id: Some(group.identity.group_id.clone()),
