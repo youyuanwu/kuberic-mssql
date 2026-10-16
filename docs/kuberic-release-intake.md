@@ -97,8 +97,8 @@ identity until the exact candidate record computes `ready_to_pin`.
 The current candidate record is
 [kuberic-release-intake-public-v1-candidate.json](kuberic-release-intake-public-v1-candidate.json).
 It is `ready_to_pin` after server-free validation and exact implementation
-commit `bd819a0d866350476a5d04b2306b529dade53c9a` (tree
-`4038d31664ae47458d1d80c1e9c001fb022221f6`) passed licensed one-replica,
+commit `f3d7f82b83d971bb801158b8e9734278436721f6` (tree
+`f324cdb0f581f2d3aab1293a8fc5780a888542f8`) passed licensed one-replica,
 three-replica, and same-root restart validation. The retained
 [evidence summary](kuberic-release-intake-public-v1-evidence.json) records the
 exact dependency, fixture image, exit statuses, and SHA-256 hashes for the

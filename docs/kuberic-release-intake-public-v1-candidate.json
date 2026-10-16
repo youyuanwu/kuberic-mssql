@@ -3,14 +3,14 @@
   "mode": "candidate",
   "current_dependency_identity": "kuberic-runtime@09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f",
   "reviewed_dependency_identity": "kuberic-runtime@ceec5887ad97d71222117610428ce715b782777e",
-  "semantic_contract_finding": "Implementation bd819a0d866350476a5d04b2306b529dade53c9a (tree 4038d31664ae47458d1d80c1e9c001fb022221f6) preserves observe-only Public V1 behavior. Licensed Stage 3 configuration/seed callbacks are a SQL-native seam, not end-to-end Public V1 Build; ordinary invalid idle-build coverage is server-free and effect-free.",
+  "semantic_contract_finding": "Implementation f3d7f82b83d971bb801158b8e9734278436721f6 (tree f324cdb0f581f2d3aab1293a8fc5780a888542f8) preserves observe-only Public V1 behavior. Licensed Stage 3 configuration/seed callbacks are a SQL-native seam, not end-to-end Public V1 Build; ordinary invalid idle-build coverage is server-free and effect-free.",
   "persistence_contract_finding": "Runtime binding schema 2, seed schema 3, and activation-bound SQL ownership reject old or mismatched state without migration; predecessor seed schemas 1 and 2 are not converted to LegacyAmbiguous under fresh Public V1 activation.",
   "fresh_state_finding": "Fresh agent and application state create one exact Public V1 activation; established, partial, old, copied, or mismatched authority rejects without mutation. Same-root licensed restart proves contained reopen and native reconciliation, not peer-session/lifecycle renewal or restored serving access.",
   "gates": [
     {
       "gate_id": "dependency_identity",
       "status": "passed",
-      "evidence": "The accepted predecessor remains 09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f; implementation bd819a0d866350476a5d04b2306b529dade53c9a, tree 4038d31664ae47458d1d80c1e9c001fb022221f6, and Cargo.lock review exact candidate ceec5887ad97d71222117610428ce715b782777e."
+      "evidence": "The accepted predecessor remains 09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f; implementation f3d7f82b83d971bb801158b8e9734278436721f6, tree f324cdb0f581f2d3aab1293a8fc5780a888542f8, and Cargo.lock review exact candidate ceec5887ad97d71222117610428ce715b782777e."
     },
     {
       "gate_id": "semantic_contract_review",
@@ -50,32 +50,32 @@
     {
       "gate_id": "formatting",
       "status": "passed",
-      "evidence": "cargo fmt --all -- --check passed for implementation bd819a0d866350476a5d04b2306b529dade53c9a (tree 4038d31664ae47458d1d80c1e9c001fb022221f6)."
+      "evidence": "cargo fmt --all -- --check passed for implementation f3d7f82b83d971bb801158b8e9734278436721f6 (tree f324cdb0f581f2d3aab1293a8fc5780a888542f8)."
     },
     {
       "gate_id": "strict_clippy",
       "status": "passed",
-      "evidence": "CARGO_BUILD_JOBS=1 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings passed for implementation bd819a0d866350476a5d04b2306b529dade53c9a."
+      "evidence": "CARGO_BUILD_JOBS=1 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings passed for implementation f3d7f82b83d971bb801158b8e9734278436721f6."
     },
     {
       "gate_id": "full_locked_tests",
       "status": "passed",
-      "evidence": "CARGO_BUILD_JOBS=1 cargo test --locked --workspace --all-features passed for implementation bd819a0d866350476a5d04b2306b529dade53c9a."
+      "evidence": "CARGO_BUILD_JOBS=1 cargo test --locked --workspace --all-features passed for implementation f3d7f82b83d971bb801158b8e9734278436721f6."
     },
     {
       "gate_id": "live_one_replica",
       "status": "passed",
-      "evidence": "docs/kuberic-release-intake-public-v1-evidence.json binds exit status 0 to implementation bd819a0d866350476a5d04b2306b529dade53c9a, tree 4038d31664ae47458d1d80c1e9c001fb022221f6, dependency ceec5887ad97d71222117610428ce715b782777e, and docs/evidence/public-v1/live-one-replica.log SHA-256 7bb69cf18cb1caddd3ee3e911cf192b9b5227915bd82f81c8643a3f7997faecd."
+      "evidence": "docs/kuberic-release-intake-public-v1-evidence.json binds exit status 0 to implementation f3d7f82b83d971bb801158b8e9734278436721f6, tree f324cdb0f581f2d3aab1293a8fc5780a888542f8, dependency ceec5887ad97d71222117610428ce715b782777e, and docs/evidence/public-v1/live-one-replica.log SHA-256 d719bfc96f128472758c6cf2d198b9b5c5650bcf08d05859d3d52192b91849e2."
     },
     {
       "gate_id": "live_three_replica",
       "status": "passed",
-      "evidence": "docs/kuberic-release-intake-public-v1-evidence.json binds exit status 0 to implementation bd819a0d866350476a5d04b2306b529dade53c9a and docs/evidence/public-v1/live-three-replica.log SHA-256 1e9b0e8a318088f9295c05514c941a69d052bc96c0d08896b1e35f9835723fcf. Contained reports are role None, Recovery first=0/last=current native AG sequence, and read/write NotPrimary; direct SQL proves native primary/secondary roles."
+      "evidence": "docs/kuberic-release-intake-public-v1-evidence.json binds exit status 0 to implementation f3d7f82b83d971bb801158b8e9734278436721f6 and docs/evidence/public-v1/live-three-replica.log SHA-256 bb3c9a3b342f152a8917bc3351e6a8d457b1b90c5d55a9eb87cdd5755e3e1321. Contained reports are role None, Recovery first=0/last=current native AG sequence, and read/write NotPrimary; direct SQL proves native primary/secondary roles."
     },
     {
       "gate_id": "live_three_replica_restart",
       "status": "passed",
-      "evidence": "docs/kuberic-release-intake-public-v1-evidence.json binds exit status 0 to implementation bd819a0d866350476a5d04b2306b529dade53c9a and docs/evidence/public-v1/live-three-replica-restart.log SHA-256 a39aa0cc36f3168c0c59a4d53716ac891bb82b21f567a96ccd8beda5396a5b82. It proves contained existing-state Open, fresh sessions, stale-session rejection, native seed-record compaction, zero redispatch, and marker continuity; not peer-session/lifecycle renewal, Public V1 Build replay, or restored serving access."
+      "evidence": "docs/kuberic-release-intake-public-v1-evidence.json binds exit status 0 to implementation f3d7f82b83d971bb801158b8e9734278436721f6 and docs/evidence/public-v1/live-three-replica-restart.log SHA-256 c7fc18773a7726162f17fcb69664282b08ea20ed7420e6d10e439e68fa2c5657. It proves contained existing-state Open, fresh sessions, stale-session rejection, native seed-record compaction, zero redispatch, and marker continuity; not peer-session/lifecycle renewal, Public V1 Build replay, or restored serving access."
     },
     {
       "gate_id": "ag_sequence_history_contract",
