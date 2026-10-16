@@ -1986,6 +1986,8 @@ impl SqlServerReplicator {
 
         let value = match outcome {
             SeedStoreWorkResult::Cancelled => {
+                let stop =
+                    stop.or_else(|| self.lifecycle_cancel.is_cancelled().then_some(Stop::Closed));
                 return Err(match stop {
                     Some(Stop::Closed) => KubericAdapterError::Closed,
                     Some(Stop::Deadline) | None => KubericAdapterError::NativeConvergenceDeadline,
