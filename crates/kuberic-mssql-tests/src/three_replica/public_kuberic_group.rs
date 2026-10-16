@@ -3,7 +3,7 @@ use std::fs;
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,13 +30,15 @@ use kuberic_mssql::{
     Guid, MutationEffect, NativeRole, Observation, ObservationFailureKind, SeedDispatchEvidence,
     SeedDispatchRequest, SqlIdentifier, SqlMutationExecutor, StandaloneDatabaseSnapshot,
 };
-use kuberic_runtime::RuntimeError as KubericRuntimeError;
-use kuberic_runtime::application::StatefulServiceReplica;
+use kuberic_runtime::application::{OpenContext, RoleChange, StatefulServiceReplica};
 use kuberic_runtime::control::proto::{self as wire, agent_control_client::AgentControlClient};
 use kuberic_runtime::control::{
     normalize_public_v1_agent_status_report, public_v1_operation_command_to_proto,
 };
-use kuberic_runtime::host::{HostError, ReplicaHost, RunningReplica};
+use kuberic_runtime::host::{
+    ApplicationStorageState, HostError, ReplicaEndpointResolver, ReplicaHost, ReplicaProcessConfig,
+    RunningReplica,
+};
 use kuberic_runtime::protocol::command::PublicV1OperationCommand;
 use kuberic_runtime::protocol::public_operations::{
     PossibleDataLossIntent, PublicLifecycleInput, PublicLifecycleRecipe, PublicOperationClass,
@@ -52,10 +54,11 @@ use kuberic_runtime::protocol::types::{
 use kuberic_runtime::replicator::{
     PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, Replicator,
 };
+use kuberic_runtime::{Result as KubericResult, RuntimeError as KubericRuntimeError};
 use tonic::{Request, transport::Channel};
 
 use super::availability_group::PreparedAvailabilityGroup;
-use super::cleanup::{CleanupClock, CleanupCoordinator};
+use super::cleanup::{CleanupClock, CleanupCoordinator, SystemCleanupClock};
 use super::kuberic_group::{MSSQL_FAILOVER_DELAY_SECONDS, MssqlGroupError};
 use super::member::ReadyMember;
 use super::model::{NativeTopologyBinding, TopologyRun};
@@ -117,6 +120,68 @@ pub enum LicensedConflictScenario {
 struct HostAttempt {
     shutdown: tokio::sync::watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<kuberic_runtime::host::Result<Option<RunningReplica>>>>,
+}
+
+struct PublicHostShutdownFenceApplication {
+    close_entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    close_release: tokio::sync::Notify,
+    released: AtomicBool,
+    close_returned: AtomicBool,
+    aborts: AtomicUsize,
+}
+
+impl PublicHostShutdownFenceApplication {
+    fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.close_release.notify_one();
+    }
+}
+
+#[async_trait]
+impl StatefulServiceReplica for PublicHostShutdownFenceApplication {
+    async fn open(self: Arc<Self>, _context: OpenContext) -> KubericResult<Arc<dyn Replicator>> {
+        Err(KubericRuntimeError::Application(
+            "shutdown fence application must not open".into(),
+        ))
+    }
+
+    async fn change_role(&self, _role: ReplicaRole) -> KubericResult<RoleChange> {
+        Ok(RoleChange {
+            service_address: None,
+        })
+    }
+
+    async fn close(&self) -> KubericResult<()> {
+        if let Some(entered) = self.close_entered.lock().unwrap().take() {
+            entered.send(()).ok();
+        }
+        while !self.released.load(Ordering::Acquire) {
+            self.close_release.notified().await;
+        }
+        self.close_returned.store(true, Ordering::Release);
+        Err(KubericRuntimeError::Application(
+            "injected public host close failure".into(),
+        ))
+    }
+
+    fn abort(&self) {
+        self.aborts.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+struct PublicHostShutdownFenceResolver {
+    control: String,
+    replication: String,
+}
+
+impl ReplicaEndpointResolver for PublicHostShutdownFenceResolver {
+    fn control_endpoint(&self, _identity: &ReplicaIdentity) -> String {
+        self.control.clone()
+    }
+
+    fn replication_endpoint(&self, _identity: &ReplicaIdentity) -> String {
+        self.replication.clone()
+    }
 }
 
 struct PublicMutationExecutor {
@@ -2188,32 +2253,13 @@ impl PublicMssqlGroup {
         let mut errors = Vec::new();
         for pod in &mut self.pods {
             if let Some(mut running) = pod.running.take() {
-                let deadline = cleanup.remaining().min(Duration::from_secs(10));
-                match tokio::time::timeout(deadline, running.wait()).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => errors.push(error.to_string()),
-                    Err(_) => {
-                        pod.application.abort();
-                        match tokio::time::timeout(
-                            cleanup.remaining().min(Duration::from_secs(10)),
-                            running.wait(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => errors.push(format!(
-                                "member {} shutdown exceeded its deadline",
-                                pod.ordinal
-                            )),
-                            Ok(Err(error)) => errors.push(format!(
-                                "member {} shutdown timed out and abort failed: {error}",
-                                pod.ordinal
-                            )),
-                            Err(_) => errors.push(format!(
-                                "member {} termination remains unconfirmed after abort",
-                                pod.ordinal
-                            )),
-                        }
-                    }
+                if let Err(error) =
+                    await_public_host_shutdown(pod.ordinal, &mut running, cleanup, || {
+                        pod.application.abort()
+                    })
+                    .await
+                {
+                    errors.push(error);
                 }
             }
         }
@@ -2225,6 +2271,283 @@ impl PublicMssqlGroup {
             )))
         }
     }
+}
+
+async fn await_public_host_shutdown(
+    ordinal: u8,
+    running: &mut RunningReplica,
+    cleanup: &CleanupCoordinator<impl CleanupClock>,
+    abort: impl FnOnce(),
+) -> Result<(), String> {
+    let deadline = cleanup.remaining().min(Duration::from_secs(10));
+    match tokio::time::timeout(deadline, running.wait()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => {
+            abort();
+            match tokio::time::timeout(
+                cleanup.remaining().min(Duration::from_secs(10)),
+                running.wait(),
+            )
+            .await
+            {
+                Ok(Ok(())) => Err(format!("member {ordinal} shutdown exceeded its deadline")),
+                Ok(Err(error)) => Err(format!(
+                    "member {ordinal} shutdown timed out and abort failed: {error}"
+                )),
+                Err(_) => Err(format!(
+                    "member {ordinal} termination remains unconfirmed after abort"
+                )),
+            }
+        }
+    }
+}
+
+#[doc(hidden)]
+pub async fn exercise_public_host_shutdown_fence(root: &Path) -> Result<MssqlGroupError, String> {
+    let host_root = root.join("public-host-shutdown-fence");
+    if host_root.exists() {
+        fs::remove_dir_all(&host_root).map_err(|error| error.to_string())?;
+    }
+    create_private_directory(&host_root).map_err(|error| error.to_string())?;
+
+    let result = exercise_public_host_shutdown_fence_inner(&host_root).await;
+    let cleanup = fs::remove_dir_all(&host_root).map_err(|error| error.to_string());
+    match (result, cleanup) {
+        (Ok(error), Ok(())) => Ok(error),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(format!("public host fence cleanup failed: {cleanup}")),
+        (Err(error), Err(cleanup)) => Err(format!(
+            "{error}; public host fence cleanup failed: {cleanup}"
+        )),
+    }
+}
+
+async fn exercise_public_host_shutdown_fence_inner(
+    host_root: &Path,
+) -> Result<MssqlGroupError, String> {
+    let resource_uid = ResourceUid::new("mssql-public-host-shutdown-fence");
+    let replica_id = ReplicaId::new(1);
+    let pod_uid = PodUid::new("public-host-fence-pod");
+    let pvc_uid = PvcUid::new("public-host-fence-pvc");
+    let initialization_id = derive_initialization_id(&resource_uid, replica_id, &pod_uid, &pvc_uid);
+    let identity = ReplicaIdentity {
+        replica_id,
+        instance_id: ReplicaInstanceId::new(pod_uid.as_str()),
+        agent_generation: derive_agent_generation(&initialization_id),
+    };
+    let control_address = free_address().map_err(|error| error.to_string())?;
+    let replication_address = free_address().map_err(|error| error.to_string())?;
+    let config = ReplicaProcessConfig {
+        resource_uid: resource_uid.clone(),
+        replica_id,
+        pod_uid: pod_uid.clone(),
+        pvc_uid: pvc_uid.clone(),
+        data_root: host_root.join("state"),
+        control_address,
+        replication_address,
+        bearer_token: AGENT_TOKEN.to_owned(),
+        rpc_deadline: Duration::from_secs(2),
+        transport_window_capacity: 16,
+    };
+    let (close_entered_tx, close_entered_rx) = tokio::sync::oneshot::channel();
+    let application = Arc::new(PublicHostShutdownFenceApplication {
+        close_entered: Mutex::new(Some(close_entered_tx)),
+        close_release: tokio::sync::Notify::new(),
+        released: AtomicBool::new(false),
+        close_returned: AtomicBool::new(false),
+        aborts: AtomicUsize::new(0),
+    });
+    let resolver = Arc::new(PublicHostShutdownFenceResolver {
+        control: format!("http://{control_address}"),
+        replication: format!("http://{replication_address}"),
+    });
+    let host = ReplicaHost::new(
+        config,
+        application.clone(),
+        ApplicationStorageState::FreshEmpty,
+        resolver,
+    );
+    let (startup_shutdown, startup_receiver) = tokio::sync::watch::channel(false);
+    let mut startup = tokio::spawn(host.start_with_shutdown(startup_receiver));
+
+    let setup = async {
+        let (mut client, report) = status_at(
+            control_address,
+            &resource_uid,
+            &identity,
+            Duration::from_secs(2),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let configuration = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            replica_id,
+            vec![ConfigurationMember {
+                identity: identity.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        client
+            .execute(authorized(wire::ExecuteCommandRequest {
+                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                resource_uid: resource_uid.to_string(),
+                target: Some(identity.clone().into()),
+                expected_process_session_id: report.process_session_id,
+                command: Some(
+                    wire::execute_command_request::Command::InitializeAgentStore(
+                        wire::InitializeAgentStoreCommand {
+                            initialization_id: initialization_id.to_string(),
+                            resource_uid: resource_uid.to_string(),
+                            local_replica_id: replica_id.value(),
+                            expected_instance_id: identity.instance_id.to_string(),
+                            expected_pod_uid: pod_uid.to_string(),
+                            expected_pvc_uid: pvc_uid.to_string(),
+                            assigned_agent_generation: identity.agent_generation.to_string(),
+                            effective_policy: Some(wire::EffectivePolicy {
+                                replica_set_size: 1,
+                                write_quorum: 1,
+                                read_quorum: 1,
+                                failover_delay_seconds: 0,
+                            }),
+                            bootstrap_configuration: Some(configuration.into()),
+                            provisioning: None,
+                        },
+                    ),
+                ),
+            }))
+            .await
+            .map_err(|error| error.to_string())?;
+        tokio::time::timeout(Duration::from_secs(5), &mut startup)
+            .await
+            .map_err(|_| "public host initialization timed out".to_owned())?
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "public host initialization was cancelled".to_owned())
+    }
+    .await;
+
+    let mut running = match setup {
+        Ok(running) => running,
+        Err(error) => {
+            startup_shutdown.send_replace(true);
+            if tokio::time::timeout(Duration::from_secs(1), &mut startup)
+                .await
+                .is_err()
+            {
+                startup.abort();
+                let _ = startup.await;
+            }
+            return Err(error);
+        }
+    };
+
+    let close_result = async {
+        let (mut client, report) = status_at(
+            control_address,
+            &resource_uid,
+            &identity,
+            Duration::from_secs(2),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let report =
+            normalize_public_v1_agent_status_report(report).map_err(|error| error.to_string())?;
+        let program = PublicOperationProgram::Close;
+        let command = PublicV1OperationCommand {
+            target: identity.clone(),
+            intent: PublicOperationIntent {
+                identity: report.identity,
+                operation_id: OperationId::new("public-host-shutdown-fence"),
+                revision: 1,
+                process_session_id: report.process_session_id,
+                class: PublicOperationClass::Close,
+                input_digest: program.digest(),
+                replay_disposition: program.replay_disposition(),
+                lifecycle: None,
+                program: Some(program),
+            },
+        };
+        let request = wire::ExecuteCommandRequest {
+            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+            resource_uid: resource_uid.to_string(),
+            target: Some(identity.clone().into()),
+            expected_process_session_id: command.intent.process_session_id.to_string(),
+            command: Some(wire::execute_command_request::Command::PublicV1Operation(
+                public_v1_operation_command_to_proto(&command)
+                    .map_err(|error| error.to_string())?,
+            )),
+        };
+        Ok::<_, String>(tokio::spawn(async move {
+            client.execute(authorized(request)).await
+        }))
+    }
+    .await;
+
+    let mut close_task = match close_result {
+        Ok(task) => task,
+        Err(error) => {
+            running.shutdown();
+            let _ = tokio::time::timeout(Duration::from_secs(2), running.wait()).await;
+            return Err(error);
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(5), close_entered_rx)
+        .await
+        .is_err()
+    {
+        close_task.abort();
+        running.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.wait()).await;
+        return Err("public host close descendant did not enter its stall".to_owned());
+    }
+
+    running.shutdown();
+    let exhausted = CleanupCoordinator::new(SystemCleanupClock::default(), Duration::ZERO);
+    let shutdown =
+        await_public_host_shutdown(1, &mut running, &exhausted, || application.abort()).await;
+    let error = match shutdown {
+        Err(message) if message.contains("termination remains unconfirmed") => {
+            MssqlGroupError::termination_unconfirmed(format!(
+                "public Kuberic shutdown failed: {message}"
+            ))
+        }
+        Err(message) => {
+            application.release();
+            let _ = close_task.await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), running.wait()).await;
+            return Err(format!(
+                "public host shutdown returned the wrong fence failure: {message}"
+            ));
+        }
+        Ok(()) => {
+            application.release();
+            let _ = close_task.await;
+            return Err("public host terminated before the cleanup fence".to_owned());
+        }
+    };
+
+    if application.aborts.load(Ordering::Acquire) == 0
+        || application.close_returned.load(Ordering::Acquire)
+        || close_task.is_finished()
+    {
+        application.release();
+        let _ = close_task.await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.wait()).await;
+        return Err("stalled public host published completion after the fence".to_owned());
+    }
+
+    application.release();
+    let _close = tokio::time::timeout(Duration::from_secs(2), &mut close_task)
+        .await
+        .map_err(|_| "released public host close did not finish".to_owned())?
+        .map_err(|error| error.to_string())?;
+    tokio::time::timeout(Duration::from_secs(2), running.wait())
+        .await
+        .map_err(|_| "released public host did not terminate".to_owned())?
+        .map_err(|error| error.to_string())?;
+    Ok(error)
 }
 
 fn alternate_guid(index: u16) -> Result<Guid, MssqlGroupError> {
@@ -3843,6 +4166,28 @@ mod tests {
         stalled.abort();
     }
 
+    #[tokio::test]
+    async fn actual_public_host_shutdown_retains_the_termination_fence() {
+        let target = std::env::current_dir().unwrap().join("target");
+        fs::create_dir_all(&target).unwrap();
+        let temporary = tempfile::Builder::new()
+            .prefix("public-host-shutdown-fence")
+            .tempdir_in(target)
+            .unwrap();
+
+        let error = exercise_public_host_shutdown_fence(temporary.path())
+            .await
+            .unwrap();
+
+        assert!(error.agent_termination_unconfirmed());
+        assert!(
+            error
+                .to_string()
+                .contains("termination remains unconfirmed after abort")
+        );
+        assert!(!temporary.path().join("public-host-shutdown-fence").exists());
+    }
+
     #[test]
     fn public_live_group_uses_no_kuberic_testing_or_private_host_api() {
         let source = include_str!("public_kuberic_group.rs");
@@ -3855,6 +4200,21 @@ mod tests {
         ];
         for forbidden in forbidden {
             assert!(!source.contains(&forbidden), "{forbidden}");
+        }
+    }
+
+    #[test]
+    fn blocked_owner_fence_uses_a_released_public_host_task() {
+        let public_host = include_str!("public_kuberic_group.rs");
+        let member = include_str!("member.rs");
+        let legacy = include_str!("kuberic_group.rs");
+        let synthetic_blocking = ["spawn", "blocking"].join("_");
+
+        assert!(public_host.contains("exercise_public_host_shutdown_fence"));
+        assert!(public_host.contains("ReplicaHost::new"));
+        assert!(member.contains("exercise_public_host_shutdown_fence"));
+        for source in [public_host, member, legacy] {
+            assert!(!source.contains(&synthetic_blocking));
         }
     }
 }
