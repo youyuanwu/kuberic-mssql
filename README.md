@@ -12,18 +12,17 @@ authentication and administrative credentials; the three standalone
 secondaries and perform one build-authorized automatic-seeding dispatch. This
 path is not exposed by the production CLI or runtime configuration.
 
-The library is compatible with the observation side of the currently pinned
-pre-alignment Kuberic contract. Its optional Kuberic runtime publishes
-validated AG configuration sequence through the current public `Replicator`
-progress API and hosts the application through Kuberic's public `ReplicaHost`;
-today that publication describes configuration and promotion authority, not
-target Service Fabric application-history progress. The adapter therefore
-remains ineligible for controller operations that require comparable first/last
-progress until Kuberic grows a safe external-native progress contract for SQL
-Server. It is not wired into the level-triggered controller. This is not a
-complete Kubernetes HA integration or an automatic failover implementation. See
-the [progress integration guide](docs/kuberic-progress.md); the
-[support and safety design](docs/design.md) remains authoritative.
+The optional Kuberic runtime is migrated to the fresh-state Public V1
+replacement contract on the feature branch. It publishes exact SQL Server AG
+`sequence_number` only after an exact native binding; capability publication
+also requires the admitted stable local role. Kuberic epochs and exact decimal
+database positions remain separate domains. The candidate dependency is not an
+accepted production pin until the version-2
+[release intake](docs/kuberic-release-intake.md) reaches `ready_to_pin`.
+The adapter is not wired into the level-triggered controller and remains
+ineligible for lease, reseed, switchover, failover, and data-loss operations.
+See the [progress integration guide](docs/kuberic-progress.md); the [support
+and safety design](docs/design.md) remains authoritative.
 Role validation never publishes a client service address; the configured
 replication address is returned only by the custom replicator's open callback.
 
@@ -104,23 +103,21 @@ cargo run --locked -p kuberic-mssql \
 Runtime identity and topology files reject unknown, duplicate, ambiguous,
 symlinked or oversized inputs. The application root contains only a private
 schema-versioned binding of non-secret identity and topology digests. Kuberic
-authority can initially arrive before remote peer sessions; missing peer
-descriptions may only be completed once, after which replay is exact. Role and
-progress callbacks still reobserve SQL Server, and no client SQL listener or
-service address is published.
+role and epoch authority can initially arrive before configuration admission;
+at that point progress is `0` and capability is `INVALID_LSN`. Public V1
+current configurations describe exact ready remote active secondaries; the
+local member is recovered from runtime identity and the configuration
+descriptor, while idle build targets remain separate and require
+`INVALID_LSN`, exact build/session/storage identity, and an exact address.
+After topology admission, role and progress publication reobserve SQL Server.
+No client SQL listener or service address is published.
 
-The current dependency pin also retains the full-topology bootstrap/current-
-configuration callback only as a licensed validation seam. It is not the future
-AG manifest: the aligned Service Fabric target configuration is expected to
-contain only remote active members, exclude the local replica and idle or
-in-build targets, identify the successor with `must_catchup`, and represent
-build targets with invalid/unknown progress rather than fabricated comparable
-history.
-
-With empty authorized roots, startup initializes Kuberic metadata and writes
-the application binding. Reusing those roots reopens established state only
-when the supplied identities, bound paths, observer target and topology still
-match; the reopened process receives a new session, and mismatches fail closed.
+With empty authorized roots, startup initializes Kuberic metadata and writes a
+Public V1 activation-bound application binding. Existing mode reopens only the
+exact binding; new mode with any established, old, partial, copied, or
+mismatched application state rejects without migration. Licensed seed records
+and SQL ownership markers are also activation-bound, so predecessor Stage 3
+authority cannot be adopted.
 The licensed three-replica validation also stops all public hosts, reopens the
 same roots with fresh sessions, rejects commands targeting the superseded
 sessions, and reconverges exact reports without restarting SQL Server.
@@ -229,13 +226,13 @@ DMV relationships. Hardened-block, redone-record, and committed-record
 positions remain separate, exact decimal strings in JSON, including values
 larger than `i64` or JavaScript's safe integer range. They are not a generic
 scalar election score. Because these lineage-scoped fields have different
-meanings and can exceed the signed 64-bit domain used by Kuberic's current
-pinned progress API, they cannot be safely narrowed, hashed, saturated, or
-substituted into that LSN slot. MSSQL remains ineligible for controller
-operations that require comparable first/last progress until upstream defines a
-safe external-native progress contract. Local recovery lineage is not assigned
-to remote DMV rows; reports about remote replicas are not that replica's self-
-observation.
+meanings and can exceed Public V1's signed 64-bit scalar domain, they cannot be
+safely narrowed, hashed, saturated, or substituted into that slot. Future
+build, recovery, and handoff decisions must compare the appropriate native
+field under exact database and recovery-fork lineage and remain gated on the
+Stage 6 lease, fencing, and authenticated mutation design. Local recovery
+lineage is not assigned to remote DMV rows; reports about remote replicas are
+not that replica's self-observation.
 Automatic-seeding history is scoped to the current native database and replica
 GUIDs. Physical-seeding rows require an already-associated local database GUID;
 pre-join destination processes may be unavailable. Empty seeding lists are not

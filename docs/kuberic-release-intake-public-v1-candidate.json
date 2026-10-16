@@ -54,28 +54,28 @@
     },
     {
       "gate_id": "strict_clippy",
-      "status": "pending",
-      "evidence": "Final strict workspace Clippy will run after documentation and licensed-evidence handling are complete."
+      "status": "passed",
+      "evidence": "CARGO_BUILD_JOBS=1 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings passed on the documented candidate branch."
     },
     {
       "gate_id": "full_locked_tests",
-      "status": "pending",
-      "evidence": "Final locked workspace all-feature tests will run after documentation and licensed-evidence handling are complete."
+      "status": "passed",
+      "evidence": "CARGO_BUILD_JOBS=1 cargo test --locked --workspace --all-features passed on the documented candidate branch."
     },
     {
       "gate_id": "live_one_replica",
       "status": "pending",
-      "evidence": "Licensed one-replica evidence has not yet been captured for this exact candidate head."
+      "evidence": "Exact-head command was attempted and failed closed in fixture preflight; the target filesystem has less than the required 6442450944 bytes free, so no licensed evidence was captured."
     },
     {
       "gate_id": "live_three_replica",
       "status": "pending",
-      "evidence": "Licensed three-replica evidence has not yet been captured for this exact candidate head."
+      "evidence": "Exact-head command was attempted and failed closed: 2456076288 fixture-filesystem bytes were available and 16106127360 were required."
     },
     {
       "gate_id": "live_three_replica_restart",
       "status": "pending",
-      "evidence": "Licensed same-root restart evidence has not yet been captured for this exact candidate head."
+      "evidence": "Exact-head restart command was attempted and failed closed: 2456076288 fixture-filesystem bytes were available and 16106127360 were required."
     },
     {
       "gate_id": "ag_sequence_history_contract",

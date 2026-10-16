@@ -2,12 +2,10 @@
 
 ## Purpose
 
-The optional Kuberic integration exposes SQL Server availability-group progress
-through the currently pinned pre-alignment Kuberic `Replicator` contract. Under
-that public API, the adapter publishes only validated AG configuration
-authority; it does not claim target Service Fabric
-application-history progress and does not convert SQL Server database log
-positions into a generic scalar.
+The optional Kuberic integration implements the fresh-state Public V1
+replacement `Replicator` contract. It publishes only exact validated SQL Server
+availability-group sequence progress; Kuberic lifecycle epochs and SQL-native
+database positions are independent authority domains.
 
 Ordinary construction is deliberately observe-only. It can open as a Kuberic
 application, validate a requested native role, and report current progress. An
@@ -17,9 +15,9 @@ one build-authorized automatic-seeding dispatch. Neither construction can
 remove/reseed replicas, grant write access, renew a lease, switch over, fail
 over, or handle data loss.
 
-This document records current pinned behavior and the remaining public-contract
-gap; it does not announce new production mutation support in this repository
-today.
+This document records the candidate implementation boundary. The exact
+candidate lockfile remains feature-branch evaluation until release intake is
+`ready_to_pin`; no new production mutation support is announced.
 
 ## Two Progress Domains
 
@@ -29,15 +27,16 @@ SQL Server exposes two different categories of progress.
 
 `sys.availability_groups.sequence_number` is a nonnegative SQL `bigint`. SQL
 Server increments it when the primary updates availability-group configuration.
-The adapter represents it as `ConfigurationSequence` and, under the current
-pin, returns its exact signed 64-bit value from Kuberic `current_progress`;
-admitted topologies currently report the same value from
-`catch_up_capability`.
+The adapter represents it as `ConfigurationSequence`. Before configuration
+admission, `current_progress` is zero and `catch_up_capability` is
+`INVALID_LSN`. After exact AG binding, both callbacks return the current exact
+nonnegative signed 64-bit sequence. A zero sequence remains valid empty
+authority and is never promoted or fabricated. Configuration epoch is never a
+fallback progress value.
 
-This is the current pinned-contract behavior: configuration and promotion-
-authority progress. It is not target Service Fabric application-history
-progress, and it is not evidence that an arbitrary customer transaction has
-been hardened or redone.
+This is the candidate Public V1 scalar-history behavior: configuration and
+promotion-authority progress. It is not evidence that an arbitrary customer
+transaction has been hardened or redone.
 
 Microsoft's public `mssql-server-ha` agent uses the same sequence:
 
@@ -49,10 +48,9 @@ Microsoft's public `mssql-server-ha` agent uses the same sequence:
 - promotion then renews the external write lease and invokes SQL Server's
   external-cluster failover path.
 
-The current adapter implements only pinned-contract local sequence
-publication. It does not implement the quorum, lease, or promotion steps. A
-safe upstream external-native progress contract remains required before MSSQL
-can participate in controller operations that compare first/last progress.
+The candidate adapter implements only local AG-sequence publication. It does
+not implement the quorum, lease, fencing, or promotion steps required for
+controller-driven role movement.
 
 ### Database-native positions
 
@@ -69,11 +67,9 @@ The observer retains these fields independently as exact decimal values:
 - `committed_record`.
 
 They are never cast, truncated, narrowed, saturated, hashed, or substituted
-for Kuberic progress or Kuberic's signed 64-bit LSN slot. Future build, catch-
-up, handoff, and recovery operations must validate the appropriate native field
-and lineage explicitly. Without a safe upstream external-native progress
-contract, MSSQL remains ineligible for controller operations that require
-comparable first/last progress.
+for Kuberic progress or Kuberic's signed 64-bit LSN slot. Future build, catch-up, handoff, and recovery operations must validate the
+appropriate native field and lineage explicitly. Database-native values remain
+outside Public V1's scalar history.
 
 ## Adapter Boundary
 
@@ -100,24 +96,19 @@ The general observer intentionally remains less restrictive about replica
 count. It can describe partial and empty groups. The exact-three rule exists
 only at the Kuberic progress-publication boundary.
 
-Role callbacks validate observation rather than changing SQL Server. PRIMARY
-must match native PRIMARY; active or idle secondary must match native SECONDARY.
-The initial no-role state may be observed before Kuberic authority admission.
-Successful role validation always returns no client service address. The
-configured replication address belongs only to `Replicator::open`; it is not a
-listener, routing endpoint, or application address.
+Role callbacks never change SQL Server. Before configuration admission, Public
+V1 role and epoch authority is recorded independently without native mutation.
+After admission, PRIMARY must match native PRIMARY and active or idle secondary
+must match native SECONDARY under a fresh observation. Successful role
+validation always returns no client service address. The configured replication
+address belongs only to `Replicator::open`; it is not a listener, routing
+endpoint, or application address.
 
 A strict topology expectation associates three stable Kuberic replica numbers
-with expected SQL Server names and AG endpoint URLs. The first current
-configuration callback combines those associations with fresh native evidence
-and the callback's full identities, roles, process sessions and replication
-addresses.
-
-The current pin uses that full-topology bootstrap/current-configuration
-callback only as a licensed validation seam. It is not the future AG manifest.
-The aligned Service Fabric target configuration should contain only remote
-active members. The local replica and idle or in-build targets stay out of that
-remote set, `must_catchup` identifies the successor, and build targets use
+with expected SQL Server names and AG endpoint URLs. The first current configuration callback combines those associations with
+fresh native evidence and Public V1's exact remote-active descriptions.
+The local replica and idle or in-build targets stay out of that remote set.
+`must_catchup` identifies the successor, and build targets use
 invalid/unknown progress rather than synthesized comparable history.
 
 Kuberic can deliver the bootstrap callback before remote sessions are known.
@@ -127,11 +118,12 @@ supplied value must still match exactly. SQL Server process incarnation is
 local evidence: each runtime freezes and revalidates its own start identity,
 while the three-member validation proves all members collectively.
 
-`catch_up_capability` is reported under the current pin as a fresh
+`catch_up_capability` is reported under the Public V1 candidate as a fresh
 configuration sequence equal to current progress after native topology
-admission. It does not depend on remote transport-session readiness. Identity,
-completed-session, address, epoch, role, health, synchronization, lineage,
-incarnation or freshness drift fails closed.
+admission and publication of the stable matching local role. It does not
+depend on remote transport-session readiness. Identity, completed-session,
+address, epoch, role, health, synchronization, lineage, incarnation or
+freshness drift fails closed.
 
 This is a conservative current-only capability: the adapter claims no earlier
 retained configuration history. It is not a database LSN and does not imply
@@ -140,23 +132,21 @@ The locked controller comparison treats a member at the current sequence or one
 behind as not requiring full repair, and a member two or more behind as
 requiring it. Contract tests preserve that exact boundary.
 
-Future public alignment also requires immutable `ReplicatorCapabilities`.
-MSSQL's initial declaration will keep catch-up-specific quorum unsupported and
-will use `ReplaceOnAmbiguity` for data-loss replay. Future build and peer-
-session entry points also require signed `BuildAuthorization` and
-`PeerSessionAuthorization`. SQL Server HADR cannot carry Kuberic tokens, so
-production mutation needs an authenticated replica-local adapter/control
-channel above HADR. The existing challenge-bound test-host exchange remains
-licensed-validation-only and is not that production transport. The eventual
-cutover must start from fresh public-only protocol state rather than reusing
-retained Stage 3 bootstrap callback state as the future mutation protocol.
+The adapter declares conservative immutable `ReplicatorCapabilities`;
+catch-up-specific quorum and write authority remain unsupported. The released
+Public V1 transport is not claimed to authenticate production mutation. SQL
+Server HADR cannot carry Kuberic authorization tokens, so Stage 6 still needs
+an authenticated replica-local adapter/control channel. The existing
+challenge-bound test-host exchange remains licensed-validation-only and is not
+that production transport.
 
-Current-pin configuration and build DTO interpretation is now localized under
-the Kuberic adapter. That compatibility component produces the existing local
-ownership, member, descriptor, topology-binding, and build-target facts before
-SQL-native classification. Native bootstrap classifiers do not consume
-Kuberic replica-set DTOs. Current callback behavior, errors, effects, seed
-record/token, target evidence, and persisted schemas are unchanged.
+Public V1 configuration and build DTO interpretation is localized under the
+Kuberic adapter. That compatibility component produces local ownership,
+member, descriptor, topology-binding, and build-target facts before SQL-native
+classification. Native bootstrap classifiers do not consume Kuberic
+replica-set DTOs. Application binding schema 2, seed schema 3, and SQL ownership
+markers bind licensed effects to the exact Public V1 activation; predecessor
+state rejects without migration.
 
 The native evidence model also exposes lineage- and field-scoped history
 positions. Exact decimal values can be ordered only when both positions name
@@ -164,18 +154,15 @@ the same native field, database identity, and recovery fork. Missing positions
 are unavailable; missing/different lineage and cross-field comparisons are
 non-orderable. This remains native evidence, not generic Kuberic progress.
 
-Server-free readiness tests distinguish:
+Server-free readiness tests cover cancellation and stale-completion fencing,
+adapter-owned local/active-peer/build-target facts, role before primary
+configuration, same-role epoch renewal, remote-active membership, invalid build
+progress, and ordinary zero-mutation behavior.
 
-- executable current evidence such as cancellation and stale-completion
-  fencing;
-- adapter-owned local, active-peer, and build-target facts;
-- current-pin gaps, including role-before-primary-configuration and newer
-  same-role secondary epochs; and
-- target gates that remain pending until a concrete release exists.
-
-The canonical version-1 intake profile and CLI are documented in
-[Kuberic release intake](kuberic-release-intake.md). They belong to the
-unpublished test crate and add no production mutation or protocol state.
+The canonical version-1 baseline and version-2 candidate intake profiles and
+CLI are documented in [Kuberic release intake](kuberic-release-intake.md).
+They belong to the unpublished test crate and add no production mutation or
+protocol state.
 
 Unbound and ordinary adapters reject bootstrap mutation and build operations.
 Only explicitly bootstrap-capable adapters accept initial current-configuration
@@ -252,9 +239,8 @@ current process session; the callback independently revalidates native replica,
 AG/group-database identity, family/recovery-fork lineage,
 synchronized/healthy/online/not-suspended state, and the fixture-frozen target
 SQL start. Old sessions, superseded builds, replayed reports and a restarted
-target SQL process cannot satisfy the callback. The exchange is confined to
-bootstrap testing construction and leaves the pinned Kuberic protocol and
-ordinary runtime unchanged.
+target SQL process cannot satisfy the callback. The exchange is confined to bootstrap testing construction and does not
+authenticate or enable ordinary runtime mutation.
 
 Source creation, full-recovery configuration, ownership, marker schema, full
 backup, log-chain establishment, backup verification, AG intent/create/GUID
@@ -368,13 +354,12 @@ target SQL process restarts and test-injected lineage mismatches at
 pre-association, in-flight-seeding and post-native/pre-reply windows. Every
 scenario performs exact cleanup.
 
-The workspace tracks Kuberic `main`, with `Cargo.lock` recording the exact
-revision used by locked builds. The current pin
-`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f` is the merge commit of
-[youyuanwu/kuberic#133](https://github.com/youyuanwu/kuberic/pull/133), which
-fixes custom-authority recovery and serializes peer replacement across
-same-root host replacement. It also contains the listener-adoption API from
-[youyuanwu/kuberic#127](https://github.com/youyuanwu/kuberic/pull/127).
+The feature branch evaluates exact Public V1 candidate
+`ceec5887ad97d71222117610428ce715b782777e`. Release-intake records retain
+`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f` as the accepted current identity
+until every version-2 candidate gate passes. Missing licensed evidence keeps
+the candidate `incomplete` and blocks pin adoption, push for merge, and a final
+pull request.
 
 ## Usage
 
