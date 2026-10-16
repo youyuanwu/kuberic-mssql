@@ -286,11 +286,13 @@ The dedicated ignored path starts three real containers from:
 
 The SQL Server image reports version `17.0.5005.3`. The fixture requires a
 clearly test-only `FixtureConfig` constructor that creates an affirmative
-`SqlServerEulaAcknowledgement` in code and injects exactly `ACCEPT_EULA=Y`.
-It consumes no acknowledgement file or environment variable, and repeated
-revalidation is idempotent. Production and future launchers remain responsible
-for explicit acknowledgement; the strict file-backed constructor and negative
-tests remain available for that purpose.
+`SqlServerEulaAcknowledgement` in code and passes exactly `ACCEPT_EULA=Y` to
+each owned container. Repository Cargo commands force that variable through
+`.cargo/config.toml` as repository-wide authorization only for the owned
+licensed fixtures; it does not authorize external or borrowed instances.
+Production still has no SQL Server launcher, never accepts an EULA, and never
+deploys SQL Server. The strict file-backed constructor and negative tests
+remain available for a future launcher contract.
 
 Fixture-only preparation creates and proves:
 
@@ -370,12 +372,13 @@ scenario performs exact cleanup.
 The feature branch evaluates exact Public V1 candidate
 `ceec5887ad97d71222117610428ce715b782777e`. Release-intake records retain
 `09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f` as the accepted current identity
-while comparing the reviewed candidate. Exact implementation commit
-`45a030be504b5a406a511acfc9196ad9fe0a24d3` (tree
-`45599af3d637870baebfefaa292f33e6b851a058`) passed licensed one-replica,
-three-replica, and same-root restart validation. The checked-in evidence
-summary and hashed logs retain those runs, and the candidate outcome is
-`ready_to_pin`.
+while comparing the reviewed candidate. The candidate record computes
+`ready_to_pin` as a contract candidate. Actual merge readiness requires the
+required exact PR-head GitHub Actions check `Shared CI validation` to pass.
+That job runs `just ci`, including licensed one-replica, three-replica, and
+same-root restart validation, and always runs `just cleanup`. Its GitHub
+Actions job log is the run evidence; no test logs or evidence artifacts are
+committed.
 
 The required `cancel_before_remove` gate has two separate evidence sources.
 Kuberic candidate exact-head CI run `38844709880` and its KSF-06 catalog prove
@@ -412,6 +415,11 @@ Run the complete server-free and Rust-owned live gates:
 ```bash
 just ci
 ```
+
+The required exact PR-head GitHub Actions job `Shared CI validation` runs this
+same command and always runs `just cleanup`. Licensed gates therefore execute
+in CI; their GitHub Actions job log is the evidence, not a checked-in log or
+artifact.
 
 Run or clean up the one-member observer/CLI path:
 

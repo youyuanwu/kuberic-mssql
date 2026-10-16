@@ -96,13 +96,18 @@ identity until the exact candidate record computes `ready_to_pin`.
 
 The current candidate record is
 [kuberic-release-intake-public-v1-candidate.json](kuberic-release-intake-public-v1-candidate.json).
-It is `ready_to_pin` after server-free validation and exact implementation
-commit `45a030be504b5a406a511acfc9196ad9fe0a24d3` (tree
-`45599af3d637870baebfefaa292f33e6b851a058`) passed licensed one-replica,
-three-replica, and same-root restart validation. The retained
-[evidence summary](kuberic-release-intake-public-v1-evidence.json) records the
-exact dependency, fixture image, exit statuses, and SHA-256 hashes for the
-checked-in logs under `docs/evidence/public-v1/`.
+It computes `ready_to_pin` as a contract candidate. Actual merge readiness
+requires the required exact PR-head GitHub Actions check
+`Shared CI validation` to pass. That job runs `just ci`, including formatting,
+strict Clippy, full locked ordinary tests, licensed one-replica,
+three-replica, and same-root restart validation, and always runs
+`just cleanup`. The GitHub Actions job log is the run evidence. Test logs and
+evidence artifacts are not committed to this repository.
+
+Repository Cargo commands force `ACCEPT_EULA=Y` through `.cargo/config.toml`
+as repository-wide authorization only for the Rust-owned licensed fixtures.
+It does not authorize external or borrowed SQL Server instances. The production
+adapter has no launcher, never accepts an EULA, and never deploys SQL Server.
 
 The licensed Stage 3 configuration and seed callbacks remain a SQL-native test
 seam, not end-to-end Public V1 Build operations. Public V1 Build evidence is
@@ -138,38 +143,31 @@ rejection after a callback task has settled; it is not host-ordering evidence.
 4. Confirm the future authenticated replica-local adapter/control channel
    owns signed build and peer authorization validation. SQL Server HADR cannot
    carry Kuberic authorization tokens.
-5. Run server-free gates with bounded resources:
+5. Run the complete exact-head pipeline through the required GitHub Actions
+   job `Shared CI validation`, which executes:
 
    ```bash
-   CARGO_BUILD_JOBS=1 just test-kuberic-readiness
-   CARGO_BUILD_JOBS=1 cargo test --locked -p kuberic-mssql-tests \
-     --test release_intake -- --test-threads=1
-   CARGO_BUILD_JOBS=1 cargo fmt --all -- --check
-   CARGO_BUILD_JOBS=1 cargo clippy --locked --workspace \
-     --all-targets --all-features -- -D warnings
-   CARGO_BUILD_JOBS=1 cargo test --locked --workspace --all-features \
-     -- --test-threads=1
+   just ci
    ```
 
-6. Only with explicitly provisioned licensed fixtures, run sequentially:
-
-   ```bash
-   CARGO_BUILD_JOBS=1 just test-live-one-replica
-   CARGO_BUILD_JOBS=1 just test-live-three-replica
-   CARGO_BUILD_JOBS=1 just test-live-three-replica-restart
-   ```
-
-   Unavailable or unrun candidate-required licensed gates remain `pending`;
-   they are never inferred from server-free success.
-7. Fill one JSON record for the applicable profile version with every
+   The command performs setup, ordinary checks, licensed one-replica,
+   licensed three-replica, and licensed same-root restart validation
+   sequentially. The workflow always follows it with `just cleanup`. The
+   exact-head check must pass; local runs are useful before pushing but do not
+   replace it. Job logs remain in GitHub Actions and are not checked in or
+   uploaded as evidence artifacts. Unavailable or unrun candidate-required
+   licensed gates remain `pending`; they are never inferred from server-free
+   success.
+6. Fill one JSON record for the applicable profile version with every
    canonical gate and nonempty evidence. Validate it:
 
    ```bash
    just validate-kuberic-release-intake /absolute/path/to/intake.json
    ```
 
-8. Do not update the dependency pin unless the candidate outcome is
-   `ready_to_pin`.
+7. Do not update the dependency pin unless the candidate outcome is
+   `ready_to_pin` and the required exact PR-head `Shared CI validation` check
+   passes.
 
 ## Record Shape
 

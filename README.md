@@ -347,6 +347,10 @@ just check
 `just check` runs formatting, strict Clippy and locked all-feature Rust tests.
 Builds default to one job; an explicitly supplied `CARGO_BUILD_JOBS` is
 preserved. Licensed live tests remain ignored during ordinary Cargo execution.
+The required GitHub Actions job `Shared CI validation` runs `just ci` at the
+exact pull-request head and always follows it with `just cleanup`. Its GitHub
+Actions job log is the CI evidence; test logs and evidence artifacts are not
+committed to this repository.
 
 Future Kuberic candidates have a separate server-free readiness group and a
 versioned intake-record validator:
@@ -374,9 +378,11 @@ just ci
 ```
 
 It runs server-free checks, the Rust one-replica observer/CLI validation, then
-the Rust three-replica topology/Kuberic validation. Both live recipes create
-only resources owned by that invocation and clean them before returning.
-Aggregate cleanup is always safe to run:
+the Rust three-replica topology/Kuberic validation and same-root restart
+validation. Licensed tests therefore run in the required CI job as well as
+locally when the same prerequisites are available. Both fixture families
+create only resources owned by that invocation and clean them before
+returning. Aggregate cleanup is always safe to run:
 
 ```bash
 just test-live-one-replica
@@ -461,11 +467,14 @@ branch, `Cargo.lock` instead resolves exact candidate
 `ceec5887ad97d71222117610428ce715b782777e` for reproducible release intake;
 that lockfile identity is not accepted pin adoption.
 
-The test crate constructs an affirmative `SqlServerEulaAcknowledgement` through
-the clearly test-only `FixtureConfig` path and injects exactly
-`ACCEPT_EULA=Y` into each SQL Server container. It does not read an
-acknowledgement file or environment variable, and repeated authorization
-revalidation is idempotent.
+Repository Cargo commands force `ACCEPT_EULA=Y` through `.cargo/config.toml`.
+That repository-wide setting authorizes only the Rust-owned licensed fixtures;
+their clearly test-only `FixtureConfig` path constructs the affirmative
+`SqlServerEulaAcknowledgement` and passes exactly `ACCEPT_EULA=Y` to each owned
+SQL Server container. It does not authorize external or borrowed instances.
+The production adapter still has no SQL Server launcher, never accepts an EULA,
+and never deploys SQL Server. File-backed authorization remains a separate
+future-launcher contract.
 
 Run the exact dedicated command with an optional fixture root:
 

@@ -7,13 +7,9 @@ use kuberic_mssql_tests::release_intake::{
     PROFILE_V1_VERSION, PROFILE_V2, PROFILE_VERSION, ReleaseIntakeMode, ReleaseIntakeRecord,
     parse_and_validate_json, validate_record,
 };
-use sha2::{Digest, Sha256};
-
 const CURRENT_DEPENDENCY: &str = "kuberic-runtime@09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f";
 const CANDIDATE_DEPENDENCY: &str = "kuberic-runtime@1111111111111111111111111111111111111111";
 const PUBLIC_V1_DEPENDENCY: &str = "kuberic-runtime@ceec5887ad97d71222117610428ce715b782777e";
-const PUBLIC_V1_IMPLEMENTATION_COMMIT: &str = "45a030be504b5a406a511acfc9196ad9fe0a24d3";
-const PUBLIC_V1_IMPLEMENTATION_TREE: &str = "45599af3d637870baebfefaa292f33e6b851a058";
 
 fn record(mode: ReleaseIntakeMode, status: GateStatus) -> ReleaseIntakeRecord {
     record_for(PROFILE_VERSION, mode, status)
@@ -408,72 +404,13 @@ fn checked_in_public_v1_candidate_is_ready_after_licensed_evidence() {
         .map(|gate| gate.evidence.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(all_evidence.contains(PUBLIC_V1_IMPLEMENTATION_COMMIT));
-    assert!(all_evidence.contains(PUBLIC_V1_IMPLEMENTATION_TREE));
-    assert!(all_evidence.contains("kuberic-release-intake-public-v1-evidence.json"));
+    assert!(all_evidence.contains("Shared CI validation"));
+    assert!(all_evidence.contains("just ci"));
+    assert!(!all_evidence.contains("docs/evidence"));
+    assert!(!all_evidence.contains("kuberic-release-intake-public-v1-evidence.json"));
+    assert!(!all_evidence.contains("kuberic-mssql-ci-evidence"));
     assert!(all_evidence.contains("38844709880"));
     assert!(all_evidence.contains("KSF-06"));
-}
-
-#[test]
-fn checked_in_public_v1_evidence_summary_binds_exact_runs_and_log_hashes() {
-    let docs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs");
-    let summary_path = docs.join("kuberic-release-intake-public-v1-evidence.json");
-    let summary: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(summary_path).unwrap()).unwrap();
-
-    assert_eq!(
-        summary["implementation_commit"],
-        PUBLIC_V1_IMPLEMENTATION_COMMIT
-    );
-    assert_eq!(
-        summary["implementation_tree"],
-        PUBLIC_V1_IMPLEMENTATION_TREE
-    );
-    assert_eq!(summary["dependency_identity"], PUBLIC_V1_DEPENDENCY);
-    assert_eq!(
-        summary["upstream_conformance"]["head_commit"],
-        "ceec5887ad97d71222117610428ce715b782777e"
-    );
-    assert_eq!(
-        summary["upstream_conformance"]["workflow_run_id"],
-        38844709880_u64
-    );
-    assert_eq!(summary["upstream_conformance"]["gate_id"], "KSF-06");
-    assert_eq!(summary["upstream_conformance"]["exit_status"], 0);
-
-    let expected = [
-        (
-            "live_one_replica",
-            "evidence/public-v1/live-one-replica.log",
-            "6f381cf8e4018e4b2607f61aa40f34f97de114be114bb73c38abf2808700a498",
-        ),
-        (
-            "live_three_replica",
-            "evidence/public-v1/live-three-replica.log",
-            "1fb70501b3d7fd2079ffc2bee61d832d0dbce9235dbcb95980a19576842e0960",
-        ),
-        (
-            "live_three_replica_restart",
-            "evidence/public-v1/live-three-replica-restart.log",
-            "fbddde45f204ff5425fb4ece3ed0242e7ce3788fd28bb1721c3cb42fc68d30fa",
-        ),
-    ];
-    let runs = summary["runs"].as_array().unwrap();
-    assert_eq!(runs.len(), expected.len());
-    for (run, (gate_id, log, expected_hash)) in runs.iter().zip(expected) {
-        assert_eq!(run["gate_id"], gate_id);
-        assert_eq!(run["exit_status"], 0);
-        assert_eq!(run["log"], log);
-        assert_eq!(run["log_sha256"], expected_hash);
-
-        let bytes = std::fs::read(docs.join(log)).unwrap();
-        let actual_hash = Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        assert_eq!(actual_hash, expected_hash);
-    }
 }
 
 #[test]

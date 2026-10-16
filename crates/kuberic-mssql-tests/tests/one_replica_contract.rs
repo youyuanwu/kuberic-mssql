@@ -226,4 +226,12 @@ fn repository_routes_one_replica_validation_without_python_fixture_helpers() {
     let workflow = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
     assert!(workflow.contains("just ci"));
     assert!(workflow.contains("just cleanup"));
+    assert!(!workflow.contains("upload-artifact"));
+    let cargo_config = fs::read_to_string(root.join(".cargo/config.toml")).unwrap();
+    assert!(cargo_config.contains("ACCEPT_EULA = { value = \"Y\", force = true }"));
+}
+
+#[test]
+fn repository_cargo_environment_accepts_the_owned_fixture_eula() {
+    assert_eq!(std::env::var("ACCEPT_EULA").as_deref(), Ok("Y"));
 }

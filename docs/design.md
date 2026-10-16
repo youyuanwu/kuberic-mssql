@@ -111,11 +111,14 @@ general repair, destructive recovery, lease, or failover capability.
 `SqlServerEulaAcknowledgement` is the shared semantic acknowledgement contract:
 it can be constructed only from an explicit affirmative value. The production
 crate deliberately provides no container or Pod launcher and never translates
-that value into `ACCEPT_EULA=Y`. Only the Rust-owned one- and three-replica fixtures use a clearly test-only
-constructor to create the affirmative semantic value in code and inject exactly
-`ACCEPT_EULA=Y`; sourceless revalidation is idempotent.
-The strict file-backed constructor and negative contract tests remain for future
-production launchers.
+that value into `ACCEPT_EULA=Y`. Repository Cargo commands force
+`ACCEPT_EULA=Y` through `.cargo/config.toml` as repository-wide authorization
+only for the Rust-owned licensed fixtures. Those fixtures use a clearly
+test-only constructor to create the affirmative semantic value and pass exactly
+`ACCEPT_EULA=Y` to their owned containers; the setting does not authorize
+external or borrowed instances. The production adapter never accepts an EULA
+or deploys SQL Server. The strict file-backed constructor and negative contract
+tests remain for future production launchers.
 
 The licensed one-replica fixture owns one container, TLS assets and test
 principals solely to validate absence, permission denial, TLS rejection and CLI
@@ -521,11 +524,10 @@ the candidate reaches `ready_to_pin`.
 5. **Public-contract adapter migration after Kuberic Phase 4/5** — implemented
    on the candidate feature branch: Public V1 host/callback translation,
    activation-bound application/seed/SQL ownership, observe-only ordinary
-   construction, and version-2 release intake. Exact implementation commit
-   `45a030be504b5a406a511acfc9196ad9fe0a24d3` (tree
-   `45599af3d637870baebfefaa292f33e6b851a058`) has checked-in licensed evidence
-   and the candidate record computes `ready_to_pin`; accepted pin adoption
-   remains a separate repository decision.
+   construction, and version-2 release intake. The candidate record computes
+   `ready_to_pin` as a contract candidate, while actual merge readiness requires
+   the required exact PR-head `Shared CI validation` GitHub Actions check to
+   pass; accepted pin adoption remains a separate repository decision.
 6. **SQL-native fencing, reseed, switchover, and failover** — establish
    verified target and old-primary fencing before destructive reseed or role
    movement, then add external lease handling, sequence arbitration,
@@ -557,19 +559,24 @@ permissions, transport and sample deadlines, freshness, cancellation, CLI
 output, and credential redaction. A dedicated server-free observer workflow
 runs these without provisioning PostgreSQL or Kubernetes.
 
-Live tests run sequentially in the shared validation job after server-free
-checks. The Rust one-replica lifecycle owns one digest-pinned SQL Server 2025
+Live tests run sequentially in the required GitHub Actions job
+`Shared CI validation`, which runs `just ci` at the exact pull-request head and
+always runs `just cleanup`, after server-free checks. GitHub Actions job logs
+are the run evidence; no test logs or evidence artifacts are committed. The
+Rust one-replica lifecycle owns one digest-pinned SQL Server 2025
 Enterprise Developer container and validates absent AG, partial permission
 denial, invalid TLS and fresh production CLI provenance. It creates no
 availability group and never adopts or borrows an existing container.
 
 The Rust three-replica lifecycle pins
 `mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726`
-and automatically accepts the EULA only through the test crate's sourceless
-authorization constructor. It creates three resource-bounded instances and real
-endpoints; explicit bootstrap-capable hosts create one synchronous external AG
-and one automatically seeded database. Fresh direct observations must prove one
-primary, two synchronized healthy
+and is authorized by the repository-wide forced Cargo environment
+`ACCEPT_EULA=Y` only for these owned licensed fixtures, together with the test
+crate's sourceless authorization constructor. Production remains unable to
+accept an EULA or deploy SQL Server. The fixture creates three resource-bounded
+instances and real endpoints; explicit bootstrap-capable hosts create one
+synchronous external AG and one automatically seeded database. Fresh direct
+observations must prove one primary, two synchronized healthy
 secondaries, common identities and lineage, completed seeding, and a marker
 readable from all members. Three in-process Kuberic agents then admit only the
 frozen current topology and publish bracketed, fenced reports. Exact ownership
