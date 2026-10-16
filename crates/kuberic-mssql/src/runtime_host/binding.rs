@@ -6,6 +6,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 
 use kuberic_runtime::host::ApplicationStorageState;
+use kuberic_runtime::protocol::types::ReplicaIdentity;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -14,7 +15,7 @@ use super::seed_state::{
     SEED_OWNER_FILE, SEED_STATE_FILE, recover_seed_temporary, validate_seed_entry,
 };
 
-pub const RUNTIME_BINDING_SCHEMA_VERSION: u32 = 1;
+pub const RUNTIME_BINDING_SCHEMA_VERSION: u32 = 2;
 const BINDING_FILE: &str = "runtime-binding.json";
 const MAX_BINDING_BYTES: u64 = 65_536;
 
@@ -27,6 +28,7 @@ pub struct RuntimeBindingIdentity {
     observer: ObserverBinding,
     topology_sha256: String,
     application_root: String,
+    activation: Option<PublicV1ActivationIdentity>,
 }
 
 impl RuntimeBindingIdentity {
@@ -50,7 +52,38 @@ impl RuntimeBindingIdentity {
                 .to_str()
                 .ok_or(RuntimeBindingError::InvalidPath)?
                 .to_owned(),
+            activation: None,
         })
+    }
+
+    fn activated(&self, identity: &ReplicaIdentity) -> Result<Self, RuntimeBindingError> {
+        if identity.replica_id.value() != self.replica_id
+            || identity.instance_id.is_empty()
+            || identity.agent_generation.is_empty()
+        {
+            return Err(RuntimeBindingError::IdentityMismatch);
+        }
+        let mut activated = self.clone();
+        activated.activation = Some(PublicV1ActivationIdentity {
+            replica_id: identity.replica_id.value(),
+            instance_id: identity.instance_id.to_string(),
+            agent_generation: identity.agent_generation.to_string(),
+        });
+        Ok(activated)
+    }
+
+    fn matches_static_identity(&self, expected: &Self) -> bool {
+        self.schema_version == expected.schema_version
+            && self.resource_uid == expected.resource_uid
+            && self.replica_id == expected.replica_id
+            && self.observer == expected.observer
+            && self.topology_sha256 == expected.topology_sha256
+            && self.application_root == expected.application_root
+            && self.activation.as_ref().is_some_and(|activation| {
+                activation.replica_id == self.replica_id
+                    && !activation.instance_id.is_empty()
+                    && !activation.agent_generation.is_empty()
+            })
     }
 
     pub fn resource_uid(&self) -> &str {
@@ -64,6 +97,14 @@ impl RuntimeBindingIdentity {
     pub fn topology_sha256(&self) -> &str {
         &self.topology_sha256
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicV1ActivationIdentity {
+    replica_id: i64,
+    instance_id: String,
+    agent_generation: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,13 +197,14 @@ impl RuntimeBindingStore {
         }
         let actual = self.load(&root)?;
         root.verify_path()?;
-        if actual != self.expected {
+        if !actual.matches_static_identity(&self.expected) {
             return Err(RuntimeBindingError::IdentityMismatch);
         }
         Ok(ApplicationStorageState::Established)
     }
 
-    pub fn initialize(&self) -> Result<(), RuntimeBindingError> {
+    pub fn initialize(&self, identity: &ReplicaIdentity) -> Result<(), RuntimeBindingError> {
+        let activated = self.expected.activated(identity)?;
         if self.storage_state()? != ApplicationStorageState::FreshEmpty {
             return Err(RuntimeBindingError::AlreadyInitialized);
         }
@@ -181,14 +223,19 @@ impl RuntimeBindingStore {
             }
         })?;
         root.verify_path()?;
-        self.save(&root)
+        self.save(&root, &activated)
     }
 
-    pub fn validate(&self) -> Result<(), RuntimeBindingError> {
-        if self.storage_state()? == ApplicationStorageState::Established {
+    pub fn validate(&self, identity: &ReplicaIdentity) -> Result<(), RuntimeBindingError> {
+        if self.storage_state()? != ApplicationStorageState::Established {
+            return Err(RuntimeBindingError::NotInitialized);
+        }
+        let root = BoundRoot::open(&self.root).map_err(|_| RuntimeBindingError::Io)?;
+        let actual = self.load(&root)?;
+        if actual == self.expected.activated(identity)? {
             Ok(())
         } else {
-            Err(RuntimeBindingError::NotInitialized)
+            Err(RuntimeBindingError::IdentityMismatch)
         }
     }
 
@@ -225,9 +272,13 @@ impl RuntimeBindingStore {
         Ok(identity)
     }
 
-    fn save(&self, root: &BoundRoot) -> Result<(), RuntimeBindingError> {
-        let bytes = serde_json::to_vec_pretty(&self.expected)
-            .map_err(|_| RuntimeBindingError::Malformed)?;
+    fn save(
+        &self,
+        root: &BoundRoot,
+        identity: &RuntimeBindingIdentity,
+    ) -> Result<(), RuntimeBindingError> {
+        let bytes =
+            serde_json::to_vec_pretty(identity).map_err(|_| RuntimeBindingError::Malformed)?;
         let temporary = format!(".{BINDING_FILE}.{}.new", std::process::id());
         let mut file = root
             .openat(

@@ -2963,6 +2963,7 @@ impl SqlServerReplicator {
         let compatibility = CurrentBuildFacts::translate(&binding, replica, published_role)?;
         let record = SeedDispatchRecord::new(
             bootstrap.resource_uid.to_string(),
+            binding.local_identity.clone(),
             binding.configuration.configuration_id.to_string(),
             binding.availability_group.name.as_str(),
             binding.availability_group.group_id.as_str(),
@@ -2974,6 +2975,7 @@ impl SqlServerReplicator {
             compatibility.targets,
             compatibility.winning_target_replica_id,
             compatibility.build_id.clone(),
+            compatibility.target_storage,
             binding.local_sql_server_start_incarnation.as_str(),
         )
         .map_err(KubericAdapterError::SeedState)?;

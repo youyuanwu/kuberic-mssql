@@ -36,8 +36,9 @@ use kuberic_runtime::protocol::public_operations::{
 };
 use kuberic_runtime::protocol::types::{
     ConfigurationDescriptor, ConfigurationMember, Epoch, OperationId, PodUid, PvcUid, ReplicaId,
-    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ReplicaStorageIdentity, ResourceUid,
-    derive_agent_generation, derive_initialization_id,
+    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ReplicaStorageIdentity,
+    ReplicaStorageIncarnationContext, ResourceUid, StorageGeneration, derive_agent_generation,
+    derive_initialization_id,
 };
 use tonic::{Request, transport::Channel};
 
@@ -429,6 +430,7 @@ fn retained_seed_record(sessions: &[String], winning_target: usize) -> SeedDispa
     };
     SeedDispatchRecord::new(
         "runtime-host-test",
+        identities[0].clone(),
         configuration().configuration_id.to_string(),
         "app-ag",
         "66666666-6666-4666-8666-666666666666",
@@ -440,6 +442,16 @@ fn retained_seed_record(sessions: &[String], winning_target: usize) -> SeedDispa
         [member(1), member(2)],
         identities[winning_target].replica_id.to_string(),
         format!("build-{}", winning_target + 1),
+        ReplicaStorageIncarnationContext {
+            replica: identities[winning_target].clone(),
+            storage: ReplicaStorageIdentity::Volatile {
+                identity: format!("runtime-storage-{}", winning_target + 1),
+            },
+            storage_generation: StorageGeneration::new(format!(
+                "runtime-storage-generation-{}",
+                winning_target + 1
+            )),
+        },
         "2026-10-07T12:00:00",
     )
     .unwrap()
@@ -1116,7 +1128,7 @@ async fn application_binding_without_agent_metadata_is_reported_unsafe_case() {
             .unwrap(),
     );
     let binding = kuberic_mssql::runtime_host::RuntimeBindingStore::new(&config).unwrap();
-    binding.initialize().unwrap();
+    binding.initialize(&identities()[0]).unwrap();
     let host = ReplicaHost::new(
         config.replica_process_config(),
         application.clone(),

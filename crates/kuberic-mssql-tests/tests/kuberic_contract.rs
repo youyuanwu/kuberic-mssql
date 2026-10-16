@@ -2999,6 +2999,7 @@ fn exact_seed_record_with_sessions(
     };
     SeedDispatchRecord::new(
         "resource-a",
+        kuberic_identity(1),
         configuration().configuration_id.to_string(),
         "test-ag",
         AG_ID,
@@ -3013,6 +3014,9 @@ fn exact_seed_record_with_sessions(
             .replica_id
             .to_string(),
         build_id,
+        target_build_with_sessions(winning_target, build_id, session_prefix)
+            .storage_incarnation
+            .unwrap(),
         "2026-10-06T12:00:00",
     )
     .unwrap()
@@ -5043,12 +5047,14 @@ async fn definite_sql_rejection_is_retryable_and_does_not_degrade_to_deadline() 
 }
 
 #[tokio::test]
-async fn legacy_dispatched_restart_compacts_exact_native_effect_without_redispatch() {
+async fn legacy_seed_state_rejects_without_migration_or_redispatch() {
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     write_legacy_dispatched_seed_record(root.path(), 1, "legacy-dispatched-build");
+    let path = root.path().join("seed-dispatch-v1.json");
+    let original = std::fs::read(&path).unwrap();
 
-    let complete = Arc::new(AtomicBool::new(true));
+    let complete = Arc::new(AtomicBool::new(false));
     let executor = Arc::new(SeedMutationExecutor {
         complete: complete.clone(),
         executions: AtomicUsize::new(0),
@@ -5059,172 +5065,20 @@ async fn legacy_dispatched_restart_compacts_exact_native_effect_without_redispat
         executor.clone() as Arc<dyn SqlMutationExecutor>,
     );
     admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
-    let (first, second) = tokio::join!(
-        replacement.build_replica(target_build_with_sessions(
-            1,
-            "replacement-build-2",
-            "replacement-session",
-        )),
-        replacement.build_replica(target_build_with_sessions(
-            2,
-            "replacement-build-3",
-            "replacement-session",
-        )),
+    let message = application_error(
+        replacement
+            .build_replica(target_build_with_sessions(
+                1,
+                "replacement-build",
+                "replacement-session",
+            ))
+            .await
+            .unwrap_err(),
     );
-    first.unwrap();
-    second.unwrap();
-
+    assert!(message.contains("unsupported seed dispatch schema version 1"));
     assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
-    let compacted: SeedDispatchRecord =
-        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
-            .unwrap();
-    assert_eq!(compacted.phase(), SeedDispatchPhase::LegacyAmbiguous);
-    assert_eq!(compacted.group_database_id(), Some(DATABASE_ID));
-    assert_eq!(compacted.operation_token(), "");
-    replacement.close().await.unwrap();
-    drop(replacement);
-
-    let replay_executor = Arc::new(SeedMutationExecutor {
-        complete: complete.clone(),
-        executions: AtomicUsize::new(0),
-    });
-    let replay = seed_replicator_with_executor(
-        root.path().to_owned(),
-        complete,
-        replay_executor.clone() as Arc<dyn SqlMutationExecutor>,
-    );
-    admit_seed_replicator_with_sessions(&replay, "same-root-restart").await;
-    replay
-        .build_replica(target_build_with_sessions(
-            1,
-            "same-root-replay",
-            "same-root-restart",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(replay_executor.executions.load(Ordering::SeqCst), 0);
-    assert!(root.path().join("seed-dispatch-v1.json").exists());
-}
-
-#[tokio::test]
-async fn legacy_dispatched_restart_without_native_evidence_requires_recovery_without_redispatch() {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    write_legacy_dispatched_seed_record(root.path(), 1, "legacy-dispatched-build");
-
-    for session in ["first-replacement", "same-root-restart"] {
-        let complete = Arc::new(AtomicBool::new(false));
-        let executor = Arc::new(SeedMutationExecutor {
-            complete: complete.clone(),
-            executions: AtomicUsize::new(0),
-        });
-        let replacement = seed_replicator_with_executor(
-            root.path().to_owned(),
-            complete,
-            executor.clone() as Arc<dyn SqlMutationExecutor>,
-        );
-        admit_seed_replicator_with_sessions(&replacement, session).await;
-        let message = application_error(
-            replacement
-                .build_replica(target_build_with_sessions(1, "replacement-build", session))
-                .await
-                .unwrap_err(),
-        );
-        assert!(
-            message.contains("operator recovery is required"),
-            "{message}"
-        );
-        assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
-        replacement.close().await.unwrap();
-        drop(replacement);
-
-        let persisted = std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&persisted).unwrap();
-        assert_eq!(value["schema_version"], serde_json::json!(2));
-        assert_eq!(value["phase"], serde_json::json!("legacy_ambiguous"));
-        assert!(value.get("operation_token").is_none());
-        let record: SeedDispatchRecord = serde_json::from_slice(&persisted).unwrap();
-        assert_eq!(record.phase(), SeedDispatchPhase::LegacyAmbiguous);
-        assert_eq!(record.operation_token(), "");
-    }
-}
-
-#[tokio::test]
-async fn legacy_dispatched_restart_rejects_incomplete_and_conflicting_evidence_without_redispatch()
-{
-    let mut incomplete = seeded_source_snapshot();
-    if let Observation::Present { value: group, .. } = &mut incomplete.availability_group {
-        group.databases[0].local.as_mut().unwrap().recovery = None;
-    }
-    let mut conflicting = seeded_source_snapshot();
-    if let Observation::Present { value: group, .. } = &mut conflicting.availability_group {
-        group.databases[0]
-            .local
-            .as_mut()
-            .unwrap()
-            .recovery
-            .as_mut()
-            .unwrap()
-            .database_guid = Some(guid("99999999-9999-4999-8999-999999999999"));
-    }
-    for (label, snapshot, expected) in [
-        ("incomplete", incomplete, "operator recovery is required"),
-        ("conflicting", conflicting, "source database association"),
-    ] {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        write_legacy_dispatched_seed_record(root.path(), 1, "legacy-dispatched-build");
-        let associated = Arc::new(AtomicBool::new(false));
-        let executor = Arc::new(SeedMutationExecutor {
-            complete: associated.clone(),
-            executions: AtomicUsize::new(0),
-        });
-        let replacement = Arc::new(
-            SqlServerReplicator::new_bootstrap_with_topology_and_target_evidence(
-                SqlServerServiceConfig::new(
-                    ResourceUid::new("resource-a"),
-                    "replica-1.example:5022",
-                )
-                .unwrap(),
-                Arc::new(ControlledSeedSource {
-                    config: observer_config(),
-                    associated: associated.clone(),
-                    associated_snapshot: snapshot,
-                }),
-                Arc::new(ScriptedClock {
-                    times: Mutex::new(vec![OBSERVED_AT].into()),
-                }),
-                kuberic_identity(1),
-                topology_expectation(),
-                SqlServerBootstrapConfig::new(SqlIdentifier::new("app-db").unwrap()),
-                executor.clone() as Arc<dyn SqlMutationExecutor>,
-                Arc::new(SeedTargetEvidenceExchange {
-                    complete: associated.clone(),
-                }),
-                root.path().to_owned(),
-            )
-            .unwrap(),
-        );
-        admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
-        associated.store(true, Ordering::SeqCst);
-        let message = application_error(
-            replacement
-                .build_replica(target_build_with_sessions(
-                    1,
-                    "replacement-build",
-                    "replacement-session",
-                ))
-                .await
-                .unwrap_err(),
-        );
-
-        assert!(message.contains(expected), "{label}: {message}");
-        assert_eq!(executor.executions.load(Ordering::SeqCst), 0, "{label}");
-        let persisted = std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&persisted).unwrap();
-        assert_eq!(value["phase"], serde_json::json!("legacy_ambiguous"));
-        assert!(value.get("operation_token").is_none());
-    }
+    assert_eq!(std::fs::read(path).unwrap(), original);
+    assert!(!root.path().join("seed-dispatch-v1.owner").exists());
 }
 
 #[tokio::test]

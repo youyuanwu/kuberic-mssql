@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use kuberic_runtime::protocol::types::{
     ConfigurationDescriptor, ProcessSessionId, ReplicaIdentity as KubericReplicaIdentity,
-    ReplicaRole,
+    ReplicaRole, ReplicaStorageIncarnationContext,
 };
 use kuberic_runtime::replicator::{ReplicaInformation, ReplicaSetConfiguration};
 
@@ -542,6 +542,7 @@ pub(super) struct CurrentBuildFacts {
     pub(super) target: HealthyTopologyMemberBinding,
     pub(super) winning_target_replica_id: String,
     pub(super) build_id: String,
+    pub(super) target_storage: ReplicaStorageIncarnationContext,
 }
 
 impl CurrentBuildFacts {
@@ -623,6 +624,7 @@ impl CurrentBuildFacts {
             target: target.clone(),
             winning_target_replica_id: replica.identity.replica_id.to_string(),
             build_id: replica.build_id.to_string(),
+            target_storage: storage.clone(),
         })
     }
 }
