@@ -1757,6 +1757,13 @@ impl SqlServerReplicator {
                         .filter(|session| !session.is_empty())
                 })
             })
+            .or_else(|| {
+                self.bootstrap.as_ref().and_then(|_| {
+                    self.admitted_topology()
+                        .map(|binding| binding.local_member().process_session_id.clone())
+                        .filter(|session| !session.is_empty())
+                })
+            })
             .ok_or(KubericAdapterError::TopologyBindingMismatch(
                 "runtime process session is unavailable",
             ))

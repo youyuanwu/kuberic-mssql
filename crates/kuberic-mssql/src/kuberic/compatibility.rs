@@ -283,6 +283,16 @@ pub(super) fn validate_incomplete_bootstrap_configuration(
     replication_address: &str,
     current: &ReplicaSetConfiguration,
 ) -> Result<bool, KubericAdapterError> {
+    if complete_remote_active_configuration(runtime_identity, current) {
+        validate_configuration_shape(
+            runtime_identity,
+            process_session_id,
+            expectation,
+            replication_address,
+            current,
+        )?;
+        return Ok(false);
+    }
     if current.replicas.len() >= usize::from(SUPPORTED_REPLICA_COUNT) {
         return Ok(false);
     }
@@ -317,6 +327,45 @@ pub(super) fn validate_incomplete_bootstrap_configuration(
     Ok(true)
 }
 
+fn complete_remote_active_configuration(
+    runtime_identity: &KubericReplicaIdentity,
+    current: &ReplicaSetConfiguration,
+) -> bool {
+    let configuration = &current.configuration;
+    if current.replicas.len() + 1 != configuration.members.len()
+        || configuration
+            .members
+            .iter()
+            .find(|member| member.identity == *runtime_identity)
+            .is_none_or(|local| {
+                local.identity.replica_id != configuration.primary_id
+                    || local.role != ReplicaRole::Primary
+            })
+        || current
+            .replicas
+            .iter()
+            .any(|replica| replica.identity == *runtime_identity)
+    {
+        return false;
+    }
+    configuration
+        .members
+        .iter()
+        .filter(|member| member.identity != *runtime_identity)
+        .all(|member| {
+            let matching = current
+                .replicas
+                .iter()
+                .filter(|replica| replica.identity == member.identity)
+                .collect::<Vec<_>>();
+            matching.len() == 1
+                && matching[0].role == ReplicaRole::ActiveSecondary
+                && member.role == ReplicaRole::ActiveSecondary
+                && !matching[0].process_session_id.is_empty()
+                && validate_replication_address(&matching[0].replication_address).is_ok()
+        })
+}
+
 pub(super) fn validate_bootstrap_configuration_replay(
     binding: &HealthyTopologyBinding,
     current: &ReplicaSetConfiguration,
@@ -334,7 +383,14 @@ fn validate_configuration_replay(
             "current descriptor differs from the frozen descriptor",
         ));
     }
-    if current.replicas.len() != binding.members.len() {
+    let omits_local_primary = current.replicas.len() + 1 == binding.members.len()
+        && binding.local_identity.replica_id == binding.configuration.primary_id
+        && binding.local_member().stable_role == ReplicaRole::Primary
+        && !current
+            .replicas
+            .iter()
+            .any(|replica| replica.identity == binding.local_identity);
+    if current.replicas.len() != binding.members.len() && !omits_local_primary {
         return Err(KubericAdapterError::TopologyBindingMismatch(
             "current replica descriptions are incomplete",
         ));
@@ -345,14 +401,21 @@ fn validate_configuration_replay(
             .iter()
             .filter(|replica| replica.identity == member.kuberic_identity)
             .collect::<Vec<_>>();
+        if matching.is_empty()
+            && omits_local_primary
+            && member.kuberic_identity == binding.local_identity
+        {
+            continue;
+        }
         if matching.len() != 1 {
             return Err(KubericAdapterError::TopologyBindingMismatch(
                 "current replica identities differ from the frozen members",
             ));
         }
         let replica = matching[0];
-        let remote_omission =
-            allow_remote_omissions && member.kuberic_identity != binding.local_identity;
+        let remote_omission = allow_remote_omissions
+            && !omits_local_primary
+            && member.kuberic_identity != binding.local_identity;
         if (replica.process_session_id != member.process_session_id
             && !(remote_omission && replica.process_session_id.is_empty()))
             || (replica.replication_address != member.replication_address

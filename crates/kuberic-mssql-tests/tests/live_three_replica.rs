@@ -679,16 +679,7 @@ async fn execute_phase2_bootstrap_lifecycle(
             let topology = launched
                 .finalize_prepared_availability_group(&prepared)
                 .await?;
-            exercise_dispatched_build_lifecycle_commands(&group, &pending.command).await?;
-            pending
-                .release
-                .send(())
-                .map_err(|_| "final replacement compaction checkpoint was not retained")?;
-            pending
-                .callback
-                .await
-                .map_err(|error| format!("final replacement callback task failed: {error}"))?
-                .map_err(|error| format!("final replacement build failed: {error}"))?;
+            exercise_dispatched_build_lifecycle_commands(&group, pending).await?;
             if group.testing_seed_dispatch_count()? != 1 {
                 return Err("final replacement did not dispatch exactly one ADD DATABASE".into());
             }
@@ -970,10 +961,15 @@ async fn assert_kuberic_build_rejected(
 
 async fn exercise_dispatched_build_lifecycle_commands(
     group: &PublicMssqlGroup,
-    winner: &PublicBuildCommand,
+    pending: PendingSeedCompaction,
 ) -> Result<(), TestError> {
+    let PendingSeedCompaction {
+        command: winner,
+        release: compaction_release,
+        callback: mut winner_callback,
+    } = pending;
     let retired_loser =
-        group.target_build_command(2, "dispatched-retired-loser", "dispatched-retired-loser")?;
+        group.target_build_command(1, "dispatched-retired-loser", "dispatched-retired-loser")?;
     group
         .testing_execute_kuberic_build_command(&retired_loser)
         .await
@@ -988,7 +984,7 @@ async fn exercise_dispatched_build_lifecycle_commands(
         .await?;
 
     let superseded_loser = group.target_build_command(
-        2,
+        1,
         "dispatched-superseded-loser",
         "dispatched-superseded-loser",
     )?;
@@ -1015,16 +1011,6 @@ async fn exercise_dispatched_build_lifecycle_commands(
         .testing_assert_build_success_not_published(&superseded_loser)
         .await?;
 
-    let replacement_winner = group.supersede_build_command(winner, "dispatched-replacement-winner");
-    group
-        .testing_execute_kuberic_build_command(&replacement_winner)
-        .await
-        .map_err(|error| format!("dispatched winning build supersession failed: {error}"))?;
-    assert_kuberic_build_rejected(group, winner, "dispatched stale winner replay").await?;
-    group
-        .testing_assert_build_success_not_published(winner)
-        .await?;
-
     let retained = group
         .testing_seed_dispatch_record()?
         .ok_or("dispatched lifecycle commands released the retained seed record")?;
@@ -1035,6 +1021,73 @@ async fn exercise_dispatched_build_lifecycle_commands(
         || group.testing_seed_dispatch_count()? != 1
     {
         return Err("retirement or supersession mutated durable seed authority".into());
+    }
+
+    let (evidence_entered_tx, evidence_entered_rx) = tokio::sync::oneshot::channel();
+    let (evidence_release_tx, evidence_release_rx) = tokio::sync::oneshot::channel();
+    group.testing_gate_next_target_evidence(evidence_entered_tx, evidence_release_rx)?;
+    compaction_release
+        .send(())
+        .map_err(|_| "dispatched winner compaction checkpoint was not retained")?;
+    tokio::select! {
+        entered = evidence_entered_rx => entered
+            .map_err(|_| "dispatched winner ended before target evidence collection")?,
+        result = &mut winner_callback => {
+            return Err(format!(
+                "dispatched winner completed before target evidence supersession: {result:?}"
+            )
+            .into());
+        }
+        _ = tokio::time::sleep(Duration::from_secs(120)) => {
+            return Err("dispatched winner did not reach target evidence collection".into());
+        }
+    }
+
+    let replacement_winner =
+        group.supersede_build_command(&winner, "dispatched-replacement-winner");
+    group
+        .testing_execute_kuberic_build_command(&replacement_winner)
+        .await
+        .map_err(|error| format!("dispatched winning build supersession failed: {error}"))?;
+    evidence_release_tx
+        .send(())
+        .map_err(|_| "dispatched winner target evidence checkpoint was not retained")?;
+    let stale_error = winner_callback
+        .await
+        .map_err(|error| format!("dispatched winner callback task failed: {error}"))?
+        .expect_err("superseded dispatched winner must not obtain completion evidence");
+    if !stale_error.message().contains("target-host test authority") {
+        return Err(format!(
+            "superseded dispatched winner returned an unexpected error: {stale_error}"
+        )
+        .into());
+    }
+    assert_kuberic_build_rejected(group, &winner, "dispatched stale winner replay").await?;
+    group
+        .testing_assert_build_success_not_published(&winner)
+        .await?;
+
+    group
+        .testing_execute_admitted_seed_callback_with_retry(&replacement_winner)
+        .await
+        .map_err(|error| format!("replacement winner reconciliation failed: {error}"))?;
+    if group.testing_seed_dispatch_count()? != 1 || group.testing_seed_dispatch_record()?.is_some()
+    {
+        return Err("replacement winner redispatched or retained reconciled seed state".into());
+    }
+
+    let replay = group.replay_build_command(&replacement_winner);
+    group
+        .testing_execute_kuberic_build_command(&replay)
+        .await
+        .map_err(|error| format!("replacement winner replay authority failed: {error}"))?;
+    group
+        .testing_execute_admitted_seed_callback_with_retry(&replay)
+        .await
+        .map_err(|error| format!("replacement winner replay callback failed: {error}"))?;
+    if group.testing_seed_dispatch_count()? != 1 || group.testing_seed_dispatch_record()?.is_some()
+    {
+        return Err("idempotent current replay redispatched or recreated seed state".into());
     }
     Ok(())
 }

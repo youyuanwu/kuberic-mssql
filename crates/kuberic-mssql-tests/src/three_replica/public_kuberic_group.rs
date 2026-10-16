@@ -147,9 +147,15 @@ struct PublicTargetEvidenceAuthority {
     process_session_id: ProcessSessionId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicHistoricalDispatchReconciliation {
+    dispatched_winner: PublicTargetEvidenceAuthority,
+    operation_token: String,
+}
+
 struct PublicTargetEvidenceAuthorityState {
     current: Vec<Option<PublicTargetEvidenceAuthority>>,
-    retained_dispatch: Option<PublicTargetEvidenceAuthority>,
+    historical_reconciliation: Option<PublicHistoricalDispatchReconciliation>,
     retired_builds: BTreeSet<String>,
 }
 
@@ -157,7 +163,7 @@ impl PublicTargetEvidenceAuthorityState {
     fn new(target_count: usize) -> Self {
         Self {
             current: vec![None; target_count],
-            retained_dispatch: None,
+            historical_reconciliation: None,
             retired_builds: BTreeSet::new(),
         }
     }
@@ -172,7 +178,13 @@ impl PublicTargetEvidenceAuthorityState {
             .get_mut(index)
             .ok_or_else(|| MssqlGroupError::new("target evidence authority index is invalid"))?;
         if current.as_ref() == Some(&authority) {
-            return Ok(());
+            return if self.retired_builds.contains(&authority.build_id) {
+                Err(MssqlGroupError::new(
+                    "target build authority has been retired, superseded, or rebound",
+                ))
+            } else {
+                Ok(())
+            };
         }
         if self.retired_builds.contains(&authority.build_id)
             || current
@@ -204,13 +216,26 @@ impl PublicTargetEvidenceAuthorityState {
         Ok(())
     }
 
-    fn retain_dispatch(&mut self, authority: PublicTargetEvidenceAuthority) {
-        self.retained_dispatch = Some(authority);
+    fn retain_dispatch(&mut self, reconciliation: PublicHistoricalDispatchReconciliation) {
+        if self
+            .historical_reconciliation
+            .as_ref()
+            .is_none_or(|retained| {
+                retained.operation_token != reconciliation.operation_token
+                    || retained.dispatched_winner != reconciliation.dispatched_winner
+            })
+        {
+            self.historical_reconciliation = Some(reconciliation);
+        }
+    }
+
+    fn finish_reconciliation(&mut self) {
+        let _ = self.historical_reconciliation.take();
     }
 
     fn exact(&self, index: usize, authority: &PublicTargetEvidenceAuthority) -> bool {
         self.current.get(index).and_then(Option::as_ref) == Some(authority)
-            || self.retained_dispatch.as_ref() == Some(authority)
+            && !self.retired_builds.contains(&authority.build_id)
     }
 
     fn exact_request(
@@ -220,17 +245,17 @@ impl PublicTargetEvidenceAuthorityState {
         identity: &ReplicaIdentity,
         process_session_id: &ProcessSessionId,
     ) -> Option<PublicTargetEvidenceAuthority> {
-        self.current
+        let authority = self
+            .current
             .get(index)
             .and_then(Option::as_ref)
-            .into_iter()
-            .chain(self.retained_dispatch.as_ref())
-            .find(|authority| {
-                authority.build_id == build_id
+            .filter(|authority| {
+                !self.retired_builds.contains(&authority.build_id)
+                    && authority.build_id == build_id
                     && authority.identity == *identity
                     && authority.process_session_id == *process_session_id
-            })
-            .cloned()
+            });
+        authority.cloned()
     }
 }
 
@@ -350,13 +375,21 @@ impl PublicTargetHostEvidenceExchange {
     }
 
     fn retain_dispatched(&self, record: &SeedDispatchRecord) -> Result<(), MssqlGroupError> {
-        let Some(authority) = dispatched_authority(record, &self.identities)? else {
+        let Some(reconciliation) = dispatched_reconciliation(record, &self.identities)? else {
             return Ok(());
         };
         self.authority
             .lock()
             .map_err(|_| MssqlGroupError::new("target evidence authority lock is poisoned"))?
-            .retain_dispatch(authority);
+            .retain_dispatch(reconciliation);
+        Ok(())
+    }
+
+    fn finish_reconciliation(&self) -> Result<(), MssqlGroupError> {
+        self.authority
+            .lock()
+            .map_err(|_| MssqlGroupError::new("target evidence authority lock is poisoned"))?
+            .finish_reconciliation();
         Ok(())
     }
 
@@ -414,10 +447,10 @@ impl PublicTargetHostEvidenceExchange {
     }
 }
 
-fn dispatched_authority(
+fn dispatched_reconciliation(
     record: &SeedDispatchRecord,
     identities: &[ReplicaIdentity; 3],
-) -> Result<Option<PublicTargetEvidenceAuthority>, MssqlGroupError> {
+) -> Result<Option<PublicHistoricalDispatchReconciliation>, MssqlGroupError> {
     if !matches!(
         record.phase(),
         SeedDispatchPhase::Submitting | SeedDispatchPhase::Accepted | SeedDispatchPhase::Ambiguous
@@ -438,10 +471,13 @@ fn dispatched_authority(
         })
         .cloned()
         .ok_or_else(|| MssqlGroupError::new("retained seed winner identity is unavailable"))?;
-    Ok(Some(PublicTargetEvidenceAuthority {
-        build_id: record.winning_build_id().to_owned(),
-        identity,
-        process_session_id: ProcessSessionId::new(target.process_session_id().to_owned()),
+    Ok(Some(PublicHistoricalDispatchReconciliation {
+        dispatched_winner: PublicTargetEvidenceAuthority {
+            build_id: record.winning_build_id().to_owned(),
+            identity,
+            process_session_id: ProcessSessionId::new(target.process_session_id().to_owned()),
+        },
+        operation_token: record.operation_token().to_owned(),
     }))
 }
 
@@ -1698,10 +1734,14 @@ impl PublicMssqlGroup {
         command: &PublicBuildCommand,
     ) -> Result<tokio::task::JoinHandle<Result<(), tonic::Status>>, tonic::Status> {
         let (replicator, build) = self.admitted_seed_callback(command)?;
+        let target_evidence = self.target_evidence.clone();
         Ok(tokio::spawn(async move {
             replicator
                 .build_replica(build)
                 .await
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            target_evidence
+                .finish_reconciliation()
                 .map_err(|error| tonic::Status::internal(error.to_string()))
         }))
     }
@@ -2003,13 +2043,18 @@ impl PublicMssqlGroup {
         &self,
         command: &PublicBuildCommand,
     ) -> Result<(), tonic::Status> {
-        if let Some(record) = self
+        match self
             .testing_seed_dispatch_record()
             .map_err(|error| tonic::Status::internal(error.to_string()))?
         {
-            self.target_evidence
+            Some(record) => self
+                .target_evidence
                 .retain_dispatched(&record)
-                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+                .map_err(|error| tonic::Status::internal(error.to_string()))?,
+            None => self
+                .target_evidence
+                .finish_reconciliation()
+                .map_err(|error| tonic::Status::internal(error.to_string()))?,
         }
         if command.retire {
             return self
@@ -2056,6 +2101,9 @@ impl PublicMssqlGroup {
         tokio::time::timeout(timeout_duration, replicator.build_replica(build))
             .await
             .map_err(|_| tonic::Status::deadline_exceeded("bootstrap seed callback timed out"))?
+            .map_err(|error| tonic::Status::internal(error.to_string()))?;
+        self.target_evidence
+            .finish_reconciliation()
             .map_err(|error| tonic::Status::internal(error.to_string()))
     }
 
@@ -3683,37 +3731,42 @@ mod tests {
         assert!(state.authorize(1, authority_a).is_err());
     }
 
-    #[tokio::test]
-    async fn revoke_while_collection_is_blocked_invalidates_revalidation() {
+    #[test]
+    fn retained_dispatched_winner_cannot_collect_after_explicit_revoke() {
         let identities = testing_identities();
         let authority = testing_authority(&identities[1], "build-a", "session-a");
-        let state = Arc::new(Mutex::new(PublicTargetEvidenceAuthorityState::new(3)));
-        state
-            .lock()
+        let record = dispatched_record(
+            &identities,
+            1,
+            "build-a",
+            ["session-source", "session-a", "session-peer"],
+        );
+        let retained = dispatched_reconciliation(&record, &identities)
             .unwrap()
-            .authorize(1, authority.clone())
-            .unwrap();
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let blocked_state = state.clone();
-        let blocked_authority = authority.clone();
-        let collection = tokio::spawn(async move {
-            assert!(blocked_state.lock().unwrap().exact(1, &blocked_authority));
-            entered_tx.send(()).unwrap();
-            release_rx.await.unwrap();
-            blocked_state.lock().unwrap().exact(1, &blocked_authority)
-        });
+            .expect("submitting dispatch must retain reconciliation state");
+        let mut state = PublicTargetEvidenceAuthorityState::new(3);
+        state.authorize(1, authority.clone()).unwrap();
+        state.retain_dispatch(retained.clone());
 
-        entered_rx.await.unwrap();
-        state.lock().unwrap().revoke(1, "build-a").unwrap();
-        release_tx.send(()).unwrap();
+        state.revoke(1, "build-a").unwrap();
 
-        assert!(!collection.await.unwrap());
-        assert!(state.lock().unwrap().retired_builds.contains("build-a"));
+        assert!(!state.exact(1, &authority));
+        assert!(
+            state
+                .exact_request(
+                    1,
+                    "build-a",
+                    &identities[1],
+                    &ProcessSessionId::new("session-a"),
+                )
+                .is_none()
+        );
+        assert_eq!(state.historical_reconciliation.as_ref(), Some(&retained));
+        assert!(state.retired_builds.contains("build-a"));
     }
 
-    #[test]
-    fn dispatched_winner_retention_comes_from_the_seed_dispatch_record() {
+    #[tokio::test]
+    async fn retained_winner_supersession_invalidates_blocked_collection() {
         let identities = testing_identities();
         let winner = testing_authority(&identities[1], "build-a", "session-a");
         let replacement = testing_authority(&identities[1], "build-b", "session-a");
@@ -3723,18 +3776,42 @@ mod tests {
             "build-a",
             ["session-source", "session-a", "session-peer"],
         );
-        let retained = dispatched_authority(&record, &identities)
+        let retained = dispatched_reconciliation(&record, &identities)
             .unwrap()
-            .expect("submitting dispatch must retain exact winning authority");
-        let mut state = PublicTargetEvidenceAuthorityState::new(3);
-        state.authorize(1, winner.clone()).unwrap();
-        state.retain_dispatch(retained);
+            .expect("submitting dispatch must retain reconciliation state");
+        let state = Arc::new(Mutex::new(PublicTargetEvidenceAuthorityState::new(3)));
+        {
+            let mut state = state.lock().unwrap();
+            state.authorize(1, winner.clone()).unwrap();
+            state.retain_dispatch(retained.clone());
+        }
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let blocked_state = state.clone();
+        let blocked_winner = winner.clone();
+        let collection = tokio::spawn(async move {
+            assert!(blocked_state.lock().unwrap().exact(1, &blocked_winner));
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            blocked_state.lock().unwrap().exact(1, &blocked_winner)
+        });
 
-        state.authorize(1, replacement.clone()).unwrap();
+        entered_rx.await.unwrap();
+        state
+            .lock()
+            .unwrap()
+            .authorize(1, replacement.clone())
+            .unwrap();
+        release_tx.send(()).unwrap();
 
+        assert!(!collection.await.unwrap());
+        let mut state = state.lock().unwrap();
         assert_eq!(state.current[1].as_ref(), Some(&replacement));
-        assert!(state.exact(1, &winner));
+        assert!(state.exact(1, &replacement));
+        assert_eq!(state.historical_reconciliation.as_ref(), Some(&retained));
         assert!(state.retired_builds.contains("build-a"));
+        state.finish_reconciliation();
+        assert!(state.historical_reconciliation.is_none());
     }
 
     #[tokio::test]

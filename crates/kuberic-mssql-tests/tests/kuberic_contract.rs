@@ -1995,6 +1995,70 @@ async fn current_configuration_replay_revalidates_availability_group_ownership()
 }
 
 #[tokio::test]
+async fn complete_remote_only_configuration_replay_revalidates_healthy_ownership() {
+    let (replicator, mutation) = bootstrap_replicator_for(
+        0,
+        vec![
+            Ok(present(bootstrap_membership_snapshot(0))),
+            Ok(present(bootstrap_membership_snapshot(0))),
+        ],
+        vec![
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
+        ],
+    );
+    replicator.open().await.unwrap();
+    replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap();
+    replicator
+        .update_current_replica_set_configuration(remote_only_primary_replica_set())
+        .await
+        .unwrap();
+    assert!(mutation.effects.lock().unwrap().is_empty());
+    assert!(mutation.databases.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn complete_remote_only_configuration_replay_rejects_missing_or_replaced_ownership() {
+    let mut missing = owned_standalone_database();
+    missing.availability_group_ownership = None;
+    let mut replaced = owned_standalone_database();
+    replaced
+        .availability_group_ownership
+        .as_mut()
+        .unwrap()
+        .resource_id = "resource-b".into();
+
+    for (name, database) in [("missing", missing), ("replaced", replaced)] {
+        let (replicator, mutation) = bootstrap_replicator_for(
+            0,
+            vec![
+                Ok(present(bootstrap_membership_snapshot(0))),
+                Ok(present(bootstrap_membership_snapshot(0))),
+            ],
+            vec![Ok(Some(owned_standalone_database())), Ok(Some(database))],
+        );
+        replicator.open().await.unwrap();
+        replicator
+            .update_current_replica_set_configuration(bound_replica_set())
+            .await
+            .unwrap();
+        let error = replicator
+            .update_current_replica_set_configuration(remote_only_primary_replica_set())
+            .await
+            .unwrap_err();
+        let message = application_error(error);
+        assert!(message.contains("conflicts"), "{name}: {message}");
+        assert!(
+            mutation.effects.lock().unwrap().is_empty(),
+            "{name} ownership replay executed SQL effects"
+        );
+    }
+}
+
+#[tokio::test]
 async fn seed_build_revalidates_the_exact_availability_group_guid_marker() {
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2729,6 +2793,15 @@ async fn close_during_bootstrap_reobservation_fences_configuration_success() {
 
 fn bound_replica_set() -> ReplicaSetConfiguration {
     replica_set_with_session_prefix("session")
+}
+
+fn remote_only_primary_replica_set() -> ReplicaSetConfiguration {
+    let mut current = bound_replica_set();
+    let primary_id = current.configuration.primary_id;
+    current
+        .replicas
+        .retain(|replica| replica.identity.replica_id != primary_id);
+    current
 }
 
 fn replica_set_with_session_prefix(prefix: &str) -> ReplicaSetConfiguration {
