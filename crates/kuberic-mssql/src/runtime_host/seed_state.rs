@@ -196,6 +196,41 @@ impl SeedDispatchRecord {
         &self.operation_token
     }
 
+    pub fn terminal_token(&self) -> String {
+        let mut digest = Sha256::new();
+        for value in [
+            "kuberic-mssql-seed-terminal-v2",
+            &self.resource_uid,
+            &self.configuration_id,
+            &self.availability_group_name,
+            &self.availability_group_id,
+            &self.database_name,
+            &self.database_guid,
+            &self.family_guid,
+            &self.recovery_fork_guid,
+            &self.sqlserver_start_time,
+        ] {
+            digest.update(value.as_bytes());
+            digest.update(b"\0");
+        }
+        let activation =
+            serde_json::to_vec(&self.activation_identity).expect("public activation serializes");
+        digest.update(&activation);
+        digest.update(b"\0");
+        for member in std::iter::once(&self.source).chain(self.targets.iter()) {
+            for value in [
+                &member.replica_id,
+                &member.instance_id,
+                &member.agent_generation,
+                &member.native_replica_id,
+            ] {
+                digest.update(value.as_bytes());
+                digest.update(b"\0");
+            }
+        }
+        hex(&digest.finalize())
+    }
+
     pub(super) fn matches_application_binding(
         &self,
         resource_uid: &str,

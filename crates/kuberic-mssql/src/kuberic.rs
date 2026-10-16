@@ -1986,6 +1986,8 @@ impl SqlServerReplicator {
 
         let value = match outcome {
             SeedStoreWorkResult::Cancelled => {
+                let stop =
+                    stop.or_else(|| self.lifecycle_cancel.is_cancelled().then_some(Stop::Closed));
                 return Err(match stop {
                     Some(Stop::Closed) => KubericAdapterError::Closed,
                     Some(Stop::Deadline) | None => KubericAdapterError::NativeConvergenceDeadline,
@@ -3668,6 +3670,7 @@ impl SqlServerReplicator {
                     context.database.name.clone(),
                     context.database.database_guid.clone(),
                     context.record.operation_token(),
+                    context.record.terminal_token(),
                 )
                 .map_err(|_| {
                     KubericAdapterError::NativeConvergenceUnsafe("seed dispatch operation token")
@@ -3706,6 +3709,7 @@ impl SqlServerReplicator {
             context.database.name.clone(),
             context.database.database_guid.clone(),
             record.operation_token(),
+            context.record.terminal_token(),
         )
         .map_err(|_| {
             KubericAdapterError::NativeConvergenceUnsafe("seed dispatch operation token")
@@ -3762,6 +3766,7 @@ impl SqlServerReplicator {
             context.database.name.clone(),
             context.database.database_guid.clone(),
             record.operation_token(),
+            context.record.terminal_token(),
         )
         .map_err(|_| {
             KubericAdapterError::NativeConvergenceUnsafe("seed dispatch operation token")
@@ -3844,6 +3849,7 @@ impl SqlServerReplicator {
                             context.database.name.clone(),
                             context.database.database_guid.clone(),
                             operation_token,
+                            context.record.terminal_token(),
                         )
                         .map_err(|_| {
                             KubericAdapterError::NativeConvergenceUnsafe(
@@ -3970,6 +3976,7 @@ impl SqlServerReplicator {
                             context.database.name.clone(),
                             context.database.database_guid.clone(),
                             operation_token,
+                            context.record.terminal_token(),
                         )
                         .map_err(|_| {
                             KubericAdapterError::NativeConvergenceUnsafe(

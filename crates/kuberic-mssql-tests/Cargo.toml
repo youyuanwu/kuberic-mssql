@@ -36,7 +36,7 @@ test = false
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true
-kuberic-mssql = { workspace = true, features = ["kuberic-testing"] }
+kuberic-mssql.workspace = true
 kuberic-runtime = { workspace = true, features = ["testing"] }
 libc.workspace = true
 rustix.workspace = true
@@ -45,7 +45,7 @@ serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tiberius.workspace = true
-tokio = { workspace = true, features = ["full", "test-util"] }
-tokio-util = { workspace = true, features = ["compat", "rt"] }
+tokio = { workspace = true, features = ["test-util"] }
+tokio-util.workspace = true
 tonic.workspace = true
 zeroize.workspace = true

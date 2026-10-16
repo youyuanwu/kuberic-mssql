@@ -2,10 +2,14 @@
 
 ## Purpose
 
-Use this procedure before changing the pinned Kuberic revision. It evaluates a
-specific dependency identity against the MSSQL adapter's current contract,
-native evidence, persistence boundary, target Service Fabric requirements, and
-licensed validation gates.
+Use this procedure before changing the Kuberic dependency declared in the root
+`Cargo.toml`. It evaluates a specific dependency identity against the MSSQL
+adapter's current contract, native evidence, persistence boundary, target
+Service Fabric requirements, and licensed validation gates.
+
+`Cargo.toml` is the dependency authority. `Cargo.lock` records reproducible
+resolution, while intake records are review inputs and do not define or
+document a separate repository pin.
 
 The intake command is unpublished test tooling. It does not change
 `Cargo.toml`, `Cargo.lock`, SQL Server, runtime state, or Kubernetes resources.
@@ -75,7 +79,7 @@ conformance.
 
 ## Profile Version 2
 
-Profile version 2 is the Public V1 candidate profile. It retains the same
+Profile version 2 is the Public V1 intake profile. It retains the same
 21-gate cardinality, ordering, and baseline/candidate requiredness as version
 1, with exactly two semantic replacements:
 
@@ -88,21 +92,14 @@ All other gate identities are unchanged. A version-2 record containing a
 version-1 replacement, or a version-1 record containing a version-2
 replacement, is invalid rather than downgraded or reinterpreted.
 
-The candidate-only feature-branch exception permits `Cargo.lock` to resolve
-the exact reviewed candidate while intake is in progress. It does not accept
-the candidate as the production pin. The branch must not be proposed for
-merge, described as pin adoption, or used to update the accepted dependency
-identity until the exact candidate record computes `ready_to_pin`.
-
-The current candidate record is
-[kuberic-release-intake-public-v1-candidate.json](kuberic-release-intake-public-v1-candidate.json).
-It computes `ready_to_pin` as a contract candidate. Actual merge readiness
-requires the required exact PR-head GitHub Actions check
-`Shared CI validation` to pass. That job runs `just ci`, including formatting,
-strict Clippy, full locked ordinary tests, licensed one-replica,
-three-replica, and same-root restart validation, and always runs
-`just cleanup`. The GitHub Actions job log is the run evidence. Test logs and
-evidence artifacts are not committed to this repository.
+A candidate record may describe the exact current and reviewed resolutions
+during intake, but it is not checked in as dependency authority. A change to
+`Cargo.toml` must not merge until the candidate computes `ready_to_pin` and the
+required exact PR-head GitHub Actions check `Shared CI validation` passes. That
+job runs `just ci`, including formatting, strict Clippy, full locked ordinary
+tests, licensed one-replica, three-replica, and same-root restart validation,
+and always runs `just cleanup`. The GitHub Actions job log is the run evidence.
+Test logs and evidence artifacts are not committed to this repository.
 
 Repository Cargo commands force `ACCEPT_EULA=Y` through `.cargo/config.toml`
 as repository-wide authorization only for the Rust-owned licensed fixtures.
@@ -122,14 +119,14 @@ stale-session rejection, native seed-record compaction, zero redispatch, and
 marker continuity. It does not prove Public V1 peer-session/lifecycle renewal,
 replay a Public V1 Build operation, or restore serving access.
 
-`cancel_before_remove` uses two-part evidence. Kuberic exact-head CI run
-`38844709880` and catalog gate KSF-06 prove host-owned cancellation/drain
-ordering. The MSSQL local readiness test separately proves effect-free remove
-rejection after a callback task has settled; it is not host-ordering evidence.
+`cancel_before_remove` uses two-part evidence. Kuberic release conformance
+catalog gate KSF-06 proves host-owned cancellation/drain ordering. The MSSQL
+local readiness test separately proves effect-free remove rejection after a
+callback task has settled; it is not host-ordering evidence.
 
 ## Intake Procedure
 
-1. Record the current locked Kuberic revision and the exact reviewed candidate.
+1. Resolve the current `Cargo.toml` dependency and the exact reviewed candidate.
    Baseline mode requires the same identity; candidate mode requires different
    identities. Identity syntax is canonical
    `<lowercase-package-name>@<40-lowercase-hex-git-revision>` with no
@@ -165,9 +162,9 @@ rejection after a callback task has settled; it is not host-ordering evidence.
    just validate-kuberic-release-intake /absolute/path/to/intake.json
    ```
 
-7. Do not update the dependency pin unless the candidate outcome is
-   `ready_to_pin` and the required exact PR-head `Shared CI validation` check
-   passes.
+7. Do not merge the `Cargo.toml` dependency change unless the candidate outcome
+   is `ready_to_pin` and the required exact PR-head
+   `Shared CI validation` check passes.
 
 ## Record Shape
 
@@ -195,38 +192,6 @@ rejection after a callback task has settled; it is not host-ordering evidence.
 The abbreviated example is not valid because all profile gates are mandatory
 record entries. Use the profile table and the validation error output to
 complete the record; requiredness and applicability are not JSON fields.
-
-## Current-Pin Baseline
-
-The readiness implementation was exercised against locked Kuberic revision
-`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f`.
-
-The complete machine-readable record is
-[kuberic-release-intake-baseline.json](kuberic-release-intake-baseline.json).
-It is validated by the release-intake integration tests and can also be
-inspected directly:
-
-```bash
-just validate-kuberic-release-intake \
-  docs/kuberic-release-intake-baseline.json
-```
-
-| Evidence | Status |
-|---|---|
-| dependency identity and semantic review | passed |
-| persistence and fresh-state review | passed |
-| native history, pinned adapter, readiness, and intake tests | passed |
-| formatting, strict Clippy, and full locked ordinary tests | passed |
-| licensed one-replica, three-replica, and restart gates | pending; not run for the server-free readiness change |
-| external progress contract | pending release |
-| role before primary configuration | pending release; current pin rejects pre-admission role |
-| newer same-role secondary epoch | pending release; current pin requires the frozen epoch |
-| remote-active membership and invalid build progress | pending release |
-| cancel-before-remove | pending release; removal remains unsupported |
-| signed authorization contract | pending release |
-
-Because all baseline-required gates passed and optional gates are accurately
-pending, the dry-run outcome is `baseline_confirmed`, not `ready_to_pin`.
 
 ## Stop Conditions
 

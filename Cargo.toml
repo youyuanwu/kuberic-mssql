@@ -17,7 +17,7 @@ publish = false
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
-kuberic-mssql = { path = "crates/kuberic-mssql", default-features = false }
+kuberic-mssql = { path = "crates/kuberic-mssql", default-features = false, features = ["kuberic-testing"] }
 kuberic-runtime = { version = "=0.0.1", default-features = false }
 libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
@@ -26,8 +26,8 @@ serde_json = "1"
 sha2 = "0.11"
 tempfile = "3"
 tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "rustls"] }
-tokio = "1"
-tokio-util = "0.7"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
 tonic = "0.14"
 zeroize = "1"
 

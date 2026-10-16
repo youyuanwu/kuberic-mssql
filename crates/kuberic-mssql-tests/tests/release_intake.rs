@@ -7,9 +7,8 @@ use kuberic_mssql_tests::release_intake::{
     PROFILE_V1_VERSION, PROFILE_V2, PROFILE_VERSION, ReleaseIntakeMode, ReleaseIntakeRecord,
     parse_and_validate_json, validate_record,
 };
-const CURRENT_DEPENDENCY: &str = "kuberic-runtime@09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f";
+const CURRENT_DEPENDENCY: &str = "kuberic-runtime@0000000000000000000000000000000000000000";
 const CANDIDATE_DEPENDENCY: &str = "kuberic-runtime@1111111111111111111111111111111111111111";
-const PUBLIC_V1_DEPENDENCY: &str = "kuberic-runtime@ceec5887ad97d71222117610428ce715b782777e";
 
 fn record(mode: ReleaseIntakeMode, status: GateStatus) -> ReleaseIntakeRecord {
     record_for(PROFILE_VERSION, mode, status)
@@ -321,12 +320,12 @@ fn missing_identities_are_invalid() {
 #[test]
 fn dependency_identities_require_canonical_package_and_lowercase_git_revision() {
     for identity in [
-        "kuberic-runtime@09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f ",
-        " kuberic-runtime@09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f",
-        "kuberic-runtime@09CE0A7BA9FDD9D6DCD207606FD0C9496A58C47F",
-        "kuberic_runtime@09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f",
-        "kuberic-runtime@09ce0a7b",
-        "kuberic-runtime@09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47g",
+        "kuberic-runtime@0000000000000000000000000000000000000000 ",
+        " kuberic-runtime@0000000000000000000000000000000000000000",
+        "kuberic-runtime@AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "kuberic_runtime@0000000000000000000000000000000000000000",
+        "kuberic-runtime@0000000",
+        "kuberic-runtime@000000000000000000000000000000000000000g",
     ] {
         let mut record = record(ReleaseIntakeMode::Candidate, GateStatus::Passed);
         record.reviewed_dependency_identity = identity.into();
@@ -363,54 +362,6 @@ fn candidate_current_identity_match_fails_dependency_identity_and_blocks() {
         validated.effective_status(GateId::DependencyIdentity),
         GateStatus::Failed
     );
-}
-
-#[test]
-fn checked_in_current_pin_baseline_record_is_complete_and_valid() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/kuberic-release-intake-baseline.json");
-    let input = std::fs::read(path).unwrap();
-    let (record, validated) = parse_and_validate_json(&input).unwrap();
-    assert_eq!(record.mode, ReleaseIntakeMode::Baseline);
-    assert_eq!(record.current_dependency_identity, CURRENT_DEPENDENCY);
-    assert_eq!(record.reviewed_dependency_identity, CURRENT_DEPENDENCY);
-    assert_eq!(record.gates.len(), PROFILE_V1.len());
-    assert_eq!(validated.outcome(), IntakeOutcome::BaselineConfirmed);
-}
-
-#[test]
-fn checked_in_public_v1_candidate_is_ready_after_licensed_evidence() {
-    let docs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs");
-    let path = docs.join("kuberic-release-intake-public-v1-candidate.json");
-    let input = std::fs::read(path).unwrap();
-    let (record, validated) = parse_and_validate_json(&input).unwrap();
-    assert_eq!(record.profile_version, PROFILE_VERSION);
-    assert_eq!(record.mode, ReleaseIntakeMode::Candidate);
-    assert_eq!(record.current_dependency_identity, CURRENT_DEPENDENCY);
-    assert_eq!(record.reviewed_dependency_identity, PUBLIC_V1_DEPENDENCY);
-    assert_eq!(record.gates.len(), PROFILE_V2.len());
-    assert_eq!(validated.outcome(), IntakeOutcome::ReadyToPin);
-    for gate in [
-        GateId::LiveOneReplica,
-        GateId::LiveThreeReplica,
-        GateId::LiveThreeReplicaRestart,
-    ] {
-        assert_eq!(validated.effective_status(gate), GateStatus::Passed);
-    }
-
-    let all_evidence = record
-        .gates
-        .iter()
-        .map(|gate| gate.evidence.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(all_evidence.contains("Shared CI validation"));
-    assert!(all_evidence.contains("just ci"));
-    assert!(!all_evidence.contains("docs/evidence"));
-    assert!(!all_evidence.contains("kuberic-release-intake-public-v1-evidence.json"));
-    assert!(!all_evidence.contains("kuberic-mssql-ci-evidence"));
-    assert!(all_evidence.contains("38844709880"));
-    assert!(all_evidence.contains("KSF-06"));
 }
 
 #[test]

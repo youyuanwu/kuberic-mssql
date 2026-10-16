@@ -15,9 +15,9 @@ one build-authorized automatic-seeding dispatch. Neither construction can
 remove/reseed replicas, grant write access, renew a lease, switch over, fail
 over, or handle data loss.
 
-This document records the candidate implementation boundary. The exact
-candidate lockfile remains feature-branch evaluation until release intake is
-`ready_to_pin`; no new production mutation support is announced.
+This document records the implemented Public V1 boundary. The root
+`Cargo.toml` is authoritative for the Kuberic dependency; no new production
+mutation support is announced.
 
 ## Two Progress Domains
 
@@ -222,7 +222,10 @@ reinterpreted as `LegacyAmbiguous` and cannot redispatch.
 The owned source database retains one matching singleton dispatch row with a
 derived operation token, exact AG/database identities, and SQL-owned phase. A
 group-scope SQL application lock distinguishes an active/ambiguous submission
-from a session that ended before any native effect. An accepted row or exact
+from a session that ended before any native effect. The exact winning
+build/storage operation token remains temporary; a separate stable
+activation/topology token identifies the v2 terminal marker so both configured
+targets can reconcile the same completed group dispatch. An accepted row or exact
 association evidence establishes one bounded terminal `master` extended
 property before file compaction. Its exact `v1:<operation-token>` value binds
 resource/configuration, AG GUID, source identity/lineage and SQL incarnation,
@@ -369,22 +372,17 @@ target SQL process restarts and test-injected lineage mismatches at
 pre-association, in-flight-seeding and post-native/pre-reply windows. Every
 scenario performs exact cleanup.
 
-The feature branch evaluates exact Public V1 candidate
-`ceec5887ad97d71222117610428ce715b782777e`. Release-intake records retain
-`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f` as the accepted current identity
-while comparing the reviewed candidate. The candidate record computes
-`ready_to_pin` as a contract candidate. Actual merge readiness requires the
-required exact PR-head GitHub Actions check `Shared CI validation` to pass.
-That job runs `just ci`, including licensed one-replica, three-replica, and
-same-root restart validation, and always runs `just cleanup`. Its GitHub
-Actions job log is the run evidence; no test logs or evidence artifacts are
-committed.
+The required GitHub Actions check `Shared CI validation` runs `just ci`,
+including licensed one-replica, three-replica, and same-root restart
+validation, and always runs `just cleanup`. Its GitHub Actions job log is the
+run evidence; no test logs or evidence artifacts are committed. The dependency
+source and version remain defined only by the root `Cargo.toml`.
 
 The required `cancel_before_remove` gate has two separate evidence sources.
-Kuberic candidate exact-head CI run `38844709880` and its KSF-06 catalog prove
-host-owned cancellation/drain ordering. The MSSQL readiness test separately
-proves effect-free remove rejection after a callback task has settled; it does
-not itself claim host ownership.
+Kuberic's release conformance catalog gate KSF-06 proves host-owned
+cancellation/drain ordering. The MSSQL readiness test separately proves
+effect-free remove rejection after a callback task has settled; it does not
+itself claim host ownership.
 
 ## Usage
 

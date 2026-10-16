@@ -137,6 +137,7 @@ pub struct SeedDispatchRequest {
     database: SqlIdentifier,
     database_guid: Guid,
     operation_token: String,
+    terminal_token: String,
 }
 
 impl SeedDispatchRequest {
@@ -146,10 +147,13 @@ impl SeedDispatchRequest {
         database: SqlIdentifier,
         database_guid: Guid,
         operation_token: impl Into<String>,
+        terminal_token: impl Into<String>,
     ) -> Result<Self, MutationContractError> {
         let operation_token = operation_token.into();
-        if operation_token.len() != 64
-            || !operation_token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        let terminal_token = terminal_token.into();
+        if [&operation_token, &terminal_token]
+            .iter()
+            .any(|token| token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()))
         {
             return Err(MutationContractError::InvalidMarker);
         }
@@ -159,6 +163,7 @@ impl SeedDispatchRequest {
             database,
             database_guid,
             operation_token,
+            terminal_token,
         })
     }
 
@@ -387,11 +392,11 @@ impl SeedDispatchRequest {
     }
 
     fn terminal_marker_name(&self) -> String {
-        format!("kuberic_seed_terminal_v1_{}", self.terminal_scope_digest())
+        format!("kuberic_seed_terminal_v2_{}", self.terminal_scope_digest())
     }
 
     fn terminal_marker_value(&self) -> String {
-        format!("v1:{}", self.operation_token)
+        format!("v2:{}", self.terminal_token)
     }
 
     fn terminal_lock_name(&self) -> String {
