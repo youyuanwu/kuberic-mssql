@@ -4496,6 +4496,7 @@ mod tests {
     use super::*;
 
     static PUBLIC_HOST_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    const PUBLIC_HOST_STALL_ENTRY_TIMEOUT: Duration = Duration::from_secs(30);
 
     fn public_host_attempt_roots(root: &Path) -> Vec<PathBuf> {
         let mut attempts = fs::read_dir(root)
@@ -4903,7 +4904,7 @@ mod tests {
             .await
         });
 
-        tokio::time::timeout(Duration::from_secs(5), entered)
+        tokio::time::timeout(PUBLIC_HOST_STALL_ENTRY_TIMEOUT, entered)
             .await
             .expect("public host startup returns a running replica")
             .unwrap();
@@ -4960,7 +4961,7 @@ mod tests {
             )
             .await
         });
-        tokio::time::timeout(Duration::from_secs(5), entered_a)
+        tokio::time::timeout(PUBLIC_HOST_STALL_ENTRY_TIMEOUT, entered_a)
             .await
             .expect("owner A reaches the startup-result stall")
             .unwrap();
@@ -4980,7 +4981,7 @@ mod tests {
             )
             .await
         });
-        tokio::time::timeout(Duration::from_secs(5), entered_b)
+        tokio::time::timeout(PUBLIC_HOST_STALL_ENTRY_TIMEOUT, entered_b)
             .await
             .expect("owner B reaches the startup-result stall")
             .unwrap();

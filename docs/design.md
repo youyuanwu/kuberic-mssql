@@ -439,7 +439,10 @@ The file record binds exact authority and native identities and distinguishes
 restart. The SQL batch takes a group-scope session application lock, publishes
 `submitting` before `ALTER AVAILABILITY GROUP ... ADD DATABASE`, and writes
 the terminal marker plus `accepted`, or `failed_retryable`, before releasing
-that lock. Recovery can acquire the same lock to prove the old submitting
+that lock. The temporary row's operation token remains bound to the exact
+winning build/storage authority; the v2 terminal marker uses a separate stable
+activation/topology token shared by later target callbacks in the same dispatch
+context. Recovery can acquire the same lock to prove the old submitting
 session is gone: exact native association or an accepted row can establish the
 terminal marker without redispatch, a held lock is ambiguous, and an absent
 effect after lock acquisition is definitely retryable.

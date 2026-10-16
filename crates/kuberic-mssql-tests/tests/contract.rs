@@ -337,6 +337,7 @@ fn mutation_surface_is_typed_and_contains_only_approved_stage_three_effects() {
         SqlIdentifier::new("application").unwrap(),
         guid(31),
         "a".repeat(64),
+        "b".repeat(64),
     )
     .unwrap();
     let submit = dispatch.testing_submission_statement(false);
@@ -350,12 +351,25 @@ fn mutation_surface_is_typed_and_contains_only_approved_stage_three_effects() {
     assert!(submit.contains("ALTER AVAILABILITY GROUP [kuberic-ag] ADD DATABASE [application]"));
     assert!(submit.find("phase=N'submitting'").unwrap() < submit.find("ADD DATABASE").unwrap());
     let (terminal_name, terminal_value) = dispatch.testing_terminal_marker();
-    assert!(terminal_name.starts_with("kuberic_seed_terminal_v1_"));
+    assert!(terminal_name.starts_with("kuberic_seed_terminal_v2_"));
     assert!(terminal_name.len() <= 128);
-    assert_eq!(terminal_value, format!("v1:{}", "a".repeat(64)));
+    assert_eq!(terminal_value, format!("v2:{}", "b".repeat(64)));
     assert!(terminal_value.len() <= 128);
     assert!(submit.contains(&terminal_name));
     assert!(submit.contains(&terminal_value));
+    let same_terminal = SeedDispatchRequest::new(
+        AvailabilityGroupName::new("kuberic-ag").unwrap(),
+        guid(30),
+        SqlIdentifier::new("application").unwrap(),
+        guid(31),
+        "c".repeat(64),
+        "b".repeat(64),
+    )
+    .unwrap();
+    assert_eq!(
+        same_terminal.testing_terminal_marker(),
+        dispatch.testing_terminal_marker()
+    );
     let reject = dispatch.testing_submission_statement(true);
     assert!(reject.contains("THROW 51001"));
     assert!(reject.find("THROW 51001").unwrap() < reject.find("ADD DATABASE").unwrap());

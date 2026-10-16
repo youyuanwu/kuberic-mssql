@@ -1086,6 +1086,8 @@ async fn retained_dispatch_survives_runtime_restart_as_historical_session_eviden
         let current = retained_seed_record(&restarted_sessions, 2);
         assert!(historical.same_dispatch_context(&current));
         assert!(!historical.same_intent_owner(&current));
+        assert_ne!(historical.operation_token(), current.operation_token());
+        assert_eq!(historical.terminal_token(), current.terminal_token());
         assert_eq!(historical.source().process_session_id(), first_sessions[0]);
         let mut associated = historical.clone();
         associated.mark_accepted().unwrap();

@@ -3670,6 +3670,7 @@ impl SqlServerReplicator {
                     context.database.name.clone(),
                     context.database.database_guid.clone(),
                     context.record.operation_token(),
+                    context.record.terminal_token(),
                 )
                 .map_err(|_| {
                     KubericAdapterError::NativeConvergenceUnsafe("seed dispatch operation token")
@@ -3708,6 +3709,7 @@ impl SqlServerReplicator {
             context.database.name.clone(),
             context.database.database_guid.clone(),
             record.operation_token(),
+            context.record.terminal_token(),
         )
         .map_err(|_| {
             KubericAdapterError::NativeConvergenceUnsafe("seed dispatch operation token")
@@ -3764,6 +3766,7 @@ impl SqlServerReplicator {
             context.database.name.clone(),
             context.database.database_guid.clone(),
             record.operation_token(),
+            context.record.terminal_token(),
         )
         .map_err(|_| {
             KubericAdapterError::NativeConvergenceUnsafe("seed dispatch operation token")
@@ -3846,6 +3849,7 @@ impl SqlServerReplicator {
                             context.database.name.clone(),
                             context.database.database_guid.clone(),
                             operation_token,
+                            context.record.terminal_token(),
                         )
                         .map_err(|_| {
                             KubericAdapterError::NativeConvergenceUnsafe(
@@ -3972,6 +3976,7 @@ impl SqlServerReplicator {
                             context.database.name.clone(),
                             context.database.database_guid.clone(),
                             operation_token,
+                            context.record.terminal_token(),
                         )
                         .map_err(|_| {
                             KubericAdapterError::NativeConvergenceUnsafe(

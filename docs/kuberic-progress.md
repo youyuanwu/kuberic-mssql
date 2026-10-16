@@ -222,7 +222,10 @@ reinterpreted as `LegacyAmbiguous` and cannot redispatch.
 The owned source database retains one matching singleton dispatch row with a
 derived operation token, exact AG/database identities, and SQL-owned phase. A
 group-scope SQL application lock distinguishes an active/ambiguous submission
-from a session that ended before any native effect. An accepted row or exact
+from a session that ended before any native effect. The exact winning
+build/storage operation token remains temporary; a separate stable
+activation/topology token identifies the v2 terminal marker so both configured
+targets can reconcile the same completed group dispatch. An accepted row or exact
 association evidence establishes one bounded terminal `master` extended
 property before file compaction. Its exact `v1:<operation-token>` value binds
 resource/configuration, AG GUID, source identity/lineage and SQL incarnation,
