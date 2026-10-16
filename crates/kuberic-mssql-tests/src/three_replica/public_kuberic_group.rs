@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -64,6 +65,9 @@ use super::member::ReadyMember;
 use super::model::{NativeTopologyBinding, TopologyRun};
 
 const AGENT_TOKEN: &str = "mssql-three-replica-agent";
+const PUBLIC_HOST_ATTEMPT_PREFIX: &str = "public-host-shutdown-fence";
+
+static PUBLIC_HOST_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
 type Source = Arc<dyn SqlServerObservationSource>;
 
@@ -124,12 +128,10 @@ struct HostAttempt {
 
 struct PublicHostShutdownFenceApplication {
     close_entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    close_release: tokio::sync::Notify,
-    released: AtomicBool,
+    close_release: tokio::sync::watch::Sender<bool>,
     delay_close_entry: bool,
     post_release_entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    post_release: tokio::sync::Notify,
-    post_released: AtomicBool,
+    post_release: tokio::sync::watch::Sender<bool>,
     delay_post_release: bool,
     close_started: AtomicBool,
     close_returned: AtomicBool,
@@ -138,14 +140,36 @@ struct PublicHostShutdownFenceApplication {
 
 impl PublicHostShutdownFenceApplication {
     fn release(&self) {
-        self.released.store(true, Ordering::Release);
-        self.close_release.notify_waiters();
+        self.close_release.send_replace(true);
     }
 
     fn release_all(&self) {
         self.release();
-        self.post_released.store(true, Ordering::Release);
-        self.post_release.notify_waiters();
+        self.post_release.send_replace(true);
+    }
+}
+
+struct PublicHostReleaseInterlock {
+    checked: tokio::sync::oneshot::Sender<()>,
+    continue_after_release: tokio::sync::oneshot::Receiver<()>,
+}
+
+async fn wait_for_public_host_release(
+    mut release: tokio::sync::watch::Receiver<bool>,
+    interlock: Option<PublicHostReleaseInterlock>,
+) {
+    let mut interlock = interlock;
+    loop {
+        if *release.borrow_and_update() {
+            return;
+        }
+        if let Some(interlock) = interlock.take() {
+            interlock.checked.send(()).ok();
+            let _ = interlock.continue_after_release.await;
+        }
+        if release.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -165,22 +189,18 @@ impl StatefulServiceReplica for PublicHostShutdownFenceApplication {
 
     async fn close(&self) -> KubericResult<()> {
         self.close_started.store(true, Ordering::Release);
-        while self.delay_close_entry && !self.released.load(Ordering::Acquire) {
-            self.close_release.notified().await;
+        if self.delay_close_entry {
+            wait_for_public_host_release(self.close_release.subscribe(), None).await;
         }
         if let Some(entered) = self.close_entered.lock().unwrap().take() {
             entered.send(()).ok();
         }
-        while !self.released.load(Ordering::Acquire) {
-            self.close_release.notified().await;
-        }
+        wait_for_public_host_release(self.close_release.subscribe(), None).await;
         if self.delay_post_release {
             if let Some(entered) = self.post_release_entered.lock().unwrap().take() {
                 entered.send(()).ok();
             }
-            while !self.post_released.load(Ordering::Acquire) {
-                self.post_release.notified().await;
-            }
+            wait_for_public_host_release(self.post_release.subscribe(), None).await;
         }
         self.close_returned.store(true, Ordering::Release);
         Err(KubericRuntimeError::Application(
@@ -204,6 +224,7 @@ type PublicHostCloseTask = tokio::task::JoinHandle<
 enum PublicHostFenceInjection {
     None,
     StartupCompletedError,
+    LateStartupAfterCleanupTimeout,
     CloseEntryTimeoutRace,
     PostReleaseDrainTimeout,
 }
@@ -224,11 +245,33 @@ impl PublicHostFenceInjection {
             Duration::from_secs(5)
         }
     }
+
+    fn startup_timeout(self) -> Duration {
+        if self == Self::LateStartupAfterCleanupTimeout {
+            Duration::from_millis(25)
+        } else {
+            Duration::from_secs(5)
+        }
+    }
+
+    fn startup_cleanup_timeout(self) -> Duration {
+        if self == Self::LateStartupAfterCleanupTimeout {
+            Duration::from_millis(25)
+        } else {
+            Duration::from_secs(2)
+        }
+    }
+}
+
+struct PublicHostStartupStall {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::watch::Receiver<bool>,
 }
 
 struct PublicHostFenceTasks {
     startup_shutdown: tokio::sync::watch::Sender<bool>,
     startup: Option<PublicHostStartupTask>,
+    startup_completion_confirmed: bool,
     running: Option<RunningReplica>,
     close: Option<PublicHostCloseTask>,
     injected_client: Option<tokio::task::JoinHandle<Result<(), String>>>,
@@ -2395,9 +2438,9 @@ async fn wait_for_public_host(
     deadline: Duration,
 ) -> PublicHostWait {
     let Some(replica) = running.as_mut() else {
-        return PublicHostWait::Confirmed(Err(
-            "public host completion was already consumed".to_owned()
-        ));
+        return PublicHostWait::Unconfirmed(
+            "public host termination ownership is missing".to_owned(),
+        );
     };
     match tokio::time::timeout(deadline, replica.wait()).await {
         Ok(result) => {
@@ -2419,13 +2462,17 @@ async fn exercise_public_host_shutdown_fence_with(
     root: &Path,
     injection: PublicHostFenceInjection,
 ) -> Result<MssqlGroupError, String> {
-    let host_root = root.join("public-host-shutdown-fence");
-    if host_root.exists() {
-        fs::remove_dir_all(&host_root).map_err(|error| error.to_string())?;
-    }
-    create_private_directory(&host_root).map_err(|error| error.to_string())?;
+    exercise_public_host_shutdown_fence_with_stall(root, injection, None).await
+}
 
-    match exercise_public_host_shutdown_fence_inner(&host_root, injection).await {
+async fn exercise_public_host_shutdown_fence_with_stall(
+    root: &Path,
+    injection: PublicHostFenceInjection,
+    startup_stall: Option<PublicHostStartupStall>,
+) -> Result<MssqlGroupError, String> {
+    let host_root = allocate_public_host_attempt_root(root).map_err(|error| error.to_string())?;
+
+    match exercise_public_host_shutdown_fence_inner(&host_root, injection, startup_stall).await {
         PublicHostFenceRun::Confirmed(result) => {
             let cleanup = fs::remove_dir_all(&host_root).map_err(|error| error.to_string());
             match (result, cleanup) {
@@ -2446,8 +2493,9 @@ async fn exercise_public_host_shutdown_fence_with(
         } => {
             let retained_root = host_root.clone();
             tokio::spawn(async move {
-                finish_retained_public_host(tasks, application).await;
-                let _ = fs::remove_dir_all(retained_root);
+                if finish_retained_public_host(tasks, application).await {
+                    let _ = fs::remove_dir_all(retained_root);
+                }
             });
             let message = match result {
                 Ok(error) => error.to_string(),
@@ -2463,6 +2511,7 @@ async fn exercise_public_host_shutdown_fence_with(
 async fn exercise_public_host_shutdown_fence_inner(
     host_root: &Path,
     injection: PublicHostFenceInjection,
+    startup_stall: Option<PublicHostStartupStall>,
 ) -> PublicHostFenceRun {
     let resource_uid = ResourceUid::new("mssql-public-host-shutdown-fence");
     let replica_id = if injection == PublicHostFenceInjection::StartupCompletedError {
@@ -2500,14 +2549,14 @@ async fn exercise_public_host_shutdown_fence_inner(
     };
     let (close_entered_tx, close_entered_rx) = tokio::sync::oneshot::channel();
     let (post_release_entered_tx, post_release_entered_rx) = tokio::sync::oneshot::channel();
+    let (close_release, _) = tokio::sync::watch::channel(false);
+    let (post_release, _) = tokio::sync::watch::channel(false);
     let application = Arc::new(PublicHostShutdownFenceApplication {
         close_entered: Mutex::new(Some(close_entered_tx)),
-        close_release: tokio::sync::Notify::new(),
-        released: AtomicBool::new(false),
+        close_release,
         delay_close_entry: injection == PublicHostFenceInjection::CloseEntryTimeoutRace,
         post_release_entered: Mutex::new(Some(post_release_entered_tx)),
-        post_release: tokio::sync::Notify::new(),
-        post_released: AtomicBool::new(false),
+        post_release,
         delay_post_release: injection == PublicHostFenceInjection::PostReleaseDrainTimeout,
         close_started: AtomicBool::new(false),
         close_returned: AtomicBool::new(false),
@@ -2524,10 +2573,24 @@ async fn exercise_public_host_shutdown_fence_inner(
         resolver,
     );
     let (startup_shutdown, startup_receiver) = tokio::sync::watch::channel(false);
-    let startup = tokio::spawn(host.start_with_shutdown(startup_receiver));
+    let startup = tokio::spawn(async move {
+        let result = host.start_with_shutdown(startup_receiver).await;
+        if matches!(result, Ok(Some(_)))
+            && let Some(mut stall) = startup_stall
+        {
+            stall.entered.send(()).ok();
+            while !*stall.release.borrow_and_update() {
+                if stall.release.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+        result
+    });
     let mut tasks = PublicHostFenceTasks {
         startup_shutdown,
         startup: Some(startup),
+        startup_completion_confirmed: false,
         running: None,
         close: None,
         injected_client: None,
@@ -2591,11 +2654,18 @@ async fn exercise_public_host_shutdown_fence_inner(
                 let _ = tasks.startup.take();
                 match result {
                     Ok(Ok(Some(running))) => {
+                        tasks.startup_completion_confirmed = true;
                         tasks.running = Some(running);
                         Err("public host became ready before initialization completed".to_owned())
                     }
-                    Ok(Ok(None)) => Err("public host initialization was cancelled".to_owned()),
-                    Ok(Err(error)) => Err(error.to_string()),
+                    Ok(Ok(None)) => {
+                        tasks.startup_completion_confirmed = true;
+                        Err("public host initialization was cancelled".to_owned())
+                    }
+                    Ok(Err(error)) => {
+                        tasks.startup_completion_confirmed = true;
+                        Err(error.to_string())
+                    }
                     Err(error) => Err(error.to_string()),
                 }
             }
@@ -2608,14 +2678,18 @@ async fn exercise_public_host_shutdown_fence_inner(
 
     let startup_result = {
         let startup = tasks.startup.as_mut().expect("startup task is pending");
-        tokio::time::timeout(Duration::from_secs(5), startup).await
+        tokio::time::timeout(injection.startup_timeout(), startup).await
     };
     let running = match startup_result {
         Ok(result) => {
             let _ = tasks.startup.take();
             match result {
-                Ok(Ok(Some(running))) => running,
+                Ok(Ok(Some(running))) => {
+                    tasks.startup_completion_confirmed = true;
+                    running
+                }
                 Ok(Ok(None)) => {
+                    tasks.startup_completion_confirmed = true;
                     return cleanup_public_host_fence(
                         "public host initialization was cancelled".to_owned(),
                         tasks,
@@ -2625,6 +2699,7 @@ async fn exercise_public_host_shutdown_fence_inner(
                     .await;
                 }
                 Ok(Err(error)) => {
+                    tasks.startup_completion_confirmed = true;
                     return cleanup_public_host_fence(
                         error.to_string(),
                         tasks,
@@ -2649,7 +2724,7 @@ async fn exercise_public_host_shutdown_fence_inner(
                 "public host initialization timed out".to_owned(),
                 tasks,
                 application,
-                Duration::from_secs(2),
+                injection.startup_cleanup_timeout(),
             )
             .await;
         }
@@ -2866,13 +2941,23 @@ async fn cleanup_public_host_fence(
     if let Some(running) = tasks.running.as_ref() {
         running.shutdown();
     }
-    settle_public_host_startup(&mut tasks, Duration::from_secs(2)).await;
+    settle_public_host_startup(&mut tasks, host_timeout.min(Duration::from_secs(2))).await;
     let _ = finish_public_host_close(&mut tasks.close, Duration::from_secs(2)).await;
     let _ = finish_injected_public_host_client(&mut tasks.injected_client, Duration::from_secs(2))
         .await;
-    match wait_for_public_host(&mut tasks.running, host_timeout).await {
+    let host_wait = if tasks.startup.is_some() || !tasks.startup_completion_confirmed {
+        PublicHostWait::Unconfirmed(
+            "public host startup termination remains unconfirmed".to_owned(),
+        )
+    } else if tasks.running.is_some() {
+        wait_for_public_host(&mut tasks.running, host_timeout).await
+    } else {
+        PublicHostWait::Confirmed(Ok(()))
+    };
+    match host_wait {
         PublicHostWait::Confirmed(_)
             if tasks.startup.is_none()
+                && tasks.startup_completion_confirmed
                 && tasks.close.is_none()
                 && tasks.injected_client.is_none() =>
         {
@@ -2892,18 +2977,18 @@ async fn settle_public_host_startup(tasks: &mut PublicHostFenceTasks, timeout: D
     let Some(startup) = tasks.startup.as_mut() else {
         return;
     };
-    match tokio::time::timeout(timeout, startup).await {
-        Ok(result) => {
-            let _ = tasks.startup.take();
-            if let Ok(Ok(Some(running))) = result {
+    if let Ok(result) = tokio::time::timeout(timeout, startup).await {
+        let _ = tasks.startup.take();
+        match result {
+            Ok(Ok(Some(running))) => {
+                tasks.startup_completion_confirmed = true;
                 running.shutdown();
                 tasks.running = Some(running);
             }
-        }
-        Err(_) => {
-            let startup = tasks.startup.take().expect("startup task is pending");
-            startup.abort();
-            let _ = startup.await;
+            Ok(Ok(None)) | Ok(Err(_)) => {
+                tasks.startup_completion_confirmed = true;
+            }
+            Err(_) => {}
         }
     }
 }
@@ -2965,7 +3050,7 @@ async fn finish_public_host_close(
 async fn finish_retained_public_host(
     mut tasks: PublicHostFenceTasks,
     application: Arc<PublicHostShutdownFenceApplication>,
-) {
+) -> bool {
     application.release_all();
     tasks.startup_shutdown.send_replace(true);
     if let Some(close) = tasks.close.as_ref()
@@ -2976,13 +3061,29 @@ async fn finish_retained_public_host(
     if let Some(running) = tasks.running.as_ref() {
         running.shutdown();
     }
-    settle_public_host_startup(&mut tasks, Duration::from_secs(2)).await;
     let _ = finish_public_host_close(&mut tasks.close, Duration::from_secs(2)).await;
     let _ = finish_injected_public_host_client(&mut tasks.injected_client, Duration::from_secs(2))
         .await;
+    if let Some(startup) = tasks.startup.take() {
+        match startup.await {
+            Ok(Ok(Some(running))) => {
+                tasks.startup_completion_confirmed = true;
+                running.shutdown();
+                tasks.running = Some(running);
+            }
+            Ok(Ok(None)) | Ok(Err(_)) => {
+                tasks.startup_completion_confirmed = true;
+            }
+            Err(_) => return false,
+        }
+    }
+    if !tasks.startup_completion_confirmed {
+        return false;
+    }
     if let Some(mut running) = tasks.running.take() {
         let _ = running.wait().await;
     }
+    true
 }
 
 fn alternate_guid(index: u16) -> Result<Guid, MssqlGroupError> {
@@ -4331,6 +4432,25 @@ fn free_address() -> Result<SocketAddr, MssqlGroupError> {
         .map_err(display_error)
 }
 
+fn allocate_public_host_attempt_root(root: &Path) -> Result<PathBuf, MssqlGroupError> {
+    loop {
+        let attempt = PUBLIC_HOST_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed);
+        let path = root.join(format!(
+            "{PUBLIC_HOST_ATTEMPT_PREFIX}-{}-{attempt}",
+            std::process::id()
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                    .map_err(display_error)?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(display_error(error)),
+        }
+    }
+}
+
 fn create_private_directory(path: &Path) -> Result<(), MssqlGroupError> {
     if !path.exists() {
         fs::create_dir_all(path).map_err(display_error)?;
@@ -4374,6 +4494,51 @@ mod tests {
     use kuberic_runtime::protocol::types::AgentGeneration;
 
     use super::*;
+
+    static PUBLIC_HOST_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn public_host_attempt_roots(root: &Path) -> Vec<PathBuf> {
+        let mut attempts = fs::read_dir(root)
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(PUBLIC_HOST_ATTEMPT_PREFIX)
+                    .then(|| entry.path())
+            })
+            .collect::<Vec<_>>();
+        attempts.sort();
+        attempts
+    }
+
+    fn public_host_startup_stall() -> (
+        PublicHostStartupStall,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::watch::channel(false);
+        (
+            PublicHostStartupStall {
+                entered,
+                release: release_rx,
+            },
+            entered_rx,
+            release,
+        )
+    }
+
+    async fn wait_for_attempt_removal(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("public host attempt root is removed after confirmed termination");
+    }
 
     fn testing_identities() -> [ReplicaIdentity; 3] {
         std::array::from_fn(|index| ReplicaIdentity {
@@ -4603,6 +4768,7 @@ mod tests {
 
     #[tokio::test]
     async fn actual_public_host_shutdown_retains_the_termination_fence() {
+        let _lock = PUBLIC_HOST_TEST_LOCK.lock().await;
         let target = std::env::current_dir().unwrap().join("target");
         fs::create_dir_all(&target).unwrap();
         let temporary = tempfile::Builder::new()
@@ -4620,11 +4786,12 @@ mod tests {
                 .to_string()
                 .contains("termination remains unconfirmed after abort")
         );
-        assert!(!temporary.path().join("public-host-shutdown-fence").exists());
+        assert!(public_host_attempt_roots(temporary.path()).is_empty());
     }
 
     #[tokio::test]
     async fn completed_public_host_startup_error_is_consumed_once_and_cleaned() {
+        let _lock = PUBLIC_HOST_TEST_LOCK.lock().await;
         let target = std::env::current_dir().unwrap().join("target");
         fs::create_dir_all(&target).unwrap();
         let temporary = tempfile::Builder::new()
@@ -4640,11 +4807,12 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("replica ID must be positive"));
-        assert!(!temporary.path().join("public-host-shutdown-fence").exists());
+        assert!(public_host_attempt_roots(temporary.path()).is_empty());
     }
 
     #[tokio::test]
     async fn public_host_close_entry_timeout_race_releases_and_drains() {
+        let _lock = PUBLIC_HOST_TEST_LOCK.lock().await;
         let target = std::env::current_dir().unwrap().join("target");
         fs::create_dir_all(&target).unwrap();
         let temporary = tempfile::Builder::new()
@@ -4663,23 +4831,24 @@ mod tests {
             error.contains("did not enter its stall after the callback started"),
             "{error}"
         );
-        assert!(!temporary.path().join("public-host-shutdown-fence").exists());
+        assert!(public_host_attempt_roots(temporary.path()).is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn post_release_drain_timeout_retains_owner_and_root_until_confirmed() {
+        let _lock = PUBLIC_HOST_TEST_LOCK.lock().await;
         let target = std::env::current_dir().unwrap().join("target");
         fs::create_dir_all(&target).unwrap();
         let temporary = tempfile::Builder::new()
             .prefix("public-host-post-release-drain")
             .tempdir_in(target)
             .unwrap();
-        let host_root = temporary.path().join("public-host-shutdown-fence");
-        create_private_directory(&host_root).unwrap();
+        let host_root = allocate_public_host_attempt_root(temporary.path()).unwrap();
 
         let (result, tasks, application) = match exercise_public_host_shutdown_fence_inner(
             &host_root,
             PublicHostFenceInjection::PostReleaseDrainTimeout,
+            None,
         )
         .await
         {
@@ -4702,14 +4871,166 @@ mod tests {
         assert!(tasks.close.is_none());
         assert!(tasks.injected_client.is_none());
 
-        tokio::time::timeout(
+        let confirmed = tokio::time::timeout(
             Duration::from_secs(5),
             finish_retained_public_host(tasks, application),
         )
         .await
         .expect("retained public host terminates after release");
+        assert!(confirmed);
         fs::remove_dir_all(&host_root).unwrap();
         assert!(!host_root.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_startup_replica_is_retained_and_joined_after_cleanup_timeout() {
+        let _lock = PUBLIC_HOST_TEST_LOCK.lock().await;
+        let target = std::env::current_dir().unwrap().join("target");
+        fs::create_dir_all(&target).unwrap();
+        let temporary = tempfile::Builder::new()
+            .prefix("public-host-late-startup")
+            .tempdir_in(target)
+            .unwrap();
+        let host_root = allocate_public_host_attempt_root(temporary.path()).unwrap();
+        let (stall, entered, release) = public_host_startup_stall();
+        let inner_root = host_root.clone();
+        let attempt = tokio::spawn(async move {
+            exercise_public_host_shutdown_fence_inner(
+                &inner_root,
+                PublicHostFenceInjection::LateStartupAfterCleanupTimeout,
+                Some(stall),
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .expect("public host startup returns a running replica")
+            .unwrap();
+        let (result, tasks, application) = match attempt.await.unwrap() {
+            PublicHostFenceRun::Unconfirmed {
+                result,
+                tasks,
+                application,
+            } => (result, tasks, application),
+            PublicHostFenceRun::Confirmed(result) => {
+                panic!("late startup unexpectedly confirmed: {result:?}")
+            }
+        };
+
+        assert!(
+            result
+                .unwrap_err()
+                .contains("public host initialization timed out")
+        );
+        assert!(tasks.startup.is_some());
+        assert!(!tasks.startup_completion_confirmed);
+        assert!(tasks.running.is_none());
+        assert!(host_root.is_dir());
+
+        release.send_replace(true);
+        let confirmed = tokio::time::timeout(
+            Duration::from_secs(5),
+            finish_retained_public_host(tasks, application),
+        )
+        .await
+        .expect("late running replica is shut down and joined");
+        assert!(confirmed);
+        assert!(host_root.is_dir());
+        fs::remove_dir_all(&host_root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_attempts_use_isolated_roots_and_stale_cleanup_cannot_remove_successor() {
+        let _lock = PUBLIC_HOST_TEST_LOCK.lock().await;
+        let target = std::env::current_dir().unwrap().join("target");
+        fs::create_dir_all(&target).unwrap();
+        let temporary = tempfile::Builder::new()
+            .prefix("public-host-isolated-attempts")
+            .tempdir_in(target)
+            .unwrap();
+
+        let (stall_a, entered_a, release_a) = public_host_startup_stall();
+        let root_a = temporary.path().to_path_buf();
+        let attempt_a = tokio::spawn(async move {
+            exercise_public_host_shutdown_fence_with_stall(
+                &root_a,
+                PublicHostFenceInjection::LateStartupAfterCleanupTimeout,
+                Some(stall_a),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_a)
+            .await
+            .expect("owner A reaches the startup-result stall")
+            .unwrap();
+        let error_a = attempt_a.await.unwrap().unwrap_err();
+        assert!(error_a.contains("ownership and state root were retained"));
+        let roots_after_a = public_host_attempt_roots(temporary.path());
+        assert_eq!(roots_after_a.len(), 1);
+        let attempt_root_a = roots_after_a[0].clone();
+
+        let (stall_b, entered_b, release_b) = public_host_startup_stall();
+        let root_b = temporary.path().to_path_buf();
+        let attempt_b = tokio::spawn(async move {
+            exercise_public_host_shutdown_fence_with_stall(
+                &root_b,
+                PublicHostFenceInjection::LateStartupAfterCleanupTimeout,
+                Some(stall_b),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_b)
+            .await
+            .expect("owner B reaches the startup-result stall")
+            .unwrap();
+        let error_b = attempt_b.await.unwrap().unwrap_err();
+        assert!(error_b.contains("ownership and state root were retained"));
+        let roots_after_b = public_host_attempt_roots(temporary.path());
+        assert_eq!(roots_after_b.len(), 2);
+        let attempt_root_b = roots_after_b
+            .into_iter()
+            .find(|path| path != &attempt_root_a)
+            .expect("retry B has an independent attempt root");
+
+        release_a.send_replace(true);
+        wait_for_attempt_removal(&attempt_root_a).await;
+        assert!(
+            attempt_root_b.is_dir(),
+            "stale cleanup owner A removed retry B's root"
+        );
+
+        release_b.send_replace(true);
+        wait_for_attempt_removal(&attempt_root_b).await;
+        assert!(public_host_attempt_roots(temporary.path()).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stateful_release_cannot_be_lost_between_check_and_wait() {
+        async fn exercise_release_gap(sender: tokio::sync::watch::Sender<bool>) {
+            let (checked, checked_rx) = tokio::sync::oneshot::channel();
+            let (continue_after_release, continue_after_release_rx) =
+                tokio::sync::oneshot::channel();
+            let waiter = tokio::spawn(wait_for_public_host_release(
+                sender.subscribe(),
+                Some(PublicHostReleaseInterlock {
+                    checked,
+                    continue_after_release: continue_after_release_rx,
+                }),
+            ));
+            checked_rx.await.unwrap();
+            sender.send_replace(true);
+            continue_after_release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("state-bearing release wakes a waiter created after release")
+                .unwrap();
+        }
+
+        let (close_release, _) = tokio::sync::watch::channel(false);
+        exercise_release_gap(close_release).await;
+        let (post_release, _) = tokio::sync::watch::channel(false);
+        exercise_release_gap(post_release).await;
     }
 
     #[test]
