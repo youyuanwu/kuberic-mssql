@@ -80,6 +80,11 @@ fn operation(value: &str) -> OpaqueId {
     OpaqueId::new("test operation", value).unwrap()
 }
 
+fn at(mut state: LeaseModel, now: Duration) -> LeaseModel {
+    state.local_state(now).unwrap();
+    state
+}
+
 #[test]
 fn authority_requires_observed_replica_and_nonempty_identity() {
     let desired = ReplicaIdentity::desired("replica", "incarnation").unwrap();
@@ -136,7 +141,7 @@ fn every_binding_field_rejects_completion_and_fence_transfer() {
         );
         let mut current = model();
         current.begin(operation("grant"), 1, seconds(0)).unwrap();
-        let before = current.clone();
+        let before = at(current.clone(), seconds(1));
         let mut other = LeaseModel::new(changed, LeaseBudget::new(timing()).unwrap(), seconds(0));
         let wrong = other.begin(operation("grant"), 1, seconds(0)).unwrap();
         assert_eq!(
@@ -185,14 +190,14 @@ fn grant_renewal_and_exact_deadline_do_not_use_response_time_as_local_start() {
 fn duplicate_and_out_of_order_completions_preserve_the_pending_request() {
     let mut state = model();
     let first = state.begin(operation("one"), 1, seconds(0)).unwrap();
-    let before = state.clone();
+    let before = at(state.clone(), seconds(1));
     assert_eq!(
         state.begin(operation("two"), 2, seconds(1)),
         Err(LeaseFenceError::RequestPending)
     );
     assert_eq!(state, before);
     state.acknowledge(&first, seconds(1)).unwrap();
-    let before = state.clone();
+    let before = at(state.clone(), seconds(2));
     assert_eq!(
         state.acknowledge(&first, seconds(2)),
         Err(LeaseFenceError::NoPendingRequest)
@@ -203,7 +208,7 @@ fn duplicate_and_out_of_order_completions_preserve_the_pending_request() {
         Err(LeaseFenceError::StaleSequence)
     );
     let second = state.begin(operation("two"), 2, seconds(2)).unwrap();
-    let before = state.clone();
+    let before = at(state.clone(), seconds(3));
     assert_eq!(
         state.acknowledge(&first, seconds(3)),
         Err(LeaseFenceError::OperationMismatch)
@@ -217,12 +222,16 @@ fn expired_delayed_completion_cannot_resurrect_local_authority() {
     for completion in [seconds(29), seconds(30), seconds(1_000)] {
         let mut state = model();
         let request = state.begin(operation("grant"), 1, seconds(0)).unwrap();
-        let before = state.clone();
+        let before = at(state.clone(), completion);
         assert_eq!(
             state.acknowledge(&request, completion),
             Err(LeaseFenceError::Expired)
         );
         assert_eq!(state, before);
+        assert_eq!(
+            state.acknowledge(&request, seconds(1)),
+            Err(LeaseFenceError::ClockRegression)
+        );
         assert_eq!(
             state.local_state(completion).unwrap(),
             LocalLeaseState::Inactive
@@ -239,7 +248,7 @@ fn cancellation_preserves_unbounded_native_effect_and_blocks_later_dispatch() {
     let mut state = model();
     let request = state.begin(operation("cancelled"), 1, seconds(0)).unwrap();
     state.cancel(&request, seconds(1)).unwrap();
-    let before = state.clone();
+    let before = at(state.clone(), seconds(2));
     assert_eq!(
         state.acknowledge(&request, seconds(2)),
         Err(LeaseFenceError::Cancelled)
@@ -268,7 +277,7 @@ fn supersession_revokes_local_authority_but_does_not_cancel_native_effect() {
         .begin(operation("old-epoch-renewal"), 2, seconds(2))
         .unwrap();
     state.revoke(seconds(3)).unwrap();
-    let before = state.clone();
+    let before = at(state.clone(), seconds(4));
     assert_eq!(
         state.acknowledge(&renewal, seconds(4)),
         Err(LeaseFenceError::Revoked)
@@ -349,6 +358,12 @@ fn native_observation_loss_and_controller_restart_do_not_prove_global_expiry() {
 
 #[test]
 fn every_zero_timing_component_and_insufficient_coverage_is_rejected() {
+    let mut candidate = timing();
+    candidate.native_application = Some(Duration::ZERO);
+    assert_eq!(
+        LeaseBudget::new(candidate),
+        Err(LeaseFenceError::InvalidTiming("native application"))
+    );
     for field in 0..9 {
         let mut candidate = timing();
         let value = match field {
@@ -392,12 +407,13 @@ fn arithmetic_and_clock_failures_preserve_state() {
     );
 
     let mut state = model();
-    let before = state.clone();
+    let before = at(state.clone(), Duration::MAX);
     assert_eq!(
         state.begin(operation("overflow"), 1, Duration::MAX),
         Err(LeaseFenceError::TimeOverflow)
     );
     assert_eq!(state, before);
+    let mut state = model();
     let request = state.begin(operation("clock"), 1, seconds(10)).unwrap();
     let before = state.clone();
     assert_eq!(

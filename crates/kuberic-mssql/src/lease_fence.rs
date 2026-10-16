@@ -142,6 +142,12 @@ fn sum(values: &[Duration]) -> Result<Duration, LeaseFenceError> {
 
 impl LeaseBudget {
     pub fn new(timing: LeaseTiming) -> Result<Self, LeaseFenceError> {
+        if timing
+            .native_application
+            .is_some_and(|value| value.is_zero())
+        {
+            return Err(LeaseFenceError::InvalidTiming("native application"));
+        }
         for (name, value) in [
             ("observation", timing.observation),
             ("reconciliation", timing.reconciliation),
@@ -275,10 +281,11 @@ impl LeaseModel {
         }
     }
 
-    fn check_time(&self, now: Duration) -> Result<(), LeaseFenceError> {
+    fn check_time(&mut self, now: Duration) -> Result<(), LeaseFenceError> {
         if now < self.last_time {
             Err(LeaseFenceError::ClockRegression)
         } else {
+            self.last_time = now;
             Ok(())
         }
     }
