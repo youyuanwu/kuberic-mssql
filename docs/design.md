@@ -183,6 +183,10 @@ For `CLUSTER_TYPE = EXTERNAL`, normal failover belongs to the external cluster
 manager. Kuberic must not issue an isolated `ALTER AVAILABILITY GROUP ...
 FAILOVER` and then infer success from an RPC response.
 
+The comparative [fencing, lease, and failover research](mssql-ha-fencing-lease-failover.md)
+documents the published Microsoft Pacemaker protocol, WSFC lease behavior,
+Kubernetes operator precedents, and the customer-visible Azure SQL HA boundary.
+
 Microsoft publishes the `mssql-server-ha` resource-agent source specifically so
 other clustering systems can follow the SQL Server protocol. Its AG helper:
 
@@ -503,48 +507,13 @@ The root `Cargo.toml` is authoritative for the Kuberic dependency source and
 version. `Cargo.lock` records reproducible resolution; this design does not
 define a separate commit pin.
 
-## Delivery Sequence
+## Future Roadmap
 
-1. **Support and safety contract** — implemented: types, validation,
-   canonical operation identity, tests, and this design.
-2. **Runtime and observation** — implemented: a replaceable TDS executor,
-   immutable DMV snapshots, freshness, startup capability checks, an
-   observe-only CLI, and Kuberic configuration-progress publication.
-3. **Bootstrap, join, and seed convergence** — implemented for explicit
-   bootstrap-capable hosts: deterministic statement-level
-   database/backup/AG/join/grant convergence, one build-authorized group seed
-   dispatch, gap-driven seed metadata, exact native postconditions,
-   restart/cancellation/retry/lost-reply recovery, isolated licensed SQL-native
-   cases, and test-only callback observation-seam validation. This stage adds
-   neither certificate provisioning nor a production mutation transport.
-4. **SF contract-gap resolution** — implemented upstream by the Public V1
-   replacement for lifecycle ordering, AG-sequence history, remote-active
-   configuration shape, immutable capabilities, exact build/session/storage
-   identity, and fresh protocol state. The released replication transport is
-   not described as authenticated.
-5. **Public-contract adapter migration after Kuberic Phase 4/5** — implemented:
-   Public V1 host/callback translation, activation-bound
-   application/seed/SQL ownership, observe-only ordinary construction, and
-   version-2 release intake. Dependency changes are declared in `Cargo.toml`
-   and must pass the required `Shared CI validation` GitHub Actions check.
-6. **SQL-native fencing, reseed, switchover, and failover** — establish
-   verified target and old-primary fencing before destructive reseed or role
-   movement, then add external lease handling, sequence arbitration,
-   authenticated fence and approval receipts, explicit data-loss recovery, and
-   live fault tests. Automatic failover remains disabled until every safety gate
-   passes.
-7. **Controller integration after public-only cutover/fresh protocol state** —
-   Pod/PVC/Secret/Service convergence through the public-only contract once
-   fresh protocol state replaces the pinned validation seam.
-8. **Kubernetes E2E and operations** — pinned licensed test environment,
-   three-replica failures, process/operator restarts, client reconnection,
-   upgrades, and runbooks.
-
-Stages 1-3 remain valid native evidence but predecessor application, fixture,
-and SQL ownership is not migrated into Public V1 activation. Stage 5 does not
-enable Stage 6 fencing, lease, reseed, switchover, failover, or data-loss
-operations. Controller integration still requires the later public-only
-vertical slice and fresh protocol state.
+Future implementation stages are maintained in the
+[Kuberic MSSQL future roadmap](roadmap.md). The roadmap contains only incomplete
+work and defines the Stage 6 lease/fencing slices, later controller integration,
+and Kubernetes end-to-end operations. This design remains the authority for the
+implemented safety and observation contract.
 
 ## Test Gates
 
