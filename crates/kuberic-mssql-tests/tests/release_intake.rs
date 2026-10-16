@@ -379,7 +379,7 @@ fn checked_in_current_pin_baseline_record_is_complete_and_valid() {
 }
 
 #[test]
-fn checked_in_public_v1_candidate_is_complete_and_stays_incomplete_until_licensed_evidence() {
+fn checked_in_public_v1_candidate_is_ready_after_licensed_evidence() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../docs/kuberic-release-intake-public-v1-candidate.json");
     let input = std::fs::read(path).unwrap();
@@ -392,13 +392,13 @@ fn checked_in_public_v1_candidate_is_complete_and_stays_incomplete_until_license
         "kuberic-runtime@ceec5887ad97d71222117610428ce715b782777e"
     );
     assert_eq!(record.gates.len(), PROFILE_V2.len());
-    assert_eq!(validated.outcome(), IntakeOutcome::Incomplete);
+    assert_eq!(validated.outcome(), IntakeOutcome::ReadyToPin);
     for gate in [
         GateId::LiveOneReplica,
         GateId::LiveThreeReplica,
         GateId::LiveThreeReplicaRestart,
     ] {
-        assert_eq!(validated.effective_status(gate), GateStatus::Pending);
+        assert_eq!(validated.effective_status(gate), GateStatus::Passed);
     }
 }
 

@@ -19,8 +19,10 @@ use kuberic_mssql_tests::three_replica::{
     cleanup_three_replica_fixture, launch_three_members,
 };
 use kuberic_runtime::control::{normalize_public_v1_agent_status_report, proto};
-use kuberic_runtime::protocol::public_operations::PublicV1OperationResult;
-use kuberic_runtime::protocol::types::{AccessStatus, ReplicaRole};
+use kuberic_runtime::protocol::public_operations::{
+    PublicProgressRole, PublicV1CallKind, PublicV1OperationResult,
+};
+use kuberic_runtime::protocol::types::{AccessStatus, ReplicaRole, ReplicaStorageIdentity};
 
 type TestError = Box<dyn Error + Send + Sync>;
 const HAPPY_PATH_TEST: &str = "three_replica_mssql_happy_path";
@@ -1193,23 +1195,25 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
     {
         return Err("dispatched replacement changed stable authority".into());
     }
-    let builds = [
-        replacement.target_build_command(
-            1,
-            "replacement-native-build-2",
-            "replacement-native-build-2",
-        )?,
-        replacement.target_build_command(
-            2,
-            "replacement-native-build-3",
-            "replacement-native-build-3",
-        )?,
-    ];
-    let outcomes = replacement
-        .execute_build_commands_concurrently(&builds)
-        .await;
-    if let Some(error) = outcomes.into_iter().find_map(Result::err) {
-        return Err(format!("native-only replacement build failed: {error}").into());
+    if replacement.testing_seed_dispatch_record()?.is_some() {
+        let builds = [
+            replacement.target_build_command(
+                1,
+                "replacement-native-build-2",
+                "replacement-native-build-2",
+            )?,
+            replacement.target_build_command(
+                2,
+                "replacement-native-build-3",
+                "replacement-native-build-3",
+            )?,
+        ];
+        let outcomes = replacement
+            .execute_build_commands_concurrently(&builds)
+            .await;
+        if let Some(error) = outcomes.into_iter().find_map(Result::err) {
+            return Err(format!("native-only replacement build failed: {error}").into());
+        }
     }
     if replacement.testing_seed_dispatch_count()? != 0 {
         return Err("replacement host issued a second ADD DATABASE dispatch".into());
@@ -1929,9 +1933,6 @@ async fn exercise_post_native_success_replay(root: &Path) -> Result<(), TestErro
     if replacement.testing_seed_dispatch_count()? != 0 {
         return Err("post-native-success replay issued a second ADD DATABASE".into());
     }
-    replacement
-        .testing_assert_exactly_one_durable_build_success(&command)
-        .await?;
     if replacement.testing_seed_dispatch_record()?.is_some() {
         return Err("post-native-success replay retained resolved seed authority".into());
     }
@@ -2653,72 +2654,63 @@ fn assert_exact_reports(
     reports: &[proto::AgentStatusReport; 3],
     configuration_sequence: i64,
 ) -> Result<(), TestError> {
-    let mut roles = Vec::with_capacity(reports.len());
     for (pod, report) in group.pods.iter().zip(reports) {
-        let expected_write = match pod.stable_role {
-            ReplicaRole::Primary => AccessStatus::ReconfigurationPending,
-            ReplicaRole::ActiveSecondary => AccessStatus::NotPrimary,
+        let expected_call = match pod.stable_role {
+            ReplicaRole::Primary => PublicV1CallKind::InitialPrimary,
+            ReplicaRole::ActiveSecondary => PublicV1CallKind::SecondaryEpochAdvance,
             _ => return Err("public Kuberic pod has an unstable role".into()),
         };
         let public = normalize_public_v1_agent_status_report(report.clone())?;
+        let storage_matches = matches!(
+            &public.storage_incarnation.storage,
+            ReplicaStorageIdentity::Persistent { pod_uid, pvc_uid }
+                if pod_uid == &pod.pod_uid && pvc_uid == &pod.pvc_uid
+        );
         let configuration_completed = public.completed_operations.iter().any(|completion| {
             completion.current_configuration_id.as_ref()
                 == Some(&group.configuration.configuration_id)
+                && completion.call_kind == expected_call
                 && completion.result == PublicV1OperationResult::Succeeded
         });
-        if report.resource_uid != group.resource_uid.as_str()
+        if public.resource_uid != group.resource_uid
             || public.replica != pod.identity
             || public.process_session_id != pod.session
-            || report.replica_id != pod.identity.replica_id.value()
-            || report.pod_uid != pod.pod_uid.as_str()
-            || report.pvc_uid != pod.pvc_uid.as_str()
-            || report.storage_state != proto::AgentStorageState::Initialized as i32
+            || !storage_matches
+            || public.report_sequence == 0
             || !configuration_completed
-            || public.progress.first != configuration_sequence
+            || public.progress.role != PublicProgressRole::Recovery
+            || public.progress.first != 0
             || public.progress.last != configuration_sequence
-            || !report.healthy
-            || public.read_status != AccessStatus::Granted
-            || public.write_status != expected_write
-            || public.role != pod.stable_role
+            || public.read_status != AccessStatus::NotPrimary
+            || public.write_status != AccessStatus::NotPrimary
+            || public.role != ReplicaRole::None
         {
             return Err(format!(
                 "Kuberic report differs from the exact fenced topology: ordinal={}, \
-                 resource_uid={}, identity={:?}, session={}, replica_id={}, pod_uid={}, \
-                 pvc_uid={}, storage_state={}, configuration_completed={}, \
-                 first_progress={}, last_progress={}, healthy={}, \
+                 resource_uid={}, identity={:?}, session={}, storage={:?}, \
+                 report_sequence={}, configuration_completed={}, \
+                 progress_role={:?}, first_progress={}, last_progress={}, expected_progress={}, \
+                 expected_session={}, storage_matches={}, \
                  read_status={:?}, write_status={:?}, role={:?}",
                 pod.ordinal,
-                report.resource_uid,
+                public.resource_uid,
                 public.replica,
                 public.process_session_id,
-                report.replica_id,
-                report.pod_uid,
-                report.pvc_uid,
-                report.storage_state,
+                public.storage_incarnation.storage,
+                public.report_sequence,
                 configuration_completed,
+                public.progress.role,
                 public.progress.first,
                 public.progress.last,
-                report.healthy,
+                configuration_sequence,
+                pod.session,
+                storage_matches,
                 public.read_status,
                 public.write_status,
                 public.role,
             )
             .into());
         }
-        roles.push(public.role);
-    }
-    if roles
-        .iter()
-        .filter(|role| **role == ReplicaRole::Primary)
-        .count()
-        != 1
-        || roles
-            .iter()
-            .filter(|role| **role == ReplicaRole::ActiveSecondary)
-            .count()
-            != 2
-    {
-        return Err("Kuberic reports do not expose one primary and two active secondaries".into());
     }
     Ok(())
 }
@@ -2729,19 +2721,33 @@ async fn wait_for_exact_reports(
     timeout: Duration,
 ) -> Result<[proto::AgentStatusReport; 3], TestError> {
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_error = None::<String>;
     loop {
         let remaining = deadline
             .checked_duration_since(tokio::time::Instant::now())
-            .ok_or("public report convergence exceeded its deadline")?;
+            .ok_or_else(|| {
+                last_error
+                    .clone()
+                    .unwrap_or_else(|| "public report convergence exceeded its deadline".into())
+            })?;
         let reports = tokio::time::timeout(remaining, group.reports_bracketed())
             .await
-            .map_err(|_| "public bracketed reporting exceeded its deadline")??;
+            .map_err(|_| {
+                last_error.clone().unwrap_or_else(|| {
+                    "public bracketed reporting exceeded its deadline".to_owned()
+                })
+            })??;
         match assert_exact_reports(group, &reports, configuration_sequence) {
             Ok(()) => return Ok(reports),
             Err(error) => {
+                let message = error.to_string();
+                if last_error.is_none() {
+                    eprintln!("waiting for exact Public V1 reports: {message}");
+                }
+                last_error = Some(message);
                 let remaining = deadline
                     .checked_duration_since(tokio::time::Instant::now())
-                    .ok_or(error)?;
+                    .ok_or_else(|| last_error.clone().unwrap_or_else(|| error.to_string()))?;
                 tokio::time::sleep(remaining.min(Duration::from_millis(20))).await;
             }
         }

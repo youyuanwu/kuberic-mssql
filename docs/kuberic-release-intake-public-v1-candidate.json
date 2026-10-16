@@ -64,18 +64,18 @@
     },
     {
       "gate_id": "live_one_replica",
-      "status": "pending",
-      "evidence": "Exact-head command was attempted and failed closed in fixture preflight; the target filesystem has less than the required 6442450944 bytes free, so no licensed evidence was captured."
+      "status": "passed",
+      "evidence": "CARGO_BUILD_JOBS=1 just test-live-one-replica passed against the exact candidate with the licensed digest-pinned SQL Server fixture."
     },
     {
       "gate_id": "live_three_replica",
-      "status": "pending",
-      "evidence": "Exact-head command was attempted and failed closed: 2456076288 fixture-filesystem bytes were available and 16106127360 were required."
+      "status": "passed",
+      "evidence": "CARGO_BUILD_JOBS=1 just test-live-three-replica passed with Public V1 lifecycle ordering, stable three-member AG sequence evidence, bounded licensed seed callbacks, exact native marker convergence, and cleanup."
     },
     {
       "gate_id": "live_three_replica_restart",
-      "status": "pending",
-      "evidence": "Exact-head restart command was attempted and failed closed: 2456076288 fixture-filesystem bytes were available and 16106127360 were required."
+      "status": "passed",
+      "evidence": "CARGO_BUILD_JOBS=1 just test-live-three-replica-restart passed with contained existing-state Open, fresh process sessions, stale-session rejection, native seed-record compaction, zero redispatch, and marker continuity."
     },
     {
       "gate_id": "ag_sequence_history_contract",
@@ -114,5 +114,5 @@
     }
   ],
   "blockers": [],
-  "outcome": "incomplete"
+  "outcome": "ready_to_pin"
 }

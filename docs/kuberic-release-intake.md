@@ -96,8 +96,8 @@ identity until the exact candidate record computes `ready_to_pin`.
 
 The current candidate record is
 [kuberic-release-intake-public-v1-candidate.json](kuberic-release-intake-public-v1-candidate.json).
-It deliberately remains `incomplete` while exact-head licensed evidence is
-pending.
+It is `ready_to_pin` after exact-head server-free and licensed one-replica,
+three-replica, and same-root restart validation passed.
 
 ## Intake Procedure
 

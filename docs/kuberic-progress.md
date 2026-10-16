@@ -357,9 +357,9 @@ scenario performs exact cleanup.
 The feature branch evaluates exact Public V1 candidate
 `ceec5887ad97d71222117610428ce715b782777e`. Release-intake records retain
 `09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f` as the accepted current identity
-until every version-2 candidate gate passes. Missing licensed evidence keeps
-the candidate `incomplete` and blocks pin adoption, push for merge, and a final
-pull request.
+while comparing the reviewed candidate. Every version-2 candidate gate,
+including licensed one-replica, three-replica, and same-root restart
+validation, now passes and the candidate outcome is `ready_to_pin`.
 
 ## Usage
 
