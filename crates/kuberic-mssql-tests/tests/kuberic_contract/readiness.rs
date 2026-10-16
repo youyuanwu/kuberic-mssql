@@ -359,25 +359,3 @@ mod adapter_owned_neutral_facts {
         assert_eq!(descriptors[2].identity.logical_id(), "3");
     }
 }
-
-mod release_blocked_candidate_gates {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum CandidateGateState {
-        PendingRelease,
-    }
-
-    #[test]
-    fn remaining_contract_gates_stay_pending_until_their_phase_lands() {
-        let gates = [(
-            "signed_authorization_contract",
-            CandidateGateState::PendingRelease,
-        )];
-
-        assert_eq!(gates.len(), 1);
-        assert!(
-            gates
-                .iter()
-                .all(|(_, state)| { matches!(state, CandidateGateState::PendingRelease) })
-        );
-    }
-}

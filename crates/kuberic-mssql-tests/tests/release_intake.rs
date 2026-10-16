@@ -4,34 +4,46 @@ use std::process::Command;
 use kuberic_mssql_tests::release_intake::{
     EXIT_BASELINE_CONFIRMED, EXIT_BLOCKED, EXIT_INCOMPLETE, EXIT_INVALID, EXIT_READY_TO_PIN,
     GateId, GateRequirement, GateResult, GateStatus, IntakeError, IntakeOutcome, PROFILE_V1,
-    PROFILE_VERSION, ReleaseIntakeMode, ReleaseIntakeRecord, parse_and_validate_json,
-    validate_record,
+    PROFILE_V1_VERSION, PROFILE_V2, PROFILE_VERSION, ReleaseIntakeMode, ReleaseIntakeRecord,
+    parse_and_validate_json, validate_record,
 };
 
 const CURRENT_DEPENDENCY: &str = "kuberic-runtime@09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f";
 const CANDIDATE_DEPENDENCY: &str = "kuberic-runtime@1111111111111111111111111111111111111111";
 
 fn record(mode: ReleaseIntakeMode, status: GateStatus) -> ReleaseIntakeRecord {
+    record_for(PROFILE_VERSION, mode, status)
+}
+
+fn record_for(
+    profile_version: u32,
+    mode: ReleaseIntakeMode,
+    status: GateStatus,
+) -> ReleaseIntakeRecord {
     let reviewed_dependency_identity = match mode {
         ReleaseIntakeMode::Baseline => CURRENT_DEPENDENCY,
         ReleaseIntakeMode::Candidate => CANDIDATE_DEPENDENCY,
     };
     ReleaseIntakeRecord {
-        profile_version: PROFILE_VERSION,
+        profile_version,
         mode,
         current_dependency_identity: CURRENT_DEPENDENCY.into(),
         reviewed_dependency_identity: reviewed_dependency_identity.into(),
         semantic_contract_finding: "semantic contract reviewed".into(),
         persistence_contract_finding: "persistence contract reviewed".into(),
         fresh_state_finding: "fresh-state activation reviewed".into(),
-        gates: PROFILE_V1
-            .iter()
-            .map(|definition| GateResult {
-                gate_id: definition.id,
-                status,
-                evidence: format!("{} evidence", definition.id),
-            })
-            .collect(),
+        gates: (if profile_version == PROFILE_V1_VERSION {
+            &PROFILE_V1
+        } else {
+            &PROFILE_V2
+        })
+        .iter()
+        .map(|definition| GateResult {
+            gate_id: definition.id,
+            status,
+            evidence: format!("{} evidence", definition.id),
+        })
+        .collect(),
         blockers: Vec::new(),
         outcome: match (mode, status) {
             (_, GateStatus::Failed) => IntakeOutcome::Blocked,
@@ -91,6 +103,46 @@ fn profile_v1_has_the_exact_canonical_matrix() {
         assert_eq!(definition.id, id);
         assert_eq!(definition.baseline, baseline);
         assert_eq!(definition.candidate, GateRequirement::Required);
+    }
+}
+
+#[test]
+fn profile_v2_has_exactly_the_two_public_v1_gate_renames() {
+    assert_eq!(PROFILE_V2.len(), PROFILE_V1.len());
+    for (v1, v2) in PROFILE_V1.iter().zip(PROFILE_V2) {
+        let expected = match v1.id {
+            GateId::ExternalProgressContract => GateId::AgSequenceHistoryContract,
+            GateId::SignedAuthorizationContract => GateId::OrdinaryMutationBoundary,
+            other => other,
+        };
+        assert_eq!(v2.id, expected);
+        assert_eq!(v2.baseline, v1.baseline);
+        assert_eq!(v2.candidate, v1.candidate);
+    }
+}
+
+#[test]
+fn profile_versions_reject_cross_version_gate_substitution() {
+    for (version, old, replacement) in [
+        (
+            PROFILE_V1_VERSION,
+            GateId::ExternalProgressContract,
+            GateId::AgSequenceHistoryContract,
+        ),
+        (
+            PROFILE_VERSION,
+            GateId::AgSequenceHistoryContract,
+            GateId::ExternalProgressContract,
+        ),
+    ] {
+        let mut record = record_for(version, ReleaseIntakeMode::Candidate, GateStatus::Passed);
+        record
+            .gates
+            .iter_mut()
+            .find(|result| result.gate_id == old)
+            .unwrap()
+            .gate_id = replacement;
+        assert_eq!(validate_record(&record), Err(IntakeError::MissingGate(old)));
     }
 }
 
@@ -202,7 +254,7 @@ fn optional_failure_neither_blocks_nor_completes_required_pending_evidence() {
 
 #[test]
 fn omitted_required_and_optional_gates_are_invalid() {
-    for gate in [GateId::Formatting, GateId::SignedAuthorizationContract] {
+    for gate in [GateId::Formatting, GateId::OrdinaryMutationBoundary] {
         let mut record = record(ReleaseIntakeMode::Baseline, GateStatus::Passed);
         record.gates.retain(|result| result.gate_id != gate);
         assert_eq!(
@@ -327,6 +379,30 @@ fn checked_in_current_pin_baseline_record_is_complete_and_valid() {
 }
 
 #[test]
+fn checked_in_public_v1_candidate_is_complete_and_stays_incomplete_until_licensed_evidence() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/kuberic-release-intake-public-v1-candidate.json");
+    let input = std::fs::read(path).unwrap();
+    let (record, validated) = parse_and_validate_json(&input).unwrap();
+    assert_eq!(record.profile_version, PROFILE_VERSION);
+    assert_eq!(record.mode, ReleaseIntakeMode::Candidate);
+    assert_eq!(record.current_dependency_identity, CURRENT_DEPENDENCY);
+    assert_eq!(
+        record.reviewed_dependency_identity,
+        "kuberic-runtime@ceec5887ad97d71222117610428ce715b782777e"
+    );
+    assert_eq!(record.gates.len(), PROFILE_V2.len());
+    assert_eq!(validated.outcome(), IntakeOutcome::Incomplete);
+    for gate in [
+        GateId::LiveOneReplica,
+        GateId::LiveThreeReplica,
+        GateId::LiveThreeReplicaRestart,
+    ] {
+        assert_eq!(validated.effective_status(gate), GateStatus::Pending);
+    }
+}
+
+#[test]
 fn missing_semantic_persistence_or_fresh_state_findings_are_invalid() {
     for field in [
         "semantic_contract_finding",
@@ -423,7 +499,7 @@ fn binary_parses_records_prints_canonical_summary_and_uses_distinct_exit_statuse
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.starts_with("Kuberic MSSQL release intake\n"));
         assert!(stdout.contains("  - dependency_identity:"));
-        assert!(stdout.contains("  - signed_authorization_contract:"));
+        assert!(stdout.contains("  - ordinary_mutation_boundary:"));
         assert!(stdout.ends_with(&format!("{expected_outcome}\n")));
         assert!(output.stderr.is_empty());
     }

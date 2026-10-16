@@ -73,6 +73,32 @@ The last seven gates remain release-blocked under the current pin. Current
 rejection or unsupported behavior is evidence of the gap, not future
 conformance.
 
+## Profile Version 2
+
+Profile version 2 is the Public V1 candidate profile. It retains the same
+21-gate cardinality, ordering, and baseline/candidate requiredness as version
+1, with exactly two semantic replacements:
+
+| Version 1 gate | Version 2 gate | Public V1 meaning |
+|---|---|---|
+| `external_progress_contract` | `ag_sequence_history_contract` | Public scalar progress is the exact nonnegative SQL availability-group `sequence_number`; Kuberic epoch and SQL-native decimal database positions remain separate domains. |
+| `signed_authorization_contract` | `ordinary_mutation_boundary` | Ordinary construction cannot reach any SQL executor path. The released Public V1 transport is not described as authenticated; licensed bootstrap remains a separate bounded test-only construction. |
+
+All other gate identities are unchanged. A version-2 record containing a
+version-1 replacement, or a version-1 record containing a version-2
+replacement, is invalid rather than downgraded or reinterpreted.
+
+The candidate-only feature-branch exception permits `Cargo.lock` to resolve
+the exact reviewed candidate while intake is in progress. It does not accept
+the candidate as the production pin. The branch must not be proposed for
+merge, described as pin adoption, or used to update the accepted dependency
+identity until the exact candidate record computes `ready_to_pin`.
+
+The current candidate record is
+[kuberic-release-intake-public-v1-candidate.json](kuberic-release-intake-public-v1-candidate.json).
+It deliberately remains `incomplete` while final locked verification or
+licensed evidence is pending.
+
 ## Intake Procedure
 
 1. Record the current locked Kuberic revision and the exact reviewed candidate.
@@ -112,8 +138,8 @@ conformance.
 
    Unavailable or unrun candidate-required licensed gates remain `pending`;
    they are never inferred from server-free success.
-7. Fill one version-1 JSON record with every canonical gate and nonempty
-   evidence. Validate it:
+7. Fill one JSON record for the applicable profile version with every
+   canonical gate and nonempty evidence. Validate it:
 
    ```bash
    just validate-kuberic-release-intake /absolute/path/to/intake.json
@@ -126,7 +152,7 @@ conformance.
 
 ```json
 {
-  "profile_version": 1,
+  "profile_version": 2,
   "mode": "candidate",
   "current_dependency_identity": "kuberic-runtime@0000000000000000000000000000000000000000",
   "reviewed_dependency_identity": "kuberic-runtime@1111111111111111111111111111111111111111",
