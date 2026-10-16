@@ -18,7 +18,9 @@ use kuberic_mssql_tests::three_replica::{
     PublicMutationFault, ReadyMember, ResourceState, RunState, SystemCleanupClock, TopologyRun,
     cleanup_three_replica_fixture, launch_three_members,
 };
-use kuberic_runtime::control::proto;
+use kuberic_runtime::control::{normalize_public_v1_agent_status_report, proto};
+use kuberic_runtime::protocol::public_operations::PublicV1OperationResult;
+use kuberic_runtime::protocol::types::{AccessStatus, ReplicaRole};
 
 type TestError = Box<dyn Error + Send + Sync>;
 const HAPPY_PATH_TEST: &str = "three_replica_mssql_happy_path";
@@ -2651,72 +2653,68 @@ fn assert_exact_reports(
     reports: &[proto::AgentStatusReport; 3],
     configuration_sequence: i64,
 ) -> Result<(), TestError> {
+    let mut roles = Vec::with_capacity(reports.len());
     for (pod, report) in group.pods.iter().zip(reports) {
-        let expected_role = match pod.stable_role {
-            kuberic_runtime::protocol::types::ReplicaRole::Primary => proto::ReplicaRole::Primary,
-            kuberic_runtime::protocol::types::ReplicaRole::ActiveSecondary => {
-                proto::ReplicaRole::ActiveSecondary
-            }
+        let expected_write = match pod.stable_role {
+            ReplicaRole::Primary => AccessStatus::ReconfigurationPending,
+            ReplicaRole::ActiveSecondary => AccessStatus::NotPrimary,
             _ => return Err("public Kuberic pod has an unstable role".into()),
         };
-        let expected_write =
-            if pod.stable_role == kuberic_runtime::protocol::types::ReplicaRole::Primary {
-                proto::AccessStatus::ReconfigurationPending
-            } else {
-                proto::AccessStatus::NotPrimary
-            };
+        let public = normalize_public_v1_agent_status_report(report.clone())?;
+        let configuration_completed = public.completed_operations.iter().any(|completion| {
+            completion.current_configuration_id.as_ref()
+                == Some(&group.configuration.configuration_id)
+                && completion.result == PublicV1OperationResult::Succeeded
+        });
         if report.resource_uid != group.resource_uid.as_str()
-            || report.identity != Some(pod.identity.clone().into())
-            || report.process_session_id != pod.session.as_str()
+            || public.replica != pod.identity
+            || public.process_session_id != pod.session
             || report.replica_id != pod.identity.replica_id.value()
             || report.pod_uid != pod.pod_uid.as_str()
             || report.pvc_uid != pod.pvc_uid.as_str()
             || report.storage_state != proto::AgentStorageState::Initialized as i32
-            || report.reported_fault == proto::FaultType::Permanent as i32
-            || report.previous_configuration.is_some()
-            || report.current_configuration != Some(group.configuration.clone().into())
-            || report.current_progress != configuration_sequence
-            || report.catch_up_capability != Some(configuration_sequence)
+            || !configuration_completed
+            || public.progress.first != configuration_sequence
+            || public.progress.last != configuration_sequence
             || !report.healthy
-            || report.read_status != proto::AccessStatus::Granted as i32
-            || report.write_status != expected_write as i32
-            || report.role != expected_role as i32
+            || public.read_status != AccessStatus::Granted
+            || public.write_status != expected_write
+            || public.role != pod.stable_role
         {
             return Err(format!(
                 "Kuberic report differs from the exact fenced topology: ordinal={}, \
                  resource_uid={}, identity={:?}, session={}, replica_id={}, pod_uid={}, \
-                 pvc_uid={}, storage_state={}, fault={}, previous_configuration={}, \
-                 current_configuration={}, progress={}, capability={:?}, healthy={}, \
-                 read_status={}, write_status={}, role={}",
+                 pvc_uid={}, storage_state={}, configuration_completed={}, \
+                 first_progress={}, last_progress={}, healthy={}, \
+                 read_status={:?}, write_status={:?}, role={:?}",
                 pod.ordinal,
                 report.resource_uid,
-                report.identity,
-                report.process_session_id,
+                public.replica,
+                public.process_session_id,
                 report.replica_id,
                 report.pod_uid,
                 report.pvc_uid,
                 report.storage_state,
-                report.reported_fault,
-                report.previous_configuration.is_some(),
-                report.current_configuration.is_some(),
-                report.current_progress,
-                report.catch_up_capability,
+                configuration_completed,
+                public.progress.first,
+                public.progress.last,
                 report.healthy,
-                report.read_status,
-                report.write_status,
-                report.role,
+                public.read_status,
+                public.write_status,
+                public.role,
             )
             .into());
         }
+        roles.push(public.role);
     }
-    if reports
+    if roles
         .iter()
-        .filter(|report| report.role == proto::ReplicaRole::Primary as i32)
+        .filter(|role| **role == ReplicaRole::Primary)
         .count()
         != 1
-        || reports
+        || roles
             .iter()
-            .filter(|report| report.role == proto::ReplicaRole::ActiveSecondary as i32)
+            .filter(|role| **role == ReplicaRole::ActiveSecondary)
             .count()
             != 2
     {

@@ -741,10 +741,9 @@ pub async fn create_blocked_owner_regression_fixture(root: &Path) -> Result<Path
         state: ResourceState::Bound,
     });
     store.save(&journal).map_err(|error| error.to_string())?;
-    let shutdown =
-        super::kuberic_group::exercise_unconfirmed_partial_agent_shutdown(&path, &run).await;
+    let shutdown = super::kuberic_group::exercise_bounded_host_shutdown_fence().await;
     if !shutdown.agent_termination_unconfirmed() {
-        return Err("partial-agent shutdown did not retain the termination fence".to_owned());
+        return Err("bounded host shutdown did not retain the termination fence".to_owned());
     }
     let acknowledgement = store.root().join("owner-regression-acknowledgement.json");
     fs::write(

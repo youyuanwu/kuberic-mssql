@@ -42,7 +42,7 @@ pub use evidence::{
     DatabaseEvidence, EvidenceError, MemberEvidence, ReplicaProfileEvidence, SeedingEvidence,
     ValidatedNativeEvidence, validate_native_evidence,
 };
-pub use kuberic_group::{MSSQL_FAILOVER_DELAY_SECONDS, MssqlGroup, MssqlGroupError, MssqlPod};
+pub use kuberic_group::{MSSQL_FAILOVER_DELAY_SECONDS, MssqlGroupError};
 pub use member::{
     CleanupEvidence as NativeCleanupEvidence, LaunchedMembers, NativeDataProof, NativeLaunchError,
     NativePhaseError, ReadyMember, cleanup_three_replica_fixture,

@@ -33,11 +33,21 @@ use kuberic_mssql::{
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::application::StatefulServiceReplica;
 use kuberic_runtime::control::proto::{self as wire, agent_control_client::AgentControlClient};
+use kuberic_runtime::control::{
+    normalize_public_v1_agent_status_report, public_v1_operation_command_to_proto,
+};
 use kuberic_runtime::host::{HostError, ReplicaHost, RunningReplica};
+use kuberic_runtime::protocol::command::PublicV1OperationCommand;
+use kuberic_runtime::protocol::public_operations::{
+    PossibleDataLossIntent, PublicBuildInput, PublicLifecycleInput, PublicLifecycleRecipe,
+    PublicOperationClass, PublicOperationIntent, PublicOperationProgram,
+    PublicOperationReplayDisposition, PublicReplicaDescriptor, PublicV1AgentReport,
+    PublicV1OperationResult,
+};
 use kuberic_runtime::protocol::types::{
-    BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor, ConfigurationMember,
-    EffectivePolicy, Epoch, OperationId, PodUid, ProcessSessionId, PvcUid, ReplicaId,
-    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, derive_agent_generation,
+    ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch, OperationId, PodUid,
+    ProcessSessionId, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
+    ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ResourceUid, derive_agent_generation,
     derive_initialization_id,
 };
 use kuberic_runtime::replicator::{
@@ -64,6 +74,7 @@ pub struct PublicMssqlPod {
     pub pvc_uid: PvcUid,
     resource_uid: ResourceUid,
     control_address: SocketAddr,
+    replication_address: SocketAddr,
     running: Option<RunningReplica>,
     source: Source,
     application: Arc<RuntimeHostApplication>,
@@ -1033,6 +1044,7 @@ impl PublicMssqlGroup {
                 pvc_uid: PvcUid::new(run.kuberic_members[index].pvc_uid.clone()),
                 resource_uid: resource_uid.clone(),
                 control_address: controls[index],
+                replication_address: replications[index],
                 running: None,
                 source,
                 application,
@@ -1120,10 +1132,8 @@ impl PublicMssqlGroup {
             tokio::time::sleep(Duration::from_secs(5)).await;
             let sessions = ensure_configuration(
                 &pods,
-                &identities,
                 &resource_uid,
                 &configuration,
-                &effective_policy,
                 operation_timeout,
                 operation_namespace,
             )
@@ -1215,6 +1225,15 @@ impl PublicMssqlGroup {
                     pod.ordinal
                 )));
             }
+            let reports = public_reports(
+                &self.pods,
+                deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .ok_or_else(|| {
+                        MssqlGroupError::new("stale-session validation exceeded its deadline")
+                    })?,
+            )
+            .await?;
             let remaining = deadline
                 .checked_duration_since(tokio::time::Instant::now())
                 .ok_or_else(|| {
@@ -1229,13 +1248,14 @@ impl PublicMssqlGroup {
             let error = tokio::time::timeout(
                 remaining,
                 client.execute(configuration_request(
+                    &self.pods,
+                    &reports,
+                    index,
                     &self.resource_uid,
                     &self.configuration,
-                    &self.effective_policy,
-                    &pod.identity,
                     session,
                     &format!("stale-restart-configuration-{}", index + 1),
-                )),
+                )?),
             )
             .await
             .map_err(|_| MssqlGroupError::new("stale-session execution exceeded its deadline"))?
@@ -1290,7 +1310,7 @@ impl PublicMssqlGroup {
 
     pub fn retire_build_command(&self, command: &PublicBuildCommand) -> PublicBuildCommand {
         PublicBuildCommand {
-            operation_id: command.operation_id.clone(),
+            operation_id: OperationId::new(format!("remove-{}", command.operation_id)),
             build_id: command.build_id.clone(),
             target: command.target.clone(),
             retire: true,
@@ -1751,10 +1771,19 @@ impl PublicMssqlGroup {
         let mut count = 0;
         for pod in &self.pods {
             let (_, report) = status(pod, self.operation_timeout).await?;
-            count += report
-                .builds
+            exact_public_report(pod, &report)?;
+            let public = report.public_v1.as_ref().ok_or_else(|| {
+                MssqlGroupError::new("public build completion report is unavailable")
+            })?;
+            count += public
+                .completed_operations
                 .iter()
-                .filter(|build| build.build_id == command.build_id.as_str() && build.completed)
+                .filter(|completion| {
+                    completion.operation_id == command.operation_id.as_str()
+                        && completion.result
+                            == wire::PublicV1OperationResultKind::PublicV1OperationResultSucceeded
+                                as i32
+                })
                 .count();
         }
         if count == 1 {
@@ -1773,11 +1802,16 @@ impl PublicMssqlGroup {
         command: &PublicBuildCommand,
     ) -> Result<(), MssqlGroupError> {
         let (_, report) = status(pod, self.operation_timeout).await?;
-        if report
-            .builds
-            .iter()
-            .any(|build| build.build_id == command.build_id.as_str() && build.completed)
-        {
+        exact_public_report(pod, &report)?;
+        let public = report
+            .public_v1
+            .as_ref()
+            .ok_or_else(|| MssqlGroupError::new("public build completion report is unavailable"))?;
+        if public.completed_operations.iter().any(|completion| {
+            completion.operation_id == command.operation_id.as_str()
+                && completion.result
+                    == wire::PublicV1OperationResultKind::PublicV1OperationResultSucceeded as i32
+        }) {
             return Err(MssqlGroupError::new(format!(
                 "stale build {} published completion from member {}",
                 command.build_id, pod.ordinal
@@ -1795,31 +1829,36 @@ impl PublicMssqlGroup {
             remaining(self.complete_deadline, "public target build")
                 .map_err(|error| tonic::Status::deadline_exceeded(error.to_string()))?,
         );
-        if !command.retire {
-            self.admit_target_build_authority(command, timeout_duration)
-                .await?;
-        }
-        let (mut client, report) = status(source, timeout_duration)
+        let (mut client, source_wire_report) = status(source, timeout_duration)
             .await
             .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
-        let request = authorized(wire::ExecuteCommandRequest {
-            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
-            resource_uid: self.resource_uid.to_string(),
-            target: Some(source.identity.clone().into()),
-            expected_process_session_id: report.process_session_id,
-            command: Some(wire::execute_command_request::Command::EnsureReplicaBuild(
-                wire::EnsureReplicaBuildCommand {
-                    operation_id: command.operation_id.to_string(),
-                    local_replica_id: source.identity.replica_id.value(),
-                    expected_instance_id: source.identity.instance_id.to_string(),
-                    expected_agent_generation: source.identity.agent_generation.to_string(),
-                    target: Some(command.target.clone().into()),
-                    authority: None,
-                    source_session_id: String::new(),
-                    retire: command.retire,
-                },
-            )),
-        });
+        let source_report = exact_public_report(source, &source_wire_report)
+            .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
+        let target = self
+            .pods
+            .iter()
+            .find(|pod| pod.identity == command.target)
+            .ok_or_else(|| tonic::Status::failed_precondition("target pod is unavailable"))?;
+        let (_, target_wire_report) = status(target, timeout_duration)
+            .await
+            .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+        let target_report = exact_public_report(target, &target_wire_report)
+            .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
+        if !command.retire {
+            self.target_evidence
+                .authorize(command, target_report.process_session_id.clone())
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+        }
+        let request = public_build_request(
+            source,
+            &source_report,
+            target,
+            &target_report,
+            &self.resource_uid,
+            &self.configuration,
+            command,
+        )
+        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         tokio::time::timeout(timeout_duration, client.execute(request))
             .await
             .map_err(|_| tonic::Status::deadline_exceeded("public target build timed out"))?
@@ -1844,42 +1883,33 @@ impl PublicMssqlGroup {
             .iter()
             .find(|pod| pod.identity == command.target)
             .ok_or_else(|| tonic::Status::failed_precondition("target pod is unavailable"))?;
-        let (mut target_client, target_report) = status(target, timeout_duration)
+        let (_, target_wire_report) = status(target, timeout_duration)
             .await
             .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
-        let target_process_session_id =
-            ProcessSessionId::new(target_report.process_session_id.clone());
-        let authority = BuildAuthority {
-            build_id: command.build_id.clone(),
-            kind: BuildAuthorityKind::Failover,
-            source: source.identity.clone(),
-            target: command.target.clone(),
-            current_configuration: self.configuration.clone(),
-            replication_boundary_lsn: 0,
-        };
-        let target_request = authorized(wire::ExecuteCommandRequest {
-            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
-            resource_uid: self.resource_uid.to_string(),
-            target: Some(command.target.clone().into()),
-            expected_process_session_id: target_report.process_session_id.clone(),
-            command: Some(wire::execute_command_request::Command::EnsureReplicaBuild(
-                wire::EnsureReplicaBuildCommand {
-                    operation_id: command.operation_id.to_string(),
-                    local_replica_id: command.target.replica_id.value(),
-                    expected_instance_id: command.target.instance_id.to_string(),
-                    expected_agent_generation: command.target.agent_generation.to_string(),
-                    target: Some(command.target.clone().into()),
-                    authority: Some(authority.into()),
-                    source_session_id: source.session.to_string(),
-                    retire: false,
-                },
-            )),
-        });
-        tokio::time::timeout(timeout_duration, target_client.execute(target_request))
+        let target_report = exact_public_report(target, &target_wire_report)
+            .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
+        let (_, source_wire_report) = status(source, timeout_duration)
             .await
-            .map_err(|_| tonic::Status::deadline_exceeded("public target admission timed out"))??;
+            .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+        let source_report = exact_public_report(source, &source_wire_report)
+            .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
+        if source_report.process_session_id != source.session {
+            return Err(tonic::Status::failed_precondition(
+                "source process session differs from the exact admitted session",
+            ));
+        }
+        public_build_request(
+            source,
+            &source_report,
+            target,
+            &target_report,
+            &self.resource_uid,
+            &self.configuration,
+            command,
+        )
+        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         self.target_evidence
-            .authorize(command, target_process_session_id)
+            .authorize(command, target_report.process_session_id)
             .map_err(|error| tonic::Status::internal(error.to_string()))?;
         Ok(())
     }
@@ -1888,11 +1918,7 @@ impl PublicMssqlGroup {
         &self,
         command: &PublicBuildCommand,
     ) -> Result<(), tonic::Status> {
-        self.execute_kuberic_build_command(command).await?;
-        if command.retire {
-            return Ok(());
-        }
-        self.execute_admitted_seed_callback(command).await
+        self.execute_kuberic_build_command(command).await
     }
 
     async fn execute_admitted_seed_callback(
@@ -2347,34 +2373,40 @@ async fn initialize(
 
 async fn ensure_configuration(
     pods: &[PublicMssqlPod; 3],
-    identities: &[ReplicaIdentity; 3],
     resource_uid: &ResourceUid,
     configuration: &ConfigurationDescriptor,
-    policy: &EffectivePolicy,
     timeout_duration: Duration,
     operation_namespace: &str,
 ) -> Result<[kuberic_runtime::protocol::types::ProcessSessionId; 3], MssqlGroupError> {
     let deadline = tokio::time::Instant::now() + timeout_duration;
     loop {
         let mut clients = Vec::new();
-        let mut sessions = Vec::new();
+        let mut reports = Vec::new();
         for pod in pods {
-            let (client, report) =
+            let (client, wire_report) =
                 status(pod, rpc_remaining(deadline, "public configuration status")?).await?;
             clients.push(client);
-            sessions.push(report.process_session_id);
+            reports.push(exact_public_report(pod, &wire_report)?);
         }
+        let reports: [PublicV1AgentReport; 3] = reports
+            .try_into()
+            .map_err(|_| MssqlGroupError::new("exactly three public reports required"))?;
         let execution_timeout = rpc_remaining(deadline, "public configuration execution")?;
-        let results = join_all(clients.into_iter().enumerate().map(|(index, mut client)| {
-            let request = configuration_request(
-                resource_uid,
-                configuration,
-                policy,
-                &identities[index],
-                &kuberic_runtime::protocol::types::ProcessSessionId::new(sessions[index].clone()),
-                &format!("{operation_namespace}-configuration-{}", index + 1),
-            );
-            async move {
+        let requests = (0..3)
+            .map(|index| {
+                configuration_request(
+                    pods,
+                    &reports,
+                    index,
+                    resource_uid,
+                    configuration,
+                    &reports[index].process_session_id,
+                    &format!("{operation_namespace}-configuration-{}", index + 1),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let results = join_all(clients.into_iter().zip(requests).map(
+            |(mut client, request)| async move {
                 tokio::time::timeout(execution_timeout, client.execute(request))
                     .await
                     .unwrap_or_else(|_| {
@@ -2382,13 +2414,13 @@ async fn ensure_configuration(
                             "public configuration execution exceeded its deadline",
                         ))
                     })
-            }
-        }))
+            },
+        ))
         .await;
         if results.iter().all(Result::is_ok) {
-            return sessions
+            return reports
+                .map(|report| report.process_session_id)
                 .into_iter()
-                .map(kuberic_runtime::protocol::types::ProcessSessionId::new)
                 .collect::<Vec<_>>()
                 .try_into()
                 .map_err(|_| MssqlGroupError::new("exactly three agent sessions required"));
@@ -2412,32 +2444,307 @@ async fn ensure_configuration(
 }
 
 fn configuration_request(
+    pods: &[PublicMssqlPod; 3],
+    reports: &[PublicV1AgentReport; 3],
+    local_index: usize,
     resource_uid: &ResourceUid,
     configuration: &ConfigurationDescriptor,
-    policy: &EffectivePolicy,
-    identity: &ReplicaIdentity,
     session: &kuberic_runtime::protocol::types::ProcessSessionId,
     operation_id: &str,
-) -> Request<wire::ExecuteCommandRequest> {
-    authorized(wire::ExecuteCommandRequest {
+) -> Result<Request<wire::ExecuteCommandRequest>, MssqlGroupError> {
+    let report = reports
+        .get(local_index)
+        .ok_or_else(|| MssqlGroupError::new("public configuration target index is invalid"))?;
+    let local = pods
+        .get(local_index)
+        .ok_or_else(|| MssqlGroupError::new("public configuration pod index is invalid"))?;
+    let role = configuration
+        .members
+        .iter()
+        .find(|member| member.identity == local.identity)
+        .map(|member| member.role)
+        .ok_or_else(|| {
+            MssqlGroupError::new("public configuration lacks the exact local replica")
+        })?;
+    let recipe = match role {
+        ReplicaRole::Primary => PublicLifecycleRecipe::InitialPrimary,
+        ReplicaRole::ActiveSecondary => PublicLifecycleRecipe::SecondaryEpochAdvance,
+        _ => {
+            return Err(MssqlGroupError::new(
+                "public lifecycle target is not a ready primary or secondary",
+            ));
+        }
+    };
+    let lifecycle = PublicLifecycleInput {
+        recipe,
+        replica: local.identity.clone(),
+        epoch: configuration.epoch,
+        possible_data_loss: PossibleDataLossIntent::NotPossible,
+        current: configuration.clone(),
+        previous: None,
+        replicas: ready_remote_secondaries(pods, reports, local_index, configuration)?,
+        data_loss_recovery: None,
+    };
+    let input_digest = lifecycle.digest();
+    let replay_disposition = PublicOperationReplayDisposition::Convergent;
+    let operation_id = OperationId::new(operation_id);
+    let revision = operation_revision(
+        report,
+        &operation_id,
+        &input_digest,
+        replay_disposition,
+        session,
+    )?;
+    let command = PublicV1OperationCommand {
+        target: local.identity.clone(),
+        intent: PublicOperationIntent {
+            identity: report.identity.clone(),
+            operation_id,
+            revision,
+            process_session_id: session.clone(),
+            class: PublicOperationClass::Authority,
+            input_digest,
+            replay_disposition,
+            lifecycle: Some(lifecycle),
+            program: None,
+        },
+    };
+    public_operation_request(resource_uid, local, session, command)
+}
+
+fn public_build_request(
+    source: &PublicMssqlPod,
+    source_report: &PublicV1AgentReport,
+    target: &PublicMssqlPod,
+    target_report: &PublicV1AgentReport,
+    resource_uid: &ResourceUid,
+    configuration: &ConfigurationDescriptor,
+    command: &PublicBuildCommand,
+) -> Result<Request<wire::ExecuteCommandRequest>, MssqlGroupError> {
+    if source_report.identity != target_report.identity
+        || source_report.history != target_report.history
+    {
+        return Err(MssqlGroupError::new(
+            "public build source and target do not share exact accepted history",
+        ));
+    }
+    let build = PublicBuildInput {
+        attempt: command.build_id.clone(),
+        epoch: configuration.epoch,
+        current_configuration_id: Some(configuration.configuration_id.clone()),
+        replica: target.identity.clone(),
+        target_storage: exact_storage_incarnation(target, target_report)?,
+        process_session_id: target_report.process_session_id.clone(),
+        replication_address: format!("http://{}", target.replication_address),
+        history: Some(source_report.history.clone()),
+    };
+    let program = if command.retire {
+        PublicOperationProgram::Remove(build)
+    } else {
+        PublicOperationProgram::Build(build)
+    };
+    let class = if command.retire {
+        PublicOperationClass::Remove {
+            target: target.identity.replica_id,
+        }
+    } else {
+        PublicOperationClass::Build {
+            target: target.identity.replica_id,
+        }
+    };
+    let revision = retained_configuration_revision(source_report, configuration)?;
+    let intent = PublicOperationIntent {
+        identity: source_report.identity.clone(),
+        operation_id: command.operation_id.clone(),
+        revision,
+        process_session_id: source_report.process_session_id.clone(),
+        class,
+        input_digest: program.digest(),
+        replay_disposition: program.replay_disposition(),
+        lifecycle: None,
+        program: Some(program),
+    };
+    public_operation_request(
+        resource_uid,
+        source,
+        &source_report.process_session_id,
+        PublicV1OperationCommand {
+            target: source.identity.clone(),
+            intent,
+        },
+    )
+}
+
+fn public_operation_request(
+    resource_uid: &ResourceUid,
+    pod: &PublicMssqlPod,
+    session: &ProcessSessionId,
+    command: PublicV1OperationCommand,
+) -> Result<Request<wire::ExecuteCommandRequest>, MssqlGroupError> {
+    let command = public_v1_operation_command_to_proto(&command).map_err(display_error)?;
+    Ok(authorized(wire::ExecuteCommandRequest {
         protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
         resource_uid: resource_uid.to_string(),
-        target: Some(identity.clone().into()),
+        target: Some(pod.identity.clone().into()),
         expected_process_session_id: session.to_string(),
-        command: Some(wire::execute_command_request::Command::EnsureConfiguration(
-            Box::new(wire::EnsureConfigurationCommand {
-                operation_id: operation_id.into(),
-                current_configuration: Some(configuration.clone().into()),
-                current_epoch: Some(configuration.epoch.into()),
-                effective_policy: Some(policy.clone().into()),
-                local_replica_id: identity.replica_id.value(),
-                expected_instance_id: identity.instance_id.to_string(),
-                expected_agent_generation: identity.agent_generation.to_string(),
-                transition_kind: wire::TransitionKind::Bootstrap as i32,
-                primary_write_status: wire::AccessStatus::ReconfigurationPending as i32,
-                ..Default::default()
-            }),
+        command: Some(wire::execute_command_request::Command::PublicV1Operation(
+            command,
         )),
+    }))
+}
+
+fn operation_revision(
+    report: &PublicV1AgentReport,
+    operation_id: &OperationId,
+    input_digest: &kuberic_runtime::protocol::public_operations::CanonicalOperationInputDigest,
+    replay_disposition: PublicOperationReplayDisposition,
+    session: &ProcessSessionId,
+) -> Result<u64, MssqlGroupError> {
+    if let Some(completion) = report.completed_operations.iter().find(|completion| {
+        completion.operation_id == *operation_id
+            && completion.process_session_id == *session
+            && completion.input_digest == *input_digest
+            && completion.replay_disposition == replay_disposition
+            && completion.history == report.history
+            && completion.storage_incarnation == report.storage_incarnation
+            && completion.result == PublicV1OperationResult::Succeeded
+    }) {
+        return Ok(completion.revision);
+    }
+    report
+        .completed_operations
+        .iter()
+        .map(|completion| completion.revision)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| MssqlGroupError::new("public operation revision overflow"))
+}
+
+fn retained_configuration_revision(
+    report: &PublicV1AgentReport,
+    configuration: &ConfigurationDescriptor,
+) -> Result<u64, MssqlGroupError> {
+    report
+        .completed_operations
+        .iter()
+        .filter(|completion| {
+            completion.process_session_id == report.process_session_id
+                && completion.history == report.history
+                && completion.storage_incarnation == report.storage_incarnation
+                && completion.current_configuration_id.as_ref()
+                    == Some(&configuration.configuration_id)
+                && completion.result == PublicV1OperationResult::Succeeded
+        })
+        .map(|completion| completion.revision)
+        .max()
+        .ok_or_else(|| {
+            MssqlGroupError::new(
+                "public build source lacks completed exact configuration authority",
+            )
+        })
+}
+
+fn ready_remote_secondaries(
+    pods: &[PublicMssqlPod; 3],
+    reports: &[PublicV1AgentReport; 3],
+    local_index: usize,
+    configuration: &ConfigurationDescriptor,
+) -> Result<Vec<PublicReplicaDescriptor>, MssqlGroupError> {
+    configuration
+        .members
+        .iter()
+        .filter(|member| {
+            member.role == ReplicaRole::ActiveSecondary
+                && member.identity.replica_id != pods[local_index].identity.replica_id
+        })
+        .map(|member| {
+            let index = pods
+                .iter()
+                .position(|pod| pod.identity == member.identity)
+                .ok_or_else(|| {
+                    MssqlGroupError::new(
+                        "public configuration secondary has no exact local fixture pod",
+                    )
+                })?;
+            let pod = &pods[index];
+            let report = &reports[index];
+            if report.role != ReplicaRole::ActiveSecondary {
+                return Err(MssqlGroupError::new(format!(
+                    "member {} is not a ready active secondary",
+                    pod.ordinal
+                )));
+            }
+            Ok(PublicReplicaDescriptor {
+                build_id: OperationId::default(),
+                identity: pod.identity.clone(),
+                replication_address: format!("http://{}", pod.replication_address),
+                process_session_id: report.process_session_id.clone(),
+                storage_incarnation: Some(exact_storage_incarnation(pod, report)?),
+                role: ReplicaRole::ActiveSecondary,
+                current_progress: report.progress.last,
+                catch_up_capability: report.progress.first,
+                must_catchup: false,
+            })
+        })
+        .collect()
+}
+
+async fn public_reports(
+    pods: &[PublicMssqlPod; 3],
+    timeout_duration: Duration,
+) -> Result<[PublicV1AgentReport; 3], MssqlGroupError> {
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+    let mut reports = Vec::new();
+    for pod in pods {
+        let (_, report) = status(pod, rpc_remaining(deadline, "public report collection")?).await?;
+        reports.push(exact_public_report(pod, &report)?);
+    }
+    reports
+        .try_into()
+        .map_err(|_| MssqlGroupError::new("exactly three public reports required"))
+}
+
+fn exact_public_report(
+    pod: &PublicMssqlPod,
+    report: &wire::AgentStatusReport,
+) -> Result<PublicV1AgentReport, MssqlGroupError> {
+    let mut public =
+        normalize_public_v1_agent_status_report(report.clone()).map_err(display_error)?;
+    if public.resource_uid != pod.resource_uid || public.replica != pod.identity {
+        return Err(MssqlGroupError::new(
+            "public report differs from the exact fixture identity",
+        ));
+    }
+    public.storage_incarnation = exact_storage_incarnation(pod, &public)?;
+    Ok(public)
+}
+
+fn exact_storage_incarnation(
+    pod: &PublicMssqlPod,
+    report: &PublicV1AgentReport,
+) -> Result<ReplicaStorageIncarnationContext, MssqlGroupError> {
+    if report.storage_incarnation.replica != pod.identity {
+        return Err(MssqlGroupError::new(
+            "public report storage differs from the exact replica identity",
+        ));
+    }
+    match &report.storage_incarnation.storage {
+        ReplicaStorageIdentity::Persistent { pod_uid, pvc_uid }
+            if pod_uid == &pod.pod_uid && pvc_uid == &pod.pvc_uid => {}
+        _ => {
+            return Err(MssqlGroupError::new(
+                "public report storage differs from the known Pod/PVC identity",
+            ));
+        }
+    }
+    Ok(ReplicaStorageIncarnationContext {
+        replica: pod.identity.clone(),
+        storage: ReplicaStorageIdentity::Persistent {
+            pod_uid: pod.pod_uid.clone(),
+            pvc_uid: pod.pvc_uid.clone(),
+        },
+        storage_generation: report.storage_incarnation.storage_generation.clone(),
     })
 }
 

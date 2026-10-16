@@ -18,8 +18,8 @@ use kuberic_runtime::protocol::types::{
 };
 use kuberic_runtime::replicator::{
     PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode,
-    Replicator, ReplicatorFactory, ReplicatorFactoryContext, ReplicatorInterfaces,
-    ReplicatorSettings,
+    Replicator, ReplicatorCapabilities, ReplicatorFactory, ReplicatorFactoryContext,
+    ReplicatorInterfaces, ReplicatorSettings,
 };
 use kuberic_runtime::{Result as KubericResult, RuntimeError as KubericRuntimeError};
 use tokio_util::sync::CancellationToken;
@@ -879,7 +879,11 @@ impl SqlServerReplicatorFactory {
     }
 
     pub fn interfaces(&self) -> ReplicatorInterfaces {
-        ReplicatorInterfaces::primary(self.replicator.clone(), None)
+        ReplicatorInterfaces::primary(
+            self.replicator.clone(),
+            None,
+            ReplicatorCapabilities::conservative(),
+        )
     }
 }
 
@@ -904,6 +908,8 @@ impl ReplicatorFactory for SqlServerReplicatorFactory {
                 .into());
             }
         }
+        self.replicator
+            .bind_process_session(context.process_session_id()?)?;
         Ok(self.interfaces())
     }
 }
@@ -914,6 +920,7 @@ pub struct SqlServerReplicator {
     clock: Arc<dyn ObservationClock>,
     bootstrap: Option<ReplicatorBootstrapCapability>,
     runtime_identity: Option<KubericReplicaIdentity>,
+    process_session_id: Mutex<Option<ProcessSessionId>>,
     expectation: Option<Arc<SqlServerTopologyExpectation>>,
     admitted_topology: Mutex<Option<Arc<HealthyTopologyBinding>>>,
     admitted_configuration: Mutex<Option<ReplicaSetConfiguration>>,
@@ -1550,6 +1557,7 @@ impl SqlServerReplicator {
             clock,
             bootstrap,
             runtime_identity,
+            process_session_id: Mutex::new(None),
             expectation,
             admitted_topology: Mutex::new(None),
             admitted_configuration: Mutex::new(None),
@@ -1571,6 +1579,51 @@ impl SqlServerReplicator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    fn bind_process_session(
+        &self,
+        process_session_id: ProcessSessionId,
+    ) -> Result<(), KubericAdapterError> {
+        let mut accepted = self
+            .process_session_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if accepted
+            .as_ref()
+            .is_some_and(|accepted| accepted != &process_session_id)
+        {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "runtime process session changed after Replicator construction",
+            ));
+        }
+        *accepted = Some(process_session_id);
+        Ok(())
+    }
+
+    fn process_session_id(
+        &self,
+        current: &ReplicaSetConfiguration,
+    ) -> Result<ProcessSessionId, KubericAdapterError> {
+        let accepted = self
+            .process_session_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        accepted
+            .or_else(|| {
+                self.runtime_identity.as_ref().and_then(|identity| {
+                    current
+                        .replicas
+                        .iter()
+                        .find(|replica| replica.identity == *identity)
+                        .map(|replica| replica.process_session_id.clone())
+                        .filter(|session| !session.is_empty())
+                })
+            })
+            .ok_or(KubericAdapterError::TopologyBindingMismatch(
+                "runtime process session is unavailable",
+            ))
     }
 
     fn begin_operation(&self) -> Result<u64, KubericAdapterError> {
@@ -2233,6 +2286,7 @@ impl SqlServerReplicator {
             .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
         let compatibility = CurrentTopologyFacts::translate(
             runtime_identity,
+            &self.process_session_id(current)?,
             expectation,
             &self.replication_address,
             current,
@@ -3729,7 +3783,7 @@ impl SqlServerReplicator {
 
     async fn validate_and_set_role(&self, role: ReplicaRole) -> KubericResult<()> {
         let generation = self.begin_operation()?;
-        if self.bootstrap.is_some() && self.admitted_topology().is_none() {
+        if self.expectation.is_some() && self.admitted_topology().is_none() {
             if !matches!(role, ReplicaRole::Primary | ReplicaRole::ActiveSecondary) {
                 return Err(KubericAdapterError::NativeRoleMismatch {
                     requested: role,
@@ -3743,9 +3797,6 @@ impl SqlServerReplicator {
         }
         let (group, observed_at) = self.observed_group(generation, false, Some(role)).await?;
         let _lifecycle = self.finish_operation(generation)?;
-        if self.expectation.is_some() && self.admitted_topology().is_none() {
-            return Err(KubericAdapterError::TopologyNotAdmitted.into());
-        }
         if self.expectation.is_none() {
             validate_native_role(role, group.local_replica.role)?;
         }
@@ -3759,6 +3810,20 @@ impl SqlServerReplicator {
             .role
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(role);
+    }
+
+    fn set_epoch(&self, epoch: Epoch) -> Result<(), KubericAdapterError> {
+        let mut accepted = self
+            .epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if accepted.as_ref().is_some_and(|accepted| epoch < *accepted) {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "runtime epoch regressed",
+            ));
+        }
+        *accepted = Some(epoch);
+        Ok(())
     }
 
     fn unsupported<T>(&self, operation: ObserveOnlyOperation) -> KubericResult<T> {
@@ -3786,27 +3851,28 @@ impl Replicator for SqlServerReplicator {
         let admitted = self.admitted_topology();
         let observed_at = if let Some(binding) = &admitted {
             let (_, observed_at) = self.observed_group(generation, false, Some(role)).await?;
-            if epoch != binding.configuration.epoch {
+            if epoch.data_loss_number != binding.configuration.epoch.data_loss_number
+                || epoch.configuration_number < binding.configuration.epoch.configuration_number
+            {
                 return Err(KubericAdapterError::TopologyBindingMismatch(
-                    "role-change epoch differs from the frozen epoch",
+                    "role-change epoch precedes or changes the admitted history",
                 )
                 .into());
             }
-            observed_at
+            Some(observed_at)
         } else if self.expectation.is_some() {
-            return Err(KubericAdapterError::TopologyNotAdmitted.into());
+            None
         } else {
             let (group, observed_at) = self.observed_group(generation, false, Some(role)).await?;
             validate_native_role(role, group.local_replica.role)?;
-            observed_at
+            Some(observed_at)
         };
         let _lifecycle = self.finish_operation(generation)?;
-        self.ensure_observation_fresh(observed_at)?;
+        if let Some(observed_at) = observed_at {
+            self.ensure_observation_fresh(observed_at)?;
+        }
+        self.set_epoch(epoch)?;
         self.set_role(role);
-        *self
-            .epoch
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(epoch);
         Ok(())
     }
 
@@ -3815,15 +3881,15 @@ impl Replicator for SqlServerReplicator {
         let admitted = self.admitted_topology();
         let observed_at = if let Some(binding) = &admitted {
             let (_, observed_at) = self.observed_group(generation, false, None).await?;
-            if epoch != binding.configuration.epoch {
+            if epoch.data_loss_number != binding.configuration.epoch.data_loss_number
+                || epoch.configuration_number < binding.configuration.epoch.configuration_number
+            {
                 return Err(KubericAdapterError::TopologyBindingMismatch(
-                    "updated epoch differs from the frozen epoch",
+                    "updated epoch precedes or changes the admitted history",
                 )
                 .into());
             }
             Some(observed_at)
-        } else if self.expectation.is_some() {
-            return Err(KubericAdapterError::TopologyNotAdmitted.into());
         } else {
             None
         };
@@ -3831,10 +3897,7 @@ impl Replicator for SqlServerReplicator {
         if let Some(observed_at) = observed_at {
             self.ensure_observation_fresh(observed_at)?;
         }
-        *self
-            .epoch
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(epoch);
+        self.set_epoch(epoch)?;
         Ok(())
     }
 
@@ -3972,6 +4035,7 @@ impl PrimaryReplicator for SqlServerReplicator {
         if self.bootstrap.is_some()
             && validate_incomplete_bootstrap_configuration(
                 runtime_identity,
+                &self.process_session_id(&current)?,
                 expectation,
                 &self.replication_address,
                 &current,
@@ -4041,6 +4105,7 @@ impl PrimaryReplicator for SqlServerReplicator {
         validate_eligible_snapshot(self.source.observer_config(), &instance, &group, false)?;
         let compatibility = CurrentTopologyFacts::translate(
             runtime_identity,
+            &self.process_session_id(&current)?,
             expectation,
             &self.replication_address,
             &current,

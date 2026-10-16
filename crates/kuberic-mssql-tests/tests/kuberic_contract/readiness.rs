@@ -120,43 +120,39 @@ mod executable_now {
     }
 }
 
-mod current_pin_gap_evidence {
+mod public_v1_lifecycle_evidence {
     use super::*;
 
     #[tokio::test]
-    async fn role_before_primary_configuration_remains_release_blocked() {
+    async fn primary_role_precedes_current_configuration() {
         let replicator = opened_bound_replicator(
             vec![Ok(present(bound_snapshot())), Ok(present(bound_snapshot()))],
             vec![OBSERVED_AT; 2],
         )
         .await;
 
-        let error = replicator
-            .change_role(configuration().epoch, ReplicaRole::Primary)
-            .await
-            .unwrap_err();
-        assert!(application_error(error).contains("not been admitted"));
-
         replicator
-            .update_current_replica_set_configuration(bound_replica_set())
+            .change_role(configuration().epoch, ReplicaRole::Primary)
             .await
             .unwrap();
         replicator
-            .change_role(configuration().epoch, ReplicaRole::Primary)
+            .update_current_replica_set_configuration(bound_replica_set())
             .await
             .unwrap();
     }
 
     #[tokio::test]
-    async fn newer_same_role_secondary_epoch_remains_release_blocked() {
+    async fn same_role_secondary_accepts_newer_epoch_without_sql_sequence_change() {
         let replicator = opened_admitted_replicator(
             1,
             vec![
                 Ok(present(bound_snapshot_for(1))),
                 Ok(present(bound_snapshot_for(1))),
                 Ok(present(bound_snapshot_for(1))),
+                Ok(present(bound_snapshot_for(1))),
+                Ok(present(bound_snapshot_for(1))),
             ],
-            vec![OBSERVED_AT; 3],
+            vec![OBSERVED_AT; 5],
         )
         .await;
 
@@ -168,11 +164,12 @@ mod current_pin_gap_evidence {
             .update_epoch(configuration().epoch)
             .await
             .unwrap();
+        replicator.update_epoch(Epoch::new(7, 43)).await.unwrap();
         let error = replicator
-            .update_epoch(Epoch::new(7, 43))
+            .update_epoch(Epoch::new(7, 42))
             .await
             .unwrap_err();
-        assert!(application_error(error).contains("frozen epoch"));
+        assert!(application_error(error).contains("regressed"));
     }
 }
 
@@ -232,6 +229,27 @@ mod adapter_owned_neutral_facts {
             assert_eq!(descriptor.server_name.as_str(), format!("sql-{index}"));
         }
     }
+
+    #[test]
+    fn remote_active_configuration_recovers_local_primary_from_runtime_facts() {
+        let mut current = bound_replica_set();
+        current
+            .replicas
+            .retain(|replica| replica.identity != kuberic_identity(1));
+
+        let descriptors = testing_current_pin_bootstrap_descriptors(
+            &kuberic_identity(1),
+            &topology_expectation(),
+            "replica-1.example:5022",
+            &current,
+        )
+        .unwrap();
+
+        assert_eq!(descriptors.len(), 3);
+        assert_eq!(descriptors[0].identity.logical_id(), "1");
+        assert_eq!(descriptors[1].identity.logical_id(), "2");
+        assert_eq!(descriptors[2].identity.logical_id(), "3");
+    }
 }
 
 mod release_blocked_candidate_gates {
@@ -241,18 +259,10 @@ mod release_blocked_candidate_gates {
     }
 
     #[test]
-    fn unreleased_contract_gates_remain_pending_candidates() {
+    fn remaining_contract_gates_stay_pending_until_their_phase_lands() {
         let gates = [
             (
                 "external_progress_contract",
-                CandidateGateState::PendingRelease,
-            ),
-            (
-                "role_before_primary_configuration",
-                CandidateGateState::PendingRelease,
-            ),
-            (
-                "same_role_secondary_epoch",
                 CandidateGateState::PendingRelease,
             ),
             (
@@ -267,7 +277,7 @@ mod release_blocked_candidate_gates {
             ),
         ];
 
-        assert_eq!(gates.len(), 7);
+        assert_eq!(gates.len(), 5);
         assert!(
             gates
                 .iter()

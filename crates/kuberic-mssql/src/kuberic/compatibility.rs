@@ -43,11 +43,18 @@ pub(super) struct CurrentTopologyFacts {
 impl CurrentTopologyFacts {
     pub(super) fn translate(
         runtime_identity: &KubericReplicaIdentity,
+        process_session_id: &ProcessSessionId,
         expectation: &SqlServerTopologyExpectation,
         replication_address: &str,
         current: &ReplicaSetConfiguration,
     ) -> Result<Self, KubericAdapterError> {
-        validate_configuration_shape(runtime_identity, expectation, replication_address, current)?;
+        validate_configuration_shape(
+            runtime_identity,
+            process_session_id,
+            expectation,
+            replication_address,
+            current,
+        )?;
         Ok(Self {
             configuration: current.configuration.clone(),
             members: current
@@ -58,14 +65,20 @@ impl CurrentTopologyFacts {
                     let description = current
                         .replicas
                         .iter()
-                        .find(|replica| replica.identity == member.identity)
-                        .expect("validated current member has one description");
+                        .find(|replica| replica.identity == member.identity);
                     CurrentMemberFacts {
                         identity: member.identity.clone(),
-                        process_session_id: description.process_session_id.clone(),
-                        replication_address: description.replication_address.clone(),
+                        process_session_id: description.map_or_else(
+                            || process_session_id.clone(),
+                            |description| description.process_session_id.clone(),
+                        ),
+                        replication_address: description.map_or_else(
+                            || replication_address.to_owned(),
+                            |description| description.replication_address.clone(),
+                        ),
                         role: member.role,
-                        described_role: description.role,
+                        described_role: description
+                            .map_or(member.role, |description| description.role),
                     }
                 })
                 .collect(),
@@ -265,6 +278,7 @@ pub(super) fn normalize_bootstrap_configuration(
 
 pub(super) fn validate_incomplete_bootstrap_configuration(
     runtime_identity: &KubericReplicaIdentity,
+    process_session_id: &ProcessSessionId,
     expectation: &SqlServerTopologyExpectation,
     replication_address: &str,
     current: &ReplicaSetConfiguration,
@@ -295,6 +309,7 @@ pub(super) fn validate_incomplete_bootstrap_configuration(
     }
     validate_configuration_shape(
         runtime_identity,
+        process_session_id,
         expectation,
         replication_address,
         &normalized,
@@ -646,6 +661,7 @@ pub(super) fn validate_replication_address(address: &str) -> Result<(), KubericA
 
 fn validate_configuration_shape(
     runtime_identity: &KubericReplicaIdentity,
+    process_session_id: &ProcessSessionId,
     expectation: &SqlServerTopologyExpectation,
     replication_address: &str,
     current: &ReplicaSetConfiguration,
@@ -653,7 +669,7 @@ fn validate_configuration_shape(
     let configuration = &current.configuration;
     if configuration.configuration_id != configuration.expected_id()
         || configuration.members.len() != usize::from(SUPPORTED_REPLICA_COUNT)
-        || current.replicas.len() != usize::from(SUPPORTED_REPLICA_COUNT)
+        || !matches!(current.replicas.len(), 2 | 3)
         || configuration.write_quorum != 2
     {
         return Err(KubericAdapterError::TopologyBindingMismatch(
@@ -721,6 +737,11 @@ fn validate_configuration_shape(
             "runtime identity differs from the local topology association",
         ));
     }
+    if process_session_id.is_empty() {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "runtime process session is empty",
+        ));
+    }
 
     for configuration_member in &configuration.members {
         if configuration_member.identity.instance_id.is_empty()
@@ -735,10 +756,19 @@ fn validate_configuration_shape(
             .iter()
             .filter(|replica| replica.identity == configuration_member.identity)
             .collect::<Vec<_>>();
-        if descriptions.len() != 1 {
+        let is_local = configuration_member.identity == *runtime_identity;
+        if descriptions.len() != usize::from(!is_local || current.replicas.len() == 3) {
             return Err(KubericAdapterError::TopologyBindingMismatch(
                 "current replica identity differs from the descriptor",
             ));
+        }
+        if descriptions.is_empty() {
+            if configuration_member.role != ReplicaRole::Primary {
+                return Err(KubericAdapterError::TopologyBindingMismatch(
+                    "only the local Primary may be omitted from remote-active descriptions",
+                ));
+            }
+            continue;
         }
         if !descriptions[0].replication_address.is_empty()
             && validate_replication_address(&descriptions[0].replication_address).is_err()
@@ -786,6 +816,12 @@ pub fn testing_current_pin_bootstrap_descriptors(
     replication_address: &str,
     current: &ReplicaSetConfiguration,
 ) -> Result<Vec<ReplicaDescriptor>, KubericAdapterError> {
-    CurrentTopologyFacts::translate(runtime_identity, expectation, replication_address, current)?
-        .bootstrap_descriptors(expectation)
+    CurrentTopologyFacts::translate(
+        runtime_identity,
+        &ProcessSessionId::new("testing-local-process-session"),
+        expectation,
+        replication_address,
+        current,
+    )?
+    .bootstrap_descriptors(expectation)
 }
