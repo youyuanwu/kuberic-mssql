@@ -12,13 +12,13 @@ authentication and administrative credentials; the three standalone
 secondaries and perform one build-authorized automatic-seeding dispatch. This
 path is not exposed by the production CLI or runtime configuration.
 
-The optional Kuberic runtime is migrated to the fresh-state Public V1
-replacement contract on the feature branch. It publishes exact SQL Server AG
-`sequence_number` only after an exact native binding; capability publication
-also requires the admitted stable local role. Kuberic epochs and exact decimal
-database positions remain separate domains. The candidate dependency is not an
-accepted production pin until the version-2
-[release intake](docs/kuberic-release-intake.md) reaches `ready_to_pin`.
+The optional Kuberic runtime implements the fresh-state Public V1 replacement
+contract. It publishes exact SQL Server AG `sequence_number` only after an
+exact native binding; capability publication also requires the admitted stable
+local role. Kuberic epochs and exact decimal database positions remain separate
+domains. The root `Cargo.toml` is authoritative for the Kuberic dependency;
+release-intake records evaluate proposed changes but do not define a separate
+documented pin.
 The adapter is not wired into the level-triggered controller and remains
 ineligible for lease, reseed, switchover, failover, and data-loss operations.
 See the [progress integration guide](docs/kuberic-progress.md); the [support
@@ -459,13 +459,9 @@ The fixture pins:
 mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726
 ```
 
-It currently tracks the Kuberic `main` branch. The accepted predecessor
-identity remains the merged
-[Kuberic PR #133](https://github.com/youyuanwu/kuberic/pull/133) commit
-`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f`. On this candidate-evaluation
-branch, `Cargo.lock` instead resolves exact candidate
-`ceec5887ad97d71222117610428ce715b782777e` for reproducible release intake;
-that lockfile identity is not accepted pin adoption.
+The root `Cargo.toml` declares the Kuberic dependency source and version.
+`Cargo.lock` records the resolver output for reproducible builds; documentation
+and release-intake artifacts do not define another dependency pin.
 
 Repository Cargo commands force `ACCEPT_EULA=Y` through `.cargo/config.toml`.
 That repository-wide setting authorizes only the Rust-owned licensed fixtures;

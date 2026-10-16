@@ -496,11 +496,9 @@ Read-only `msdb` history proves the full/log/VERIFY chain, while the local
 marker joined to the current AG GUID proves completion of `GRANT CREATE ANY
 DATABASE`; retries issue only the next missing safe statement.
 
-The feature branch locks exact Public V1 candidate
-`ceec5887ad97d71222117610428ce715b782777e` for evaluation. The accepted
-current identity remains
-`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f` in release-intake evidence until
-the candidate reaches `ready_to_pin`.
+The root `Cargo.toml` is authoritative for the Kuberic dependency source and
+version. `Cargo.lock` records reproducible resolution; this design does not
+define a separate commit pin.
 
 ## Delivery Sequence
 
@@ -521,13 +519,11 @@ the candidate reaches `ready_to_pin`.
    configuration shape, immutable capabilities, exact build/session/storage
    identity, and fresh protocol state. The released replication transport is
    not described as authenticated.
-5. **Public-contract adapter migration after Kuberic Phase 4/5** — implemented
-   on the candidate feature branch: Public V1 host/callback translation,
-   activation-bound application/seed/SQL ownership, observe-only ordinary
-   construction, and version-2 release intake. The candidate record computes
-   `ready_to_pin` as a contract candidate, while actual merge readiness requires
-   the required exact PR-head `Shared CI validation` GitHub Actions check to
-   pass; accepted pin adoption remains a separate repository decision.
+5. **Public-contract adapter migration after Kuberic Phase 4/5** — implemented:
+   Public V1 host/callback translation, activation-bound
+   application/seed/SQL ownership, observe-only ordinary construction, and
+   version-2 release intake. Dependency changes are declared in `Cargo.toml`
+   and must pass the required `Shared CI validation` GitHub Actions check.
 6. **SQL-native fencing, reseed, switchover, and failover** — establish
    verified target and old-primary fencing before destructive reseed or role
    movement, then add external lease handling, sequence arbitration,
@@ -599,10 +595,10 @@ switchover, failover, replica replacement, Kubernetes lifecycle, and client
 routing remain unimplemented.
 
 The `cancel_before_remove` intake gate combines upstream and local evidence:
-Kuberic exact-head CI run `38844709880` and catalog gate KSF-06 prove
-host-owned cancellation/drain ordering, while the MSSQL readiness test proves
-that remove rejection is effect-free after a callback task has settled. The
-local test is not represented as host-owned ordering.
+Kuberic release conformance catalog gate KSF-06 proves host-owned
+cancellation/drain ordering, while the MSSQL readiness test proves that remove
+rejection is effect-free after a callback task has settled. The local test is
+not represented as host-owned ordering.
 
 ## References
 

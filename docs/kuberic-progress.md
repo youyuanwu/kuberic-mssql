@@ -15,9 +15,9 @@ one build-authorized automatic-seeding dispatch. Neither construction can
 remove/reseed replicas, grant write access, renew a lease, switch over, fail
 over, or handle data loss.
 
-This document records the candidate implementation boundary. The exact
-candidate lockfile remains feature-branch evaluation until release intake is
-`ready_to_pin`; no new production mutation support is announced.
+This document records the implemented Public V1 boundary. The root
+`Cargo.toml` is authoritative for the Kuberic dependency; no new production
+mutation support is announced.
 
 ## Two Progress Domains
 
@@ -369,22 +369,17 @@ target SQL process restarts and test-injected lineage mismatches at
 pre-association, in-flight-seeding and post-native/pre-reply windows. Every
 scenario performs exact cleanup.
 
-The feature branch evaluates exact Public V1 candidate
-`ceec5887ad97d71222117610428ce715b782777e`. Release-intake records retain
-`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f` as the accepted current identity
-while comparing the reviewed candidate. The candidate record computes
-`ready_to_pin` as a contract candidate. Actual merge readiness requires the
-required exact PR-head GitHub Actions check `Shared CI validation` to pass.
-That job runs `just ci`, including licensed one-replica, three-replica, and
-same-root restart validation, and always runs `just cleanup`. Its GitHub
-Actions job log is the run evidence; no test logs or evidence artifacts are
-committed.
+The required GitHub Actions check `Shared CI validation` runs `just ci`,
+including licensed one-replica, three-replica, and same-root restart
+validation, and always runs `just cleanup`. Its GitHub Actions job log is the
+run evidence; no test logs or evidence artifacts are committed. The dependency
+source and version remain defined only by the root `Cargo.toml`.
 
 The required `cancel_before_remove` gate has two separate evidence sources.
-Kuberic candidate exact-head CI run `38844709880` and its KSF-06 catalog prove
-host-owned cancellation/drain ordering. The MSSQL readiness test separately
-proves effect-free remove rejection after a callback task has settled; it does
-not itself claim host ownership.
+Kuberic's release conformance catalog gate KSF-06 proves host-owned
+cancellation/drain ordering. The MSSQL readiness test separately proves
+effect-free remove rejection after a callback task has settled; it does not
+itself claim host ownership.
 
 ## Usage
 
