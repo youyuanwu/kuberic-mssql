@@ -899,26 +899,15 @@ async fn reports(
         }
         if reports.iter().enumerate().all(|(index, report)| {
             report.public_v1.as_ref().is_some_and(|public| {
-                let expected_role = if !require_current_session_lifecycle || index == 0 {
-                    // Initial-primary access remains denied, so the runtime
-                    // revokes the primary role after recording the lifecycle.
-                    // A restarted host also begins with no admitted role.
-                    wire::ReplicaRole::None
-                } else {
-                    wire::ReplicaRole::ActiveSecondary
-                };
-                let expected_read = if !require_current_session_lifecycle || index == 0 {
-                    wire::AccessStatus::NotPrimary
-                } else {
-                    wire::AccessStatus::Granted
-                };
                 public
                     .identity
                     .as_ref()
                     .is_some_and(|identity| identity.replica_id == index as i64 + 1)
-                    && public.role == expected_role as i32
-                    && public.read_status == expected_read as i32
+                    && public.role == wire::ReplicaRole::None as i32
+                    && public.read_status == wire::AccessStatus::NotPrimary as i32
                     && public.write_status == wire::AccessStatus::NotPrimary as i32
+                    && (!require_current_session_lifecycle
+                        || (public.first_progress == 0 && public.last_progress == 42))
                     && (!require_current_session_lifecycle || lifecycle_completed(public, index))
             })
         }) {

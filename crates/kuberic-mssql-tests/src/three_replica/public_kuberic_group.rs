@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
@@ -20,7 +20,7 @@ use kuberic_mssql::runtime_config::ObserverConfig;
 use kuberic_mssql::runtime_error::RuntimeError;
 use kuberic_mssql::runtime_host::{
     RuntimeEndpointResolver, RuntimeHostApplication, RuntimeHostArgs, RuntimeHostConfig,
-    SeedDispatchRecord,
+    SeedDispatchPhase, SeedDispatchRecord,
 };
 use kuberic_mssql::tds::{
     SeedSubmissionAction, SeedSubmissionCheckpoint, SeedSubmissionProbe, TdsExecutor,
@@ -135,17 +135,103 @@ struct PublicTargetHostEvidenceExchange {
     identities: [ReplicaIdentity; 3],
     frozen_sql_starts: [SqlServerStartIncarnation; 3],
     sources: Arc<Mutex<Vec<Option<Source>>>>,
-    authorities: Arc<Mutex<Vec<BTreeMap<String, PublicTargetEvidenceAuthority>>>>,
-    retired_builds: Arc<Mutex<BTreeSet<String>>>,
+    authority: Arc<Mutex<PublicTargetEvidenceAuthorityState>>,
     injection: Arc<Mutex<Option<PublicTargetEvidenceInjection>>>,
     gate: Arc<Mutex<Option<SeedGate>>>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PublicTargetEvidenceAuthority {
     build_id: String,
     identity: ReplicaIdentity,
     process_session_id: ProcessSessionId,
+}
+
+struct PublicTargetEvidenceAuthorityState {
+    current: Vec<Option<PublicTargetEvidenceAuthority>>,
+    retained_dispatch: Option<PublicTargetEvidenceAuthority>,
+    retired_builds: BTreeSet<String>,
+}
+
+impl PublicTargetEvidenceAuthorityState {
+    fn new(target_count: usize) -> Self {
+        Self {
+            current: vec![None; target_count],
+            retained_dispatch: None,
+            retired_builds: BTreeSet::new(),
+        }
+    }
+
+    fn authorize(
+        &mut self,
+        index: usize,
+        authority: PublicTargetEvidenceAuthority,
+    ) -> Result<(), MssqlGroupError> {
+        let current = self
+            .current
+            .get_mut(index)
+            .ok_or_else(|| MssqlGroupError::new("target evidence authority index is invalid"))?;
+        if current.as_ref() == Some(&authority) {
+            return Ok(());
+        }
+        if self.retired_builds.contains(&authority.build_id)
+            || current
+                .as_ref()
+                .is_some_and(|active| active.build_id == authority.build_id)
+        {
+            return Err(MssqlGroupError::new(
+                "target build authority has been retired, superseded, or rebound",
+            ));
+        }
+        if let Some(previous) = current.replace(authority) {
+            self.retired_builds.insert(previous.build_id);
+        }
+        Ok(())
+    }
+
+    fn revoke(&mut self, index: usize, build_id: &str) -> Result<(), MssqlGroupError> {
+        let current = self
+            .current
+            .get_mut(index)
+            .ok_or_else(|| MssqlGroupError::new("target evidence authority index is invalid"))?;
+        if current
+            .as_ref()
+            .is_some_and(|authority| authority.build_id == build_id)
+        {
+            *current = None;
+        }
+        self.retired_builds.insert(build_id.to_owned());
+        Ok(())
+    }
+
+    fn retain_dispatch(&mut self, authority: PublicTargetEvidenceAuthority) {
+        self.retained_dispatch = Some(authority);
+    }
+
+    fn exact(&self, index: usize, authority: &PublicTargetEvidenceAuthority) -> bool {
+        self.current.get(index).and_then(Option::as_ref) == Some(authority)
+            || self.retained_dispatch.as_ref() == Some(authority)
+    }
+
+    fn exact_request(
+        &self,
+        index: usize,
+        build_id: &str,
+        identity: &ReplicaIdentity,
+        process_session_id: &ProcessSessionId,
+    ) -> Option<PublicTargetEvidenceAuthority> {
+        self.current
+            .get(index)
+            .and_then(Option::as_ref)
+            .into_iter()
+            .chain(self.retained_dispatch.as_ref())
+            .find(|authority| {
+                authority.build_id == build_id
+                    && authority.identity == *identity
+                    && authority.process_session_id == *process_session_id
+            })
+            .cloned()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,12 +259,7 @@ impl PublicTargetHostEvidenceExchange {
             identities,
             frozen_sql_starts,
             sources: Arc::new(Mutex::new(vec![None, None, None])),
-            authorities: Arc::new(Mutex::new(vec![
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-            ])),
-            retired_builds: Arc::new(Mutex::new(BTreeSet::new())),
+            authority: Arc::new(Mutex::new(PublicTargetEvidenceAuthorityState::new(3))),
             injection: Arc::new(Mutex::new(None)),
             gate: Arc::new(Mutex::new(None)),
         })
@@ -255,29 +336,67 @@ impl PublicTargetHostEvidenceExchange {
             .iter()
             .position(|identity| identity == &command.target)
             .ok_or_else(|| MssqlGroupError::new("target evidence identity is unknown"))?;
-        let mut authorities = self
-            .authorities
+        self.authority
             .lock()
-            .map_err(|_| MssqlGroupError::new("target evidence authority lock is poisoned"))?;
-        let mut retired = self
-            .retired_builds
+            .map_err(|_| MssqlGroupError::new("target evidence authority lock is poisoned"))?
+            .authorize(
+                index,
+                PublicTargetEvidenceAuthority {
+                    build_id: command.build_id.to_string(),
+                    identity: command.target.clone(),
+                    process_session_id,
+                },
+            )
+    }
+
+    fn retain_dispatched(&self, record: &SeedDispatchRecord) -> Result<(), MssqlGroupError> {
+        let Some(authority) = dispatched_authority(record, &self.identities)? else {
+            return Ok(());
+        };
+        self.authority
             .lock()
-            .map_err(|_| MssqlGroupError::new("retired build lock is poisoned"))?;
-        if retired.contains(command.build_id.as_str()) {
-            return Err(MssqlGroupError::new(
-                "target build authority has been retired or superseded",
-            ));
-        }
-        retired.extend(authorities[index].keys().cloned());
-        authorities[index].insert(
-            command.build_id.to_string(),
-            PublicTargetEvidenceAuthority {
-                build_id: command.build_id.to_string(),
-                identity: command.target.clone(),
-                process_session_id,
-            },
-        );
+            .map_err(|_| MssqlGroupError::new("target evidence authority lock is poisoned"))?
+            .retain_dispatch(authority);
         Ok(())
+    }
+
+    fn exact_authority(
+        &self,
+        index: usize,
+        build_id: &str,
+        identity: &ReplicaIdentity,
+        process_session_id: &ProcessSessionId,
+    ) -> Result<PublicTargetEvidenceAuthority, KubericAdapterError> {
+        self.authority
+            .lock()
+            .map_err(|_| {
+                KubericAdapterError::NativeConvergenceUnsafe("target-host test authority")
+            })?
+            .exact_request(index, build_id, identity, process_session_id)
+            .ok_or(KubericAdapterError::NativeConvergenceUnsafe(
+                "target-host test authority",
+            ))
+    }
+
+    fn revalidate_authority(
+        &self,
+        index: usize,
+        authority: &PublicTargetEvidenceAuthority,
+    ) -> Result<(), KubericAdapterError> {
+        if self
+            .authority
+            .lock()
+            .map_err(|_| {
+                KubericAdapterError::NativeConvergenceUnsafe("target-host test authority")
+            })?
+            .exact(index, authority)
+        {
+            Ok(())
+        } else {
+            Err(KubericAdapterError::NativeConvergenceUnsafe(
+                "target-host test authority",
+            ))
+        }
     }
 
     fn revoke(&self, command: &PublicBuildCommand) -> Result<(), MssqlGroupError> {
@@ -288,17 +407,42 @@ impl PublicTargetHostEvidenceExchange {
         else {
             return Ok(());
         };
-        let mut authorities = self
-            .authorities
+        self.authority
             .lock()
-            .map_err(|_| MssqlGroupError::new("target evidence authority lock is poisoned"))?;
-        authorities[index].remove(command.build_id.as_str());
-        self.retired_builds
-            .lock()
-            .map_err(|_| MssqlGroupError::new("retired build lock is poisoned"))?
-            .insert(command.build_id.to_string());
-        Ok(())
+            .map_err(|_| MssqlGroupError::new("target evidence authority lock is poisoned"))?
+            .revoke(index, command.build_id.as_str())
     }
+}
+
+fn dispatched_authority(
+    record: &SeedDispatchRecord,
+    identities: &[ReplicaIdentity; 3],
+) -> Result<Option<PublicTargetEvidenceAuthority>, MssqlGroupError> {
+    if !matches!(
+        record.phase(),
+        SeedDispatchPhase::Submitting | SeedDispatchPhase::Accepted | SeedDispatchPhase::Ambiguous
+    ) {
+        return Ok(None);
+    }
+    let target = record
+        .targets()
+        .iter()
+        .find(|target| target.replica_id() == record.winning_target_replica_id())
+        .ok_or_else(|| MssqlGroupError::new("retained seed winner target is unavailable"))?;
+    let identity = identities
+        .iter()
+        .find(|identity| {
+            identity.replica_id.to_string() == target.replica_id()
+                && identity.instance_id.as_str() == target.instance_id()
+                && identity.agent_generation.as_str() == target.agent_generation()
+        })
+        .cloned()
+        .ok_or_else(|| MssqlGroupError::new("retained seed winner identity is unavailable"))?;
+    Ok(Some(PublicTargetEvidenceAuthority {
+        build_id: record.winning_build_id().to_owned(),
+        identity,
+        process_session_id: ProcessSessionId::new(target.process_session_id().to_owned()),
+    }))
 }
 
 #[async_trait]
@@ -321,40 +465,12 @@ impl TargetHostEvidenceExchange for PublicTargetHostEvidenceExchange {
             .ok_or(KubericAdapterError::NativeConvergenceConflict(
                 "target-host test authority",
             ))?;
-        let authority = {
-            let authorities = self.authorities.lock().map_err(|_| {
-                KubericAdapterError::NativeConvergenceUnsafe("target-host test authority")
-            })?;
-            let authority = authorities
-                .get(index)
-                .and_then(|authorities| authorities.get(request.build_id()))
-                .cloned();
-            let Some(authority) = authority else {
-                eprintln!(
-                    "missing target authority: index={index}, build={}, active={:?}, retired={:?}",
-                    request.build_id(),
-                    authorities
-                        .get(index)
-                        .map(|active| active.keys().cloned().collect::<Vec<_>>()),
-                    self.retired_builds
-                        .lock()
-                        .map(|retired| retired.iter().cloned().collect::<Vec<_>>())
-                        .unwrap_or_default(),
-                );
-                return Err(KubericAdapterError::NativeConvergenceUnsafe(
-                    "target-host test authority",
-                ));
-            };
-            authority
-        };
-        if authority.identity != *request.target_identity()
-            || authority.build_id != request.build_id()
-            || authority.process_session_id != *request.target_process_session_id()
-        {
-            return Err(KubericAdapterError::NativeConvergenceConflict(
-                "target-host test authority",
-            ));
-        }
+        let authority = self.exact_authority(
+            index,
+            request.build_id(),
+            request.target_identity(),
+            request.target_process_session_id(),
+        )?;
         let source = self
             .sources
             .lock()
@@ -376,6 +492,7 @@ impl TargetHostEvidenceExchange for PublicTargetHostEvidenceExchange {
             gate.release.await.map_err(|_| {
                 KubericAdapterError::NativeConvergenceUnsafe("target-host evidence gate")
             })?;
+            self.revalidate_authority(index, &authority)?;
         }
         let mut snapshot = match source
             .observe()
@@ -446,6 +563,7 @@ impl TargetHostEvidenceExchange for PublicTargetHostEvidenceExchange {
                 value.recovery_fork_id = alternate;
             }
         }
+        self.revalidate_authority(index, &authority)?;
         Ok(TargetHostEvidenceReport::new(
             request.clone(),
             self.frozen_sql_starts[index].clone(),
@@ -1885,6 +2003,14 @@ impl PublicMssqlGroup {
         &self,
         command: &PublicBuildCommand,
     ) -> Result<(), tonic::Status> {
+        if let Some(record) = self
+            .testing_seed_dispatch_record()
+            .map_err(|error| tonic::Status::internal(error.to_string()))?
+        {
+            self.target_evidence
+                .retain_dispatched(&record)
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+        }
         if command.retire {
             return self
                 .target_evidence
@@ -2085,6 +2211,8 @@ fn retryable_public_build_error(error: &tonic::Status) -> bool {
             && error
                 .message()
                 .contains("genuinely ambiguous SQL submission outcome"))
+        || (error.code() == tonic::Code::Internal
+            && error.message().contains("seed dispatch state is missing"))
 }
 
 async fn admit_bootstrap_replicators(
@@ -3436,7 +3564,178 @@ fn display_error(error: impl std::fmt::Display) -> MssqlGroupError {
 
 #[cfg(test)]
 mod tests {
+    use kuberic_mssql::runtime_host::SeedDispatchTarget;
+    use kuberic_runtime::protocol::types::AgentGeneration;
+
     use super::*;
+
+    fn testing_identities() -> [ReplicaIdentity; 3] {
+        std::array::from_fn(|index| ReplicaIdentity {
+            replica_id: ReplicaId::new(index as i64 + 1),
+            instance_id: ReplicaInstanceId::new(format!("pod-{}", index + 1)),
+            agent_generation: AgentGeneration::new(format!("generation-{}", index + 1)),
+        })
+    }
+
+    fn testing_authority(
+        identity: &ReplicaIdentity,
+        build_id: &str,
+        session: &str,
+    ) -> PublicTargetEvidenceAuthority {
+        PublicTargetEvidenceAuthority {
+            build_id: build_id.to_owned(),
+            identity: identity.clone(),
+            process_session_id: ProcessSessionId::new(session),
+        }
+    }
+
+    fn dispatched_record(
+        identities: &[ReplicaIdentity; 3],
+        winning_target: usize,
+        build_id: &str,
+        sessions: [&str; 3],
+    ) -> SeedDispatchRecord {
+        let member = |index: usize| {
+            SeedDispatchTarget::new(
+                identities[index].replica_id.to_string(),
+                identities[index].instance_id.to_string(),
+                identities[index].agent_generation.to_string(),
+                sessions[index],
+                format!("00000000-0000-4000-8000-00000000000{}", index + 1),
+            )
+            .unwrap()
+        };
+        let mut record = SeedDispatchRecord::new(
+            "resource",
+            identities[0].clone(),
+            "configuration",
+            "availability-group",
+            "00000000-0000-4000-8000-000000000010",
+            "database",
+            "00000000-0000-4000-8000-000000000011",
+            "00000000-0000-4000-8000-000000000012",
+            "00000000-0000-4000-8000-000000000013",
+            member(0),
+            [member(1), member(2)],
+            identities[winning_target].replica_id.to_string(),
+            build_id,
+            ReplicaStorageIncarnationContext {
+                replica: identities[winning_target].clone(),
+                storage: ReplicaStorageIdentity::Volatile {
+                    identity: format!("storage-{winning_target}"),
+                },
+                storage_generation: StorageGeneration::new(format!(
+                    "storage-generation-{winning_target}"
+                )),
+            },
+            "2026-10-16T09:49:30Z",
+        )
+        .unwrap();
+        record.mark_submitting().unwrap();
+        record
+    }
+
+    #[test]
+    fn identical_current_target_authorization_is_idempotent() {
+        let identities = testing_identities();
+        let authority = testing_authority(&identities[1], "build-a", "session-a");
+        let mut state = PublicTargetEvidenceAuthorityState::new(3);
+
+        state.authorize(1, authority.clone()).unwrap();
+        state.authorize(1, authority.clone()).unwrap();
+
+        assert_eq!(state.current[1].as_ref(), Some(&authority));
+        assert!(state.retired_builds.is_empty());
+        assert_eq!(
+            state.exact_request(
+                1,
+                "build-a",
+                &identities[1],
+                &ProcessSessionId::new("session-a"),
+            ),
+            Some(authority)
+        );
+        assert!(
+            state
+                .exact_request(
+                    1,
+                    "build-a",
+                    &identities[1],
+                    &ProcessSessionId::new("different-session"),
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn target_authority_supersession_retires_the_previous_exact_build() {
+        let identities = testing_identities();
+        let authority_a = testing_authority(&identities[1], "build-a", "session-a");
+        let authority_b = testing_authority(&identities[1], "build-b", "session-a");
+        let mut state = PublicTargetEvidenceAuthorityState::new(3);
+
+        state.authorize(1, authority_a.clone()).unwrap();
+        state.authorize(1, authority_b.clone()).unwrap();
+
+        assert_eq!(state.current[1].as_ref(), Some(&authority_b));
+        assert!(!state.exact(1, &authority_a));
+        assert!(state.retired_builds.contains("build-a"));
+        assert!(state.authorize(1, authority_a).is_err());
+    }
+
+    #[tokio::test]
+    async fn revoke_while_collection_is_blocked_invalidates_revalidation() {
+        let identities = testing_identities();
+        let authority = testing_authority(&identities[1], "build-a", "session-a");
+        let state = Arc::new(Mutex::new(PublicTargetEvidenceAuthorityState::new(3)));
+        state
+            .lock()
+            .unwrap()
+            .authorize(1, authority.clone())
+            .unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let blocked_state = state.clone();
+        let blocked_authority = authority.clone();
+        let collection = tokio::spawn(async move {
+            assert!(blocked_state.lock().unwrap().exact(1, &blocked_authority));
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            blocked_state.lock().unwrap().exact(1, &blocked_authority)
+        });
+
+        entered_rx.await.unwrap();
+        state.lock().unwrap().revoke(1, "build-a").unwrap();
+        release_tx.send(()).unwrap();
+
+        assert!(!collection.await.unwrap());
+        assert!(state.lock().unwrap().retired_builds.contains("build-a"));
+    }
+
+    #[test]
+    fn dispatched_winner_retention_comes_from_the_seed_dispatch_record() {
+        let identities = testing_identities();
+        let winner = testing_authority(&identities[1], "build-a", "session-a");
+        let replacement = testing_authority(&identities[1], "build-b", "session-a");
+        let record = dispatched_record(
+            &identities,
+            1,
+            "build-a",
+            ["session-source", "session-a", "session-peer"],
+        );
+        let retained = dispatched_authority(&record, &identities)
+            .unwrap()
+            .expect("submitting dispatch must retain exact winning authority");
+        let mut state = PublicTargetEvidenceAuthorityState::new(3);
+        state.authorize(1, winner.clone()).unwrap();
+        state.retain_dispatch(retained);
+
+        state.authorize(1, replacement.clone()).unwrap();
+
+        assert_eq!(state.current[1].as_ref(), Some(&replacement));
+        assert!(state.exact(1, &winner));
+        assert!(state.retired_builds.contains("build-a"));
+    }
 
     #[tokio::test]
     async fn stalled_public_control_connection_is_deadline_bounded() {

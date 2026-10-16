@@ -196,6 +196,22 @@ impl SeedDispatchRecord {
         &self.operation_token
     }
 
+    pub(super) fn matches_application_binding(
+        &self,
+        resource_uid: &str,
+        replica_id: i64,
+        instance_id: &str,
+        agent_generation: &str,
+    ) -> bool {
+        self.resource_uid == resource_uid
+            && self.activation_identity.replica_id.value() == replica_id
+            && self.activation_identity.instance_id.as_str() == instance_id
+            && self.activation_identity.agent_generation.as_str() == agent_generation
+            && self.source.replica_id == replica_id.to_string()
+            && self.source.instance_id == instance_id
+            && self.source.agent_generation == agent_generation
+    }
+
     pub fn mark_submitting(&mut self) -> Result<(), SeedStateError> {
         if !matches!(
             self.phase,
@@ -720,7 +736,10 @@ fn read_record(root: &BoundRoot) -> Result<Option<(SeedDispatchRecord, bool)>, S
     decode_record(&bytes).map(Some)
 }
 
-pub(super) fn validate_seed_entry(root: &BoundRoot, name: &str) -> Result<(), SeedStateError> {
+pub(super) fn validate_seed_entry(
+    root: &BoundRoot,
+    name: &str,
+) -> Result<Option<SeedDispatchRecord>, SeedStateError> {
     let max = match name {
         SEED_STATE_FILE => MAX_SEED_STATE_BYTES,
         SEED_OWNER_FILE => 0,
@@ -740,8 +759,9 @@ pub(super) fn validate_seed_entry(root: &BoundRoot, name: &str) -> Result<(), Se
         }
         let (record, _) = decode_record(&bytes)?;
         record.validate()?;
+        return Ok(Some(record));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn verify_private_file(file: &File, max_bytes: u64) -> Result<(), SeedStateError> {

@@ -499,7 +499,7 @@ pub(super) fn topology_enriches(
     if previous.local_identity != current.local_identity
         || previous.configuration != current.configuration
         || (previous.database_lineage.is_some()
-            && previous.native_configuration_sequence != current.native_configuration_sequence)
+            && current.native_configuration_sequence < previous.native_configuration_sequence)
         || previous.availability_group != current.availability_group
         || previous
             .database_lineage

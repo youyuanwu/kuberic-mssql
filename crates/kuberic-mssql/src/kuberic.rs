@@ -514,6 +514,30 @@ pub struct HealthyTopologyBinding {
     members: Vec<HealthyTopologyMemberBinding>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeTopologyMemberBinding {
+    native_replica_id: Guid,
+    sql_endpoint: SqlServerMemberEndpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeTopologyBinding {
+    availability_group: AvailabilityGroupIdentity,
+    database_lineage: Option<DatabaseLineage>,
+    bootstrap_database_name: Option<SqlIdentifier>,
+    bootstrap_database: Option<StandaloneDatabaseIdentity>,
+    local_sql_replica_identity: SqlReplicaIdentity,
+    local_sql_server_start_incarnation: SqlServerStartIncarnation,
+    local_stable_role: ReplicaRole,
+    members: Vec<NativeTopologyMemberBinding>,
+}
+
+#[derive(Debug, Clone)]
+struct NativeProgressBinding {
+    topology: NativeTopologyBinding,
+    latest_sequence: ConfigurationSequence,
+}
+
 impl HealthyTopologyBinding {
     pub fn local_identity(&self) -> &KubericReplicaIdentity {
         &self.local_identity
@@ -585,6 +609,26 @@ impl HealthyTopologyBinding {
             .iter()
             .find(|member| member.kuberic_identity == self.local_identity)
             .expect("binding constructor requires one local member")
+    }
+
+    fn native_topology(&self) -> NativeTopologyBinding {
+        NativeTopologyBinding {
+            availability_group: self.availability_group.clone(),
+            database_lineage: self.database_lineage.clone(),
+            bootstrap_database_name: self.bootstrap_database_name.clone(),
+            bootstrap_database: self.bootstrap_database.clone(),
+            local_sql_replica_identity: self.local_sql_replica_identity.clone(),
+            local_sql_server_start_incarnation: self.local_sql_server_start_incarnation.clone(),
+            local_stable_role: self.local_member().stable_role,
+            members: self
+                .members
+                .iter()
+                .map(|member| NativeTopologyMemberBinding {
+                    native_replica_id: member.native_replica_id.clone(),
+                    sql_endpoint: member.sql_endpoint.clone(),
+                })
+                .collect(),
+        }
     }
 }
 
@@ -926,12 +970,15 @@ pub struct SqlServerReplicator {
     admitted_topology: Mutex<Option<Arc<HealthyTopologyBinding>>>,
     admitted_configuration: Mutex<Option<ReplicaSetConfiguration>>,
     admitted_bootstrap_database: Mutex<Option<StandaloneDatabaseIdentity>>,
+    native_progress: Mutex<Option<NativeProgressBinding>>,
     lifecycle: RwLock<ReplicatorLifecycle>,
     lifecycle_cancel: CancellationToken,
     role: Mutex<Option<ReplicaRole>>,
     epoch: Mutex<Option<Epoch>>,
     #[cfg(feature = "kuberic-testing")]
     observation_injection: Mutex<Option<TestingObservationInjection>>,
+    #[cfg(feature = "kuberic-testing")]
+    lifecycle_publication_gate: Mutex<Option<TestingLifecyclePublicationGate>>,
 }
 
 #[cfg(feature = "kuberic-testing")]
@@ -952,6 +999,12 @@ struct TestingObservationInjection {
     snapshot: Option<InstanceSnapshot>,
     entered: tokio::sync::oneshot::Sender<()>,
     release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(feature = "kuberic-testing")]
+struct TestingLifecyclePublicationGate {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 #[derive(Clone)]
@@ -1455,6 +1508,23 @@ impl SqlServerReplicator {
         Ok(())
     }
 
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_gate_lifecycle_publication(
+        &self,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> Result<(), KubericAdapterError> {
+        let mut gate = self.lifecycle_publication_gate.lock().map_err(|_| {
+            KubericAdapterError::NativeConvergenceUnsafe("test lifecycle publication seam")
+        })?;
+        if gate.is_some() {
+            return Err(KubericAdapterError::SeedState(SeedStateError::AlreadyOwned));
+        }
+        *gate = Some(TestingLifecyclePublicationGate { entered, release });
+        Ok(())
+    }
+
     pub fn new(
         replication_address: String,
         source: Arc<dyn SqlServerObservationSource>,
@@ -1563,6 +1633,7 @@ impl SqlServerReplicator {
             admitted_topology: Mutex::new(None),
             admitted_configuration: Mutex::new(None),
             admitted_bootstrap_database: Mutex::new(None),
+            native_progress: Mutex::new(None),
             lifecycle: RwLock::new(ReplicatorLifecycle {
                 state: CREATED,
                 generation: 0,
@@ -1572,6 +1643,8 @@ impl SqlServerReplicator {
             epoch: Mutex::new(None),
             #[cfg(feature = "kuberic-testing")]
             observation_injection: Mutex::new(None),
+            #[cfg(feature = "kuberic-testing")]
+            lifecycle_publication_gate: Mutex::new(None),
         }
     }
 
@@ -1580,6 +1653,68 @@ impl SqlServerReplicator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    fn native_progress_binding(&self) -> Option<NativeProgressBinding> {
+        self.native_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn publish_native_progress(
+        &self,
+        topology: NativeTopologyBinding,
+        sequence: ConfigurationSequence,
+    ) -> Result<(), KubericAdapterError> {
+        let mut accepted = self
+            .native_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = accepted.as_ref() {
+            if previous.topology != topology {
+                return Err(KubericAdapterError::TopologyBindingMismatch(
+                    "native topology differs from the bound association",
+                ));
+            }
+            if sequence < previous.latest_sequence {
+                return Err(KubericAdapterError::TopologyBindingMismatch(
+                    "configuration sequence regressed",
+                ));
+            }
+        }
+        *accepted = Some(NativeProgressBinding {
+            topology,
+            latest_sequence: sequence,
+        });
+        Ok(())
+    }
+
+    fn validate_native_progress(
+        &self,
+        topology: &NativeTopologyBinding,
+        sequence: ConfigurationSequence,
+    ) -> Result<(), KubericAdapterError> {
+        if let Some(previous) = self.native_progress_binding() {
+            if previous.topology != *topology {
+                return Err(KubericAdapterError::TopologyBindingMismatch(
+                    "native topology differs from the bound association",
+                ));
+            }
+            if sequence < previous.latest_sequence {
+                return Err(KubericAdapterError::TopologyBindingMismatch(
+                    "configuration sequence regressed",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn published_role(&self) -> Option<ReplicaRole> {
+        *self
+            .role
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn bind_process_session(
@@ -1682,6 +1817,26 @@ impl SqlServerReplicator {
             return Err(KubericAdapterError::Closed);
         }
         Ok(lifecycle)
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    fn wait_for_testing_lifecycle_publication(&self) -> Result<(), KubericAdapterError> {
+        let gate = self
+            .lifecycle_publication_gate
+            .lock()
+            .map_err(|_| {
+                KubericAdapterError::NativeConvergenceUnsafe("test lifecycle publication seam")
+            })?
+            .take();
+        if let Some(gate) = gate {
+            gate.entered.send(()).map_err(|_| {
+                KubericAdapterError::NativeConvergenceUnsafe("test lifecycle publication seam")
+            })?;
+            gate.release.recv().map_err(|_| {
+                KubericAdapterError::NativeConvergenceUnsafe("test lifecycle publication seam")
+            })?;
+        }
+        Ok(())
     }
 
     async fn seed_store_work<T, F>(
@@ -1942,12 +2097,19 @@ impl SqlServerReplicator {
         .await
     }
 
-    async fn observed_group(
+    async fn observe_group_snapshot(
         &self,
         generation: u64,
         require_progress_role: bool,
-        requested_role: Option<ReplicaRole>,
-    ) -> Result<(AvailabilityGroupSnapshot, u64), KubericAdapterError> {
+        allow_absent: bool,
+    ) -> Result<
+        Option<(
+            crate::observation::InstanceMetadata,
+            AvailabilityGroupSnapshot,
+            u64,
+        )>,
+        KubericAdapterError,
+    > {
         #[cfg(feature = "kuberic-testing")]
         let injected = self.take_testing_incarnation_observation().await?;
         #[cfg(feature = "kuberic-testing")]
@@ -1997,9 +2159,8 @@ impl SqlServerReplicator {
                     "availability-group and instance timestamps differ",
                 ));
             }
-            Observation::Absent { .. } => {
-                return Err(KubericAdapterError::AvailabilityGroupAbsent);
-            }
+            Observation::Absent { .. } if allow_absent => return Ok(None),
+            Observation::Absent { .. } => return Err(KubericAdapterError::AvailabilityGroupAbsent),
             Observation::Failed(failure) => {
                 return Err(KubericAdapterError::ObservationUnavailable(failure.kind));
             }
@@ -2010,38 +2171,101 @@ impl SqlServerReplicator {
             &group,
             require_progress_role,
         )?;
+        Ok(Some((snapshot.instance, group, observed_at)))
+    }
+
+    async fn observed_group(
+        &self,
+        generation: u64,
+        require_progress_role: bool,
+        requested_role: Option<ReplicaRole>,
+    ) -> Result<(AvailabilityGroupSnapshot, u64), KubericAdapterError> {
+        let (instance, group, observed_at) = self
+            .observe_group_snapshot(generation, require_progress_role, false)
+            .await?
+            .expect("absence is rejected");
         let admitted = self.admitted_topology();
         if let Some(binding) = &admitted {
             validate_bound_evidence(
                 binding,
                 self.source.observer_config(),
-                &snapshot.instance,
+                &instance,
                 &group,
                 requested_role,
             )?;
-            if require_progress_role {
-                if let Some(role) = *self
-                    .role
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                {
-                    if !published_role_matches(binding, role) {
-                        return Err(KubericAdapterError::TopologyBindingMismatch(
-                            "published local role differs from the frozen stable role",
-                        ));
-                    }
-                }
+            self.validate_native_progress(
+                &binding.native_topology(),
+                group.configuration_sequence,
+            )?;
+            if require_progress_role
+                && self
+                    .published_role()
+                    .is_some_and(|role| !published_role_matches(binding, role))
+            {
+                return Err(KubericAdapterError::TopologyBindingMismatch(
+                    "published local role differs from the frozen stable role",
+                ));
+            }
+        } else if let Some(binding) = self.native_progress_binding() {
+            validate_native_bound_evidence(
+                &binding.topology,
+                self.source.observer_config(),
+                &instance,
+                &group,
+                requested_role,
+            )?;
+            self.validate_native_progress(&binding.topology, group.configuration_sequence)?;
+            if require_progress_role
+                && self
+                    .published_role()
+                    .is_none_or(|role| role != binding.topology.local_stable_role)
+            {
+                return Err(KubericAdapterError::TopologyBindingMismatch(
+                    "published local role differs from the bound stable role",
+                ));
             }
         } else if require_progress_role {
-            if let Some(role) = *self
-                .role
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-            {
+            if let Some(role) = self.published_role() {
                 validate_native_role(role, group.local_replica.role.clone())?;
             }
         }
         Ok((group, observed_at))
+    }
+
+    async fn observe_secondary_association(
+        &self,
+        generation: u64,
+    ) -> Result<Option<(NativeTopologyBinding, ConfigurationSequence, u64)>, KubericAdapterError>
+    {
+        let expectation = self
+            .expectation
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
+        let runtime_identity = self
+            .runtime_identity
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
+        let Some((instance, group, observed_at)) =
+            self.observe_group_snapshot(generation, true, true).await?
+        else {
+            return Ok(None);
+        };
+        let binding = associate_native_topology(
+            runtime_identity,
+            expectation,
+            &instance,
+            &group,
+            ReplicaRole::ActiveSecondary,
+        )?;
+        validate_native_bound_evidence(
+            &binding,
+            self.source.observer_config(),
+            &instance,
+            &group,
+            Some(ReplicaRole::ActiveSecondary),
+        )?;
+        self.validate_native_progress(&binding, group.configuration_sequence)?;
+        Ok(Some((binding, group.configuration_sequence, observed_at)))
     }
 
     fn ensure_observation_fresh(&self, observed_at: u64) -> Result<(), KubericAdapterError> {
@@ -3847,12 +4071,32 @@ impl SqlServerReplicator {
                 }
                 .into());
             }
-            drop(self.finish_operation(generation)?);
+            let association = if self.bootstrap.is_none()
+                && role == ReplicaRole::ActiveSecondary
+                && self.native_progress_binding().is_none()
+            {
+                self.observe_secondary_association(generation).await?
+            } else if let Some(binding) = self.native_progress_binding() {
+                let (group, observed_at) =
+                    self.observed_group(generation, false, Some(role)).await?;
+                Some((binding.topology, group.configuration_sequence, observed_at))
+            } else {
+                None
+            };
+            let _lifecycle = self.finish_operation(generation)?;
+            #[cfg(feature = "kuberic-testing")]
+            self.wait_for_testing_lifecycle_publication()?;
+            if let Some((topology, sequence, observed_at)) = association {
+                self.ensure_observation_fresh(observed_at)?;
+                self.publish_native_progress(topology, sequence)?;
+            }
             self.set_role(role);
             return Ok(());
         }
         let (group, observed_at) = self.observed_group(generation, false, Some(role)).await?;
         let _lifecycle = self.finish_operation(generation)?;
+        #[cfg(feature = "kuberic-testing")]
+        self.wait_for_testing_lifecycle_publication()?;
         if self.expectation.is_none() {
             validate_native_role(role, group.local_replica.role)?;
         }
@@ -3905,8 +4149,9 @@ impl Replicator for SqlServerReplicator {
     async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> KubericResult<()> {
         let generation = self.begin_operation()?;
         let admitted = self.admitted_topology();
-        let observed_at = if let Some(binding) = &admitted {
-            let (_, observed_at) = self.observed_group(generation, false, Some(role)).await?;
+        let mut unbound_observed_at = None;
+        let native = if let Some(binding) = &admitted {
+            let (group, observed_at) = self.observed_group(generation, false, Some(role)).await?;
             if epoch.data_loss_number != binding.configuration.epoch.data_loss_number
                 || epoch.configuration_number < binding.configuration.epoch.configuration_number
             {
@@ -3915,16 +4160,42 @@ impl Replicator for SqlServerReplicator {
                 )
                 .into());
             }
-            Some(observed_at)
+            Some((
+                binding.native_topology(),
+                group.configuration_sequence,
+                observed_at,
+            ))
         } else if self.expectation.is_some() {
-            None
+            if !matches!(role, ReplicaRole::Primary | ReplicaRole::ActiveSecondary) {
+                return Err(KubericAdapterError::NativeRoleMismatch {
+                    requested: role,
+                    observed: None,
+                }
+                .into());
+            }
+            if let Some(binding) = self.native_progress_binding() {
+                let (group, observed_at) =
+                    self.observed_group(generation, false, Some(role)).await?;
+                Some((binding.topology, group.configuration_sequence, observed_at))
+            } else if self.bootstrap.is_none() && role == ReplicaRole::ActiveSecondary {
+                self.observe_secondary_association(generation).await?
+            } else {
+                None
+            }
         } else {
             let (group, observed_at) = self.observed_group(generation, false, Some(role)).await?;
             validate_native_role(role, group.local_replica.role)?;
-            Some(observed_at)
+            unbound_observed_at = Some(observed_at);
+            None
         };
         let _lifecycle = self.finish_operation(generation)?;
-        if let Some(observed_at) = observed_at {
+        #[cfg(feature = "kuberic-testing")]
+        self.wait_for_testing_lifecycle_publication()?;
+        if let Some((topology, sequence, observed_at)) = native {
+            self.ensure_observation_fresh(observed_at)?;
+            self.publish_native_progress(topology, sequence)?;
+        }
+        if let Some(observed_at) = unbound_observed_at {
             self.ensure_observation_fresh(observed_at)?;
         }
         self.set_epoch(epoch)?;
@@ -3935,8 +4206,8 @@ impl Replicator for SqlServerReplicator {
     async fn update_epoch(&self, epoch: Epoch) -> KubericResult<()> {
         let generation = self.begin_operation()?;
         let admitted = self.admitted_topology();
-        let observed_at = if let Some(binding) = &admitted {
-            let (_, observed_at) = self.observed_group(generation, false, None).await?;
+        let native = if let Some(binding) = &admitted {
+            let (group, observed_at) = self.observed_group(generation, false, None).await?;
             if epoch.data_loss_number != binding.configuration.epoch.data_loss_number
                 || epoch.configuration_number < binding.configuration.epoch.configuration_number
             {
@@ -3945,13 +4216,23 @@ impl Replicator for SqlServerReplicator {
                 )
                 .into());
             }
-            Some(observed_at)
+            Some((
+                binding.native_topology(),
+                group.configuration_sequence,
+                observed_at,
+            ))
+        } else if let Some(binding) = self.native_progress_binding() {
+            let (group, observed_at) = self.observed_group(generation, false, None).await?;
+            Some((binding.topology, group.configuration_sequence, observed_at))
         } else {
             None
         };
         let _lifecycle = self.finish_operation(generation)?;
-        if let Some(observed_at) = observed_at {
+        #[cfg(feature = "kuberic-testing")]
+        self.wait_for_testing_lifecycle_publication()?;
+        if let Some((topology, sequence, observed_at)) = native {
             self.ensure_observation_fresh(observed_at)?;
+            self.publish_native_progress(topology, sequence)?;
         }
         self.set_epoch(epoch)?;
         Ok(())
@@ -3986,37 +4267,81 @@ impl Replicator for SqlServerReplicator {
 
     async fn current_progress(&self) -> KubericResult<i64> {
         let generation = self.begin_operation()?;
-        if self.expectation.is_some() && self.admitted_topology().is_none() {
-            drop(self.finish_operation(generation)?);
+        let admitted = self.admitted_topology();
+        let native = self.native_progress_binding();
+        if self.expectation.is_some() && admitted.is_none() && native.is_none() {
+            if self.bootstrap.is_none()
+                && self.published_role() == Some(ReplicaRole::ActiveSecondary)
+                && let Some((topology, sequence, observed_at)) =
+                    self.observe_secondary_association(generation).await?
+            {
+                let _lifecycle = self.finish_operation(generation)?;
+                #[cfg(feature = "kuberic-testing")]
+                self.wait_for_testing_lifecycle_publication()?;
+                self.ensure_observation_fresh(observed_at)?;
+                self.publish_native_progress(topology, sequence)?;
+                return Ok(sequence.value());
+            }
+            let _lifecycle = self.finish_operation(generation)?;
+            #[cfg(feature = "kuberic-testing")]
+            self.wait_for_testing_lifecycle_publication()?;
             return Ok(0);
         }
         let (group, observed_at) = self.observed_group(generation, true, None).await?;
         let value = group.configuration_sequence.value();
         let _lifecycle = self.finish_operation(generation)?;
+        #[cfg(feature = "kuberic-testing")]
+        self.wait_for_testing_lifecycle_publication()?;
         self.ensure_observation_fresh(observed_at)?;
+        if let Some(binding) = admitted {
+            self.publish_native_progress(binding.native_topology(), group.configuration_sequence)?;
+        } else if let Some(binding) = native {
+            self.publish_native_progress(binding.topology, group.configuration_sequence)?;
+        }
         Ok(value)
     }
 
     async fn catch_up_capability(&self) -> KubericResult<i64> {
         let generation = self.begin_operation()?;
-        let Some(binding) = self.admitted_topology() else {
+        let admitted = self.admitted_topology();
+        let native = self.native_progress_binding();
+        if admitted.is_none() && native.is_none() {
             if self.expectation.is_some() {
-                drop(self.finish_operation(generation)?);
+                if self.bootstrap.is_none()
+                    && self.published_role() == Some(ReplicaRole::ActiveSecondary)
+                    && let Some((topology, sequence, observed_at)) =
+                        self.observe_secondary_association(generation).await?
+                {
+                    let _lifecycle = self.finish_operation(generation)?;
+                    #[cfg(feature = "kuberic-testing")]
+                    self.wait_for_testing_lifecycle_publication()?;
+                    self.ensure_observation_fresh(observed_at)?;
+                    self.publish_native_progress(topology, sequence)?;
+                    return Ok(sequence.value());
+                }
+                let _lifecycle = self.finish_operation(generation)?;
+                #[cfg(feature = "kuberic-testing")]
+                self.wait_for_testing_lifecycle_publication()?;
                 return Ok(INVALID_LSN);
             }
             return self.unsupported(ObserveOnlyOperation::CatchUpCapability);
-        };
+        }
 
         {
             let _lifecycle = self.finish_operation(generation)?;
-            if self
-                .role
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none_or(|role| !published_role_matches(&binding, role))
-            {
+            let role_matches = if let Some(binding) = &admitted {
+                self.published_role()
+                    .is_some_and(|role| published_role_matches(binding, role))
+            } else {
+                self.published_role().is_some_and(|role| {
+                    native
+                        .as_ref()
+                        .is_some_and(|binding| role == binding.topology.local_stable_role)
+                })
+            };
+            if !role_matches {
                 return Err(KubericAdapterError::TopologyBindingMismatch(
-                    "capability requires the frozen stable local role to be published",
+                    "capability requires the bound stable local role to be published",
                 )
                 .into());
             }
@@ -4025,18 +4350,30 @@ impl Replicator for SqlServerReplicator {
         let value = group.configuration_sequence.value();
         self.ensure_observation_fresh(observed_at)?;
         let _lifecycle = self.finish_operation(generation)?;
-        if self
-            .role
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_none_or(|role| !published_role_matches(&binding, role))
-        {
+        #[cfg(feature = "kuberic-testing")]
+        self.wait_for_testing_lifecycle_publication()?;
+        let role_matches = if let Some(binding) = &admitted {
+            self.published_role()
+                .is_some_and(|role| published_role_matches(binding, role))
+        } else {
+            self.published_role().is_some_and(|role| {
+                native
+                    .as_ref()
+                    .is_some_and(|binding| role == binding.topology.local_stable_role)
+            })
+        };
+        if !role_matches {
             return Err(KubericAdapterError::TopologyBindingMismatch(
-                "capability requires the frozen stable local role to be published",
+                "capability requires the bound stable local role to be published",
             )
             .into());
         }
         self.ensure_observation_fresh(observed_at)?;
+        if let Some(binding) = admitted {
+            self.publish_native_progress(binding.native_topology(), group.configuration_sequence)?;
+        } else if let Some(binding) = native {
+            self.publish_native_progress(binding.topology, group.configuration_sequence)?;
+        }
         Ok(value)
     }
 }
@@ -4172,6 +4509,26 @@ impl PrimaryReplicator for SqlServerReplicator {
         )?;
         self.ensure_observation_fresh(observed_at)?;
         let _lifecycle = self.finish_operation(generation)?;
+        let native_topology = candidate.native_topology();
+        let native_sequence = candidate.native_configuration_sequence;
+        let mut native_progress = self
+            .native_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = native_progress.as_ref() {
+            if previous.topology != native_topology {
+                return Err(KubericAdapterError::TopologyBindingMismatch(
+                    "native topology differs from the bound association",
+                )
+                .into());
+            }
+            if native_sequence < previous.latest_sequence {
+                return Err(KubericAdapterError::TopologyBindingMismatch(
+                    "configuration sequence regressed",
+                )
+                .into());
+            }
+        }
         let mut admitted_topology = self
             .admitted_topology
             .lock()
@@ -4217,6 +4574,10 @@ impl PrimaryReplicator for SqlServerReplicator {
             *admitted_configuration = Some(current);
             *admitted_bootstrap_database = bootstrap_database;
         }
+        *native_progress = Some(NativeProgressBinding {
+            topology: native_topology,
+            latest_sequence: native_sequence,
+        });
         Ok(())
     }
 
@@ -4718,13 +5079,6 @@ fn admit_topology(
     current: &CurrentTopologyFacts,
     options: TopologyAdmissionOptions<'_>,
 ) -> Result<HealthyTopologyBinding, KubericAdapterError> {
-    if !options.allow_unassociated_database
-        && group.configuration_sequence.value() != current.configuration.epoch.configuration_number
-    {
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "configuration sequence differs from the current configuration",
-        ));
-    }
     if instance.server_name != *expectation.local_member().server_name()
         || instance.property_server_name != *expectation.local_member().server_name()
     {
@@ -4874,6 +5228,100 @@ fn admit_topology(
     Ok(candidate)
 }
 
+fn associate_native_topology(
+    runtime_identity: &KubericReplicaIdentity,
+    expectation: &SqlServerTopologyExpectation,
+    instance: &crate::observation::InstanceMetadata,
+    group: &AvailabilityGroupSnapshot,
+    stable_role: ReplicaRole,
+) -> Result<NativeTopologyBinding, KubericAdapterError> {
+    if runtime_identity.replica_id != expectation.local_replica_id()
+        || instance.server_name != *expectation.local_member().server_name()
+        || instance.property_server_name != *expectation.local_member().server_name()
+    {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "local runtime and SQL topology identities differ",
+        ));
+    }
+    if group.databases.len() != usize::from(SUPPORTED_DATABASE_COUNT) {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "exactly one managed database is required",
+        ));
+    }
+    let database = &group.databases[0];
+    let recovery_fork_id = database
+        .local
+        .as_ref()
+        .and_then(|local| local.recovery.as_ref())
+        .and_then(|recovery| recovery.recovery_fork_guid.clone())
+        .ok_or(KubericAdapterError::TopologyBindingMismatch(
+            "local database recovery lineage is unavailable",
+        ))?;
+    let mut members = Vec::with_capacity(usize::from(SUPPORTED_REPLICA_COUNT));
+    for expected in expectation.members() {
+        let matching = group
+            .replicas
+            .iter()
+            .filter(|replica| {
+                replica.server_name == *expected.server_name()
+                    && replica.endpoint_url.as_deref() == Some(expected.endpoint_url())
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "SQL topology association does not identify one native replica",
+            ));
+        }
+        members.push(NativeTopologyMemberBinding {
+            native_replica_id: matching[0].replica_id.clone(),
+            sql_endpoint: SqlServerMemberEndpoint::new(
+                expected.server_name().clone(),
+                expected.endpoint_url(),
+            )?,
+        });
+    }
+    if members.iter().enumerate().any(|(index, member)| {
+        members[..index]
+            .iter()
+            .any(|other| other.native_replica_id == member.native_replica_id)
+    }) {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "native replica identities must be unique",
+        ));
+    }
+    let local_native_id = group.local_replica.identity.native_replica_id().ok_or(
+        KubericAdapterError::TopologyBindingMismatch(
+            "local native replica identity is unavailable",
+        ),
+    )?;
+    let local_member = members
+        .iter()
+        .find(|member| {
+            member.sql_endpoint.server_name() == expectation.local_member().server_name()
+        })
+        .expect("topology expectation includes the local member");
+    if local_member.native_replica_id != *local_native_id {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "local SQL association differs from the observed native replica",
+        ));
+    }
+    Ok(NativeTopologyBinding {
+        availability_group: group.identity.clone(),
+        database_lineage: Some(DatabaseLineage {
+            database: database.identity.clone(),
+            recovery_fork_id,
+        }),
+        bootstrap_database_name: None,
+        bootstrap_database: None,
+        local_sql_replica_identity: group.local_replica.identity.clone(),
+        local_sql_server_start_incarnation: SqlServerStartIncarnation::new(
+            instance.sqlserver_start_time.clone(),
+        )?,
+        local_stable_role: stable_role,
+        members,
+    })
+}
+
 fn validate_observer_expectation(
     config: &ObserverConfig,
     expectation: &SqlServerTopologyExpectation,
@@ -4969,24 +5417,32 @@ fn validate_bound_evidence(
     group: &AvailabilityGroupSnapshot,
     requested_role: Option<ReplicaRole>,
 ) -> Result<(), KubericAdapterError> {
-    let local = binding.local_member();
+    validate_native_bound_evidence(
+        &binding.native_topology(),
+        config,
+        instance,
+        group,
+        requested_role,
+    )
+}
+
+fn validate_native_bound_evidence(
+    binding: &NativeTopologyBinding,
+    config: &ObserverConfig,
+    instance: &crate::observation::InstanceMetadata,
+    group: &AvailabilityGroupSnapshot,
+    requested_role: Option<ReplicaRole>,
+) -> Result<(), KubericAdapterError> {
     let target = config.target();
     if instance.sqlserver_start_time != binding.local_sql_server_start_incarnation.as_str() {
         return Err(KubericAdapterError::NativeConvergenceUnsafe(
             "SQL Server process incarnation",
         ));
     }
-    if binding.database_lineage.is_some()
-        && group.configuration_sequence != binding.native_configuration_sequence
-    {
-        return Err(KubericAdapterError::TopologyBindingMismatch(
-            "configuration sequence differs from the frozen configuration",
-        ));
-    }
     if target.replica.logical_id() != binding.local_sql_replica_identity.logical_id()
         || target.replica.incarnation() != binding.local_sql_replica_identity.incarnation()
-        || instance.server_name != *local.server_name()
-        || instance.property_server_name != *local.server_name()
+        || instance.server_name != target.expected_server_name
+        || instance.property_server_name != target.expected_server_name
     {
         return Err(KubericAdapterError::TopologyBindingMismatch(
             "local SQL server or incarnation evidence differs",
@@ -5002,12 +5458,12 @@ fn validate_bound_evidence(
             "local SQL replica identity differs",
         ));
     }
-    if requested_role.is_some_and(|role| !published_role_matches(binding, role)) {
+    if requested_role.is_some_and(|role| role != binding.local_stable_role) {
         return Err(KubericAdapterError::TopologyBindingMismatch(
             "requested role differs from the frozen stable role",
         ));
     }
-    let expected_native_role = native_role_for(local.stable_role);
+    let expected_native_role = native_role_for(binding.local_stable_role);
     if group.local_replica.role.as_ref() != Some(&expected_native_role) {
         return Err(KubericAdapterError::TopologyBindingMismatch(
             "local native role differs from the frozen stable role",
@@ -5023,9 +5479,9 @@ fn validate_bound_evidence(
             .replicas
             .iter()
             .filter(|replica| {
-                &replica.replica_id == member.native_replica_id()
-                    && replica.server_name == *member.server_name()
-                    && replica.endpoint_url.as_deref() == Some(member.sql_endpoint_url())
+                replica.replica_id == member.native_replica_id
+                    && replica.server_name == *member.sql_endpoint.server_name()
+                    && replica.endpoint_url.as_deref() == Some(member.sql_endpoint.endpoint_url())
             })
             .collect::<Vec<_>>();
         if matching.len() != 1 {
@@ -5041,9 +5497,7 @@ fn validate_bound_evidence(
     let local_replica = group
         .replicas
         .iter()
-        .find(|replica| {
-            &replica.replica_id == local_native_id && replica.server_name == *local.server_name()
-        })
+        .find(|replica| &replica.replica_id == local_native_id)
         .expect("native membership was validated");
     let Some(state) = &local_replica.state else {
         return Err(KubericAdapterError::TopologyBindingMismatch(
@@ -5164,7 +5618,11 @@ fn validate_bound_evidence(
             "local database replica evidence is incomplete",
         ));
     }
-    validate_bound_database_state(matching_states[0], database_lineage, local.stable_role)
+    validate_bound_database_state(
+        matching_states[0],
+        database_lineage,
+        binding.local_stable_role,
+    )
 }
 
 fn validate_bound_database_state(

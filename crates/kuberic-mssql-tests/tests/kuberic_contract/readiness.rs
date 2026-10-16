@@ -279,6 +279,58 @@ mod public_v1_lifecycle_evidence {
             .unwrap_err();
         assert!(application_error(error).contains("regressed"));
     }
+
+    #[tokio::test]
+    async fn ordinary_secondary_binds_native_progress_without_primary_configuration() {
+        let mut recreated = bound_snapshot_with_sequence(1, "21");
+        if let Observation::Present { value, .. } = &mut recreated.availability_group {
+            value.identity.group_id = guid("99999999-9999-4999-8999-999999999999");
+        }
+        let replicator = bound_replicator_for(
+            1,
+            vec![
+                Ok(present(bound_snapshot_with_sequence(1, "17"))),
+                Ok(present(bound_snapshot_with_sequence(1, "18"))),
+                Ok(present(bound_snapshot_with_sequence(1, "19"))),
+                Ok(present(bound_snapshot_with_sequence(1, "20"))),
+                Ok(present(recreated)),
+            ],
+            vec![OBSERVED_AT; 10],
+        );
+        replicator.open().await.unwrap();
+
+        replicator
+            .change_role(configuration().epoch, ReplicaRole::ActiveSecondary)
+            .await
+            .unwrap();
+        replicator.update_epoch(Epoch::new(7, 43)).await.unwrap();
+        assert!(replicator.admitted_topology().is_none());
+        assert_eq!(replicator.current_progress().await.unwrap(), 19);
+        assert_eq!(replicator.catch_up_capability().await.unwrap(), 20);
+
+        let error = replicator.current_progress().await.unwrap_err();
+        assert!(application_error(error).contains("availability-group identity"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_secondary_progress_fails_when_bound_evidence_becomes_stale() {
+        let replicator = bound_replicator_for(
+            1,
+            vec![
+                Ok(present(bound_snapshot_with_sequence(1, "17"))),
+                Ok(present(bound_snapshot_with_sequence(1, "18"))),
+            ],
+            vec![OBSERVED_AT, OBSERVED_AT, OBSERVED_AT + MAX_AGE + 1],
+        );
+        replicator.open().await.unwrap();
+        replicator
+            .change_role(configuration().epoch, ReplicaRole::ActiveSecondary)
+            .await
+            .unwrap();
+
+        let error = replicator.current_progress().await.unwrap_err();
+        assert!(application_error(error).contains("stale"));
+    }
 }
 
 mod adapter_owned_neutral_facts {

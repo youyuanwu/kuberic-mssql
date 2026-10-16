@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::config::RuntimeHostConfig;
-use super::seed_state::{SEED_OWNER_FILE, SEED_STATE_FILE, validate_seed_entry};
+use super::seed_state::{
+    SEED_OWNER_FILE, SEED_STATE_FILE, SeedDispatchRecord, validate_seed_entry,
+};
 
 pub const RUNTIME_BINDING_SCHEMA_VERSION: u32 = 2;
 const BINDING_FILE: &str = "runtime-binding.json";
@@ -82,6 +84,17 @@ impl RuntimeBindingIdentity {
                     && !activation.instance_id.is_empty()
                     && !activation.agent_generation.is_empty()
             })
+    }
+
+    fn matches_seed_record(&self, record: &SeedDispatchRecord) -> bool {
+        self.activation.as_ref().is_some_and(|activation| {
+            record.matches_application_binding(
+                &self.resource_uid,
+                activation.replica_id,
+                &activation.instance_id,
+                &activation.agent_generation,
+            )
+        })
     }
 
     pub fn resource_uid(&self) -> &str {
@@ -157,6 +170,7 @@ impl RuntimeBindingStore {
         };
         root.verify_path()?;
         let entries = root.entries()?;
+        let mut seed_record = None;
         for entry in &entries {
             let Some(name) = entry.to_str() else {
                 return Err(RuntimeBindingError::UnsafeState);
@@ -164,7 +178,11 @@ impl RuntimeBindingStore {
             match name {
                 BINDING_FILE => {}
                 SEED_STATE_FILE | SEED_OWNER_FILE => {
-                    validate_seed_entry(&root, name).map_err(map_seed_error)?;
+                    if let Some(record) =
+                        validate_seed_entry(&root, name).map_err(map_seed_error)?
+                    {
+                        seed_record = Some(record);
+                    }
                 }
                 _ => return Err(RuntimeBindingError::UnsafeState),
             }
@@ -182,6 +200,12 @@ impl RuntimeBindingStore {
         let actual = self.load(&root)?;
         root.verify_path()?;
         if !actual.matches_static_identity(&self.expected) {
+            return Err(RuntimeBindingError::IdentityMismatch);
+        }
+        if seed_record
+            .as_ref()
+            .is_some_and(|record| !actual.matches_seed_record(record))
+        {
             return Err(RuntimeBindingError::IdentityMismatch);
         }
         Ok(ApplicationStorageState::Established)

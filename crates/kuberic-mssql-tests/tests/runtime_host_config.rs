@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -23,10 +24,22 @@ struct Files {
 }
 
 fn activation_identity(replica_id: i64) -> ReplicaIdentity {
+    activation_identity_with(
+        replica_id,
+        format!("pod-{replica_id}"),
+        format!("generation-{replica_id}"),
+    )
+}
+
+fn activation_identity_with(
+    replica_id: i64,
+    instance_id: impl Into<String>,
+    agent_generation: impl Into<String>,
+) -> ReplicaIdentity {
     ReplicaIdentity {
         replica_id: ReplicaId::new(replica_id),
-        instance_id: ReplicaInstanceId::new(format!("pod-{replica_id}")),
-        agent_generation: AgentGeneration::new(format!("generation-{replica_id}")),
+        instance_id: ReplicaInstanceId::new(instance_id),
+        agent_generation: AgentGeneration::new(agent_generation),
     }
 }
 
@@ -147,8 +160,14 @@ fn args(files: &Files) -> RuntimeHostArgs {
 }
 
 async fn config(root: &Path) -> RuntimeHostConfig {
+    config_for_resource(root, "resource-a").await
+}
+
+async fn config_for_resource(root: &Path, resource_uid: &str) -> RuntimeHostConfig {
     let files = files(root);
-    RuntimeHostConfig::load(args(&files), root).await.unwrap()
+    let mut host_args = args(&files);
+    host_args.resource_uid = resource_uid.to_owned();
+    RuntimeHostConfig::load(host_args, root).await.unwrap()
 }
 
 #[tokio::test]
@@ -663,9 +682,20 @@ fn seed_guid(value: u32) -> String {
 }
 
 fn seed_record() -> SeedDispatchRecord {
+    seed_record_for("resource-a", activation_identity(1), "session-1")
+}
+
+fn seed_record_for(
+    resource_uid: &str,
+    activation: ReplicaIdentity,
+    source_process_session_id: &str,
+) -> SeedDispatchRecord {
+    let source_replica_id = activation.replica_id.to_string();
+    let source_instance_id = activation.instance_id.to_string();
+    let source_agent_generation = activation.agent_generation.to_string();
     SeedDispatchRecord::new(
-        "resource-a",
-        activation_identity(1),
+        resource_uid,
+        activation,
         "configuration-1",
         "app-ag",
         seed_guid(10),
@@ -673,7 +703,14 @@ fn seed_record() -> SeedDispatchRecord {
         seed_guid(20),
         seed_guid(21),
         seed_guid(22),
-        SeedDispatchTarget::new("1", "pod-1", "generation-1", "session-1", seed_guid(31)).unwrap(),
+        SeedDispatchTarget::new(
+            source_replica_id,
+            source_instance_id,
+            source_agent_generation,
+            source_process_session_id,
+            seed_guid(31),
+        )
+        .unwrap(),
         [
             SeedDispatchTarget::new("2", "pod-2", "generation-2", "session-2", seed_guid(32))
                 .unwrap(),
@@ -686,6 +723,144 @@ fn seed_record() -> SeedDispatchRecord {
         "2026-10-08 23:00:00.000",
     )
     .unwrap()
+}
+
+fn application_file_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fs::read_dir(root)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().into_string().unwrap(),
+                fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+async fn initialized_seed_application(
+    root: &Path,
+    resource_uid: &str,
+    activation: ReplicaIdentity,
+    source_process_session_id: &str,
+) -> RuntimeBindingStore {
+    let runtime_config = config_for_resource(root, resource_uid).await;
+    let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
+    binding.initialize(&activation).unwrap();
+    {
+        let store = SeedDispatchStore::open(binding.root()).unwrap();
+        store
+            .create(&seed_record_for(
+                resource_uid,
+                activation,
+                source_process_session_id,
+            ))
+            .unwrap();
+    }
+    assert_eq!(
+        binding.storage_state().unwrap(),
+        ApplicationStorageState::Established
+    );
+    binding
+}
+
+#[tokio::test]
+async fn runtime_binding_accepts_same_activation_seed_with_historical_process_session() {
+    let temporary = tempfile::tempdir().unwrap();
+    let activation = activation_identity(1);
+    let binding = initialized_seed_application(
+        temporary.path(),
+        "resource-a",
+        activation.clone(),
+        "historical-process-session",
+    )
+    .await;
+    let before = application_file_bytes(binding.root());
+
+    binding.validate(&activation).unwrap();
+    assert_eq!(
+        binding.storage_state().unwrap(),
+        ApplicationStorageState::Established
+    );
+    assert_eq!(application_file_bytes(binding.root()), before);
+}
+
+#[tokio::test]
+async fn runtime_binding_rejects_seed_record_copied_from_another_resource_without_mutation() {
+    let recipient = tempfile::tempdir().unwrap();
+    let recipient_activation = activation_identity(1);
+    let recipient_binding = initialized_seed_application(
+        recipient.path(),
+        "resource-a",
+        recipient_activation.clone(),
+        "recipient-session",
+    )
+    .await;
+
+    let donor = tempfile::tempdir().unwrap();
+    let donor_binding = initialized_seed_application(
+        donor.path(),
+        "resource-b",
+        activation_identity(1),
+        "donor-session",
+    )
+    .await;
+    fs::copy(
+        donor_binding.root().join("seed-dispatch-v1.json"),
+        recipient_binding.root().join("seed-dispatch-v1.json"),
+    )
+    .unwrap();
+    let spliced = application_file_bytes(recipient_binding.root());
+
+    assert_eq!(
+        recipient_binding.storage_state(),
+        Err(RuntimeBindingError::IdentityMismatch)
+    );
+    assert_eq!(
+        recipient_binding.validate(&recipient_activation),
+        Err(RuntimeBindingError::IdentityMismatch)
+    );
+    assert_eq!(application_file_bytes(recipient_binding.root()), spliced);
+}
+
+#[tokio::test]
+async fn runtime_binding_rejects_seed_record_copied_from_another_activation_without_mutation() {
+    let recipient = tempfile::tempdir().unwrap();
+    let recipient_activation = activation_identity(1);
+    let recipient_binding = initialized_seed_application(
+        recipient.path(),
+        "resource-a",
+        recipient_activation.clone(),
+        "recipient-session",
+    )
+    .await;
+
+    let donor = tempfile::tempdir().unwrap();
+    let donor_activation =
+        activation_identity_with(1, "replacement-pod-1", "replacement-generation-1");
+    let donor_binding = initialized_seed_application(
+        donor.path(),
+        "resource-a",
+        donor_activation,
+        "donor-session",
+    )
+    .await;
+    fs::copy(
+        donor_binding.root().join("seed-dispatch-v1.json"),
+        recipient_binding.root().join("seed-dispatch-v1.json"),
+    )
+    .unwrap();
+    let spliced = application_file_bytes(recipient_binding.root());
+
+    assert_eq!(
+        recipient_binding.storage_state(),
+        Err(RuntimeBindingError::IdentityMismatch)
+    );
+    assert_eq!(
+        recipient_binding.validate(&recipient_activation),
+        Err(RuntimeBindingError::IdentityMismatch)
+    );
+    assert_eq!(application_file_bytes(recipient_binding.root()), spliced);
 }
 
 #[tokio::test]
