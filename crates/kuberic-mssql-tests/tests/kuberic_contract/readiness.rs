@@ -118,6 +118,114 @@ mod executable_now {
             assert!(application_error(failure).contains("observe-only"));
         }
     }
+
+    #[tokio::test]
+    async fn build_requires_exact_idle_public_v1_authority() {
+        let cases = [
+            {
+                let mut build = target_build(1, "readiness-build-empty-id");
+                build.build_id = OperationId::default();
+                build
+            },
+            {
+                let mut build = target_build(1, "readiness-build-progress");
+                build.current_progress = 0;
+                build
+            },
+            {
+                let mut build = target_build(1, "readiness-build-role");
+                build.role = ReplicaRole::ActiveSecondary;
+                build
+            },
+            {
+                let mut build = target_build(1, "readiness-build-storage");
+                build.storage_incarnation = None;
+                build
+            },
+            {
+                let mut build = target_build(1, "readiness-build-storage-identity");
+                build.storage_incarnation.as_mut().unwrap().replica = kuberic_identity(3);
+                build
+            },
+            {
+                let mut build = target_build(1, "readiness-build-session");
+                build.process_session_id = ProcessSessionId::new("stale-session");
+                build
+            },
+            {
+                let mut build = target_build(1, "readiness-build-address");
+                build.replication_address = "stale.example:5022".into();
+                build
+            },
+        ];
+
+        for build in cases {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let complete = Arc::new(AtomicBool::new(false));
+            let executor = Arc::new(SeedMutationExecutor {
+                complete: complete.clone(),
+                executions: AtomicUsize::new(0),
+            });
+            let replicator = seed_replicator_with_executor(
+                root.path().to_owned(),
+                complete,
+                executor.clone() as Arc<dyn SqlMutationExecutor>,
+            );
+            admit_seed_replicator(&replicator).await;
+
+            let message = application_error(replicator.build_replica(build).await.unwrap_err());
+            assert!(
+                message.contains("target build") || message.contains("session, address, or role"),
+                "{message}"
+            );
+            assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn host_owned_build_is_cancelled_and_joined_before_remove() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let complete = Arc::new(AtomicBool::new(false));
+        let executor = Arc::new(SeedMutationExecutor {
+            complete: complete.clone(),
+            executions: AtomicUsize::new(0),
+        });
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let replicator = seed_replicator_with_executor(
+            root.path().to_owned(),
+            complete,
+            executor.clone() as Arc<dyn SqlMutationExecutor>,
+        );
+        admit_seed_replicator(&replicator).await;
+        replicator
+            .testing_gate_seed_intent(entered_tx, release_rx)
+            .unwrap();
+
+        let build = tokio::spawn({
+            let replicator = replicator.clone();
+            async move {
+                replicator
+                    .build_replica(target_build(1, "readiness-host-owned-build"))
+                    .await
+            }
+        });
+        entered_rx.await.unwrap();
+
+        build.abort();
+        assert!(build.await.unwrap_err().is_cancelled());
+        assert!(release_tx.send(()).is_err());
+        assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+
+        let removal = replicator
+            .remove_replica(ReplicaId::new(2))
+            .await
+            .unwrap_err();
+        assert!(application_error(removal).contains("observe-only"));
+        assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    }
 }
 
 mod public_v1_lifecycle_evidence {
@@ -260,24 +368,12 @@ mod release_blocked_candidate_gates {
 
     #[test]
     fn remaining_contract_gates_stay_pending_until_their_phase_lands() {
-        let gates = [
-            (
-                "external_progress_contract",
-                CandidateGateState::PendingRelease,
-            ),
-            (
-                "remote_active_membership",
-                CandidateGateState::PendingRelease,
-            ),
-            ("invalid_build_progress", CandidateGateState::PendingRelease),
-            ("cancel_before_remove", CandidateGateState::PendingRelease),
-            (
-                "signed_authorization_contract",
-                CandidateGateState::PendingRelease,
-            ),
-        ];
+        let gates = [(
+            "signed_authorization_contract",
+            CandidateGateState::PendingRelease,
+        )];
 
-        assert_eq!(gates.len(), 5);
+        assert_eq!(gates.len(), 1);
         assert!(
             gates
                 .iter()

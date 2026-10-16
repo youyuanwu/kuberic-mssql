@@ -550,6 +550,26 @@ impl CurrentBuildFacts {
         replica: &ReplicaInformation,
         published_role: Option<ReplicaRole>,
     ) -> Result<Self, KubericAdapterError> {
+        replica.validate_public_progress().map_err(|_| {
+            KubericAdapterError::TopologyBindingMismatch(
+                "target build must be idle with INVALID_LSN progress",
+            )
+        })?;
+        let storage = replica.storage_incarnation.as_ref().ok_or(
+            KubericAdapterError::TopologyBindingMismatch(
+                "target build lacks an exact storage incarnation",
+            ),
+        )?;
+        storage.validate().map_err(|_| {
+            KubericAdapterError::TopologyBindingMismatch(
+                "target build storage incarnation is incomplete",
+            )
+        })?;
+        if storage.replica != replica.identity {
+            return Err(KubericAdapterError::TopologyBindingMismatch(
+                "target build storage incarnation differs from its identity",
+            ));
+        }
         let source = binding.local_member();
         if source.kuberic_identity.replica_id != binding.configuration.primary_id
             || source.stable_role != ReplicaRole::Primary
@@ -570,10 +590,7 @@ impl CurrentBuildFacts {
             || target.process_session_id.is_empty()
             || replica.process_session_id != target.process_session_id
             || replica.replication_address != target.replication_address
-            || !matches!(
-                replica.role,
-                ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
-            )
+            || replica.role != ReplicaRole::IdleSecondary
         {
             return Err(KubericAdapterError::TopologyBindingMismatch(
                 "target build session, address, or role differs from the admitted configuration",

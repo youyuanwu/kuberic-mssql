@@ -38,7 +38,8 @@ use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::protocol::types::{
     AgentGeneration, ConfigurationDescriptor, ConfigurationId, ConfigurationMember, Epoch,
     OperationId, PartitionId, ProcessSessionId, ReplicaId,
-    ReplicaIdentity as KubericReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
+    ReplicaIdentity as KubericReplicaIdentity, ReplicaInstanceId, ReplicaRole,
+    ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ResourceUid, StorageGeneration,
 };
 use kuberic_runtime::replicator::{
     PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode,
@@ -1800,7 +1801,7 @@ async fn explicit_bootstrap_path_assigns_exact_effect_ownership_and_replays_from
             .database_lineage()
             .is_none()
     );
-    assert_eq!(primary.current_progress().await.unwrap(), 42);
+    assert_eq!(primary.current_progress().await.unwrap(), 43);
 
     for local_index in [1, 2] {
         let (secondary, mutation) = bootstrap_replicator_for(
@@ -2962,6 +2963,16 @@ fn target_build_with_sessions(
         target.replication_address.clone(),
     );
     build.process_session_id = target.process_session_id.clone();
+    build.storage_incarnation = Some(ReplicaStorageIncarnationContext {
+        replica: target.identity.clone(),
+        storage: ReplicaStorageIdentity::Volatile {
+            identity: format!("storage-{}", target.identity.replica_id),
+        },
+        storage_generation: StorageGeneration::new(format!(
+            "storage-generation-{}",
+            target.identity.replica_id
+        )),
+    });
     build
 }
 
@@ -3553,9 +3564,10 @@ async fn bound_topology_admits_exact_current_replays_and_reports_fresh_capabilit
     )
     .await;
 
-    assert!(
-        application_error(replicator.catch_up_capability().await.unwrap_err())
-            .contains("not been admitted")
+    assert_eq!(replicator.current_progress().await.unwrap(), 0);
+    assert_eq!(
+        replicator.catch_up_capability().await.unwrap(),
+        kuberic_runtime::application::INVALID_LSN
     );
     replicator
         .update_current_replica_set_configuration(current.clone())
@@ -3598,9 +3610,9 @@ async fn failed_current_admission_does_not_poison_an_exact_retry() {
         .await
         .unwrap_err();
     assert!(application_error(error).contains("configuration sequence"));
-    assert!(
-        application_error(replicator.catch_up_capability().await.unwrap_err())
-            .contains("not been admitted")
+    assert_eq!(
+        replicator.catch_up_capability().await.unwrap(),
+        kuberic_runtime::application::INVALID_LSN
     );
 
     replicator
@@ -5686,10 +5698,7 @@ async fn bound_role_and_epoch_callbacks_require_fresh_evidence_and_monotonic_epo
         .change_role(configuration().epoch, ReplicaRole::Primary)
         .await
         .unwrap();
-    replicator
-        .update_epoch(Epoch::new(7, 43))
-        .await
-        .unwrap();
+    replicator.update_epoch(Epoch::new(7, 43)).await.unwrap();
     assert!(
         application_error(
             replicator

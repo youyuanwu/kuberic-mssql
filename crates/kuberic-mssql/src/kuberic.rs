@@ -10,7 +10,7 @@ mod compatibility;
 
 use async_trait::async_trait;
 use kuberic_runtime::application::{
-    OpenContext, RoleChange, StateProvider, StatefulServiceReplica,
+    INVALID_LSN, OpenContext, RoleChange, StateProvider, StatefulServiceReplica,
 };
 use kuberic_runtime::protocol::types::{
     ConfigurationDescriptor, Epoch, PartitionId, ProcessSessionId, ReplicaId,
@@ -3930,21 +3930,12 @@ impl Replicator for SqlServerReplicator {
 
     async fn current_progress(&self) -> KubericResult<i64> {
         let generation = self.begin_operation()?;
-        if self.bootstrap.is_some() && self.admitted_topology().is_none() {
+        if self.expectation.is_some() && self.admitted_topology().is_none() {
             drop(self.finish_operation(generation)?);
             return Ok(0);
         }
         let (group, observed_at) = self.observed_group(generation, true, None).await?;
-        let value = self.admitted_topology().map_or_else(
-            || group.configuration_sequence.value(),
-            |binding| {
-                if binding.database_lineage().is_none() {
-                    binding.configuration().epoch.configuration_number
-                } else {
-                    group.configuration_sequence.value()
-                }
-            },
-        );
+        let value = group.configuration_sequence.value();
         let _lifecycle = self.finish_operation(generation)?;
         self.ensure_observation_fresh(observed_at)?;
         Ok(value)
@@ -3954,7 +3945,8 @@ impl Replicator for SqlServerReplicator {
         let generation = self.begin_operation()?;
         let Some(binding) = self.admitted_topology() else {
             if self.expectation.is_some() {
-                return Err(KubericAdapterError::TopologyNotAdmitted.into());
+                drop(self.finish_operation(generation)?);
+                return Ok(INVALID_LSN);
             }
             return self.unsupported(ObserveOnlyOperation::CatchUpCapability);
         };
@@ -3974,11 +3966,7 @@ impl Replicator for SqlServerReplicator {
             }
         }
         let (group, observed_at) = self.observed_group(generation, true, None).await?;
-        let value = if binding.database_lineage().is_none() {
-            binding.configuration().epoch.configuration_number
-        } else {
-            group.configuration_sequence.value()
-        };
+        let value = group.configuration_sequence.value();
         self.ensure_observation_fresh(observed_at)?;
         let _lifecycle = self.finish_operation(generation)?;
         if self
