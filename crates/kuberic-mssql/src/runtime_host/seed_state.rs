@@ -6,12 +6,15 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use kuberic_runtime::protocol::types::{
+    ReplicaIdentity as KubericReplicaIdentity, ReplicaStorageIncarnationContext,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::binding::{BoundRoot, process_is_gone, temporary_file_pid};
+use super::binding::BoundRoot;
 
-pub const SEED_DISPATCH_SCHEMA_VERSION: u32 = 2;
+pub const SEED_DISPATCH_SCHEMA_VERSION: u32 = 3;
 pub(super) const SEED_STATE_FILE: &str = "seed-dispatch-v1.json";
 pub(super) const SEED_OWNER_FILE: &str = "seed-dispatch-v1.owner";
 pub(super) const MAX_SEED_STATE_BYTES: u64 = 65_536;
@@ -95,6 +98,7 @@ pub struct SeedDispatchRecord {
     schema_version: u32,
     revision: u64,
     resource_uid: String,
+    activation_identity: KubericReplicaIdentity,
     configuration_id: String,
     availability_group_name: String,
     availability_group_id: String,
@@ -106,6 +110,7 @@ pub struct SeedDispatchRecord {
     targets: [SeedDispatchTarget; 2],
     winning_target_replica_id: String,
     winning_build_id: String,
+    winning_target_storage: ReplicaStorageIncarnationContext,
     sqlserver_start_time: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     operation_token: String,
@@ -117,6 +122,7 @@ impl SeedDispatchRecord {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         resource_uid: impl Into<String>,
+        activation_identity: KubericReplicaIdentity,
         configuration_id: impl Into<String>,
         availability_group_name: impl Into<String>,
         availability_group_id: impl Into<String>,
@@ -128,12 +134,14 @@ impl SeedDispatchRecord {
         targets: [SeedDispatchTarget; 2],
         winning_target_replica_id: impl Into<String>,
         winning_build_id: impl Into<String>,
+        winning_target_storage: ReplicaStorageIncarnationContext,
         sqlserver_start_time: impl Into<String>,
     ) -> Result<Self, SeedStateError> {
         let mut record = Self {
             schema_version: SEED_DISPATCH_SCHEMA_VERSION,
             revision: 1,
             resource_uid: resource_uid.into(),
+            activation_identity,
             configuration_id: configuration_id.into(),
             availability_group_name: availability_group_name.into(),
             availability_group_id: availability_group_id.into(),
@@ -145,6 +153,7 @@ impl SeedDispatchRecord {
             targets,
             winning_target_replica_id: winning_target_replica_id.into(),
             winning_build_id: winning_build_id.into(),
+            winning_target_storage,
             sqlserver_start_time: sqlserver_start_time.into(),
             operation_token: String::new(),
             phase: SeedDispatchPhase::Intent,
@@ -185,6 +194,22 @@ impl SeedDispatchRecord {
 
     pub fn operation_token(&self) -> &str {
         &self.operation_token
+    }
+
+    pub(super) fn matches_application_binding(
+        &self,
+        resource_uid: &str,
+        replica_id: i64,
+        instance_id: &str,
+        agent_generation: &str,
+    ) -> bool {
+        self.resource_uid == resource_uid
+            && self.activation_identity.replica_id.value() == replica_id
+            && self.activation_identity.instance_id.as_str() == instance_id
+            && self.activation_identity.agent_generation.as_str() == agent_generation
+            && self.source.replica_id == replica_id.to_string()
+            && self.source.instance_id == instance_id
+            && self.source.agent_generation == agent_generation
     }
 
     pub fn mark_submitting(&mut self) -> Result<(), SeedStateError> {
@@ -329,15 +354,32 @@ impl SeedDispatchRecord {
             validate_id(&member.process_session_id)?;
             validate_guid(&member.native_replica_id)?;
         }
+        self.winning_target_storage
+            .validate()
+            .map_err(|_| SeedStateError::Malformed)?;
+        let winning_target = self
+            .targets
+            .iter()
+            .find(|target| target.replica_id == self.winning_target_replica_id)
+            .ok_or(SeedStateError::IdentityMismatch)?;
         if self.targets[0].replica_id == self.targets[1].replica_id
             || self
                 .targets
                 .iter()
                 .any(|target| target.replica_id == self.source.replica_id)
-            || !self
-                .targets
-                .iter()
-                .any(|target| target.replica_id == self.winning_target_replica_id)
+            || self.activation_identity.replica_id.to_string() != self.source.replica_id
+            || self.activation_identity.instance_id.to_string() != self.source.instance_id
+            || self.activation_identity.agent_generation.to_string() != self.source.agent_generation
+            || self.winning_target_storage.replica.replica_id.to_string()
+                != winning_target.replica_id
+            || self.winning_target_storage.replica.instance_id.to_string()
+                != winning_target.instance_id
+            || self
+                .winning_target_storage
+                .replica
+                .agent_generation
+                .to_string()
+                != winning_target.agent_generation
         {
             return Err(SeedStateError::IdentityMismatch);
         }
@@ -347,6 +389,7 @@ impl SeedDispatchRecord {
     fn same_identity(&self, other: &Self) -> bool {
         self.schema_version == other.schema_version
             && self.resource_uid == other.resource_uid
+            && self.activation_identity == other.activation_identity
             && self.configuration_id == other.configuration_id
             && self.availability_group_name == other.availability_group_name
             && self.availability_group_id == other.availability_group_id
@@ -358,6 +401,7 @@ impl SeedDispatchRecord {
             && self.targets == other.targets
             && self.winning_target_replica_id == other.winning_target_replica_id
             && self.winning_build_id == other.winning_build_id
+            && self.winning_target_storage == other.winning_target_storage
             && self.sqlserver_start_time == other.sqlserver_start_time
             && self.operation_token == other.operation_token
     }
@@ -365,6 +409,7 @@ impl SeedDispatchRecord {
     pub fn same_dispatch_context(&self, other: &Self) -> bool {
         self.schema_version == other.schema_version
             && self.resource_uid == other.resource_uid
+            && self.activation_identity == other.activation_identity
             && self.configuration_id == other.configuration_id
             && self.availability_group_name == other.availability_group_name
             && self.availability_group_id == other.availability_group_id
@@ -384,6 +429,7 @@ impl SeedDispatchRecord {
             && self.targets == other.targets
             && self.winning_target_replica_id == other.winning_target_replica_id
             && self.winning_build_id == other.winning_build_id
+            && self.winning_target_storage == other.winning_target_storage
     }
 
     fn validate_initial(&self) -> Result<(), SeedStateError> {
@@ -436,7 +482,7 @@ impl SeedDispatchRecord {
     fn derive_operation_token(&self) -> String {
         let mut digest = Sha256::new();
         for value in [
-            "kuberic-mssql-seed-dispatch-v2",
+            "kuberic-mssql-seed-dispatch-v3",
             &self.resource_uid,
             &self.configuration_id,
             &self.availability_group_name,
@@ -450,6 +496,14 @@ impl SeedDispatchRecord {
             digest.update(value.as_bytes());
             digest.update(b"\0");
         }
+        let activation =
+            serde_json::to_vec(&self.activation_identity).expect("public activation serializes");
+        digest.update(&activation);
+        digest.update(b"\0");
+        let storage =
+            serde_json::to_vec(&self.winning_target_storage).expect("public storage serializes");
+        digest.update(&storage);
+        digest.update(b"\0");
         for member in std::iter::once(&self.source).chain(self.targets.iter()) {
             for value in [
                 &member.replica_id,
@@ -476,6 +530,9 @@ impl SeedDispatchStore {
     pub fn open(root: &Path) -> Result<Self, SeedStateError> {
         let root = BoundRoot::open(root).map_err(map_root_error)?;
         root.verify_path().map_err(SeedStateError::from)?;
+        if let Some((record, _)) = read_record(&root)? {
+            record.validate()?;
+        }
         let owner = root
             .openat(
                 SEED_OWNER_FILE,
@@ -513,24 +570,9 @@ impl SeedDispatchStore {
     }
 
     fn load_unlocked(&self) -> Result<Option<SeedDispatchRecord>, SeedStateError> {
-        let file = match self.root.openat(
-            SEED_STATE_FILE,
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            0,
-        ) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(SeedStateError::Io),
+        let Some((record, migrated)) = read_record(&self.root)? else {
+            return Ok(None);
         };
-        verify_private_file(&file, MAX_SEED_STATE_BYTES)?;
-        let mut bytes = Vec::new();
-        file.take(MAX_SEED_STATE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| SeedStateError::Io)?;
-        if bytes.len() as u64 > MAX_SEED_STATE_BYTES {
-            return Err(SeedStateError::UnsafeState);
-        }
-        let (record, migrated) = decode_record(&bytes)?;
         record.validate()?;
         if migrated {
             self.write_unlocked(&record)?;
@@ -673,7 +715,31 @@ impl SeedDispatchStore {
     }
 }
 
-pub(super) fn validate_seed_entry(root: &BoundRoot, name: &str) -> Result<(), SeedStateError> {
+fn read_record(root: &BoundRoot) -> Result<Option<(SeedDispatchRecord, bool)>, SeedStateError> {
+    let file = match root.openat(
+        SEED_STATE_FILE,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        0,
+    ) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(SeedStateError::Io),
+    };
+    verify_private_file(&file, MAX_SEED_STATE_BYTES)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SEED_STATE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| SeedStateError::Io)?;
+    if bytes.len() as u64 > MAX_SEED_STATE_BYTES {
+        return Err(SeedStateError::UnsafeState);
+    }
+    decode_record(&bytes).map(Some)
+}
+
+pub(super) fn validate_seed_entry(
+    root: &BoundRoot,
+    name: &str,
+) -> Result<Option<SeedDispatchRecord>, SeedStateError> {
     let max = match name {
         SEED_STATE_FILE => MAX_SEED_STATE_BYTES,
         SEED_OWNER_FILE => 0,
@@ -693,24 +759,9 @@ pub(super) fn validate_seed_entry(root: &BoundRoot, name: &str) -> Result<(), Se
         }
         let (record, _) = decode_record(&bytes)?;
         record.validate()?;
+        return Ok(Some(record));
     }
-    Ok(())
-}
-
-pub(super) fn recover_seed_temporary(root: &BoundRoot, name: &str) -> Result<bool, SeedStateError> {
-    let Some(pid) = temporary_file_pid(name, SEED_STATE_FILE) else {
-        return Ok(false);
-    };
-    if !process_is_gone(pid).map_err(SeedStateError::from)? {
-        return Err(SeedStateError::UnsafeState);
-    }
-    let temporary = root
-        .openat(name, libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0)
-        .map_err(|_| SeedStateError::UnsafeState)?;
-    verify_private_file(&temporary, MAX_SEED_STATE_BYTES)?;
-    drop(temporary);
-    root.unlinkat(name).map_err(SeedStateError::from)?;
-    Ok(true)
+    Ok(None)
 }
 
 fn verify_private_file(file: &File, max_bytes: u64) -> Result<(), SeedStateError> {
@@ -747,35 +798,6 @@ fn validate_guid(value: &str) -> Result<(), SeedStateError> {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacySeedDispatchRecord {
-    schema_version: u32,
-    revision: u64,
-    resource_uid: String,
-    configuration_id: String,
-    availability_group_name: String,
-    availability_group_id: String,
-    database_name: String,
-    database_guid: String,
-    family_guid: String,
-    recovery_fork_guid: String,
-    source: SeedDispatchTarget,
-    targets: [SeedDispatchTarget; 2],
-    winning_target_replica_id: String,
-    winning_build_id: String,
-    sqlserver_start_time: String,
-    phase: LegacySeedDispatchPhase,
-    group_database_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum LegacySeedDispatchPhase {
-    Intent,
-    Dispatched,
-}
-
 fn decode_record(bytes: &[u8]) -> Result<(SeedDispatchRecord, bool), SeedStateError> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| SeedStateError::Malformed)?;
@@ -786,48 +808,6 @@ fn decode_record(bytes: &[u8]) -> Result<(SeedDispatchRecord, bool), SeedStateEr
         Some(version) if version == u64::from(SEED_DISPATCH_SCHEMA_VERSION) => {
             let record = serde_json::from_value(value).map_err(|_| SeedStateError::Malformed)?;
             Ok((record, false))
-        }
-        Some(1) => {
-            let legacy: LegacySeedDispatchRecord =
-                serde_json::from_value(value).map_err(|_| SeedStateError::Malformed)?;
-            if legacy.schema_version != 1
-                || legacy.revision == 0
-                || matches!(legacy.phase, LegacySeedDispatchPhase::Intent)
-                    && (legacy.revision != 1 || legacy.group_database_id.is_some())
-                || matches!(legacy.phase, LegacySeedDispatchPhase::Dispatched)
-                    && legacy.revision < 2
-            {
-                return Err(SeedStateError::Malformed);
-            }
-            let record = SeedDispatchRecord {
-                schema_version: SEED_DISPATCH_SCHEMA_VERSION,
-                revision: legacy.revision,
-                resource_uid: legacy.resource_uid,
-                configuration_id: legacy.configuration_id,
-                availability_group_name: legacy.availability_group_name,
-                availability_group_id: legacy.availability_group_id,
-                database_name: legacy.database_name,
-                database_guid: legacy.database_guid,
-                family_guid: legacy.family_guid,
-                recovery_fork_guid: legacy.recovery_fork_guid,
-                source: legacy.source,
-                targets: legacy.targets,
-                winning_target_replica_id: legacy.winning_target_replica_id,
-                winning_build_id: legacy.winning_build_id,
-                sqlserver_start_time: legacy.sqlserver_start_time,
-                operation_token: String::new(),
-                phase: match legacy.phase {
-                    LegacySeedDispatchPhase::Intent => SeedDispatchPhase::Intent,
-                    LegacySeedDispatchPhase::Dispatched => SeedDispatchPhase::LegacyAmbiguous,
-                },
-                group_database_id: legacy.group_database_id,
-            };
-            let mut record = record;
-            if record.phase == SeedDispatchPhase::Intent {
-                record.operation_token = record.derive_operation_token();
-            }
-            record.validate()?;
-            Ok((record, true))
         }
         Some(version) => Err(SeedStateError::UnsupportedSchema(
             u32::try_from(version).unwrap_or(u32::MAX),

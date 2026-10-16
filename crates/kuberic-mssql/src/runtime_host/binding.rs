@@ -6,15 +6,16 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 
 use kuberic_runtime::host::ApplicationStorageState;
+use kuberic_runtime::protocol::types::ReplicaIdentity;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::config::RuntimeHostConfig;
 use super::seed_state::{
-    SEED_OWNER_FILE, SEED_STATE_FILE, recover_seed_temporary, validate_seed_entry,
+    SEED_OWNER_FILE, SEED_STATE_FILE, SeedDispatchRecord, validate_seed_entry,
 };
 
-pub const RUNTIME_BINDING_SCHEMA_VERSION: u32 = 1;
+pub const RUNTIME_BINDING_SCHEMA_VERSION: u32 = 2;
 const BINDING_FILE: &str = "runtime-binding.json";
 const MAX_BINDING_BYTES: u64 = 65_536;
 
@@ -27,6 +28,7 @@ pub struct RuntimeBindingIdentity {
     observer: ObserverBinding,
     topology_sha256: String,
     application_root: String,
+    activation: Option<PublicV1ActivationIdentity>,
 }
 
 impl RuntimeBindingIdentity {
@@ -50,6 +52,48 @@ impl RuntimeBindingIdentity {
                 .to_str()
                 .ok_or(RuntimeBindingError::InvalidPath)?
                 .to_owned(),
+            activation: None,
+        })
+    }
+
+    fn activated(&self, identity: &ReplicaIdentity) -> Result<Self, RuntimeBindingError> {
+        if identity.replica_id.value() != self.replica_id
+            || identity.instance_id.is_empty()
+            || identity.agent_generation.is_empty()
+        {
+            return Err(RuntimeBindingError::IdentityMismatch);
+        }
+        let mut activated = self.clone();
+        activated.activation = Some(PublicV1ActivationIdentity {
+            replica_id: identity.replica_id.value(),
+            instance_id: identity.instance_id.to_string(),
+            agent_generation: identity.agent_generation.to_string(),
+        });
+        Ok(activated)
+    }
+
+    fn matches_static_identity(&self, expected: &Self) -> bool {
+        self.schema_version == expected.schema_version
+            && self.resource_uid == expected.resource_uid
+            && self.replica_id == expected.replica_id
+            && self.observer == expected.observer
+            && self.topology_sha256 == expected.topology_sha256
+            && self.application_root == expected.application_root
+            && self.activation.as_ref().is_some_and(|activation| {
+                activation.replica_id == self.replica_id
+                    && !activation.instance_id.is_empty()
+                    && !activation.agent_generation.is_empty()
+            })
+    }
+
+    fn matches_seed_record(&self, record: &SeedDispatchRecord) -> bool {
+        self.activation.as_ref().is_some_and(|activation| {
+            record.matches_application_binding(
+                &self.resource_uid,
+                activation.replica_id,
+                &activation.instance_id,
+                &activation.agent_generation,
+            )
         })
     }
 
@@ -64,6 +108,14 @@ impl RuntimeBindingIdentity {
     pub fn topology_sha256(&self) -> &str {
         &self.topology_sha256
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicV1ActivationIdentity {
+    replica_id: i64,
+    instance_id: String,
+    agent_generation: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,8 +169,8 @@ impl RuntimeBindingStore {
             Err(_) => return Err(RuntimeBindingError::Io),
         };
         root.verify_path()?;
-        let mut entries = root.entries()?;
-        let mut recovered = false;
+        let entries = root.entries()?;
+        let mut seed_record = None;
         for entry in &entries {
             let Some(name) = entry.to_str() else {
                 return Err(RuntimeBindingError::UnsafeState);
@@ -126,23 +178,14 @@ impl RuntimeBindingStore {
             match name {
                 BINDING_FILE => {}
                 SEED_STATE_FILE | SEED_OWNER_FILE => {
-                    validate_seed_entry(&root, name).map_err(map_seed_error)?;
-                }
-                _ => {
-                    if recover_temporary(&root, name, BINDING_FILE)?
-                        || recover_seed_temporary(&root, name).map_err(map_seed_error)?
+                    if let Some(record) =
+                        validate_seed_entry(&root, name).map_err(map_seed_error)?
                     {
-                        recovered = true;
-                    } else {
-                        return Err(RuntimeBindingError::UnsafeState);
+                        seed_record = Some(record);
                     }
                 }
+                _ => return Err(RuntimeBindingError::UnsafeState),
             }
-        }
-        if recovered {
-            root.file.sync_all().map_err(|_| RuntimeBindingError::Io)?;
-            root.verify_path()?;
-            entries = root.entries()?;
         }
         if entries.is_empty() {
             return Ok(ApplicationStorageState::FreshEmpty);
@@ -156,13 +199,20 @@ impl RuntimeBindingStore {
         }
         let actual = self.load(&root)?;
         root.verify_path()?;
-        if actual != self.expected {
+        if !actual.matches_static_identity(&self.expected) {
+            return Err(RuntimeBindingError::IdentityMismatch);
+        }
+        if seed_record
+            .as_ref()
+            .is_some_and(|record| !actual.matches_seed_record(record))
+        {
             return Err(RuntimeBindingError::IdentityMismatch);
         }
         Ok(ApplicationStorageState::Established)
     }
 
-    pub fn initialize(&self) -> Result<(), RuntimeBindingError> {
+    pub fn initialize(&self, identity: &ReplicaIdentity) -> Result<(), RuntimeBindingError> {
+        let activated = self.expected.activated(identity)?;
         if self.storage_state()? != ApplicationStorageState::FreshEmpty {
             return Err(RuntimeBindingError::AlreadyInitialized);
         }
@@ -181,14 +231,19 @@ impl RuntimeBindingStore {
             }
         })?;
         root.verify_path()?;
-        self.save(&root)
+        self.save(&root, &activated)
     }
 
-    pub fn validate(&self) -> Result<(), RuntimeBindingError> {
-        if self.storage_state()? == ApplicationStorageState::Established {
+    pub fn validate(&self, identity: &ReplicaIdentity) -> Result<(), RuntimeBindingError> {
+        if self.storage_state()? != ApplicationStorageState::Established {
+            return Err(RuntimeBindingError::NotInitialized);
+        }
+        let root = BoundRoot::open(&self.root).map_err(|_| RuntimeBindingError::Io)?;
+        let actual = self.load(&root)?;
+        if actual == self.expected.activated(identity)? {
             Ok(())
         } else {
-            Err(RuntimeBindingError::NotInitialized)
+            Err(RuntimeBindingError::IdentityMismatch)
         }
     }
 
@@ -225,9 +280,13 @@ impl RuntimeBindingStore {
         Ok(identity)
     }
 
-    fn save(&self, root: &BoundRoot) -> Result<(), RuntimeBindingError> {
-        let bytes = serde_json::to_vec_pretty(&self.expected)
-            .map_err(|_| RuntimeBindingError::Malformed)?;
+    fn save(
+        &self,
+        root: &BoundRoot,
+        identity: &RuntimeBindingIdentity,
+    ) -> Result<(), RuntimeBindingError> {
+        let bytes =
+            serde_json::to_vec_pretty(identity).map_err(|_| RuntimeBindingError::Malformed)?;
         let temporary = format!(".{BINDING_FILE}.{}.new", std::process::id());
         let mut file = root
             .openat(
@@ -358,54 +417,6 @@ impl BoundRoot {
             Err(RuntimeBindingError::Io)
         }
     }
-}
-
-pub(super) fn temporary_file_pid(name: &str, file_name: &str) -> Option<libc::pid_t> {
-    let prefix = format!(".{file_name}.");
-    name.strip_prefix(&prefix)?
-        .strip_suffix(".new")?
-        .parse::<libc::pid_t>()
-        .ok()
-        .filter(|pid| *pid > 0)
-}
-
-pub(super) fn process_is_gone(pid: libc::pid_t) -> Result<bool, RuntimeBindingError> {
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return Ok(false);
-    }
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(libc::ESRCH) => Ok(true),
-        Some(libc::EPERM) => Ok(false),
-        _ => Err(RuntimeBindingError::Io),
-    }
-}
-
-fn recover_temporary(
-    root: &BoundRoot,
-    name: &str,
-    file_name: &str,
-) -> Result<bool, RuntimeBindingError> {
-    let Some(pid) = temporary_file_pid(name, file_name) else {
-        return Ok(false);
-    };
-    if !process_is_gone(pid)? {
-        return Err(RuntimeBindingError::UnsafeState);
-    }
-    let temporary = root
-        .openat(name, libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0)
-        .map_err(|_| RuntimeBindingError::UnsafeState)?;
-    let metadata = temporary
-        .metadata()
-        .map_err(|_| RuntimeBindingError::UnsafeState)?;
-    if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err(RuntimeBindingError::UnsafeState);
-    }
-    drop(temporary);
-    root.unlinkat(name)?;
-    Ok(true)
 }
 
 fn map_seed_error(error: super::seed_state::SeedStateError) -> RuntimeBindingError {

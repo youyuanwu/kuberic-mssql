@@ -1,0 +1,2 @@
+[env]
+ACCEPT_EULA = { value = "Y", force = true }

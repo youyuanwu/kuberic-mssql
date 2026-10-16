@@ -118,45 +118,163 @@ mod executable_now {
             assert!(application_error(failure).contains("observe-only"));
         }
     }
+
+    #[tokio::test]
+    async fn build_requires_exact_idle_public_v1_authority() {
+        let cases = [
+            {
+                let mut build = target_build(1, "readiness-build-empty-id");
+                build.build_id = OperationId::default();
+                build
+            },
+            {
+                let mut build = target_build(1, "readiness-build-progress");
+                build.current_progress = 0;
+                build
+            },
+            {
+                let mut build = target_build(1, "readiness-build-role");
+                build.role = ReplicaRole::ActiveSecondary;
+                build
+            },
+            {
+                let mut build = target_build(1, "readiness-build-storage");
+                build.storage_incarnation = None;
+                build
+            },
+            {
+                let mut build = target_build(1, "readiness-build-storage-identity");
+                build.storage_incarnation.as_mut().unwrap().replica = kuberic_identity(3);
+                build
+            },
+            {
+                let mut build = target_build(1, "readiness-build-session");
+                build.process_session_id = ProcessSessionId::new("stale-session");
+                build
+            },
+            {
+                let mut build = target_build(1, "readiness-build-address");
+                build.replication_address = "stale.example:5022".into();
+                build
+            },
+        ];
+
+        for build in cases {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let complete = Arc::new(AtomicBool::new(false));
+            let executor = Arc::new(SeedMutationExecutor {
+                complete: complete.clone(),
+                executions: AtomicUsize::new(0),
+            });
+            let replicator = seed_replicator_with_executor(
+                root.path().to_owned(),
+                complete,
+                executor.clone() as Arc<dyn SqlMutationExecutor>,
+            );
+            admit_seed_replicator(&replicator).await;
+
+            let message = application_error(replicator.build_replica(build).await.unwrap_err());
+            assert!(
+                message.contains("target build") || message.contains("session, address, or role"),
+                "{message}"
+            );
+            assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn adapter_remove_is_effect_free_after_build_task_settlement() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let complete = Arc::new(AtomicBool::new(false));
+        let executor = Arc::new(SeedMutationExecutor {
+            complete: complete.clone(),
+            executions: AtomicUsize::new(0),
+        });
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let replicator = seed_replicator_with_executor(
+            root.path().to_owned(),
+            complete,
+            executor.clone() as Arc<dyn SqlMutationExecutor>,
+        );
+        admit_seed_replicator(&replicator).await;
+        replicator
+            .testing_gate_seed_intent(entered_tx, release_rx)
+            .unwrap();
+
+        let build = tokio::spawn({
+            let replicator = replicator.clone();
+            async move {
+                replicator
+                    .build_replica(target_build(1, "readiness-host-owned-build"))
+                    .await
+            }
+        });
+        entered_rx.await.unwrap();
+
+        build.abort();
+        assert!(build.await.unwrap_err().is_cancelled());
+        assert!(release_tx.send(()).is_err());
+        assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+
+        let removal = replicator
+            .remove_replica(ReplicaId::new(2))
+            .await
+            .unwrap_err();
+        assert!(application_error(removal).contains("observe-only"));
+        assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn upstream_public_v1_catalog_binds_cancel_before_remove_to_host_scenarios() {
+        for scenario in [
+            "hosted_public_v1_build_dispatches_exact_attempt_and_waits_for_matching_completion",
+            "hosted_public_v1_removal_drains_build_excludes_peer_and_rejects_stale_session",
+        ] {
+            kuberic_runtime::testing::assert_public_v1_conformance_gate(
+                "built-in-replacement",
+                "KSF-06",
+                scenario,
+            );
+        }
+    }
 }
 
-mod current_pin_gap_evidence {
+mod public_v1_lifecycle_evidence {
     use super::*;
 
     #[tokio::test]
-    async fn role_before_primary_configuration_remains_release_blocked() {
+    async fn primary_role_precedes_current_configuration() {
         let replicator = opened_bound_replicator(
             vec![Ok(present(bound_snapshot())), Ok(present(bound_snapshot()))],
             vec![OBSERVED_AT; 2],
         )
         .await;
 
-        let error = replicator
-            .change_role(configuration().epoch, ReplicaRole::Primary)
-            .await
-            .unwrap_err();
-        assert!(application_error(error).contains("not been admitted"));
-
         replicator
-            .update_current_replica_set_configuration(bound_replica_set())
+            .change_role(configuration().epoch, ReplicaRole::Primary)
             .await
             .unwrap();
         replicator
-            .change_role(configuration().epoch, ReplicaRole::Primary)
+            .update_current_replica_set_configuration(bound_replica_set())
             .await
             .unwrap();
     }
 
     #[tokio::test]
-    async fn newer_same_role_secondary_epoch_remains_release_blocked() {
+    async fn same_role_secondary_accepts_newer_epoch_without_sql_sequence_change() {
         let replicator = opened_admitted_replicator(
             1,
             vec![
                 Ok(present(bound_snapshot_for(1))),
                 Ok(present(bound_snapshot_for(1))),
                 Ok(present(bound_snapshot_for(1))),
+                Ok(present(bound_snapshot_for(1))),
+                Ok(present(bound_snapshot_for(1))),
             ],
-            vec![OBSERVED_AT; 3],
+            vec![OBSERVED_AT; 5],
         )
         .await;
 
@@ -168,11 +286,64 @@ mod current_pin_gap_evidence {
             .update_epoch(configuration().epoch)
             .await
             .unwrap();
+        replicator.update_epoch(Epoch::new(7, 43)).await.unwrap();
         let error = replicator
-            .update_epoch(Epoch::new(7, 43))
+            .update_epoch(Epoch::new(7, 42))
             .await
             .unwrap_err();
-        assert!(application_error(error).contains("frozen epoch"));
+        assert!(application_error(error).contains("regressed"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_secondary_binds_native_progress_without_primary_configuration() {
+        let mut recreated = bound_snapshot_with_sequence(1, "21");
+        if let Observation::Present { value, .. } = &mut recreated.availability_group {
+            value.identity.group_id = guid("99999999-9999-4999-8999-999999999999");
+        }
+        let replicator = bound_replicator_for(
+            1,
+            vec![
+                Ok(present(bound_snapshot_with_sequence(1, "17"))),
+                Ok(present(bound_snapshot_with_sequence(1, "18"))),
+                Ok(present(bound_snapshot_with_sequence(1, "19"))),
+                Ok(present(bound_snapshot_with_sequence(1, "20"))),
+                Ok(present(recreated)),
+            ],
+            vec![OBSERVED_AT; 10],
+        );
+        replicator.open().await.unwrap();
+
+        replicator
+            .change_role(configuration().epoch, ReplicaRole::ActiveSecondary)
+            .await
+            .unwrap();
+        replicator.update_epoch(Epoch::new(7, 43)).await.unwrap();
+        assert!(replicator.admitted_topology().is_none());
+        assert_eq!(replicator.current_progress().await.unwrap(), 19);
+        assert_eq!(replicator.catch_up_capability().await.unwrap(), 20);
+
+        let error = replicator.current_progress().await.unwrap_err();
+        assert!(application_error(error).contains("availability-group identity"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_secondary_progress_fails_when_bound_evidence_becomes_stale() {
+        let replicator = bound_replicator_for(
+            1,
+            vec![
+                Ok(present(bound_snapshot_with_sequence(1, "17"))),
+                Ok(present(bound_snapshot_with_sequence(1, "18"))),
+            ],
+            vec![OBSERVED_AT, OBSERVED_AT, OBSERVED_AT + MAX_AGE + 1],
+        );
+        replicator.open().await.unwrap();
+        replicator
+            .change_role(configuration().epoch, ReplicaRole::ActiveSecondary)
+            .await
+            .unwrap();
+
+        let error = replicator.current_progress().await.unwrap_err();
+        assert!(application_error(error).contains("stale"));
     }
 }
 
@@ -232,46 +403,25 @@ mod adapter_owned_neutral_facts {
             assert_eq!(descriptor.server_name.as_str(), format!("sql-{index}"));
         }
     }
-}
-
-mod release_blocked_candidate_gates {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum CandidateGateState {
-        PendingRelease,
-    }
 
     #[test]
-    fn unreleased_contract_gates_remain_pending_candidates() {
-        let gates = [
-            (
-                "external_progress_contract",
-                CandidateGateState::PendingRelease,
-            ),
-            (
-                "role_before_primary_configuration",
-                CandidateGateState::PendingRelease,
-            ),
-            (
-                "same_role_secondary_epoch",
-                CandidateGateState::PendingRelease,
-            ),
-            (
-                "remote_active_membership",
-                CandidateGateState::PendingRelease,
-            ),
-            ("invalid_build_progress", CandidateGateState::PendingRelease),
-            ("cancel_before_remove", CandidateGateState::PendingRelease),
-            (
-                "signed_authorization_contract",
-                CandidateGateState::PendingRelease,
-            ),
-        ];
+    fn remote_active_configuration_recovers_local_primary_from_runtime_facts() {
+        let mut current = bound_replica_set();
+        current
+            .replicas
+            .retain(|replica| replica.identity != kuberic_identity(1));
 
-        assert_eq!(gates.len(), 7);
-        assert!(
-            gates
-                .iter()
-                .all(|(_, state)| { matches!(state, CandidateGateState::PendingRelease) })
-        );
+        let descriptors = testing_current_pin_bootstrap_descriptors(
+            &kuberic_identity(1),
+            &topology_expectation(),
+            "replica-1.example:5022",
+            &current,
+        )
+        .unwrap();
+
+        assert_eq!(descriptors.len(), 3);
+        assert_eq!(descriptors[0].identity.logical_id(), "1");
+        assert_eq!(descriptors[1].identity.logical_id(), "2");
+        assert_eq!(descriptors[2].identity.logical_id(), "3");
     }
 }

@@ -157,6 +157,7 @@ fn standalone_database_preflight_refuses_unowned_same_name_state() {
     let ownership = StandaloneDatabaseOwnership {
         resource_id: "default/example".into(),
         configuration_id: "configuration-1".into(),
+        activation_id: "activation-1".into(),
     };
     let snapshot = StandaloneDatabaseSnapshot {
         identity: Some(identity.clone()),
@@ -374,6 +375,7 @@ fn mutation_surface_rejects_wrong_shape_and_native_bootstrap_identity() {
             availability_group.clone(),
             "default/example",
             "configuration-1",
+            "activation-1",
             vec![descriptor(1), descriptor(2)]
         ),
         Err(MutationContractError::ReplicaCount)
@@ -386,6 +388,7 @@ fn mutation_surface_rejects_wrong_shape_and_native_bootstrap_identity() {
             availability_group,
             "default/example",
             "configuration-1",
+            "activation-1",
             replicas
         ),
         Err(MutationContractError::NativeBootstrapIdentity)
@@ -399,6 +402,7 @@ fn mutation_surface_rejects_wrong_shape_and_native_bootstrap_identity() {
             availability_group,
             "default/example",
             "configuration-1",
+            "activation-1",
             replicas
         ),
         Err(MutationContractError::DuplicateReplica)
@@ -439,6 +443,7 @@ fn every_partial_source_database_postcondition_is_incomplete_but_recoverable() {
     let ownership = StandaloneDatabaseOwnership {
         resource_id: "default/example".into(),
         configuration_id: "configuration-1".into(),
+        activation_id: "activation-1".into(),
     };
     let identity = StandaloneDatabaseIdentity {
         name: database.clone(),
@@ -500,12 +505,14 @@ fn creation_intents_and_seeding_permission_have_closed_read_only_evidence() {
         database.clone(),
         "default/example",
         "configuration-1",
+        "activation-1",
     )
     .unwrap();
     let create_source = MutationEffect::create_source_database(
         database.clone(),
         "default/example",
         "configuration-1",
+        "activation-1",
     )
     .unwrap();
     let group_intent = MutationEffect::retain_availability_group_creation_intent(
@@ -513,6 +520,7 @@ fn creation_intents_and_seeding_permission_have_closed_read_only_evidence() {
         group.clone(),
         "default/example",
         "configuration-1",
+        "activation-1",
     )
     .unwrap();
     let grant = MutationEffect::grant_create_any_database(group);

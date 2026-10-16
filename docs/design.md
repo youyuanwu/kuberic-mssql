@@ -77,10 +77,10 @@ validation:
   native replica GUIDs;
 - exact SQL Server `numeric(25,0)` database progress values without narrowing
   them to Kuberic progress;
-- a dedicated signed `ConfigurationSequence` and optional observe-only Kuberic
-  adapter that, under the currently pinned pre-alignment Kuberic contract,
-  publishes validated AG configuration authority as current progress rather than
-  target Service Fabric application-history progress;
+- a dedicated signed `ConfigurationSequence` and optional Public V1 Kuberic
+  adapter that publishes validated AG configuration authority only after exact
+  native binding, while keeping lifecycle epochs and native decimal database
+  positions separate;
 - observations that distinguish present, absent, stale, and failed evidence;
 - versioned operation envelopes with canonical SHA-256 input signatures;
 - explicit destructive approvals and fence references;
@@ -111,11 +111,14 @@ general repair, destructive recovery, lease, or failover capability.
 `SqlServerEulaAcknowledgement` is the shared semantic acknowledgement contract:
 it can be constructed only from an explicit affirmative value. The production
 crate deliberately provides no container or Pod launcher and never translates
-that value into `ACCEPT_EULA=Y`. Only the Rust-owned one- and three-replica fixtures use a clearly test-only
-constructor to create the affirmative semantic value in code and inject exactly
-`ACCEPT_EULA=Y`; sourceless revalidation is idempotent.
-The strict file-backed constructor and negative contract tests remain for future
-production launchers.
+that value into `ACCEPT_EULA=Y`. Repository Cargo commands force
+`ACCEPT_EULA=Y` through `.cargo/config.toml` as repository-wide authorization
+only for the Rust-owned licensed fixtures. Those fixtures use a clearly
+test-only constructor to create the affirmative semantic value and pass exactly
+`ACCEPT_EULA=Y` to their owned containers; the setting does not authorize
+external or borrowed instances. The production adapter never accepts an EULA
+or deploys SQL Server. The strict file-backed constructor and negative contract
+tests remain for future production launchers.
 
 The licensed one-replica fixture owns one container, TLS assets and test
 principals solely to validate absence, permission denial, TLS rejection and CLI
@@ -243,9 +246,11 @@ cannot be truncated into the former classic runtime's scalar `i64`, compared acr
 different databases, or compared across incompatible recovery histories. They
 also cannot be safely narrowed, hashed, saturated, or substituted into
 Kuberic's signed 64-bit LSN slot. Every progress-bearing transition therefore
-includes both the database GUID and recovery-fork GUID. A safe upstream
-external-native progress contract is a prerequisite before MSSQL can participate
-in controller operations that compare first/last progress.
+includes both the database GUID and recovery-fork GUID. Public V1 uses the AG
+configuration sequence for its scalar history contract; any future operation
+that depends on database-native progress must still compare the appropriate
+field under exact lineage and satisfy the Stage 6 lease, fencing, and
+authenticated mutation design.
 
 The production crate now exposes repository-owned native history positions for
 future adapter integration. A position binds one exact decimal value to one
@@ -318,12 +323,12 @@ There are three separate trust boundaries:
 3. Authenticated command authority between the future operator and replica
    agent.
 
-Future build and peer-mutation entry points also require signed
-`BuildAuthorization` and `PeerSessionAuthorization`. SQL Server HADR cannot
-carry Kuberic tokens, so production authority-changing work needs an
-authenticated replica-local adapter/control channel above HADR. The existing
-challenge-bound fixture exchange is a licensed validation seam only; it is not
-the production mutation transport.
+The released Public V1 transport is not claimed to authenticate production
+mutation authority. SQL Server HADR cannot carry Kuberic authorization tokens,
+so production authority-changing work still needs an authenticated
+replica-local adapter/control channel above HADR. The existing challenge-bound
+fixture exchange is a licensed validation seam only; it is not the production
+mutation transport.
 
 Only Kubernetes Secret references belong in desired state. Passwords,
 certificate private keys, connection strings containing credentials, and SQL
@@ -365,42 +370,35 @@ The SQL Server code now includes an independently runnable public
 automatic Kubernetes failover.
 
 Each runtime receives a strict stable mapping from three Kuberic replica
-numbers to SQL Server names and AG endpoint URLs. The current-configuration
-callback supplies dynamic full identities, roles, sessions and addresses.
+numbers to SQL Server names and AG endpoint URLs. Public V1 current
+configuration supplies exact ready remote active descriptions, while the local
+member is recovered from runtime identity and the configuration descriptor.
+Idle or in-build targets stay outside that remote set and carry
+`INVALID_LSN`, exact build/session/storage identity, and an exact address.
 Fresh SQL evidence freezes native replica GUIDs, AG/database lineage and the
-local SQL process start. Bootstrap callbacks may omit remote transport
-descriptions. Complete values freeze the binding. Later callbacks may omit
-remote session or address projections, but cannot clear the frozen values; any
-supplied value must still match exactly.
+local SQL process start. A complete remote-only primary callback converges the
+source database and AG ownership foundation without admitting a partial native
+group. A later explicit full projection completes local joins and native
+admission before freezing the binding; later omitted projections cannot clear
+it, and every supplied value must still match exactly.
 
-The current Kuberic pin still exercises a full-topology bootstrap/current-
-configuration callback in licensed validation, but that seam is not the future
-AG manifest. The aligned Service Fabric target configuration should contain only
-remote active members; the local replica and idle or in-build targets stay out
-of the remote set, `must_catchup` identifies the chosen successor, and build
-targets carry invalid/unknown progress rather than synthesized comparable
-history.
+The adapter publishes conservative immutable `ReplicatorCapabilities`.
+Catch-up-specific quorum and all write authority remain unsupported.
 
-Future immutable `ReplicatorCapabilities` must describe that narrower public
-contract. MSSQL's initial declaration will keep catch-up-specific quorum
-unsupported and will use `ReplaceOnAmbiguity` for data-loss replay. Stage 3
-behavior under the current pin remains unchanged until upstream Kuberic
-implements the aligned contract.
-
-Current-pin DTO interpretation is contained in a compatibility component under
+Public V1 DTO interpretation is contained in a compatibility component under
 the Kuberic adapter. It owns validation, normalization, local bootstrap
 ownership, desired SQL descriptors, replay/enrichment, topology admission, and
-build-target facts. SQL-native convergence classifiers no longer import or
-interpret Kuberic replica-set DTOs. This changes reachability, not semantics:
-the existing callbacks, errors, mutation order, seed record/token, target
-evidence, and persisted formats remain unchanged.
+build-target facts. SQL-native convergence classifiers do not import or
+interpret Kuberic replica-set DTOs. Application binding schema 2, seed schema
+3, and SQL ownership markers bind licensed behavior to the exact Public V1
+activation and reject predecessor state without migration.
 
-The unpublished test crate owns a versioned release-intake profile and CLI. It
-separates executable current evidence, adapter-owned neutral facts, current-pin
-gaps, and release-blocked target gates. In particular, role before primary
-configuration and a newer same-role secondary epoch remain release-blocked
-under the current pin rather than being reported as present conformance. See
-[Kuberic release intake](kuberic-release-intake.md).
+The unpublished test crate owns versioned release-intake profiles and a CLI.
+Profile v1 preserves the predecessor baseline; profile v2 records executable
+Public V1 evidence for role-before-configuration, same-role epoch renewal,
+remote-active membership, invalid build progress, cancellation-before-removal,
+AG-sequence progress, and the ordinary zero-mutation boundary. See [Kuberic
+release intake](kuberic-release-intake.md).
 
 The application persists a schema-versioned non-secret runtime binding and,
 only while native SQL cannot prove whether group seeding was dispatched, one
@@ -427,9 +425,13 @@ and current process session. The callback then validates the target native
 replica GUID, exact AG and group-database identities, family/recovery-fork
 lineage, local synchronized/healthy/online/not-suspended state, and the target
 SQL start identity frozen by the licensed fixture. A report created for an old
-challenge, build or process session is not reusable. This exchange exists only
-in reviewed bootstrap-testing construction and does not alter the pinned
-Kuberic protocol or ordinary read-only runtime.
+challenge, build or process session is not reusable. This exchange exists only in reviewed bootstrap-testing construction and does
+not alter the Kuberic protocol or ordinary read-only runtime. The licensed
+Stage 3 configuration and seed callbacks are a SQL-native convergence seam,
+not end-to-end Public V1 Build operations. Public V1 Build conformance in this
+repository is limited to server-free ordinary-path validation and effect-free
+negative coverage; the licensed callbacks do not prove host Build admission,
+receipts, or target-membership semantics.
 
 The file record binds exact authority and native identities and distinguishes
 `Intent`, `Submitting`, `Accepted`, genuinely `Ambiguous`, and
@@ -442,14 +444,10 @@ session is gone: exact native association or an accepted row can establish the
 terminal marker without redispatch, a held lock is ambiguous, and an absent
 effect after lock acquisition is definitely retryable.
 
-Schema-v1 file records migrate fail closed. Old `Dispatched` becomes the
-dedicated, tokenless `LegacyAmbiguous` phase because schema v1 had no SQL-owned
-row, application-lock handshake, or terminal marker. It can compact only when
-the record's exact native source association already exists; compaction records
-the exact group-database identity and retains the tokenless legacy tombstone so
-later restarts remain fenced. Missing or incomplete association requires
-explicit operator recovery and can never become `FailedRetryable`, a new
-`Intent`, or another submission.
+Predecessor seed schemas 1 and 2 reject without migration under fresh Public V1
+activation. They are not converted to `LegacyAmbiguous`, compacted, or
+redispatched. Only schema-3 records created for the exact activation can enter
+native reconciliation.
 
 Current configuration replay, secondary join, and seed build require native
 markers to match the resource, accepted configuration, AG name, and observed
@@ -464,11 +462,14 @@ another `ADD DATABASE`. Previous/current
 transitions, catch-up quorum, removal, data loss, destructive recovery, failover
 and lease behavior remain explicit unsupported errors.
 
-Role is not write authority. The healthy reports expose one primary and two
-active secondaries, but write access is never granted. No client SQL service
-address is published and there is no external write lease. The fixture's marker
-write uses its private administrator connection to the directly observed native
-primary and is not a Kuberic client-access decision.
+Role is not write authority. The contained observe-only Public V1 reports use
+role `None`, progress role `Recovery`, `first = 0`, `last =` the current native
+AG sequence, and read/write access `NotPrimary`. Those report roles are
+distinct from direct SQL observation, which proves one native primary and two
+native secondaries. No client SQL service address is published and there is no
+external write lease. The fixture's marker write uses its private administrator
+connection to the directly observed native primary and is not a Kuberic
+client-access decision.
 
 Stage 3 first identifies what Kuberic's private agent store retains and what
 exact SQL Server postcondition can be reobserved after restart. The PostgreSQL
@@ -484,7 +485,8 @@ marker only binds creation ownership and native identity. No general second
 operation database or result ledger was added.
 
 Bootstrap SQL is level-triggered at statement granularity. Scoped native DDL
-triggers persist the exact resource/configuration-derived creation intent before
+triggers persist the exact resource/configuration/Public V1 activation-derived
+creation intent before
 `CREATE DATABASE` and `CREATE AVAILABILITY GROUP`; only the corresponding
 token-bearing typed statement can atomically write the generated creation
 receipt. Recovery mode, ownership, marker schema, full backup, log backup,
@@ -494,14 +496,11 @@ Read-only `msdb` history proves the full/log/VERIFY chain, while the local
 marker joined to the current AG GUID proves completion of `GRANT CREATE ANY
 DATABASE`; retries issue only the next missing safe statement.
 
-The current implementation tracks Kuberic `main`; `Cargo.lock` freezes the
-exact revision used by each build. The current pin
-`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f` is the merge commit of
-[youyuanwu/kuberic#133](https://github.com/youyuanwu/kuberic/pull/133), which
-fixes custom-authority recovery and serializes peer replacement when public
-hosts reopen the same durable roots. It also includes the testing-only
-bound-listener handoff from
-[youyuanwu/kuberic#127](https://github.com/youyuanwu/kuberic/pull/127).
+The feature branch locks exact Public V1 candidate
+`ceec5887ad97d71222117610428ce715b782777e` for evaluation. The accepted
+current identity remains
+`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f` in release-intake evidence until
+the candidate reaches `ready_to_pin`.
 
 ## Delivery Sequence
 
@@ -517,13 +516,18 @@ bound-listener handoff from
    restart/cancellation/retry/lost-reply recovery, isolated licensed SQL-native
    cases, and test-only callback observation-seam validation. This stage adds
    neither certificate provisioning nor a production mutation transport.
-4. **SF contract-gap resolution** — upstream external-native progress,
-   remote-active target-configuration shape, immutable capabilities, and signed
-   build/peer-session authorizations for replica-local mutation transport.
-5. **Public-contract adapter migration after Kuberic Phase 4/5** — move from
-   the current pin's configuration-sequence publication and licensed validation
-   seam to the aligned public contract, while preserving the implemented Stage 3
-   native bootstrap evidence.
+4. **SF contract-gap resolution** — implemented upstream by the Public V1
+   replacement for lifecycle ordering, AG-sequence history, remote-active
+   configuration shape, immutable capabilities, exact build/session/storage
+   identity, and fresh protocol state. The released replication transport is
+   not described as authenticated.
+5. **Public-contract adapter migration after Kuberic Phase 4/5** — implemented
+   on the candidate feature branch: Public V1 host/callback translation,
+   activation-bound application/seed/SQL ownership, observe-only ordinary
+   construction, and version-2 release intake. The candidate record computes
+   `ready_to_pin` as a contract candidate, while actual merge readiness requires
+   the required exact PR-head `Shared CI validation` GitHub Actions check to
+   pass; accepted pin adoption remains a separate repository decision.
 6. **SQL-native fencing, reseed, switchover, and failover** — establish
    verified target and old-primary fencing before destructive reseed or role
    movement, then add external lease handling, sequence arbitration,
@@ -537,12 +541,11 @@ bound-listener handoff from
    three-replica failures, process/operator restarts, client reconnection,
    upgrades, and runbooks.
 
-Stages 1-3 remain valid under the current Kuberic pin. No dependency pin update
-happens until Stage 4's upstream contract work is implemented. Stages 1-3 do
-not require operator2. Stage 4 is upstream Kuberic work; Stages 5-8 depend on
-that public-only contract and the minimum youyuanwu/kuberic#79 vertical slice,
-but do not need to wait for every youyuanwu/kuberic#79 operation to be
-complete.
+Stages 1-3 remain valid native evidence but predecessor application, fixture,
+and SQL ownership is not migrated into Public V1 activation. Stage 5 does not
+enable Stage 6 fencing, lease, reseed, switchover, failover, or data-loss
+operations. Controller integration still requires the later public-only
+vertical slice and fresh protocol state.
 
 ## Test Gates
 
@@ -556,19 +559,24 @@ permissions, transport and sample deadlines, freshness, cancellation, CLI
 output, and credential redaction. A dedicated server-free observer workflow
 runs these without provisioning PostgreSQL or Kubernetes.
 
-Live tests run sequentially in the shared validation job after server-free
-checks. The Rust one-replica lifecycle owns one digest-pinned SQL Server 2025
+Live tests run sequentially in the required GitHub Actions job
+`Shared CI validation`, which runs `just ci` at the exact pull-request head and
+always runs `just cleanup`, after server-free checks. GitHub Actions job logs
+are the run evidence; no test logs or evidence artifacts are committed. The
+Rust one-replica lifecycle owns one digest-pinned SQL Server 2025
 Enterprise Developer container and validates absent AG, partial permission
 denial, invalid TLS and fresh production CLI provenance. It creates no
 availability group and never adopts or borrows an existing container.
 
 The Rust three-replica lifecycle pins
 `mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726`
-and automatically accepts the EULA only through the test crate's sourceless
-authorization constructor. It creates three resource-bounded instances and real
-endpoints; explicit bootstrap-capable hosts create one synchronous external AG
-and one automatically seeded database. Fresh direct observations must prove one
-primary, two synchronized healthy
+and is authorized by the repository-wide forced Cargo environment
+`ACCEPT_EULA=Y` only for these owned licensed fixtures, together with the test
+crate's sourceless authorization constructor. Production remains unable to
+accept an EULA or deploy SQL Server. The fixture creates three resource-bounded
+instances and real endpoints; explicit bootstrap-capable hosts create one
+synchronous external AG and one automatically seeded database. Fresh direct
+observations must prove one primary, two synchronized healthy
 secondaries, common identities and lineage, completed seeding, and a marker
 readable from all members. Three in-process Kuberic agents then admit only the
 frozen current topology and publish bracketed, fenced reports. Exact ownership
@@ -578,7 +586,10 @@ foreign or replaced resources, and perform bounded recovery without requiring
 SQL Server availability. `just cleanup` invokes both exact cleanup binaries.
 The three-runtime validation also performs a host-only same-root restart:
 replacement processes receive fresh sessions, stale-session commands are
-rejected, exact reports reconverge, and native marker continuity is retained.
+rejected, existing-state Open succeeds, native seed records compact without
+redispatch, exact contained reports reconverge, and native marker continuity is
+retained. This is not Public V1 peer-session/lifecycle renewal, does not replay
+an end-to-end Public V1 Build, and does not restore serving access.
 Fault, signal and recovery cases remain explicitly invoked, including failure
 after replacement-host startup followed by exact cleanup and retry. This does
 not advance the production delivery sequence: licensed validation restarts a
@@ -586,6 +597,12 @@ target SQL process only to prove build-evidence invalidation; it does not own or
 contain that process lifecycle. Write-lease expiry, old-primary fencing,
 switchover, failover, replica replacement, Kubernetes lifecycle, and client
 routing remain unimplemented.
+
+The `cancel_before_remove` intake gate combines upstream and local evidence:
+Kuberic exact-head CI run `38844709880` and catalog gate KSF-06 prove
+host-owned cancellation/drain ordering, while the MSSQL readiness test proves
+that remove rejection is effect-free after a callback task has settled. The
+local test is not represented as host-owned ordering.
 
 ## References
 

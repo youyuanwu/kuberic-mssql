@@ -387,13 +387,18 @@ impl StatefulServiceReplica for RuntimeHostApplication {
         match context.mode {
             OpenMode::New => match self.binding.storage_state().map_err(binding_error)? {
                 ApplicationStorageState::FreshEmpty => {
-                    self.binding.initialize().map_err(binding_error)?;
+                    self.binding
+                        .initialize(&context.identity)
+                        .map_err(binding_error)?;
                 }
                 ApplicationStorageState::Established => {
-                    self.binding.validate().map_err(binding_error)?;
+                    return Err(binding_error(RuntimeBindingError::AlreadyInitialized));
                 }
             },
-            OpenMode::Existing => self.binding.validate().map_err(binding_error)?,
+            OpenMode::Existing => self
+                .binding
+                .validate(&context.identity)
+                .map_err(binding_error)?,
         }
         self.inner.clone().open(context).await
     }

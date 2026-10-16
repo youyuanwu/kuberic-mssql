@@ -372,6 +372,9 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
     let workflow = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
     assert!(workflow.contains("just cleanup\n"));
     assert!(!workflow.contains("just cleanup-live-three-replica\n"));
+    assert!(!workflow.contains("upload-artifact"));
+    let cargo_config = fs::read_to_string(root.join(".cargo/config.toml")).unwrap();
+    assert!(cargo_config.contains("ACCEPT_EULA = { value = \"Y\", force = true }"));
 }
 
 #[test]

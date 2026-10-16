@@ -3,7 +3,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub const PROFILE_VERSION: u32 = 1;
+pub const PROFILE_V1_VERSION: u32 = 1;
+pub const PROFILE_V2_VERSION: u32 = 2;
+pub const PROFILE_VERSION: u32 = PROFILE_V2_VERSION;
 pub const EXIT_READY_TO_PIN: i32 = 0;
 pub const EXIT_INVALID: i32 = 2;
 pub const EXIT_BLOCKED: i32 = 3;
@@ -44,12 +46,14 @@ pub enum GateId {
     LiveThreeReplica,
     LiveThreeReplicaRestart,
     ExternalProgressContract,
+    AgSequenceHistoryContract,
     RoleBeforePrimaryConfiguration,
     SameRoleSecondaryEpoch,
     RemoteActiveMembership,
     InvalidBuildProgress,
     CancelBeforeRemove,
     SignedAuthorizationContract,
+    OrdinaryMutationBoundary,
 }
 
 impl fmt::Display for GateId {
@@ -70,12 +74,14 @@ impl fmt::Display for GateId {
             Self::LiveThreeReplica => "live_three_replica",
             Self::LiveThreeReplicaRestart => "live_three_replica_restart",
             Self::ExternalProgressContract => "external_progress_contract",
+            Self::AgSequenceHistoryContract => "ag_sequence_history_contract",
             Self::RoleBeforePrimaryConfiguration => "role_before_primary_configuration",
             Self::SameRoleSecondaryEpoch => "same_role_secondary_epoch",
             Self::RemoteActiveMembership => "remote_active_membership",
             Self::InvalidBuildProgress => "invalid_build_progress",
             Self::CancelBeforeRemove => "cancel_before_remove",
             Self::SignedAuthorizationContract => "signed_authorization_contract",
+            Self::OrdinaryMutationBoundary => "ordinary_mutation_boundary",
         })
     }
 }
@@ -153,6 +159,30 @@ pub const PROFILE_V1: [GateDefinition; 21] = [
     candidate_required(GateId::SignedAuthorizationContract),
 ];
 
+pub const PROFILE_V2: [GateDefinition; 21] = [
+    required(GateId::DependencyIdentity),
+    required(GateId::SemanticContractReview),
+    required(GateId::PersistenceContractReview),
+    required(GateId::FreshStateActivationReview),
+    required(GateId::NativeHistoryContract),
+    required(GateId::PinnedAdapterContract),
+    required(GateId::SfReadinessContract),
+    required(GateId::ReleaseIntakeContract),
+    required(GateId::Formatting),
+    required(GateId::StrictClippy),
+    required(GateId::FullLockedTests),
+    candidate_required(GateId::LiveOneReplica),
+    candidate_required(GateId::LiveThreeReplica),
+    candidate_required(GateId::LiveThreeReplicaRestart),
+    candidate_required(GateId::AgSequenceHistoryContract),
+    candidate_required(GateId::RoleBeforePrimaryConfiguration),
+    candidate_required(GateId::SameRoleSecondaryEpoch),
+    candidate_required(GateId::RemoteActiveMembership),
+    candidate_required(GateId::InvalidBuildProgress),
+    candidate_required(GateId::CancelBeforeRemove),
+    candidate_required(GateId::OrdinaryMutationBoundary),
+];
+
 const fn required(id: GateId) -> GateDefinition {
     GateDefinition {
         id,
@@ -221,6 +251,7 @@ pub enum IntakeError {
     EmptyGateEvidence(GateId),
     DuplicateGate(GateId),
     MissingGate(GateId),
+    UnexpectedGate(GateId),
     ClaimedOutcome {
         claimed: IntakeOutcome,
         computed: IntakeOutcome,
@@ -243,6 +274,7 @@ impl fmt::Display for IntakeError {
             }
             Self::DuplicateGate(gate) => write!(formatter, "duplicate gate {gate}"),
             Self::MissingGate(gate) => write!(formatter, "missing gate {gate}"),
+            Self::UnexpectedGate(gate) => write!(formatter, "unexpected gate {gate}"),
             Self::ClaimedOutcome { claimed, computed } => write!(
                 formatter,
                 "claimed outcome {claimed} does not match computed outcome {computed}"
@@ -279,9 +311,7 @@ pub fn parse_and_validate_json(
 }
 
 pub fn validate_record(record: &ReleaseIntakeRecord) -> Result<ValidatedIntake, IntakeError> {
-    if record.profile_version != PROFILE_VERSION {
-        return Err(IntakeError::UnknownProfileVersion(record.profile_version));
-    }
+    let profile = profile(record.profile_version)?;
     require_dependency_identity(
         &record.current_dependency_identity,
         "current_dependency_identity",
@@ -312,9 +342,14 @@ pub fn validate_record(record: &ReleaseIntakeRecord) -> Result<ValidatedIntake, 
             return Err(IntakeError::DuplicateGate(result.gate_id));
         }
     }
-    for definition in PROFILE_V1 {
+    for definition in profile {
         if !results.contains_key(&definition.id) {
             return Err(IntakeError::MissingGate(definition.id));
+        }
+    }
+    for gate in results.keys() {
+        if !profile.iter().any(|definition| definition.id == *gate) {
+            return Err(IntakeError::UnexpectedGate(*gate));
         }
     }
 
@@ -332,11 +367,11 @@ pub fn validate_record(record: &ReleaseIntakeRecord) -> Result<ValidatedIntake, 
         _ => {}
     }
 
-    let has_failed_required = PROFILE_V1
+    let has_failed_required = profile
         .iter()
         .filter(|definition| definition.requirement(record.mode) == GateRequirement::Required)
         .any(|definition| results[&definition.id] == GateStatus::Failed);
-    let has_pending_required = PROFILE_V1
+    let has_pending_required = profile
         .iter()
         .filter(|definition| definition.requirement(record.mode) == GateRequirement::Required)
         .any(|definition| results[&definition.id] == GateStatus::Pending);
@@ -361,6 +396,14 @@ pub fn validate_record(record: &ReleaseIntakeRecord) -> Result<ValidatedIntake, 
         outcome,
         effective_statuses: results,
     })
+}
+
+fn profile(version: u32) -> Result<&'static [GateDefinition], IntakeError> {
+    match version {
+        PROFILE_V1_VERSION => Ok(&PROFILE_V1),
+        PROFILE_V2_VERSION => Ok(&PROFILE_V2),
+        version => Err(IntakeError::UnknownProfileVersion(version)),
+    }
 }
 
 fn require_value(value: &str, field: &'static str) -> Result<(), IntakeError> {
@@ -419,7 +462,7 @@ pub fn render_summary(record: &ReleaseIntakeRecord, validated: &ValidatedIntake)
         record.fresh_state_finding
     ));
     summary.push_str("gates:\n");
-    for definition in PROFILE_V1 {
+    for definition in profile(record.profile_version).expect("validated profile version") {
         let recorded = record
             .gates
             .iter()

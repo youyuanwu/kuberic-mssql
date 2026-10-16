@@ -27,12 +27,14 @@ pub struct StandaloneDatabaseIdentity {
 pub struct StandaloneDatabaseOwnership {
     pub resource_id: String,
     pub configuration_id: String,
+    pub activation_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailabilityGroupOwnership {
     pub resource_id: String,
     pub configuration_id: String,
+    pub activation_id: String,
     pub name: AvailabilityGroupName,
     /// Identity captured atomically by the scoped server DDL trigger that
     /// authorizes exactly one application-created availability group.
@@ -115,6 +117,8 @@ pub fn source_database_creation_token(
     digest.update(ownership.resource_id.as_bytes());
     digest.update(b"\0");
     digest.update(ownership.configuration_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(ownership.activation_id.as_bytes());
     digest.update(b"\0");
     digest.update(database.as_str().as_bytes());
     hex(&digest.finalize())

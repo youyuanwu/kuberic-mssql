@@ -248,14 +248,16 @@ impl SqlMutationExecutor for TdsMutationExecutor {
                         let database_ownership = match (
                             optional_text(&row, "kuberic_resource_id", STAGE)?,
                             optional_text(&row, "kuberic_configuration_id", STAGE)?,
+                            optional_text(&row, "kuberic_activation_id", STAGE)?,
                         ) {
-                            (Some(resource_id), Some(configuration_id)) => {
+                            (Some(resource_id), Some(configuration_id), Some(activation_id)) => {
                                 Some(StandaloneDatabaseOwnership {
                                     resource_id,
                                     configuration_id,
+                                    activation_id,
                                 })
                             }
-                            (None, None) => None,
+                            (None, None, None) => None,
                             _ => {
                                 return Err(malformed(
                                     STAGE,
@@ -267,20 +269,23 @@ impl SqlMutationExecutor for TdsMutationExecutor {
                         let availability_group_ownership = match (
                             optional_text(&row, "kuberic_ag_resource_id", STAGE)?,
                             optional_text(&row, "kuberic_ag_configuration_id", STAGE)?,
+                            optional_text(&row, "kuberic_ag_activation_id", STAGE)?,
                             optional_text(&row, "kuberic_ag_name", STAGE)?,
                             optional_guid(&row, "kuberic_ag_created_id", STAGE)?,
                             optional_guid(&row, "kuberic_ag_id", STAGE)?,
                         ) {
-                            (None, None, None, None, None) => None,
+                            (None, None, None, None, None, None) => None,
                             (
                                 Some(resource_id),
                                 Some(configuration_id),
+                                Some(activation_id),
                                 Some(name),
                                 creation_group_id,
                                 group_id,
                             ) => Some(AvailabilityGroupOwnership {
                                 resource_id,
                                 configuration_id,
+                                activation_id,
                                 name: AvailabilityGroupName::new(name).map_err(|_| {
                                     malformed(
                                         STAGE,

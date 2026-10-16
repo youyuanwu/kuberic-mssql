@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -10,12 +11,46 @@ use kuberic_mssql::runtime_host::{
     SeedDispatchRecord, SeedDispatchStore, SeedDispatchTarget, SeedStateError,
 };
 use kuberic_runtime::host::ApplicationStorageState;
+use kuberic_runtime::protocol::types::{
+    AgentGeneration, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaStorageIdentity,
+    ReplicaStorageIncarnationContext, StorageGeneration,
+};
 
 struct Files {
     observer: PathBuf,
     topology: PathBuf,
     routes: PathBuf,
     token: PathBuf,
+}
+
+fn activation_identity(replica_id: i64) -> ReplicaIdentity {
+    activation_identity_with(
+        replica_id,
+        format!("pod-{replica_id}"),
+        format!("generation-{replica_id}"),
+    )
+}
+
+fn activation_identity_with(
+    replica_id: i64,
+    instance_id: impl Into<String>,
+    agent_generation: impl Into<String>,
+) -> ReplicaIdentity {
+    ReplicaIdentity {
+        replica_id: ReplicaId::new(replica_id),
+        instance_id: ReplicaInstanceId::new(instance_id),
+        agent_generation: AgentGeneration::new(agent_generation),
+    }
+}
+
+fn storage_incarnation(replica_id: i64) -> ReplicaStorageIncarnationContext {
+    ReplicaStorageIncarnationContext {
+        replica: activation_identity(replica_id),
+        storage: ReplicaStorageIdentity::Volatile {
+            identity: format!("storage-{replica_id}"),
+        },
+        storage_generation: StorageGeneration::new(format!("storage-generation-{replica_id}")),
+    }
 }
 
 fn write_private(path: &Path, value: impl AsRef<[u8]>) {
@@ -125,8 +160,14 @@ fn args(files: &Files) -> RuntimeHostArgs {
 }
 
 async fn config(root: &Path) -> RuntimeHostConfig {
+    config_for_resource(root, "resource-a").await
+}
+
+async fn config_for_resource(root: &Path, resource_uid: &str) -> RuntimeHostConfig {
     let files = files(root);
-    RuntimeHostConfig::load(args(&files), root).await.unwrap()
+    let mut host_args = args(&files);
+    host_args.resource_uid = resource_uid.to_owned();
+    RuntimeHostConfig::load(host_args, root).await.unwrap()
 }
 
 #[tokio::test]
@@ -357,13 +398,28 @@ async fn runtime_binding_is_durable_secret_free_and_rejects_identity_drift() {
         store.storage_state().unwrap(),
         ApplicationStorageState::FreshEmpty
     );
-    store.initialize().unwrap();
+    assert_eq!(
+        store.validate(&activation_identity(1)),
+        Err(RuntimeBindingError::NotInitialized)
+    );
+    assert!(!store.root().exists());
+    assert_eq!(
+        store.initialize(&activation_identity(2)),
+        Err(RuntimeBindingError::IdentityMismatch)
+    );
+    assert!(!store.root().exists());
+    store.initialize(&activation_identity(1)).unwrap();
     assert_eq!(
         store.storage_state().unwrap(),
         ApplicationStorageState::Established
     );
-    store.validate().unwrap();
+    store.validate(&activation_identity(1)).unwrap();
     let bytes = fs::read(store.path()).unwrap();
+    assert_eq!(
+        store.validate(&activation_identity(2)),
+        Err(RuntimeBindingError::IdentityMismatch)
+    );
+    assert_eq!(fs::read(store.path()).unwrap(), bytes.clone());
     let text = String::from_utf8(bytes).unwrap();
     assert!(!text.contains("agent-token-value"));
     assert!(!text.contains("password"));
@@ -522,10 +578,14 @@ async fn runtime_binding_rejects_extra_malformed_unsupported_and_symlinked_state
     let temporary = tempfile::tempdir().unwrap();
     let runtime_config = config(temporary.path()).await;
     let store = RuntimeBindingStore::new(&runtime_config).unwrap();
-    store.initialize().unwrap();
+    store.initialize(&activation_identity(1)).unwrap();
 
     fs::set_permissions(store.path(), fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(store.storage_state(), Err(RuntimeBindingError::UnsafeState));
+    assert_eq!(
+        store.validate(&activation_identity(1)),
+        Err(RuntimeBindingError::UnsafeState)
+    );
     fs::set_permissions(store.path(), fs::Permissions::from_mode(0o600)).unwrap();
 
     fs::write(store.root().join("foreign"), "foreign").unwrap();
@@ -537,11 +597,20 @@ async fn runtime_binding_rejects_extra_malformed_unsupported_and_symlinked_state
     assert_eq!(store.storage_state(), Err(RuntimeBindingError::Malformed));
 
     let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
-    value["schema_version"] = serde_json::json!(2);
+    value["schema_version"] = serde_json::json!(1);
+    let schema_v1 = serde_json::to_vec(&value).unwrap();
+    fs::write(store.path(), &schema_v1).unwrap();
+    assert_eq!(
+        store.storage_state(),
+        Err(RuntimeBindingError::UnsupportedSchema(1))
+    );
+    assert_eq!(fs::read(store.path()).unwrap(), schema_v1);
+
+    value["schema_version"] = serde_json::json!(99);
     fs::write(store.path(), serde_json::to_vec(&value).unwrap()).unwrap();
     assert_eq!(
         store.storage_state(),
-        Err(RuntimeBindingError::UnsupportedSchema(2))
+        Err(RuntimeBindingError::UnsupportedSchema(99))
     );
 
     let other = tempfile::tempdir().unwrap();
@@ -575,7 +644,7 @@ async fn runtime_binding_rejects_extra_malformed_unsupported_and_symlinked_state
 }
 
 #[tokio::test]
-async fn runtime_binding_recovers_only_stale_private_initialization_files() {
+async fn runtime_binding_rejects_partial_initialization_files_without_mutation() {
     let temporary = tempfile::tempdir().unwrap();
     let runtime_config = config(temporary.path()).await;
     let store = RuntimeBindingStore::new(&runtime_config).unwrap();
@@ -584,12 +653,20 @@ async fn runtime_binding_recovers_only_stale_private_initialization_files() {
 
     let stale = store.root().join(".runtime-binding.json.2147483647.new");
     write_private(&stale, "incomplete");
+    let stale_bytes = fs::read(&stale).unwrap();
+    assert_eq!(store.storage_state(), Err(RuntimeBindingError::UnsafeState));
     assert_eq!(
-        store.storage_state().unwrap(),
-        ApplicationStorageState::FreshEmpty
+        store.validate(&activation_identity(1)),
+        Err(RuntimeBindingError::UnsafeState)
     );
-    assert!(!stale.exists());
-    store.initialize().unwrap();
+    assert_eq!(fs::read(&stale).unwrap(), stale_bytes);
+    assert_eq!(
+        store.initialize(&activation_identity(1)),
+        Err(RuntimeBindingError::UnsafeState)
+    );
+    assert_eq!(fs::read(&stale).unwrap(), stale_bytes);
+    fs::remove_file(&stale).unwrap();
+    store.initialize(&activation_identity(1)).unwrap();
 
     fs::remove_file(store.path()).unwrap();
     let active = store
@@ -605,8 +682,20 @@ fn seed_guid(value: u32) -> String {
 }
 
 fn seed_record() -> SeedDispatchRecord {
+    seed_record_for("resource-a", activation_identity(1), "session-1")
+}
+
+fn seed_record_for(
+    resource_uid: &str,
+    activation: ReplicaIdentity,
+    source_process_session_id: &str,
+) -> SeedDispatchRecord {
+    let source_replica_id = activation.replica_id.to_string();
+    let source_instance_id = activation.instance_id.to_string();
+    let source_agent_generation = activation.agent_generation.to_string();
     SeedDispatchRecord::new(
-        "resource-a",
+        resource_uid,
+        activation,
         "configuration-1",
         "app-ag",
         seed_guid(10),
@@ -615,36 +704,163 @@ fn seed_record() -> SeedDispatchRecord {
         seed_guid(21),
         seed_guid(22),
         SeedDispatchTarget::new(
-            "replica-1",
-            "pod-1",
-            "generation-1",
-            "session-1",
+            source_replica_id,
+            source_instance_id,
+            source_agent_generation,
+            source_process_session_id,
             seed_guid(31),
         )
         .unwrap(),
         [
-            SeedDispatchTarget::new(
-                "replica-2",
-                "pod-2",
-                "generation-2",
-                "session-2",
-                seed_guid(32),
-            )
-            .unwrap(),
-            SeedDispatchTarget::new(
-                "replica-3",
-                "pod-3",
-                "generation-3",
-                "session-3",
-                seed_guid(33),
-            )
-            .unwrap(),
+            SeedDispatchTarget::new("2", "pod-2", "generation-2", "session-2", seed_guid(32))
+                .unwrap(),
+            SeedDispatchTarget::new("3", "pod-3", "generation-3", "session-3", seed_guid(33))
+                .unwrap(),
         ],
-        "replica-2",
+        "2",
         "build-2",
+        storage_incarnation(2),
         "2026-10-08 23:00:00.000",
     )
     .unwrap()
+}
+
+fn application_file_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fs::read_dir(root)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().into_string().unwrap(),
+                fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+async fn initialized_seed_application(
+    root: &Path,
+    resource_uid: &str,
+    activation: ReplicaIdentity,
+    source_process_session_id: &str,
+) -> RuntimeBindingStore {
+    let runtime_config = config_for_resource(root, resource_uid).await;
+    let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
+    binding.initialize(&activation).unwrap();
+    {
+        let store = SeedDispatchStore::open(binding.root()).unwrap();
+        store
+            .create(&seed_record_for(
+                resource_uid,
+                activation,
+                source_process_session_id,
+            ))
+            .unwrap();
+    }
+    assert_eq!(
+        binding.storage_state().unwrap(),
+        ApplicationStorageState::Established
+    );
+    binding
+}
+
+#[tokio::test]
+async fn runtime_binding_accepts_same_activation_seed_with_historical_process_session() {
+    let temporary = tempfile::tempdir().unwrap();
+    let activation = activation_identity(1);
+    let binding = initialized_seed_application(
+        temporary.path(),
+        "resource-a",
+        activation.clone(),
+        "historical-process-session",
+    )
+    .await;
+    let before = application_file_bytes(binding.root());
+
+    binding.validate(&activation).unwrap();
+    assert_eq!(
+        binding.storage_state().unwrap(),
+        ApplicationStorageState::Established
+    );
+    assert_eq!(application_file_bytes(binding.root()), before);
+}
+
+#[tokio::test]
+async fn runtime_binding_rejects_seed_record_copied_from_another_resource_without_mutation() {
+    let recipient = tempfile::tempdir().unwrap();
+    let recipient_activation = activation_identity(1);
+    let recipient_binding = initialized_seed_application(
+        recipient.path(),
+        "resource-a",
+        recipient_activation.clone(),
+        "recipient-session",
+    )
+    .await;
+
+    let donor = tempfile::tempdir().unwrap();
+    let donor_binding = initialized_seed_application(
+        donor.path(),
+        "resource-b",
+        activation_identity(1),
+        "donor-session",
+    )
+    .await;
+    fs::copy(
+        donor_binding.root().join("seed-dispatch-v1.json"),
+        recipient_binding.root().join("seed-dispatch-v1.json"),
+    )
+    .unwrap();
+    let spliced = application_file_bytes(recipient_binding.root());
+
+    assert_eq!(
+        recipient_binding.storage_state(),
+        Err(RuntimeBindingError::IdentityMismatch)
+    );
+    assert_eq!(
+        recipient_binding.validate(&recipient_activation),
+        Err(RuntimeBindingError::IdentityMismatch)
+    );
+    assert_eq!(application_file_bytes(recipient_binding.root()), spliced);
+}
+
+#[tokio::test]
+async fn runtime_binding_rejects_seed_record_copied_from_another_activation_without_mutation() {
+    let recipient = tempfile::tempdir().unwrap();
+    let recipient_activation = activation_identity(1);
+    let recipient_binding = initialized_seed_application(
+        recipient.path(),
+        "resource-a",
+        recipient_activation.clone(),
+        "recipient-session",
+    )
+    .await;
+
+    let donor = tempfile::tempdir().unwrap();
+    let donor_activation =
+        activation_identity_with(1, "replacement-pod-1", "replacement-generation-1");
+    let donor_binding = initialized_seed_application(
+        donor.path(),
+        "resource-a",
+        donor_activation,
+        "donor-session",
+    )
+    .await;
+    fs::copy(
+        donor_binding.root().join("seed-dispatch-v1.json"),
+        recipient_binding.root().join("seed-dispatch-v1.json"),
+    )
+    .unwrap();
+    let spliced = application_file_bytes(recipient_binding.root());
+
+    assert_eq!(
+        recipient_binding.storage_state(),
+        Err(RuntimeBindingError::IdentityMismatch)
+    );
+    assert_eq!(
+        recipient_binding.validate(&recipient_activation),
+        Err(RuntimeBindingError::IdentityMismatch)
+    );
+    assert_eq!(application_file_bytes(recipient_binding.root()), spliced);
 }
 
 #[tokio::test]
@@ -652,7 +868,7 @@ async fn runtime_binding_allows_one_owned_seed_dispatch_record() {
     let temporary = tempfile::tempdir().unwrap();
     let runtime_config = config(temporary.path()).await;
     let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
-    binding.initialize().unwrap();
+    binding.initialize(&activation_identity(1)).unwrap();
 
     let store = SeedDispatchStore::open(binding.root()).unwrap();
     assert_eq!(store.load().unwrap(), None);
@@ -749,7 +965,7 @@ async fn seed_dispatch_store_serializes_concurrent_record_creation() {
     let temporary = tempfile::tempdir().unwrap();
     let runtime_config = config(temporary.path()).await;
     let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
-    binding.initialize().unwrap();
+    binding.initialize(&activation_identity(1)).unwrap();
     let store = Arc::new(SeedDispatchStore::open(binding.root()).unwrap());
     let barrier = Arc::new(Barrier::new(3));
 
@@ -785,7 +1001,7 @@ async fn intent_and_definite_failure_can_be_released_but_submitting_cannot() {
     let temporary = tempfile::tempdir().unwrap();
     let runtime_config = config(temporary.path()).await;
     let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
-    binding.initialize().unwrap();
+    binding.initialize(&activation_identity(1)).unwrap();
     let store = SeedDispatchStore::open(binding.root()).unwrap();
 
     let record = seed_record();
@@ -810,28 +1026,26 @@ async fn intent_and_definite_failure_can_be_released_but_submitting_cannot() {
 }
 
 #[tokio::test]
-async fn legacy_dispatched_seed_state_migrates_to_non_redispatchable_ambiguity_without_a_token() {
+async fn legacy_dispatched_seed_state_rejects_without_migration() {
     let temporary = tempfile::tempdir().unwrap();
     let runtime_config = config(temporary.path()).await;
     let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
-    binding.initialize().unwrap();
+    binding.initialize(&activation_identity(1)).unwrap();
     let path = binding.root().join("seed-dispatch-v1.json");
     let mut legacy = serde_json::to_value(seed_record()).unwrap();
     legacy["schema_version"] = serde_json::json!(1);
     legacy["revision"] = serde_json::json!(2);
     legacy["phase"] = serde_json::json!("dispatched");
     legacy.as_object_mut().unwrap().remove("operation_token");
-    write_private(&path, serde_json::to_string_pretty(&legacy).unwrap());
+    let original = serde_json::to_vec_pretty(&legacy).unwrap();
+    write_private(&path, &original);
 
-    let store = SeedDispatchStore::open(binding.root()).unwrap();
-    let migrated = store.load().unwrap().unwrap();
-    assert_eq!(migrated.phase(), SeedDispatchPhase::LegacyAmbiguous);
-    assert_eq!(migrated.revision(), 2);
-    assert_eq!(migrated.operation_token(), "");
-    let persisted: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-    assert_eq!(persisted["schema_version"], serde_json::json!(2));
-    assert_eq!(persisted["phase"], serde_json::json!("legacy_ambiguous"));
-    assert!(persisted.get("operation_token").is_none());
+    assert_eq!(
+        SeedDispatchStore::open(binding.root()).err(),
+        Some(SeedStateError::UnsupportedSchema(1))
+    );
+    assert_eq!(fs::read(path).unwrap(), original);
+    assert!(!binding.root().join("seed-dispatch-v1.owner").exists());
 }
 
 #[tokio::test]
@@ -839,7 +1053,7 @@ async fn seed_dispatch_state_rejects_unknown_corrupt_and_active_temporary_files(
     let temporary = tempfile::tempdir().unwrap();
     let runtime_config = config(temporary.path()).await;
     let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
-    binding.initialize().unwrap();
+    binding.initialize(&activation_identity(1)).unwrap();
 
     {
         let store = SeedDispatchStore::open(binding.root()).unwrap();
@@ -869,11 +1083,13 @@ async fn seed_dispatch_state_rejects_unknown_corrupt_and_active_temporary_files(
 
     let stale = binding.root().join(".seed-dispatch-v1.json.2147483647.new");
     write_private(&stale, "incomplete");
+    let stale_bytes = fs::read(&stale).unwrap();
     assert_eq!(
-        binding.storage_state().unwrap(),
-        ApplicationStorageState::Established
+        binding.storage_state(),
+        Err(RuntimeBindingError::UnsafeState)
     );
-    assert!(!stale.exists());
+    assert_eq!(fs::read(&stale).unwrap(), stale_bytes);
+    fs::remove_file(stale).unwrap();
 
     fs::write(binding.root().join("foreign"), "foreign").unwrap();
     assert_eq!(
@@ -888,7 +1104,7 @@ async fn seed_dispatch_layout_rejects_symlinks_and_oversized_state() {
         let temporary = tempfile::tempdir().unwrap();
         let runtime_config = config(temporary.path()).await;
         let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
-        binding.initialize().unwrap();
+        binding.initialize(&activation_identity(1)).unwrap();
         let target = temporary.path().join("target");
         write_private(&target, "{}");
         symlink(&target, binding.root().join(entry)).unwrap();
@@ -902,7 +1118,7 @@ async fn seed_dispatch_layout_rejects_symlinks_and_oversized_state() {
     let temporary = tempfile::tempdir().unwrap();
     let runtime_config = config(temporary.path()).await;
     let binding = RuntimeBindingStore::new(&runtime_config).unwrap();
-    binding.initialize().unwrap();
+    binding.initialize(&activation_identity(1)).unwrap();
     write_private(
         &binding.root().join("seed-dispatch-v1.json"),
         vec![b'x'; 65_537],
