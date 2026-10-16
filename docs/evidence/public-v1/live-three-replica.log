@@ -1,14 +1,15 @@
-commit=105c56a29ccb30682decca7d06e55714d6a17391
-started_at=2026-10-16T11:51:37Z
+commit=bd819a0d866350476a5d04b2306b529dade53c9a
+started_at=2026-10-16T15:36:18Z
 command=CARGO_BUILD_JOBS=1 just test-live-three-replica
 env -u SQLSERVER_TEST_EULA_ACCEPTED KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m 'target/mssql-three-replica')" CARGO_BUILD_JOBS=1 cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_happy_path -- --ignored --exact --test-threads=1
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+   Compiling kuberic-mssql-tests v0.0.1 (/data/code/kuberic-mssql/crates/kuberic-mssql-tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.90s
      Running tests/live_three_replica.rs (target/debug/deps/live_three_replica-0c142a36e9b9d005)
 
 running 1 test
 test three_replica_mssql_happy_path ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 152.13s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 154.39s
 
-finished_at=2026-10-16T11:54:09Z
+finished_at=2026-10-16T15:38:58Z
 exit_status=0

@@ -1,6 +1,6 @@
 {
-  "implementation_commit": "105c56a29ccb30682decca7d06e55714d6a17391",
-  "implementation_tree": "854919021f7653fc5c50188d8b73d6e50ec4930e",
+  "implementation_commit": "bd819a0d866350476a5d04b2306b529dade53c9a",
+  "implementation_tree": "4038d31664ae47458d1d80c1e9c001fb022221f6",
   "dependency_identity": "kuberic-runtime@ceec5887ad97d71222117610428ce715b782777e",
   "fixture_image": "mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726",
   "upstream_conformance": {
@@ -14,29 +14,29 @@
     {
       "gate_id": "live_one_replica",
       "command": "CARGO_BUILD_JOBS=1 just test-live-one-replica",
-      "started_at": "2026-10-16T11:51:06Z",
-      "finished_at": "2026-10-16T11:51:31Z",
+      "started_at": "2026-10-16T15:35:42Z",
+      "finished_at": "2026-10-16T15:36:12Z",
       "exit_status": 0,
       "log": "evidence/public-v1/live-one-replica.log",
-      "log_sha256": "a77c9fe981bb1d78791f2f014fa38cd8a0757abd83529476a3536908ddabbe5e"
+      "log_sha256": "7bb69cf18cb1caddd3ee3e911cf192b9b5227915bd82f81c8643a3f7997faecd"
     },
     {
       "gate_id": "live_three_replica",
       "command": "CARGO_BUILD_JOBS=1 just test-live-three-replica",
-      "started_at": "2026-10-16T11:51:37Z",
-      "finished_at": "2026-10-16T11:54:09Z",
+      "started_at": "2026-10-16T15:36:18Z",
+      "finished_at": "2026-10-16T15:38:58Z",
       "exit_status": 0,
       "log": "evidence/public-v1/live-three-replica.log",
-      "log_sha256": "21ff5911c22b1d33fe4bb2fc78bd202cc541ea6f4c40f1c7f6a41090171c2629"
+      "log_sha256": "1e9b0e8a318088f9295c05514c941a69d052bc96c0d08896b1e35f9835723fcf"
     },
     {
       "gate_id": "live_three_replica_restart",
       "command": "CARGO_BUILD_JOBS=1 just test-live-three-replica-restart",
-      "started_at": "2026-10-16T11:54:15Z",
-      "finished_at": "2026-10-16T11:56:46Z",
+      "started_at": "2026-10-16T15:39:12Z",
+      "finished_at": "2026-10-16T15:41:44Z",
       "exit_status": 0,
       "log": "evidence/public-v1/live-three-replica-restart.log",
-      "log_sha256": "304788ab76f946e9f8e9f55f753c099422904347329c856bc229833b2ef646ab"
+      "log_sha256": "a39aa0cc36f3168c0c59a4d53716ac891bb82b21f567a96ccd8beda5396a5b82"
     }
   ]
 }
