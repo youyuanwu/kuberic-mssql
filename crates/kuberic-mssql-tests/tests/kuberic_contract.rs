@@ -1528,12 +1528,11 @@ fn bootstrap_absent_snapshot(local_index: usize) -> InstanceSnapshot {
 }
 
 fn bootstrap_membership_snapshot(local_index: usize) -> InstanceSnapshot {
-    let mut sample = bound_snapshot_for(local_index);
+    let mut sample = bootstrap_foundation_snapshot(local_index);
     let group = match &mut sample.availability_group {
         Observation::Present { value, .. } => value,
         _ => unreachable!(),
     };
-    group.databases.clear();
     if local_index == 0 {
         for (index, replica) in group.replicas.iter_mut().enumerate() {
             replica.state = Some(ReplicaState {
@@ -1555,6 +1554,16 @@ fn bootstrap_membership_snapshot(local_index: usize) -> InstanceSnapshot {
             });
         }
     }
+    sample
+}
+
+fn bootstrap_foundation_snapshot(local_index: usize) -> InstanceSnapshot {
+    let mut sample = bound_snapshot_for(local_index);
+    let group = match &mut sample.availability_group {
+        Observation::Present { value, .. } => value,
+        _ => unreachable!(),
+    };
+    group.databases.clear();
     sample
 }
 
@@ -1992,6 +2001,60 @@ async fn current_configuration_replay_revalidates_availability_group_ownership()
         .unwrap_err();
     assert!(application_error(error).contains("conflicts"));
     assert!(mutation.effects.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn complete_remote_only_configuration_converges_source_foundation_without_admission() {
+    let (replicator, mutation) = bootstrap_replicator_for(
+        0,
+        vec![
+            Ok(present(bootstrap_absent_snapshot(0))),
+            Ok(present(bootstrap_absent_snapshot(0))),
+            Ok(present(bootstrap_foundation_snapshot(0))),
+            Ok(present(bootstrap_membership_snapshot(0))),
+        ],
+        vec![
+            Ok(None),
+            Ok(Some(owned_standalone_database_without_group_intent())),
+            Ok(Some(owned_standalone_database_with_group_intent())),
+            Ok(Some(owned_standalone_database())),
+            Ok(Some(owned_standalone_database())),
+        ],
+    );
+    replicator
+        .testing_bind_process_session(ProcessSessionId::new("session-1"))
+        .unwrap();
+    replicator.open().await.unwrap();
+
+    replicator
+        .update_current_replica_set_configuration(remote_only_primary_replica_set())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *mutation.effects.lock().unwrap(),
+        vec![
+            "retain source database creation intent",
+            "retain availability group intent",
+            "retain availability group creation intent"
+        ]
+    );
+    assert!(replicator.admitted_topology().is_none());
+
+    replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap();
+
+    assert!(replicator.admitted_topology().is_some());
+    assert_eq!(
+        *mutation.effects.lock().unwrap(),
+        vec![
+            "retain source database creation intent",
+            "retain availability group intent",
+            "retain availability group creation intent"
+        ]
+    );
 }
 
 #[tokio::test]

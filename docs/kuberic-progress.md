@@ -105,18 +105,23 @@ address belongs only to `Replicator::open`; it is not a listener, routing
 endpoint, or application address.
 
 A strict topology expectation associates three stable Kuberic replica numbers
-with expected SQL Server names and AG endpoint URLs. The first current configuration callback combines those associations with
-fresh native evidence and Public V1's exact remote-active descriptions.
+with expected SQL Server names and AG endpoint URLs. A complete remote-only
+primary callback combines those associations with fresh native evidence to
+converge and validate the primary-owned source database and AG ownership
+foundation, then returns while secondary-local joins remain outstanding.
 The local replica and idle or in-build targets stay out of that remote set.
 `must_catchup` identifies the successor, and build targets use
 invalid/unknown progress rather than synthesized comparable history.
 
 Kuberic can deliver the bootstrap callback before remote sessions are known.
-Complete remote descriptions freeze the binding. Later callbacks may omit a
-remote session or address projection without clearing that binding, while every
-supplied value must still match exactly. SQL Server process incarnation is
-local evidence: each runtime freezes and revalidates its own start identity,
-while the three-member validation proves all members collectively.
+Remote-only foundation convergence does not admit or freeze a partial native
+group. A later explicit full projection performs local joins, requires complete
+native admission, and freezes the binding. Once frozen, later callbacks may
+omit a remote session or address projection without clearing that binding,
+while every supplied value must still match exactly. SQL Server process
+incarnation is local evidence: each runtime freezes and revalidates its own
+start identity, while the three-member validation proves all members
+collectively.
 
 `catch_up_capability` is reported under the Public V1 candidate as a fresh
 configuration sequence equal to current progress after native topology

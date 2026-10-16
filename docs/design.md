@@ -373,8 +373,11 @@ member is recovered from runtime identity and the configuration descriptor.
 Idle or in-build targets stay outside that remote set and carry
 `INVALID_LSN`, exact build/session/storage identity, and an exact address.
 Fresh SQL evidence freezes native replica GUIDs, AG/database lineage and the
-local SQL process start. Complete values freeze the binding; later omitted
-projections cannot clear it, and every supplied value must still match exactly.
+local SQL process start. A complete remote-only primary callback converges the
+source database and AG ownership foundation without admitting a partial native
+group. A later explicit full projection completes local joins and native
+admission before freezing the binding; later omitted projections cannot clear
+it, and every supplied value must still match exactly.
 
 The adapter publishes conservative immutable `ReplicatorCapabilities`.
 Catch-up-specific quorum and all write authority remain unsupported.

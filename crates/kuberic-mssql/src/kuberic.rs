@@ -53,10 +53,11 @@ use crate::{
 };
 
 use compatibility::{
-    CurrentBuildFacts, CurrentTopologyFacts, build_enriched_configuration, configuration_enriches,
+    BootstrapConvergenceScope, CurrentBuildFacts, CurrentTopologyFacts,
+    bootstrap_convergence_scope, build_enriched_configuration, configuration_enriches,
     configuration_is_complete, normalize_bootstrap_configuration, topology_enriches,
     validate_admitted_build_configuration, validate_bootstrap_configuration_replay,
-    validate_build_id, validate_incomplete_bootstrap_configuration, validate_replication_address,
+    validate_build_id, validate_replication_address,
 };
 
 #[cfg(not(feature = "kuberic-testing"))]
@@ -1334,7 +1335,29 @@ enum SourceAssociation {
     Exact(DatabaseIdentity),
 }
 
+enum BootstrapConvergenceResult {
+    SourceFoundation,
+    FullTopology(Box<BootstrapConvergedTopology>),
+}
+
+struct BootstrapConvergedTopology {
+    instance: crate::observation::InstanceMetadata,
+    group: AvailabilityGroupSnapshot,
+    observed_at: u64,
+    database: Option<StandaloneDatabaseIdentity>,
+    deadline: tokio::time::Instant,
+}
+
 impl SqlServerReplicator {
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_bind_process_session(
+        &self,
+        process_session_id: ProcessSessionId,
+    ) -> Result<(), KubericAdapterError> {
+        self.bind_process_session(process_session_id)
+    }
+
     #[cfg(feature = "kuberic-testing")]
     #[doc(hidden)]
     pub fn testing_gate_seed_intent(
@@ -2531,16 +2554,8 @@ impl SqlServerReplicator {
         &self,
         generation: u64,
         current: &ReplicaSetConfiguration,
-    ) -> Result<
-        (
-            crate::observation::InstanceMetadata,
-            AvailabilityGroupSnapshot,
-            u64,
-            Option<crate::bootstrap::StandaloneDatabaseIdentity>,
-            tokio::time::Instant,
-        ),
-        KubericAdapterError,
-    > {
+        scope: BootstrapConvergenceScope,
+    ) -> Result<BootstrapConvergenceResult, KubericAdapterError> {
         let runtime_identity = self
             .runtime_identity
             .as_ref()
@@ -2881,6 +2896,16 @@ impl SqlServerReplicator {
                         false,
                     ) {
                         NativeConvergenceState::Complete
+                            if scope == BootstrapConvergenceScope::SourceFoundation
+                                && group
+                                    .as_ref()
+                                    .is_some_and(bootstrap_source_foundation_ready) =>
+                        {
+                            drop(self.finish_operation(generation)?);
+                            bootstrap_remaining(deadline)?;
+                            return Ok(BootstrapConvergenceResult::SourceFoundation);
+                        }
+                        NativeConvergenceState::Complete
                             if group.as_ref().is_some_and(|group| {
                                 bootstrap_membership_ready(group, ownership, &descriptors)
                             }) =>
@@ -2933,7 +2958,15 @@ impl SqlServerReplicator {
                             let group = group.expect("complete classifier requires a group");
                             drop(self.finish_operation(generation)?);
                             bootstrap_remaining(deadline)?;
-                            return Ok((instance, group, observed_at, database_identity, deadline));
+                            return Ok(BootstrapConvergenceResult::FullTopology(Box::new(
+                                BootstrapConvergedTopology {
+                                    instance,
+                                    group,
+                                    observed_at,
+                                    database: database_identity,
+                                    deadline,
+                                },
+                            )));
                         }
                         NativeConvergenceState::Absent => {
                             self.execute_bootstrap_effect(
@@ -3165,7 +3198,15 @@ impl SqlServerReplicator {
                             }
                             drop(self.finish_operation(generation)?);
                             bootstrap_remaining(deadline)?;
-                            return Ok((instance, group, observed_at, database_identity, deadline));
+                            return Ok(BootstrapConvergenceResult::FullTopology(Box::new(
+                                BootstrapConvergedTopology {
+                                    instance,
+                                    group,
+                                    observed_at,
+                                    database: database_identity,
+                                    deadline,
+                                },
+                            )));
                         }
                         NativeConvergenceState::Absent | NativeConvergenceState::Incomplete => {
                             self.execute_bootstrap_effect(
@@ -4419,16 +4460,20 @@ impl PrimaryReplicator for SqlServerReplicator {
         } else {
             current
         };
-        let generation = self.begin_operation()?;
-        if self.bootstrap.is_some()
-            && validate_incomplete_bootstrap_configuration(
+        let process_session_id = self.process_session_id(&current)?;
+        let bootstrap_scope = if self.bootstrap.is_some() {
+            bootstrap_convergence_scope(
                 runtime_identity,
-                &self.process_session_id(&current)?,
+                &process_session_id,
                 expectation,
                 &self.replication_address,
                 &current,
             )?
-        {
+        } else {
+            BootstrapConvergenceScope::FullTopology
+        };
+        let generation = self.begin_operation()?;
+        if bootstrap_scope == BootstrapConvergenceScope::Deferred {
             drop(self.finish_operation(generation)?);
             return Ok(());
         }
@@ -4471,8 +4516,22 @@ impl PrimaryReplicator for SqlServerReplicator {
 
         let (instance, group, observed_at, bootstrap_database, bootstrap_deadline) =
             if self.bootstrap.is_some() {
-                self.converge_bootstrap_configuration(generation, &current)
+                match self
+                    .converge_bootstrap_configuration(generation, &current, bootstrap_scope)
                     .await?
+                {
+                    BootstrapConvergenceResult::SourceFoundation => return Ok(()),
+                    BootstrapConvergenceResult::FullTopology(converged) => {
+                        let BootstrapConvergedTopology {
+                            instance,
+                            group,
+                            observed_at,
+                            database,
+                            deadline,
+                        } = *converged;
+                        (instance, group, observed_at, database, deadline)
+                    }
+                }
             } else {
                 let observation = self
                     .source
@@ -4493,7 +4552,7 @@ impl PrimaryReplicator for SqlServerReplicator {
         validate_eligible_snapshot(self.source.observer_config(), &instance, &group, false)?;
         let compatibility = CurrentTopologyFacts::translate(
             runtime_identity,
-            &self.process_session_id(&current)?,
+            &process_session_id,
             expectation,
             &self.replication_address,
             &current,
@@ -5401,6 +5460,31 @@ fn bootstrap_membership_ready(
                 })
                 .count()
                 == 1)
+}
+
+fn bootstrap_source_foundation_ready(group: &AvailabilityGroupSnapshot) -> bool {
+    if !group.local_replica.state_available
+        || group.local_replica.role.as_ref() != Some(&NativeRole::Primary)
+    {
+        return false;
+    }
+    let Some(local_id) = group.local_replica.identity.native_replica_id() else {
+        return false;
+    };
+    group
+        .replicas
+        .iter()
+        .find(|replica| &replica.replica_id == local_id)
+        .and_then(|replica| replica.state.as_ref())
+        .is_some_and(|state| {
+            state.provenance == NativeProvenance::Local
+                && state.role == Some(NativeRole::Primary)
+                && state.operational_state.as_deref() == Some("ONLINE")
+                && state.connected_state.as_deref() == Some("CONNECTED")
+                && state
+                    .last_connect_error_number
+                    .is_none_or(|number| number == 0)
+        })
 }
 
 fn validate_bootstrap_instance(

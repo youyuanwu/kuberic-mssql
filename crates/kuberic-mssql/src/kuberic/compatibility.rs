@@ -25,6 +25,13 @@ pub enum BootstrapOwnershipError {
     UnsupportedRole,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BootstrapConvergenceScope {
+    Deferred,
+    SourceFoundation,
+    FullTopology,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct CurrentMemberFacts {
     pub(super) identity: KubericReplicaIdentity,
@@ -276,13 +283,13 @@ pub(super) fn normalize_bootstrap_configuration(
     })
 }
 
-pub(super) fn validate_incomplete_bootstrap_configuration(
+pub(super) fn bootstrap_convergence_scope(
     runtime_identity: &KubericReplicaIdentity,
     process_session_id: &ProcessSessionId,
     expectation: &SqlServerTopologyExpectation,
     replication_address: &str,
     current: &ReplicaSetConfiguration,
-) -> Result<bool, KubericAdapterError> {
+) -> Result<BootstrapConvergenceScope, KubericAdapterError> {
     if complete_remote_active_configuration(runtime_identity, current) {
         validate_configuration_shape(
             runtime_identity,
@@ -291,10 +298,10 @@ pub(super) fn validate_incomplete_bootstrap_configuration(
             replication_address,
             current,
         )?;
-        return Ok(false);
+        return Ok(BootstrapConvergenceScope::SourceFoundation);
     }
     if current.replicas.len() >= usize::from(SUPPORTED_REPLICA_COUNT) {
-        return Ok(false);
+        return Ok(BootstrapConvergenceScope::FullTopology);
     }
     let mut normalized = current.clone();
     for member in &current.configuration.members {
@@ -324,7 +331,7 @@ pub(super) fn validate_incomplete_bootstrap_configuration(
         replication_address,
         &normalized,
     )?;
-    Ok(true)
+    Ok(BootstrapConvergenceScope::Deferred)
 }
 
 fn complete_remote_active_configuration(
