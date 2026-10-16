@@ -1,0 +1,42 @@
+{
+  "implementation_commit": "830da0ff5943aaec19633579866c9fd2134129a8",
+  "implementation_tree": "99d586d9474cb1df8eb2401400e16da0427b2399",
+  "dependency_identity": "kuberic-runtime@ceec5887ad97d71222117610428ce715b782777e",
+  "fixture_image": "mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726",
+  "upstream_conformance": {
+    "repository": "youyuanwu/kuberic",
+    "head_commit": "ceec5887ad97d71222117610428ce715b782777e",
+    "workflow_run_id": 38844709880,
+    "gate_id": "KSF-06",
+    "exit_status": 0
+  },
+  "runs": [
+    {
+      "gate_id": "live_one_replica",
+      "command": "CARGO_BUILD_JOBS=1 just test-live-one-replica",
+      "started_at": "2026-10-16T10:09:29Z",
+      "finished_at": "2026-10-16T10:09:58Z",
+      "exit_status": 0,
+      "log": "evidence/public-v1/live-one-replica.log",
+      "log_sha256": "10f2803bad22b5d509fb3b34e13e8352861fb5e80631910b1b30290278baed56"
+    },
+    {
+      "gate_id": "live_three_replica",
+      "command": "CARGO_BUILD_JOBS=1 just test-live-three-replica",
+      "started_at": "2026-10-16T10:10:06Z",
+      "finished_at": "2026-10-16T10:13:04Z",
+      "exit_status": 0,
+      "log": "evidence/public-v1/live-three-replica.log",
+      "log_sha256": "80c7c1e5bfba7ad8775a133207bb416691ac2d6f16bee84c51cbbf5ae6e9d9f9"
+    },
+    {
+      "gate_id": "live_three_replica_restart",
+      "command": "CARGO_BUILD_JOBS=1 just test-live-three-replica-restart",
+      "started_at": "2026-10-16T10:13:11Z",
+      "finished_at": "2026-10-16T10:15:47Z",
+      "exit_status": 0,
+      "log": "evidence/public-v1/live-three-replica-restart.log",
+      "log_sha256": "5c661bf68f2a4355f70ab7a33e8c672f9c71266aa0e80da13ccffe9d61de00b0"
+    }
+  ]
+}

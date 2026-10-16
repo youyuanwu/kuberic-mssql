@@ -148,6 +148,13 @@ replica-set DTOs. Application binding schema 2, seed schema 3, and SQL ownership
 markers bind licensed effects to the exact Public V1 activation; predecessor
 state rejects without migration.
 
+The licensed Stage 3 current-configuration and seed-build callbacks are a
+test-only SQL-native convergence seam. They are not end-to-end Public V1 Build
+operations and do not prove host Build admission, receipts, or membership
+semantics. Public V1 Build evidence here is ordinary/server-free negative
+coverage: idle-build DTO validation and effect-free rejection with zero SQL
+executor calls.
+
 The native evidence model also exposes lineage- and field-scoped history
 positions. Exact decimal values can be ordered only when both positions name
 the same native field, database identity, and recovery fork. Missing positions
@@ -203,11 +210,9 @@ pre-association `Intent`/`Submitting`/`Accepted`/`Ambiguous`/
 association plus the exact terminal SQL marker removes that temporary record.
 This bounded file/SQL marker exists only to reconcile the external-effect
 ambiguity around `ADD DATABASE`; Kuberic's stateless default-replicator design
-does not require deleting that reconciliation seam. A schema-v1 `Dispatched`
-record instead migrates to tokenless `LegacyAmbiguous`: exact native
-association may compact its group-database identity into a retained tombstone,
-while absent, incomplete, or conflicting association fails closed and cannot
-redispatch.
+does not require deleting that reconciliation seam. Predecessor seed schemas 1
+and 2 reject without migration under fresh Public V1 activation. They are not
+reinterpreted as `LegacyAmbiguous` and cannot redispatch.
 
 The owned source database retains one matching singleton dispatch row with a
 derived operation token, exact AG/database identities, and SQL-owned phase. A
@@ -316,23 +321,26 @@ authority. Reports are bracketed by fresh direct observations and must show:
 - one shared resource and current configuration with no previous
   configuration;
 - three exact identities and process sessions;
-- one Kuberic primary and two active secondaries matching native roles;
-- current progress and catch-up capability equal to the corresponding fresh
-  native configuration sequence;
+- contained observe-only report role `None`;
+- progress role `Recovery`, with `first = 0` and `last` equal to the
+  corresponding fresh native AG sequence;
+- read and write access both `NotPrimary`;
 - healthy initialized durable state; and
-- fenced write access: stable primary and active-secondary roles may report
-  read access as granted, but write is never granted and no client service
-  address is published.
+- no client service address.
 
-Role is not write authority. No SQL external write lease is acquired. The
-replicated marker is written only by the fixture administrator against the
-directly observed native primary.
+These contained Public V1 report roles are distinct from SQL-native topology:
+direct SQL observation still proves exactly one native primary and two native
+secondaries. No SQL external write lease is acquired. The replicated marker is
+written only by the fixture administrator against the directly observed native
+primary.
 
 The licensed same-root restart test stops all three public hosts while retaining
-SQL Server and durable roots. It covers every retained seed handshake phase,
-fresh replacement sessions, stale-session rejection, restart-driven
-compaction, zero duplicate `ADD DATABASE`, exact report convergence and marker
-continuity. SQL Server processes are not restarted.
+SQL Server and durable roots. It proves contained existing-state Open, fresh
+replacement sessions, stale-session rejection, native seed-record compaction,
+zero redispatch, exact contained report convergence, and marker continuity.
+SQL Server processes are not restarted. It is not Public V1 peer-session or
+lifecycle renewal, does not replay an end-to-end Public V1 Build operation, and
+does not restore serving access.
 
 The ignored live tests additionally prove handled-signal and SIGKILL recovery.
 The fault recipe uses test-only callback seams after each independently
@@ -357,9 +365,18 @@ scenario performs exact cleanup.
 The feature branch evaluates exact Public V1 candidate
 `ceec5887ad97d71222117610428ce715b782777e`. Release-intake records retain
 `09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f` as the accepted current identity
-while comparing the reviewed candidate. Every version-2 candidate gate,
-including licensed one-replica, three-replica, and same-root restart
-validation, now passes and the candidate outcome is `ready_to_pin`.
+while comparing the reviewed candidate. Exact implementation commit
+`830da0ff5943aaec19633579866c9fd2134129a8` (tree
+`99d586d9474cb1df8eb2401400e16da0427b2399`) passed licensed one-replica,
+three-replica, and same-root restart validation. The checked-in evidence
+summary and hashed logs retain those runs, and the candidate outcome is
+`ready_to_pin`.
+
+The required `cancel_before_remove` gate has two separate evidence sources.
+Kuberic candidate exact-head CI run `38844709880` and its KSF-06 catalog prove
+host-owned cancellation/drain ordering. The MSSQL readiness test separately
+proves effect-free remove rejection after a callback task has settled; it does
+not itself claim host ownership.
 
 ## Usage
 
@@ -451,10 +468,11 @@ This integration does not yet provide:
 
 Those stages require separate design and safety review.
 
-The current Kuberic pin validates durable same-root public-host restart under
-real licensed observation timing. That evidence covers Kuberic host replacement
-only; SQL Server process ownership/restart, Kubernetes lifecycle, native member
-replacement, and failover remain deferred above.
+The candidate validates contained same-root public-host reopen under real
+licensed observation timing. That evidence covers host replacement and native
+reconciliation only; it does not prove peer-session/lifecycle renewal, restore
+serving access, or cover SQL Server process ownership/restart, Kubernetes
+lifecycle, native member replacement, or failover.
 
 ## References
 

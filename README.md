@@ -453,12 +453,13 @@ The fixture pins:
 mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726
 ```
 
-It currently tracks the Kuberic `main` branch. `Cargo.lock` resolves the exact
-revision used by reproducible builds; the current revision is the merged
+It currently tracks the Kuberic `main` branch. The accepted predecessor
+identity remains the merged
 [Kuberic PR #133](https://github.com/youyuanwu/kuberic/pull/133) commit
-`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f`. It includes
-the custom-authority same-root recovery fix and the earlier testing listener
-handoff from [Kuberic PR #127](https://github.com/youyuanwu/kuberic/pull/127).
+`09ce0a7ba9fdd9d6dcd207606fd0c9496a58c47f`. On this candidate-evaluation
+branch, `Cargo.lock` instead resolves exact candidate
+`ceec5887ad97d71222117610428ce715b782777e` for reproducible release intake;
+that lockfile identity is not accepted pin adoption.
 
 The test crate constructs an affirmative `SqlServerEulaAcknowledgement` through
 the clearly test-only `FixtureConfig` path and injects exactly

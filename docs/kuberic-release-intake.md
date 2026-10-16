@@ -96,8 +96,31 @@ identity until the exact candidate record computes `ready_to_pin`.
 
 The current candidate record is
 [kuberic-release-intake-public-v1-candidate.json](kuberic-release-intake-public-v1-candidate.json).
-It is `ready_to_pin` after exact-head server-free and licensed one-replica,
-three-replica, and same-root restart validation passed.
+It is `ready_to_pin` after server-free validation and exact implementation
+commit `830da0ff5943aaec19633579866c9fd2134129a8` (tree
+`99d586d9474cb1df8eb2401400e16da0427b2399`) passed licensed one-replica,
+three-replica, and same-root restart validation. The retained
+[evidence summary](kuberic-release-intake-public-v1-evidence.json) records the
+exact dependency, fixture image, exit statuses, and SHA-256 hashes for the
+checked-in logs under `docs/evidence/public-v1/`.
+
+The licensed Stage 3 configuration and seed callbacks remain a SQL-native test
+seam, not end-to-end Public V1 Build operations. Public V1 Build evidence is
+ordinary/server-free negative coverage for valid idle-build DTOs and
+effect-free rejection. The licensed happy path's contained reports use role
+`None`, progress role `Recovery`, `first = 0`, `last =` the current native AG
+sequence, and read/write access `NotPrimary`; direct SQL observation separately
+proves one native primary and two native secondaries.
+
+The same-root run proves contained existing-state Open, fresh sessions,
+stale-session rejection, native seed-record compaction, zero redispatch, and
+marker continuity. It does not prove Public V1 peer-session/lifecycle renewal,
+replay a Public V1 Build operation, or restore serving access.
+
+`cancel_before_remove` uses two-part evidence. Kuberic exact-head CI run
+`38844709880` and catalog gate KSF-06 prove host-owned cancellation/drain
+ordering. The MSSQL local readiness test separately proves effect-free remove
+rejection after a callback task has settled; it is not host-ordering evidence.
 
 ## Intake Procedure
 

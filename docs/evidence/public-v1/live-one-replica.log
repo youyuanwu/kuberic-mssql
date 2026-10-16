@@ -1,0 +1,15 @@
+commit=830da0ff5943aaec19633579866c9fd2134129a8
+started_at=2026-10-16T10:09:29Z
+command=CARGO_BUILD_JOBS=1 just test-live-one-replica
+env -u SQLSERVER_TEST_EULA_ACCEPTED SQLSERVER_ONE_REPLICA_ROOT="$(realpath -m 'target/mssql-one-replica')" CARGO_BUILD_JOBS=1 cargo test --locked -p kuberic-mssql-tests --test live_one_replica one_replica_mssql_observation_and_cli -- --ignored --exact --test-threads=1 --nocapture
+   Compiling kuberic-mssql-tests v0.0.1 (/data/code/kuberic-mssql/crates/kuberic-mssql-tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.45s
+     Running tests/live_one_replica.rs (target/debug/deps/live_one_replica-64cc4622af40f6ec)
+
+running 1 test
+test one_replica_mssql_observation_and_cli ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 23.78s
+
+finished_at=2026-10-16T10:09:58Z
+exit_status=0

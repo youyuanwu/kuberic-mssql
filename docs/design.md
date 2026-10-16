@@ -419,9 +419,13 @@ and current process session. The callback then validates the target native
 replica GUID, exact AG and group-database identities, family/recovery-fork
 lineage, local synchronized/healthy/online/not-suspended state, and the target
 SQL start identity frozen by the licensed fixture. A report created for an old
-challenge, build or process session is not reusable. This exchange exists only
-in reviewed bootstrap-testing construction and does not alter the pinned
-Kuberic protocol or ordinary read-only runtime.
+challenge, build or process session is not reusable. This exchange exists only in reviewed bootstrap-testing construction and does
+not alter the Kuberic protocol or ordinary read-only runtime. The licensed
+Stage 3 configuration and seed callbacks are a SQL-native convergence seam,
+not end-to-end Public V1 Build operations. Public V1 Build conformance in this
+repository is limited to server-free ordinary-path validation and effect-free
+negative coverage; the licensed callbacks do not prove host Build admission,
+receipts, or target-membership semantics.
 
 The file record binds exact authority and native identities and distinguishes
 `Intent`, `Submitting`, `Accepted`, genuinely `Ambiguous`, and
@@ -434,14 +438,10 @@ session is gone: exact native association or an accepted row can establish the
 terminal marker without redispatch, a held lock is ambiguous, and an absent
 effect after lock acquisition is definitely retryable.
 
-Schema-v1 file records migrate fail closed. Old `Dispatched` becomes the
-dedicated, tokenless `LegacyAmbiguous` phase because schema v1 had no SQL-owned
-row, application-lock handshake, or terminal marker. It can compact only when
-the record's exact native source association already exists; compaction records
-the exact group-database identity and retains the tokenless legacy tombstone so
-later restarts remain fenced. Missing or incomplete association requires
-explicit operator recovery and can never become `FailedRetryable`, a new
-`Intent`, or another submission.
+Predecessor seed schemas 1 and 2 reject without migration under fresh Public V1
+activation. They are not converted to `LegacyAmbiguous`, compacted, or
+redispatched. Only schema-3 records created for the exact activation can enter
+native reconciliation.
 
 Current configuration replay, secondary join, and seed build require native
 markers to match the resource, accepted configuration, AG name, and observed
@@ -456,11 +456,14 @@ another `ADD DATABASE`. Previous/current
 transitions, catch-up quorum, removal, data loss, destructive recovery, failover
 and lease behavior remain explicit unsupported errors.
 
-Role is not write authority. The healthy reports expose one primary and two
-active secondaries, but write access is never granted. No client SQL service
-address is published and there is no external write lease. The fixture's marker
-write uses its private administrator connection to the directly observed native
-primary and is not a Kuberic client-access decision.
+Role is not write authority. The contained observe-only Public V1 reports use
+role `None`, progress role `Recovery`, `first = 0`, `last =` the current native
+AG sequence, and read/write access `NotPrimary`. Those report roles are
+distinct from direct SQL observation, which proves one native primary and two
+native secondaries. No client SQL service address is published and there is no
+external write lease. The fixture's marker write uses its private administrator
+connection to the directly observed native primary and is not a Kuberic
+client-access decision.
 
 Stage 3 first identifies what Kuberic's private agent store retains and what
 exact SQL Server postcondition can be reobserved after restart. The PostgreSQL
@@ -515,8 +518,11 @@ the candidate reaches `ready_to_pin`.
 5. **Public-contract adapter migration after Kuberic Phase 4/5** — implemented
    on the candidate feature branch: Public V1 host/callback translation,
    activation-bound application/seed/SQL ownership, observe-only ordinary
-   construction, and version-2 release intake. Pin adoption remains gated on
-   exact-head licensed evidence and `ready_to_pin`.
+   construction, and version-2 release intake. Exact implementation commit
+   `830da0ff5943aaec19633579866c9fd2134129a8` (tree
+   `99d586d9474cb1df8eb2401400e16da0427b2399`) has checked-in licensed evidence
+   and the candidate record computes `ready_to_pin`; accepted pin adoption
+   remains a separate repository decision.
 6. **SQL-native fencing, reseed, switchover, and failover** — establish
    verified target and old-primary fencing before destructive reseed or role
    movement, then add external lease handling, sequence arbitration,
@@ -570,7 +576,10 @@ foreign or replaced resources, and perform bounded recovery without requiring
 SQL Server availability. `just cleanup` invokes both exact cleanup binaries.
 The three-runtime validation also performs a host-only same-root restart:
 replacement processes receive fresh sessions, stale-session commands are
-rejected, exact reports reconverge, and native marker continuity is retained.
+rejected, existing-state Open succeeds, native seed records compact without
+redispatch, exact contained reports reconverge, and native marker continuity is
+retained. This is not Public V1 peer-session/lifecycle renewal, does not replay
+an end-to-end Public V1 Build, and does not restore serving access.
 Fault, signal and recovery cases remain explicitly invoked, including failure
 after replacement-host startup followed by exact cleanup and retry. This does
 not advance the production delivery sequence: licensed validation restarts a
@@ -578,6 +587,12 @@ target SQL process only to prove build-evidence invalidation; it does not own or
 contain that process lifecycle. Write-lease expiry, old-primary fencing,
 switchover, failover, replica replacement, Kubernetes lifecycle, and client
 routing remain unimplemented.
+
+The `cancel_before_remove` intake gate combines upstream and local evidence:
+Kuberic exact-head CI run `38844709880` and catalog gate KSF-06 prove
+host-owned cancellation/drain ordering, while the MSSQL readiness test proves
+that remove rejection is effect-free after a callback task has settled. The
+local test is not represented as host-owned ordering.
 
 ## References
 

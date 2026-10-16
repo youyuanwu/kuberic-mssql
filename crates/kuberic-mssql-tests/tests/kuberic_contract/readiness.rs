@@ -184,7 +184,7 @@ mod executable_now {
     }
 
     #[tokio::test]
-    async fn host_owned_build_is_cancelled_and_joined_before_remove() {
+    async fn adapter_remove_is_effect_free_after_build_task_settlement() {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let complete = Arc::new(AtomicBool::new(false));
@@ -225,6 +225,20 @@ mod executable_now {
             .unwrap_err();
         assert!(application_error(removal).contains("observe-only"));
         assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn upstream_public_v1_catalog_binds_cancel_before_remove_to_host_scenarios() {
+        for scenario in [
+            "hosted_public_v1_build_dispatches_exact_attempt_and_waits_for_matching_completion",
+            "hosted_public_v1_removal_drains_build_excludes_peer_and_rejects_stale_session",
+        ] {
+            kuberic_runtime::testing::assert_public_v1_conformance_gate(
+                "built-in-replacement",
+                "KSF-06",
+                scenario,
+            );
+        }
     }
 }
 
