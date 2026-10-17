@@ -378,6 +378,11 @@ impl RuntimeHostApplication {
         )])
     }
 
+    /// Waits for MSSQL-local drainage, not generic host post-Abort containment.
+    pub async fn wait_for_containment(&self) -> KubericResult<()> {
+        self.inner.wait_for_containment().await.map_err(Into::into)
+    }
+
     #[cfg(feature = "kuberic-testing")]
     #[doc(hidden)]
     pub fn testing_replicator(&self) -> Option<Arc<SqlServerReplicator>> {

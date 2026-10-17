@@ -58,11 +58,13 @@ Planned work:
 - use separate native AG election evidence without treating configuration
   freshness as transaction durability or narrowing native `numeric(25,0)`
   positions to the public signed-64-bit slot;
-- bind work to exact accepted authority, fence predecessor dispatch and
-  completion on epoch changes, and preserve exclusion for ambiguous submitted
-  effects across cancellation and restart;
-- make Close drain owned descendants and Abort contain them without awaiting
-  graceful work;
+- connect adapter-local containment to the generic public host through a
+  supported custom-replicator witness/drain interface; host completion after
+  Abort or an interrupted terminal root must not certify containment without
+  waiting for actual custom descendants;
+- resolve terminal reporting without fabricated progress: the current public
+  Close drains the adapter but its subsequent report returns
+  `Unavailable`/Closed;
 - separate idle nonvoting build targets from active membership, prove exact
   build completion before admission, and replace partial bootstrap success
   with the documented public configuration postconditions;
@@ -82,7 +84,8 @@ Exit criteria:
   relying on compatibility placeholders or provider-free synthetic history;
 - a superseded callback cannot dispatch new work or publish success, and
   unresolved predecessor effects cannot authorize successor writes;
-- Close waits for owned work and Abort promptly establishes containment;
+- hosted Close, Abort and shutdown preserve and await actual custom-descendant
+  containment without requiring graceful work after Abort;
 - an idle build target does not vote, and public build/configuration completion
   certifies the exact supported postconditions;
 - unsupported operations remain explicit errors and ordinary production

@@ -430,7 +430,14 @@ impl SqlMutationExecutor for GatedSeedMutationExecutor {
         &self,
         _request: &SeedDispatchRequest,
     ) -> Result<SeedDispatchEvidence, RuntimeError> {
-        Ok(seed_terminal_evidence(&self.complete))
+        Ok(
+            if self.executions.load(Ordering::SeqCst) != 0 && !self.complete.load(Ordering::SeqCst)
+            {
+                SeedDispatchEvidence::Ambiguous
+            } else {
+                seed_terminal_evidence(&self.complete)
+            },
+        )
     }
 }
 
@@ -2846,7 +2853,7 @@ async fn close_during_bootstrap_reobservation_fences_configuration_success() {
     });
     entered_rx.await.unwrap();
     replicator.close().await.unwrap();
-    release_tx.send(()).unwrap();
+    assert!(release_tx.send(()).is_err());
     assert!(matches!(
         task.await.unwrap(),
         Err(KubericRuntimeError::Closed)
@@ -4508,6 +4515,341 @@ async fn bound_evidence_rejects_stale_future_failed_closed_and_aborted_calls() {
 }
 
 #[tokio::test]
+async fn accepted_epoch_fences_predecessor_progress_and_same_role_work() {
+    for operation in ["epoch", "same-role", "equal", "regressing"] {
+        let retired = matches!(operation, "epoch" | "same-role");
+        let predecessor = bound_snapshot_with_sequence(0, if retired { "99" } else { "42" });
+        let (replicator, entered, release) = gated_bound_replicator(
+            vec![
+                Ok(present(bound_snapshot())),
+                Ok(present(bound_snapshot())),
+                Ok(present(predecessor)),
+                Ok(present(bound_snapshot())),
+                Ok(present(bound_snapshot())),
+            ],
+            vec![OBSERVED_AT; 20],
+            2,
+        );
+        replicator.open().await.unwrap();
+        replicator
+            .update_current_replica_set_configuration(bound_replica_set())
+            .await
+            .unwrap();
+        replicator
+            .change_role(configuration().epoch, ReplicaRole::Primary)
+            .await
+            .unwrap();
+        let callback = tokio::spawn({
+            let replicator = replicator.clone();
+            async move { replicator.current_progress().await }
+        });
+        entered.await.unwrap();
+        match operation {
+            "epoch" => replicator.update_epoch(Epoch::new(7, 43)).await.unwrap(),
+            "same-role" => replicator
+                .change_role(Epoch::new(7, 43), ReplicaRole::Primary)
+                .await
+                .unwrap(),
+            "equal" => replicator
+                .update_epoch(configuration().epoch)
+                .await
+                .unwrap(),
+            "regressing" => {
+                let error = replicator
+                    .update_epoch(Epoch::new(7, 41))
+                    .await
+                    .unwrap_err();
+                assert!(application_error(error).contains("epoch"));
+            }
+            _ => unreachable!(),
+        }
+        let _ = release.send(());
+        let result = callback.await.unwrap();
+        if retired {
+            assert!(
+                matches!(result, Err(KubericRuntimeError::Closed)),
+                "{operation}"
+            );
+        } else {
+            assert_eq!(result.unwrap(), 42, "{operation}");
+        }
+        assert_eq!(replicator.current_progress().await.unwrap(), 42);
+    }
+}
+
+#[tokio::test]
+async fn accepted_epoch_cancels_ordinary_configuration_observation_before_release() {
+    for admitted in [false, true] {
+        let (replicator, entered, release) = gated_bound_replicator(
+            vec![Ok(present(bound_snapshot())); 3],
+            vec![OBSERVED_AT; 12],
+            usize::from(admitted),
+        );
+        replicator.open().await.unwrap();
+        if admitted {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+                .unwrap();
+        }
+        assert_eq!(replicator.admitted_topology().is_some(), admitted);
+        let callback = tokio::spawn({
+            let replicator = replicator.clone();
+            async move {
+                replicator
+                    .update_current_replica_set_configuration(bound_replica_set())
+                    .await
+            }
+        });
+        entered.await.unwrap();
+        replicator.update_epoch(Epoch::new(7, 43)).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), callback)
+            .await
+            .expect("retired observation must not require external release")
+            .unwrap();
+        assert!(matches!(result, Err(KubericRuntimeError::Closed)));
+        assert!(release.send(()).is_err());
+        assert_eq!(replicator.admitted_topology().is_some(), admitted);
+    }
+}
+
+#[tokio::test]
+async fn accepted_epoch_cancels_target_evidence_before_release() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let exchange = Arc::new(ControlledTargetEvidenceExchange::with_gate(
+        [ControlledTargetEvidenceMode::Healthy],
+        entered_tx,
+        release_rx,
+    ));
+    let replicator = seed_replicator_with_executor_and_target_evidence(
+        root.path().to_owned(),
+        complete,
+        executor.clone(),
+        exchange.clone(),
+    );
+    admit_seed_replicator(&replicator).await;
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "retired-target-evidence"))
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    replicator.update_epoch(Epoch::new(7, 43)).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(3), callback)
+        .await
+        .expect("retired target evidence must not require external release")
+        .unwrap();
+    assert!(matches!(result, Err(KubericRuntimeError::Closed)));
+    assert!(release_tx.send(()).is_err());
+    assert!(exchange.previous_request.lock().unwrap().is_none());
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn accepted_epoch_prevents_pending_seed_store_and_spawned_task_dispatch() {
+    for boundary in ["store", "intent", "spawn"] {
+        let root = tempfile::tempdir().unwrap();
+        let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+        admit_seed_replicator(&replicator).await;
+        let (entered, release) = oneshot::channel();
+        let (resume, resumed) = oneshot::channel();
+        let store_gate = match boundary {
+            "store" => Some(
+                replicator
+                    .testing_gate_seed_store(
+                        TestingSeedStoreOperation::Create,
+                        TestingSeedStoreStage::BeforeStart,
+                    )
+                    .unwrap(),
+            ),
+            "intent" => {
+                replicator
+                    .testing_gate_seed_intent(entered, resumed)
+                    .unwrap();
+                None
+            }
+            "spawn" => {
+                replicator
+                    .testing_gate_seed_dispatch(entered, resumed)
+                    .unwrap();
+                None
+            }
+            _ => unreachable!(),
+        };
+        let callback = tokio::spawn({
+            let replicator = replicator.clone();
+            async move {
+                replicator
+                    .build_replica(target_build(1, "retired-before-native-dispatch"))
+                    .await
+            }
+        });
+        if let Some(gate) = &store_gate {
+            gate.entered.notified().await;
+        } else {
+            release.await.unwrap();
+        }
+        replicator
+            .change_role(Epoch::new(7, 43), ReplicaRole::Primary)
+            .await
+            .unwrap();
+        if let Some(gate) = &store_gate {
+            gate.release();
+        } else {
+            resume.send(()).unwrap();
+        }
+        assert!(matches!(
+            callback.await.unwrap(),
+            Err(KubericRuntimeError::Closed)
+        ));
+        assert_eq!(executor.executions.load(Ordering::SeqCst), 0, "{boundary}");
+        let path = root.path().join("seed-dispatch-v1.json");
+        if boundary == "store" {
+            assert!(!path.exists());
+        } else {
+            let record: SeedDispatchRecord =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(
+                record.phase(),
+                if boundary == "intent" {
+                    SeedDispatchPhase::Intent
+                } else {
+                    SeedDispatchPhase::Submitting
+                }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn epoch_retirement_before_submission_spawn_releases_the_active_owner() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+    let (entered, held) = oneshot::channel();
+    let (release, resumed) = oneshot::channel();
+    replicator
+        .testing_gate_seed_submission_owner(entered, resumed)
+        .unwrap();
+    let predecessor = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "retired-submission-owner"))
+                .await
+        }
+    });
+    held.await.unwrap();
+    let retained: SeedDispatchRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(retained.phase(), SeedDispatchPhase::Submitting);
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    replicator.update_epoch(Epoch::new(7, 43)).await.unwrap();
+    assert!(matches!(
+        predecessor.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    assert!(release.send(()).is_err());
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        replicator.build_replica(target_build(2, "reconciled-submission-owner")),
+    )
+    .await
+    .expect("same-adapter successor must reconcile proven non-submission")
+    .unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn accepted_epoch_preserves_active_seed_ambiguity_and_restart_exclusion() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let executor = Arc::new(GatedSeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release_rx)),
+    });
+    let replicator =
+        seed_replicator_with_executor(root.path().to_owned(), complete.clone(), executor.clone());
+    admit_seed_replicator(&replicator).await;
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "active-predecessor"))
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    replicator.update_epoch(Epoch::new(7, 43)).await.unwrap();
+    callback.abort();
+    assert!(callback.await.unwrap_err().is_cancelled());
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            replicator.build_replica(target_build(2, "excluded-successor")),
+        )
+        .await
+        .is_err()
+    );
+    let record: SeedDispatchRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
+            .unwrap();
+    assert!(matches!(
+        record.phase(),
+        SeedDispatchPhase::Submitting | SeedDispatchPhase::Ambiguous
+    ));
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    drop(replicator);
+
+    let replacement =
+        seed_replicator_with_executor(root.path().to_owned(), complete.clone(), executor.clone());
+    admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
+    let error = replacement
+        .build_replica(target_build_with_sessions(
+            2,
+            "excluded-reopen",
+            "replacement-session",
+        ))
+        .await
+        .unwrap_err();
+    assert!(application_error(error).contains("owned"));
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+
+    release_tx.send(()).unwrap();
+    while !complete.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+    replacement
+        .build_replica(target_build_with_sessions(
+            2,
+            "reconciled-reopen",
+            "replacement-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn close_during_observation_cannot_publish_current_admission() {
     let current = bound_replica_set();
     let (replicator, entered, release) =
@@ -4523,7 +4865,7 @@ async fn close_during_observation_cannot_publish_current_admission() {
     });
     entered.await.unwrap();
     replicator.close().await.unwrap();
-    release.send(()).unwrap();
+    assert!(release.send(()).is_err());
     assert!(matches!(
         task.await.unwrap(),
         Err(KubericRuntimeError::Closed)
@@ -4557,7 +4899,7 @@ async fn native_configuration_sequence_is_fenced_by_close_and_abort() {
         } else {
             replicator.abort();
         }
-        release.send(()).unwrap();
+        let _ = release.send(());
         assert_eq!(
             task.await.unwrap().unwrap_err(),
             KubericAdapterError::Closed
@@ -4683,7 +5025,10 @@ async fn close_waits_for_preadmission_role_publication_guard() {
     assert!(closed_rx.recv_timeout(Duration::from_millis(20)).is_err());
     release_tx.send(()).unwrap();
 
-    callback.join().unwrap().unwrap();
+    assert!(matches!(
+        callback.join().unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
     close.join().unwrap().unwrap();
     assert!(matches!(
         replicator.current_progress().await,
@@ -4692,7 +5037,7 @@ async fn close_waits_for_preadmission_role_publication_guard() {
 }
 
 #[tokio::test]
-async fn abort_waits_for_preadmission_progress_result_guard() {
+async fn abort_does_not_wait_for_preadmission_progress_result_guard() {
     for operation in ["progress", "capability", "native"] {
         let replicator =
             opened_bound_replicator(vec![Ok(present(bound_snapshot()))], vec![OBSERVED_AT; 2])
@@ -4739,18 +5084,13 @@ async fn abort_waits_for_preadmission_progress_result_guard() {
         abort_started_rx
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
-        assert!(aborted_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        aborted_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         release_tx.send(()).unwrap();
 
-        assert_eq!(
-            callback.join().unwrap().unwrap(),
-            match operation {
-                "progress" => Some(0),
-                "capability" => Some(kuberic_runtime::application::INVALID_LSN),
-                "native" => None,
-                _ => unreachable!(),
-            }
-        );
+        assert!(matches!(
+            callback.join().unwrap(),
+            Err(KubericRuntimeError::Closed)
+        ));
         abort.join().unwrap();
         assert!(matches!(
             replicator.current_progress().await,
@@ -4782,6 +5122,263 @@ async fn concurrent_target_builds_select_one_dispatch_and_replay_from_native_evi
     replicator.build_replica(second).await.unwrap();
     assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
     assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
+async fn aborted_admission_does_not_wait_for_retired_exclusive_publication() {
+    let replicator = opened_bound_replicator(Vec::new(), Vec::new()).await;
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    replicator
+        .testing_gate_lifecycle_publication(entered_tx, release_rx)
+        .unwrap();
+    let predecessor = std::thread::spawn({
+        let replicator = replicator.clone();
+        move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(replicator.change_role(configuration().epoch, ReplicaRole::Primary))
+        }
+    });
+    entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    replicator.abort();
+    let (completed, received) = mpsc::channel();
+    let successor = std::thread::spawn({
+        let replicator = replicator.clone();
+        move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            completed
+                .send((
+                    runtime.block_on(replicator.current_progress()),
+                    runtime.block_on(replicator.open()),
+                ))
+                .unwrap();
+        }
+    });
+    let (progress, open) = received
+        .recv_timeout(Duration::from_secs(3))
+        .expect("post-Abort admissions must reject before the old writer is released");
+    assert!(matches!(progress, Err(KubericRuntimeError::Closed)));
+    assert!(matches!(open, Err(KubericRuntimeError::Closed)));
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        predecessor.join().unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    successor.join().unwrap();
+    replicator.wait_for_containment().await.unwrap();
+}
+
+#[tokio::test]
+async fn handled_concurrent_seed_removal_does_not_poison_local_drainage() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    {
+        let store = SeedDispatchStore::open(root.path()).unwrap();
+        let intent = exact_seed_record(1, "historical-compaction");
+        store.create(&intent).unwrap();
+        let mut accepted = intent.clone();
+        accepted.mark_accepted().unwrap();
+        let mut associated = store.replace(intent.revision(), accepted).unwrap();
+        associated.associate_group_database(DATABASE_ID).unwrap();
+        store.replace(associated.revision(), associated).unwrap();
+    }
+    let complete = Arc::new(AtomicBool::new(true));
+    let executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let replicator =
+        seed_replicator_with_executor(root.path().to_owned(), complete.clone(), executor.clone());
+    admit_seed_replicator(&replicator).await;
+    let (entered, held) = oneshot::channel();
+    let (release, resumed) = oneshot::channel();
+    replicator
+        .testing_gate_seed_compaction(entered, resumed)
+        .unwrap();
+    let first = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "first-compactor"))
+                .await
+        }
+    });
+    held.await.unwrap();
+    replicator
+        .build_replica(target_build(2, "winning-compactor"))
+        .await
+        .unwrap();
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+    release.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    replicator.close().await.unwrap();
+    replicator.wait_for_containment().await.unwrap();
+    replicator.close().await.unwrap();
+
+    let replacement =
+        seed_replicator_with_executor(root.path().to_owned(), complete, executor.clone());
+    admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
+    replacement
+        .build_replica(target_build_with_sessions(
+            2,
+            "after-compaction-drain",
+            "replacement-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        replicator.current_progress().await,
+        Err(KubericRuntimeError::Closed)
+    ));
+}
+
+#[tokio::test]
+async fn local_close_retains_started_store_work_across_cancelled_waiters() {
+    for operation in [
+        TestingSeedStoreOperation::Open,
+        TestingSeedStoreOperation::Create,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+        admit_seed_replicator(&replicator).await;
+        let gate = replicator
+            .testing_gate_seed_store(operation, TestingSeedStoreStage::Started)
+            .unwrap();
+        let callback = tokio::spawn({
+            let replicator = replicator.clone();
+            async move {
+                replicator
+                    .build_replica(target_build(1, "owned-store"))
+                    .await
+            }
+        });
+        gate.entered.notified().await;
+        callback.abort();
+        assert!(callback.await.unwrap_err().is_cancelled());
+        let mut close = Box::pin(replicator.close());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut close)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            replicator.current_progress().await,
+            Err(KubericRuntimeError::Closed)
+        ));
+        drop(close);
+        let mut retry = Box::pin(replicator.close());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut retry)
+                .await
+                .is_err()
+        );
+        replicator.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), replicator.wait_for_containment())
+                .await
+                .is_err()
+        );
+        assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(3), retry)
+            .await
+            .unwrap()
+            .unwrap();
+        replicator.wait_for_containment().await.unwrap();
+        replicator.close().await.unwrap();
+        assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+
+        let (replacement, replacement_executor, _) = seed_replicator(root.path().to_owned());
+        admit_seed_replicator_with_sessions(&replacement, "replacement-session").await;
+        replacement
+            .build_replica(target_build_with_sessions(
+                2,
+                "after-local-drain",
+                "replacement-session",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replacement_executor.executions.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn local_abort_distinguishes_pending_and_started_seed_submissions() {
+    for started in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let complete = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let executor = Arc::new(GatedSeedMutationExecutor {
+            complete: complete.clone(),
+            executions: AtomicUsize::new(0),
+            entered: Mutex::new(started.then_some(entered_tx)),
+            release: Mutex::new(started.then_some(release_rx)),
+        });
+        let replicator =
+            seed_replicator_with_executor(root.path().to_owned(), complete, executor.clone());
+        admit_seed_replicator(&replicator).await;
+        let (dispatch_entered, dispatch_ready) = oneshot::channel();
+        let (dispatch_release, dispatch_resume) = oneshot::channel();
+        if !started {
+            replicator
+                .testing_gate_seed_dispatch(dispatch_entered, dispatch_resume)
+                .unwrap();
+        }
+        let callback = tokio::spawn({
+            let replicator = replicator.clone();
+            async move {
+                replicator
+                    .build_replica(target_build(1, "owned-submission"))
+                    .await
+            }
+        });
+        if started {
+            entered_rx.await.unwrap();
+        } else {
+            dispatch_ready.await.unwrap();
+        }
+        callback.abort();
+        assert!(callback.await.unwrap_err().is_cancelled());
+        replicator.abort();
+        if started {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), replicator.wait_for_containment())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+            release_tx.send(()).unwrap();
+        } else {
+            let _ = dispatch_release.send(());
+        }
+        tokio::time::timeout(Duration::from_secs(3), replicator.wait_for_containment())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            executor.executions.load(Ordering::SeqCst),
+            usize::from(started)
+        );
+        let retained: SeedDispatchRecord = serde_json::from_slice(
+            &std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(retained.phase(), SeedDispatchPhase::Submitting);
+        assert!(matches!(
+            replicator.open().await,
+            Err(KubericRuntimeError::Closed)
+        ));
+    }
 }
 
 #[tokio::test]

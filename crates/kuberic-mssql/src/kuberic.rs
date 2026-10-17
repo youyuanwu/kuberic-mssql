@@ -1,12 +1,13 @@
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 #[cfg(feature = "kuberic-testing")]
 use std::sync::Condvar;
 
 mod compatibility;
+mod owned_work;
 
 use async_trait::async_trait;
 use kuberic_runtime::application::{
@@ -59,6 +60,7 @@ use compatibility::{
     validate_admitted_build_configuration, validate_bootstrap_configuration_replay,
     validate_build_id, validate_replication_address,
 };
+use owned_work::{OwnedOperation, OwnedResult, OwnedWork};
 
 #[cfg(not(feature = "kuberic-testing"))]
 use compatibility::BootstrapOwnership;
@@ -641,6 +643,7 @@ pub struct SqlServerService {
     bootstrap: Option<BootstrapCapability>,
     open_attempt: tokio::sync::Mutex<()>,
     lifecycle: Mutex<ServiceLifecycle>,
+    retained_replicator: Mutex<Option<Arc<SqlServerReplicator>>>,
 }
 
 #[derive(Clone)]
@@ -765,6 +768,7 @@ impl SqlServerService {
             bootstrap,
             open_attempt: tokio::sync::Mutex::new(()),
             lifecycle: Mutex::new(ServiceLifecycle::Created),
+            retained_replicator: Mutex::new(None),
         }
     }
 
@@ -789,6 +793,37 @@ impl SqlServerService {
             _ => None,
         }
     }
+
+    fn retained_replicator(&self) -> Option<Arc<SqlServerReplicator>> {
+        self.retained_replicator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Drains the retained MSSQL object after Close or Abort without invoking Close.
+    /// This is local ownership evidence, not a generic Kuberic-host containment hook.
+    pub async fn wait_for_containment(&self) -> Result<(), KubericAdapterError> {
+        {
+            let lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(
+                *lifecycle,
+                ServiceLifecycle::Created | ServiceLifecycle::Open(_)
+            ) {
+                return Err(KubericAdapterError::InvalidConfiguration(
+                    "local containment requires Close or Abort",
+                ));
+            }
+        }
+        let _attempt = self.open_attempt.lock().await;
+        if let Some(replicator) = self.retained_replicator() {
+            replicator.wait_for_containment().await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -797,6 +832,15 @@ impl StatefulServiceReplica for SqlServerService {
         self.validate_resource_identity(
             &context.partition.get_partition_information().partition_id,
         )?;
+        if !matches!(
+            *self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ServiceLifecycle::Created
+        ) {
+            return Err(KubericRuntimeError::Closed);
+        }
         let _attempt = self.open_attempt.lock().await;
         if !matches!(
             *self
@@ -838,6 +882,20 @@ impl StatefulServiceReplica for SqlServerService {
                 self.clock.clone(),
             )
         });
+        *self
+            .retained_replicator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(replicator.clone());
+        if !matches!(
+            *self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ServiceLifecycle::Created
+        ) {
+            replicator.abort();
+            return Err(KubericRuntimeError::Closed);
+        }
         let interfaces = context
             .partition
             .with_factory(Arc::new(SqlServerReplicatorFactory::new(
@@ -877,39 +935,30 @@ impl StatefulServiceReplica for SqlServerService {
     }
 
     async fn close(&self) -> KubericResult<()> {
-        let replicator = {
+        {
             let mut lifecycle = self
                 .lifecycle
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let replicator = match &*lifecycle {
-                ServiceLifecycle::Open(replicator) => Some(replicator.clone()),
-                _ => None,
-            };
-            *lifecycle = ServiceLifecycle::Closed;
-            replicator
-        };
-        let _attempt = self.open_attempt.lock().await;
-        if let Some(replicator) = replicator {
-            replicator.close().await?;
+            if !matches!(*lifecycle, ServiceLifecycle::Aborted) {
+                *lifecycle = ServiceLifecycle::Closed;
+            }
         }
-        Ok(())
+        if let Some(replicator) = self.retained_replicator() {
+            replicator.begin_close();
+        }
+        self.wait_for_containment().await.map_err(Into::into)
     }
 
     fn abort(&self) {
-        let replicator = {
+        {
             let mut lifecycle = self
                 .lifecycle
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let replicator = match &*lifecycle {
-                ServiceLifecycle::Open(replicator) => Some(replicator.clone()),
-                _ => None,
-            };
             *lifecycle = ServiceLifecycle::Aborted;
-            replicator
-        };
-        if let Some(replicator) = replicator {
+        }
+        if let Some(replicator) = self.retained_replicator() {
             replicator.abort();
         }
     }
@@ -972,10 +1021,11 @@ pub struct SqlServerReplicator {
     admitted_configuration: Mutex<Option<ReplicaSetConfiguration>>,
     admitted_bootstrap_database: Mutex<Option<StandaloneDatabaseIdentity>>,
     native_progress: Mutex<Option<NativeProgressBinding>>,
-    lifecycle: RwLock<ReplicatorLifecycle>,
+    lifecycle: Arc<RwLock<ReplicatorLifecycle>>,
+    lifecycle_state: Arc<std::sync::atomic::AtomicU8>,
     lifecycle_cancel: CancellationToken,
+    owned_work: Arc<OwnedWork>,
     role: Mutex<Option<ReplicaRole>>,
-    epoch: Mutex<Option<Epoch>>,
     #[cfg(feature = "kuberic-testing")]
     observation_injection: Mutex<Option<TestingObservationInjection>>,
     #[cfg(feature = "kuberic-testing")]
@@ -1028,6 +1078,10 @@ struct SeedCoordinator {
     intent_gate: Mutex<Option<SeedGate>>,
     #[cfg(feature = "kuberic-testing")]
     submission_gate: Mutex<Option<SeedGate>>,
+    #[cfg(feature = "kuberic-testing")]
+    dispatch_gate: Mutex<Option<SeedGate>>,
+    #[cfg(feature = "kuberic-testing")]
+    submission_owner_gate: Mutex<Option<SeedGate>>,
     #[cfg(feature = "kuberic-testing")]
     compaction_gate: Mutex<Option<SeedGate>>,
     #[cfg(feature = "kuberic-testing")]
@@ -1201,6 +1255,7 @@ impl Drop for SeedStoreCancellation {
     }
 }
 
+#[derive(Clone)]
 enum SeedStoreWorkResult<T> {
     Cancelled,
     Complete(Result<T, SeedStateError>),
@@ -1219,6 +1274,10 @@ impl SeedCoordinator {
             intent_gate: Mutex::new(None),
             #[cfg(feature = "kuberic-testing")]
             submission_gate: Mutex::new(None),
+            #[cfg(feature = "kuberic-testing")]
+            dispatch_gate: Mutex::new(None),
+            #[cfg(feature = "kuberic-testing")]
+            submission_owner_gate: Mutex::new(None),
             #[cfg(feature = "kuberic-testing")]
             compaction_gate: Mutex::new(None),
             #[cfg(feature = "kuberic-testing")]
@@ -1267,6 +1326,11 @@ impl SeedCoordinator {
     }
 
     #[cfg(feature = "kuberic-testing")]
+    async fn pause_before_dispatch_if_requested(&self) -> Result<(), KubericAdapterError> {
+        self.pause_if_requested(&self.dispatch_gate).await
+    }
+
+    #[cfg(feature = "kuberic-testing")]
     async fn pause_before_compaction_if_requested(&self) -> Result<(), KubericAdapterError> {
         self.pause_if_requested(&self.compaction_gate).await
     }
@@ -1305,10 +1369,24 @@ impl Drop for ActiveSeedSubmission {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct ReplicatorLifecycle {
-    state: u8,
+    state: Arc<std::sync::atomic::AtomicU8>,
     generation: u64,
+    epoch: Option<Epoch>,
+    cancelled: CancellationToken,
+}
+
+impl ReplicatorLifecycle {
+    fn ensure_current(&self, generation: u64) -> Result<(), KubericAdapterError> {
+        if self.state.load(std::sync::atomic::Ordering::Acquire) != OPEN
+            || self.generation != generation
+            || self.cancelled.is_cancelled()
+        {
+            return Err(KubericAdapterError::Closed);
+        }
+        Ok(())
+    }
 }
 
 struct SeedBuildContext {
@@ -1321,7 +1399,7 @@ struct SeedBuildContext {
 
 struct SeedDispatchAttempt {
     request: SeedDispatchRequest,
-    task: tokio::task::JoinHandle<Result<SeedDispatchEvidence, RuntimeError>>,
+    task: OwnedResult<Result<SeedDispatchEvidence, RuntimeError>>,
 }
 
 enum SeedDispatchAction {
@@ -1395,6 +1473,52 @@ impl SqlServerReplicator {
             .seed;
         let mut gate = seed
             .submission_gate
+            .lock()
+            .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?;
+        if gate.is_some() {
+            return Err(KubericAdapterError::SeedState(SeedStateError::AlreadyOwned));
+        }
+        *gate = Some(SeedGate { entered, release });
+        Ok(())
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_gate_seed_dispatch(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), KubericAdapterError> {
+        let seed = &self
+            .bootstrap
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?
+            .seed;
+        let mut gate = seed
+            .dispatch_gate
+            .lock()
+            .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?;
+        if gate.is_some() {
+            return Err(KubericAdapterError::SeedState(SeedStateError::AlreadyOwned));
+        }
+        *gate = Some(SeedGate { entered, release });
+        Ok(())
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_gate_seed_submission_owner(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), KubericAdapterError> {
+        let seed = &self
+            .bootstrap
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?
+            .seed;
+        let mut gate = seed
+            .submission_owner_gate
             .lock()
             .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?;
         if gate.is_some() {
@@ -1645,6 +1769,8 @@ impl SqlServerReplicator {
         expectation: Option<Arc<SqlServerTopologyExpectation>>,
         bootstrap: Option<ReplicatorBootstrapCapability>,
     ) -> Self {
+        let lifecycle_cancel = CancellationToken::new();
+        let lifecycle_state = Arc::new(std::sync::atomic::AtomicU8::new(CREATED));
         Self {
             replication_address,
             source,
@@ -1657,13 +1783,16 @@ impl SqlServerReplicator {
             admitted_configuration: Mutex::new(None),
             admitted_bootstrap_database: Mutex::new(None),
             native_progress: Mutex::new(None),
-            lifecycle: RwLock::new(ReplicatorLifecycle {
-                state: CREATED,
+            lifecycle: Arc::new(RwLock::new(ReplicatorLifecycle {
+                state: lifecycle_state.clone(),
                 generation: 0,
-            }),
-            lifecycle_cancel: CancellationToken::new(),
+                epoch: None,
+                cancelled: lifecycle_cancel.child_token(),
+            })),
+            lifecycle_state,
+            lifecycle_cancel,
+            owned_work: OwnedWork::new(),
             role: Mutex::new(None),
-            epoch: Mutex::new(None),
             #[cfg(feature = "kuberic-testing")]
             observation_injection: Mutex::new(None),
             #[cfg(feature = "kuberic-testing")]
@@ -1685,7 +1814,7 @@ impl SqlServerReplicator {
     pub async fn native_configuration_sequence(
         &self,
     ) -> Result<Option<ConfigurationSequence>, KubericAdapterError> {
-        let generation = self.begin_operation()?;
+        let (generation, _operation) = self.begin_operation()?;
         let admitted = self.admitted_topology();
         let native = self.native_progress_binding();
         if self.expectation.is_some() && admitted.is_none() && native.is_none() {
@@ -1870,13 +1999,25 @@ impl SqlServerReplicator {
             .collect())
     }
 
-    fn begin_operation(&self) -> Result<u64, KubericAdapterError> {
+    fn begin_operation(&self) -> Result<(u64, OwnedOperation), KubericAdapterError> {
+        match self
+            .lifecycle_state
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            CREATED => return Err(KubericAdapterError::NotOpen),
+            CLOSED | ABORTED => return Err(KubericAdapterError::Closed),
+            OPEN => {}
+            _ => unreachable!("SQL Server replicator lifecycle is invalid"),
+        }
         let lifecycle = self
             .lifecycle
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match lifecycle.state {
-            OPEN => Ok(lifecycle.generation),
+        match lifecycle.state.load(std::sync::atomic::Ordering::Acquire) {
+            OPEN => {
+                lifecycle.ensure_current(lifecycle.generation)?;
+                Ok((lifecycle.generation, self.owned_work.enter()?))
+            }
             CREATED => Err(KubericAdapterError::NotOpen),
             CLOSED | ABORTED => Err(KubericAdapterError::Closed),
             _ => unreachable!("SQL Server replicator lifecycle is invalid"),
@@ -1891,10 +2032,65 @@ impl SqlServerReplicator {
             .lifecycle
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if lifecycle.state != OPEN || lifecycle.generation != generation {
-            return Err(KubericAdapterError::Closed);
-        }
+        lifecycle.ensure_current(generation)?;
         Ok(lifecycle)
+    }
+
+    fn finish_authority_transition(
+        &self,
+        generation: u64,
+    ) -> Result<RwLockWriteGuard<'_, ReplicatorLifecycle>, KubericAdapterError> {
+        let lifecycle = self
+            .lifecycle
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.ensure_current(generation)?;
+        Ok(lifecycle)
+    }
+
+    async fn await_authorized<T>(
+        &self,
+        generation: u64,
+        future: impl std::future::Future<Output = T>,
+    ) -> Result<T, KubericAdapterError> {
+        let cancelled = self.finish_operation(generation)?.cancelled.clone();
+        tokio::pin!(future);
+        tokio::select! {
+            biased;
+            _ = cancelled.cancelled() => Err(KubericAdapterError::Closed),
+            result = std::future::poll_fn(|context| {
+                let _authority = match self.finish_operation(generation) {
+                    Ok(authority) => authority,
+                    Err(error) => return std::task::Poll::Ready(Err(error)),
+                };
+                future.as_mut().poll(context).map(Ok)
+            }) => result,
+        }
+    }
+
+    /// Joins adapter-owned work after Close or Abort, retaining results across cancelled waits.
+    /// This neither proves SQL rollback nor replaces durable reconciliation of submitted effects.
+    pub async fn wait_for_containment(&self) -> Result<(), KubericAdapterError> {
+        self.owned_work.wait().await?;
+        if let Some(bootstrap) = &self.bootstrap {
+            bootstrap
+                .seed
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+        Ok(())
+    }
+
+    fn begin_close(&self) {
+        self.owned_work.seal();
+        self.lifecycle_state
+            .fetch_max(CLOSED, std::sync::atomic::Ordering::AcqRel);
+        self.lifecycle_cancel.cancel();
+        if let Some(bootstrap) = &self.bootstrap {
+            bootstrap.seed.cancel_store_work();
+        }
     }
 
     #[cfg(feature = "kuberic-testing")]
@@ -1914,6 +2110,13 @@ impl SqlServerReplicator {
                 KubericAdapterError::NativeConvergenceUnsafe("test lifecycle publication seam")
             })?;
         }
+        if self
+            .lifecycle_state
+            .load(std::sync::atomic::Ordering::Acquire)
+            != OPEN
+        {
+            return Err(KubericAdapterError::Closed);
+        }
         Ok(())
     }
 
@@ -1925,7 +2128,7 @@ impl SqlServerReplicator {
         work: F,
     ) -> Result<T, KubericAdapterError>
     where
-        T: Send + 'static,
+        T: Clone + Send + Sync + 'static,
         F: FnOnce() -> Result<T, SeedStateError> + Send + 'static,
     {
         let seed = self
@@ -1936,10 +2139,10 @@ impl SqlServerReplicator {
             .clone();
         #[cfg(not(feature = "kuberic-testing"))]
         let _ = operation;
-        drop(self.finish_operation(generation)?);
+        let operation_cancel = self.finish_operation(generation)?.cancelled.clone();
         let permit = tokio::select! {
             biased;
-            _ = self.lifecycle_cancel.cancelled() => {
+            _ = operation_cancel.cancelled() => {
                 return Err(KubericAdapterError::Closed);
             }
             permit = tokio::time::timeout(
@@ -1973,36 +2176,48 @@ impl SqlServerReplicator {
         });
         seed.register_store_control(&control)
             .map_err(KubericAdapterError::SeedState)?;
-        if self.lifecycle_cancel.is_cancelled() {
+        if operation_cancel.is_cancelled() {
             control.cancel();
         }
         let cancellation = SeedStoreCancellation(control.clone());
-        let (completed, mut result) = tokio::sync::oneshot::channel();
         let thread_control = control.clone();
-        std::thread::Builder::new()
-            .name("mssql-seed-store".into())
-            .spawn(move || {
-                let _permit = permit;
-                #[cfg(feature = "kuberic-testing")]
-                if let Some(hook) = &hook {
-                    hook.checkpoint(TestingSeedStoreStage::BeforeStart, &thread_control);
+        let lifecycle = self.lifecycle.clone();
+        let mut result = self.owned_work.spawn(
+            || {
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    #[cfg(feature = "kuberic-testing")]
+                    if let Some(hook) = &hook {
+                        hook.checkpoint(TestingSeedStoreStage::BeforeStart, &thread_control);
+                    }
+                    let authority = lifecycle
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if authority.ensure_current(generation).is_err() || !thread_control.begin() {
+                        return SeedStoreWorkResult::Cancelled;
+                    }
+                    drop(authority);
+                    #[cfg(feature = "kuberic-testing")]
+                    if let Some(hook) = &hook {
+                        hook.checkpoint(TestingSeedStoreStage::Started, &thread_control);
+                    }
+                    let outcome = work();
+                    #[cfg(feature = "kuberic-testing")]
+                    if let Some(hook) = &hook {
+                        hook.checkpoint(TestingSeedStoreStage::Completed, &thread_control);
+                    }
+                    SeedStoreWorkResult::Complete(outcome)
+                })
+            },
+            |outcome| match outcome {
+                SeedStoreWorkResult::Complete(Err(error))
+                    if matches!(error, SeedStateError::Io | SeedStateError::UnsafeState) =>
+                {
+                    Some(KubericAdapterError::SeedState(*error))
                 }
-                if !thread_control.begin() {
-                    let _ = completed.send(SeedStoreWorkResult::Cancelled);
-                    return;
-                }
-                #[cfg(feature = "kuberic-testing")]
-                if let Some(hook) = &hook {
-                    hook.checkpoint(TestingSeedStoreStage::Started, &thread_control);
-                }
-                let outcome = work();
-                #[cfg(feature = "kuberic-testing")]
-                if let Some(hook) = &hook {
-                    hook.checkpoint(TestingSeedStoreStage::Completed, &thread_control);
-                }
-                let _ = completed.send(SeedStoreWorkResult::Complete(outcome));
-            })
-            .map_err(|_| KubericAdapterError::SeedState(SeedStateError::Io))?;
+                _ => None,
+            },
+        )?;
 
         enum Stop {
             Deadline,
@@ -2016,7 +2231,7 @@ impl SqlServerReplicator {
                 stop = Some(Stop::Deadline);
                 None
             }
-            _ = self.lifecycle_cancel.cancelled() => {
+            _ = operation_cancel.cancelled() => {
                 stop = Some(Stop::Closed);
                 None
             }
@@ -2026,16 +2241,12 @@ impl SqlServerReplicator {
                 control.cancel();
                 result.await
             }
-        }
-        .map_err(|_| {
-            KubericAdapterError::NativeConvergenceUnsafe("seed dispatch store worker terminated")
-        })?;
+        }?;
         drop(cancellation);
 
         let value = match outcome {
             SeedStoreWorkResult::Cancelled => {
-                let stop =
-                    stop.or_else(|| self.lifecycle_cancel.is_cancelled().then_some(Stop::Closed));
+                let stop = stop.or_else(|| operation_cancel.is_cancelled().then_some(Stop::Closed));
                 return Err(match stop {
                     Some(Stop::Closed) => KubericAdapterError::Closed,
                     Some(Stop::Deadline) | None => KubericAdapterError::NativeConvergenceDeadline,
@@ -2191,7 +2402,9 @@ impl SqlServerReplicator {
         KubericAdapterError,
     > {
         #[cfg(feature = "kuberic-testing")]
-        let injected = self.take_testing_incarnation_observation().await?;
+        let injected = self
+            .await_authorized(generation, self.take_testing_incarnation_observation())
+            .await??;
         #[cfg(feature = "kuberic-testing")]
         let observation = match injected {
             Some(snapshot) => Observation::Present {
@@ -2199,16 +2412,14 @@ impl SqlServerReplicator {
                 value: snapshot,
             },
             None => self
-                .source
-                .observe()
-                .await
+                .await_authorized(generation, self.source.observe())
+                .await?
                 .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))?,
         };
         #[cfg(not(feature = "kuberic-testing"))]
         let observation = self
-            .source
-            .observe()
-            .await
+            .await_authorized(generation, self.source.observe())
+            .await?
             .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))?;
         drop(self.finish_operation(generation)?);
         let (snapshot, observed_at) = match observation {
@@ -2375,7 +2586,12 @@ impl SqlServerReplicator {
         KubericAdapterError,
     > {
         let remaining = bootstrap_remaining(deadline)?;
-        let observation = tokio::time::timeout(remaining, self.source.observe()).await;
+        let observation = self
+            .await_authorized(
+                generation,
+                tokio::time::timeout(remaining, self.source.observe()),
+            )
+            .await?;
         drop(self.finish_operation(generation)?);
         let observation = observation
             .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)?
@@ -2465,7 +2681,12 @@ impl SqlServerReplicator {
         effect: &MutationEffect,
     ) -> Result<bool, KubericAdapterError> {
         let remaining = bootstrap_remaining(deadline)?;
-        let result = tokio::time::timeout(remaining, executor.execute(effect)).await;
+        let result = self
+            .await_authorized(
+                generation,
+                tokio::time::timeout(remaining, executor.execute(effect)),
+            )
+            .await?;
         drop(self.finish_operation(generation)?);
         let result = result.map_err(|_| KubericAdapterError::NativeConvergenceDeadline)?;
         match result {
@@ -2487,8 +2708,12 @@ impl SqlServerReplicator {
         database: &SqlIdentifier,
     ) -> Result<Option<crate::bootstrap::StandaloneDatabaseSnapshot>, KubericAdapterError> {
         let remaining = bootstrap_remaining(deadline)?;
-        let result =
-            tokio::time::timeout(remaining, executor.observe_standalone_database(database)).await;
+        let result = self
+            .await_authorized(
+                generation,
+                tokio::time::timeout(remaining, executor.observe_standalone_database(database)),
+            )
+            .await?;
         drop(self.finish_operation(generation)?);
         result
             .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)?
@@ -2503,11 +2728,15 @@ impl SqlServerReplicator {
         database: &SqlIdentifier,
     ) -> Result<Option<crate::bootstrap::StandaloneDatabaseSnapshot>, KubericAdapterError> {
         let remaining = bootstrap_remaining(deadline)?;
-        let result = tokio::time::timeout(
-            remaining,
-            executor.observe_availability_group_ownership(database),
-        )
-        .await;
+        let result = self
+            .await_authorized(
+                generation,
+                tokio::time::timeout(
+                    remaining,
+                    executor.observe_availability_group_ownership(database),
+                ),
+            )
+            .await?;
         drop(self.finish_operation(generation)?);
         result
             .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)?
@@ -2522,8 +2751,12 @@ impl SqlServerReplicator {
         effect: &MutationEffect,
     ) -> Result<bool, KubericAdapterError> {
         let remaining = bootstrap_remaining(deadline)?;
-        let result =
-            tokio::time::timeout(remaining, executor.observe_effect_completion(effect)).await;
+        let result = self
+            .await_authorized(
+                generation,
+                tokio::time::timeout(remaining, executor.observe_effect_completion(effect)),
+            )
+            .await?;
         drop(self.finish_operation(generation)?);
         result
             .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)?
@@ -3299,7 +3532,8 @@ impl SqlServerReplicator {
             .poll_interval()
             .max(Duration::from_millis(100))
             .min(remaining);
-        tokio::time::sleep(retry_delay).await;
+        self.await_authorized(generation, tokio::time::sleep(retry_delay))
+            .await?;
         drop(self.finish_operation(generation)?);
         bootstrap_remaining(deadline)?;
         Ok(())
@@ -3401,12 +3635,16 @@ impl SqlServerReplicator {
                 context.build_id, context.target.process_session_id
             ),
         };
-        let report = tokio::time::timeout(
-            bootstrap_remaining(deadline)?,
-            bootstrap.target_evidence.collect(&request),
-        )
-        .await
-        .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)??;
+        let report = self
+            .await_authorized(
+                generation,
+                tokio::time::timeout(
+                    bootstrap_remaining(deadline)?,
+                    bootstrap.target_evidence.collect(&request),
+                ),
+            )
+            .await?
+            .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)??;
         drop(self.finish_operation(generation)?);
         let now_unix_millis = self
             .clock
@@ -3430,7 +3668,8 @@ impl SqlServerReplicator {
         #[allow(unused_mut)]
         let mut group = group.ok_or(KubericAdapterError::AvailabilityGroupAbsent)?;
         #[cfg(feature = "kuberic-testing")]
-        self.inject_testing_observation(&mut group).await?;
+        self.await_authorized(generation, self.inject_testing_observation(&mut group))
+            .await??;
         if let Err(error) =
             validate_eligible_snapshot(self.source.observer_config(), &instance, &group, false)
         {
@@ -3642,19 +3881,23 @@ impl SqlServerReplicator {
             .as_ref()
             .ok_or(KubericAdapterError::TopologyNotAdmitted)?
             .executor;
-        let evidence = tokio::time::timeout(
-            bootstrap_remaining(deadline)?,
-            executor.reconcile_seed_dispatch(request),
-        )
-        .await
-        .map_err(|_| {
-            KubericAdapterError::NativeMutationAmbiguous("add database to availability group")
-        })?
-        .map_err(|error| KubericAdapterError::NativeMutationFailed {
-            effect: "reconcile add database submission",
-            kind: error.kind,
-            server_code: error.server_code,
-        })?;
+        let evidence = self
+            .await_authorized(
+                generation,
+                tokio::time::timeout(
+                    bootstrap_remaining(deadline)?,
+                    executor.reconcile_seed_dispatch(request),
+                ),
+            )
+            .await?
+            .map_err(|_| {
+                KubericAdapterError::NativeMutationAmbiguous("add database to availability group")
+            })?
+            .map_err(|error| KubericAdapterError::NativeMutationFailed {
+                effect: "reconcile add database submission",
+                kind: error.kind,
+                server_code: error.server_code,
+            })?;
         drop(self.finish_operation(generation)?);
         Ok(evidence)
     }
@@ -3669,7 +3912,9 @@ impl SqlServerReplicator {
             .bootstrap
             .as_ref()
             .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
-        let _arbiter = bootstrap.seed.arbiter.lock().await;
+        let _arbiter = self
+            .await_authorized(generation, bootstrap.seed.arbiter.lock())
+            .await?;
         drop(self.finish_operation(generation)?);
         let group = self
             .observe_seed_group(generation, deadline, context)
@@ -3793,7 +4038,8 @@ impl SqlServerReplicator {
             }
         }
         #[cfg(feature = "kuberic-testing")]
-        bootstrap.seed.pause_after_intent_if_requested().await?;
+        self.await_authorized(generation, bootstrap.seed.pause_after_intent_if_requested())
+            .await??;
         drop(self.finish_operation(generation)?);
         record
             .mark_submitting()
@@ -3802,10 +4048,11 @@ impl SqlServerReplicator {
             .seed_store_replace(generation, deadline, record.revision(), record)
             .await?;
         #[cfg(feature = "kuberic-testing")]
-        bootstrap
-            .seed
-            .pause_before_submission_if_requested()
-            .await?;
+        self.await_authorized(
+            generation,
+            bootstrap.seed.pause_before_submission_if_requested(),
+        )
+        .await??;
         drop(self.finish_operation(generation)?);
         let executor = bootstrap.executor.clone();
         let request = SeedDispatchRequest::new(
@@ -3825,12 +4072,59 @@ impl SqlServerReplicator {
             .submission_active
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let seed = bootstrap.seed.clone();
+        let active = ActiveSeedSubmission(seed.clone());
+        let lifecycle = self.lifecycle.clone();
+        #[cfg(feature = "kuberic-testing")]
+        self.await_authorized(
+            generation,
+            seed.pause_if_requested(&seed.submission_owner_gate),
+        )
+        .await??;
+        #[cfg(feature = "kuberic-testing")]
+        let cancelled = self.finish_operation(generation)?.cancelled.clone();
         Ok(SeedDispatchAction::Submitted(SeedDispatchAttempt {
             request,
-            task: tokio::spawn(async move {
-                let _active = ActiveSeedSubmission(seed);
-                executor.submit_seed_dispatch(&submitted_request).await
-            }),
+            task: self.owned_work.spawn(
+                || {
+                    tokio::spawn(async move {
+                        let _active = active;
+                        #[cfg(feature = "kuberic-testing")]
+                        tokio::select! {
+                            biased;
+                            _ = cancelled.cancelled() => Err(KubericAdapterError::Closed),
+                            result = seed.pause_before_dispatch_if_requested() => result,
+                        }
+                        .map_err(|_| {
+                            RuntimeError::new(
+                                ObservationFailureKind::Inconsistent,
+                                "seed dispatch",
+                                "submission authority was retired before dispatch",
+                            )
+                        })?;
+                        let mut submission = executor.submit_seed_dispatch(&submitted_request);
+                        let mut started = false;
+                        std::future::poll_fn(|context| {
+                            if started {
+                                return submission.as_mut().poll(context);
+                            }
+                            let authority = lifecycle
+                                .read()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if authority.ensure_current(generation).is_err() {
+                                return std::task::Poll::Ready(Err(RuntimeError::new(
+                                    ObservationFailureKind::Inconsistent,
+                                    "seed dispatch",
+                                    "submission authority was retired before dispatch",
+                                )));
+                            }
+                            started = true;
+                            submission.as_mut().poll(context)
+                        })
+                        .await
+                    })
+                },
+                |_| None,
+            )?,
         }))
     }
 
@@ -3926,10 +4220,11 @@ impl SqlServerReplicator {
                         }
                         #[cfg(feature = "kuberic-testing")]
                         if record.is_some() {
-                            bootstrap
-                                .seed
-                                .pause_before_compaction_if_requested()
-                                .await?;
+                            self.await_authorized(
+                                generation,
+                                bootstrap.seed.pause_before_compaction_if_requested(),
+                            )
+                            .await??;
                             drop(self.finish_operation(generation)?);
                         }
                         if let Some(mut record) = record {
@@ -3981,10 +4276,11 @@ impl SqlServerReplicator {
                                 }
                             }
                             #[cfg(feature = "kuberic-testing")]
-                            bootstrap
-                                .seed
-                                .pause_before_completion_if_requested()
-                                .await?;
+                            self.await_authorized(
+                                generation,
+                                bootstrap.seed.pause_before_completion_if_requested(),
+                            )
+                            .await??;
                             drop(self.finish_operation(generation)?);
                             return Ok(());
                         }
@@ -4165,7 +4461,7 @@ impl SqlServerReplicator {
     }
 
     async fn validate_and_set_role(&self, role: ReplicaRole) -> KubericResult<()> {
-        let generation = self.begin_operation()?;
+        let (generation, _operation) = self.begin_operation()?;
         if self.expectation.is_some() && self.admitted_topology().is_none() {
             if !matches!(role, ReplicaRole::Primary | ReplicaRole::ActiveSecondary) {
                 return Err(KubericAdapterError::NativeRoleMismatch {
@@ -4215,18 +4511,28 @@ impl SqlServerReplicator {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(role);
     }
 
-    fn set_epoch(&self, epoch: Epoch) -> Result<(), KubericAdapterError> {
-        let mut accepted = self
-            .epoch
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if accepted.as_ref().is_some_and(|accepted| epoch < *accepted) {
+    fn validate_epoch(
+        lifecycle: &ReplicatorLifecycle,
+        epoch: Epoch,
+    ) -> Result<(), KubericAdapterError> {
+        if lifecycle.epoch.is_some_and(|accepted| epoch < accepted) {
             return Err(KubericAdapterError::TopologyBindingMismatch(
                 "runtime epoch regressed",
             ));
         }
-        *accepted = Some(epoch);
         Ok(())
+    }
+
+    fn accept_epoch(&self, lifecycle: &mut ReplicatorLifecycle, epoch: Epoch) {
+        if lifecycle.epoch != Some(epoch) {
+            lifecycle.cancelled.cancel();
+            lifecycle.generation = lifecycle.generation.wrapping_add(1);
+            lifecycle.cancelled = self.lifecycle_cancel.child_token();
+            lifecycle.epoch = Some(epoch);
+            if let Some(bootstrap) = &self.bootstrap {
+                bootstrap.seed.cancel_store_work();
+            }
+        }
     }
 
     fn unsupported<T>(&self, operation: ObserveOnlyOperation) -> KubericResult<T> {
@@ -4237,20 +4543,32 @@ impl SqlServerReplicator {
 #[async_trait]
 impl Replicator for SqlServerReplicator {
     async fn open(&self) -> KubericResult<String> {
+        if self
+            .lifecycle_state
+            .load(std::sync::atomic::Ordering::Acquire)
+            != CREATED
+        {
+            return Err(KubericRuntimeError::Closed);
+        }
         let mut lifecycle = self
             .lifecycle
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if lifecycle.state != CREATED {
-            return Err(KubericRuntimeError::Closed);
-        }
-        lifecycle.state = OPEN;
+        lifecycle
+            .state
+            .compare_exchange(
+                CREATED,
+                OPEN,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| KubericRuntimeError::Closed)?;
         lifecycle.generation = lifecycle.generation.wrapping_add(1);
         Ok(self.replication_address.clone())
     }
 
     async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> KubericResult<()> {
-        let generation = self.begin_operation()?;
+        let (generation, _operation) = self.begin_operation()?;
         let admitted = self.admitted_topology();
         let mut unbound_observed_at = None;
         let native = if let Some(binding) = &admitted {
@@ -4291,9 +4609,10 @@ impl Replicator for SqlServerReplicator {
             unbound_observed_at = Some(observed_at);
             None
         };
-        let _lifecycle = self.finish_operation(generation)?;
+        let mut lifecycle = self.finish_authority_transition(generation)?;
         #[cfg(feature = "kuberic-testing")]
         self.wait_for_testing_lifecycle_publication()?;
+        Self::validate_epoch(&lifecycle, epoch)?;
         if let Some((topology, sequence, observed_at)) = native {
             self.ensure_observation_fresh(observed_at)?;
             self.publish_native_progress(topology, sequence)?;
@@ -4301,13 +4620,13 @@ impl Replicator for SqlServerReplicator {
         if let Some(observed_at) = unbound_observed_at {
             self.ensure_observation_fresh(observed_at)?;
         }
-        self.set_epoch(epoch)?;
+        self.accept_epoch(&mut lifecycle, epoch);
         self.set_role(role);
         Ok(())
     }
 
     async fn update_epoch(&self, epoch: Epoch) -> KubericResult<()> {
-        let generation = self.begin_operation()?;
+        let (generation, _operation) = self.begin_operation()?;
         let admitted = self.admitted_topology();
         let native = if let Some(binding) = &admitted {
             let (group, observed_at) = self.observed_group(generation, false, None).await?;
@@ -4330,38 +4649,27 @@ impl Replicator for SqlServerReplicator {
         } else {
             None
         };
-        let _lifecycle = self.finish_operation(generation)?;
+        let mut lifecycle = self.finish_authority_transition(generation)?;
         #[cfg(feature = "kuberic-testing")]
         self.wait_for_testing_lifecycle_publication()?;
+        Self::validate_epoch(&lifecycle, epoch)?;
         if let Some((topology, sequence, observed_at)) = native {
             self.ensure_observation_fresh(observed_at)?;
             self.publish_native_progress(topology, sequence)?;
         }
-        self.set_epoch(epoch)?;
+        self.accept_epoch(&mut lifecycle, epoch);
         Ok(())
     }
 
     async fn close(&self) -> KubericResult<()> {
-        let mut lifecycle = self
-            .lifecycle
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        lifecycle.state = CLOSED;
-        lifecycle.generation = lifecycle.generation.wrapping_add(1);
-        self.lifecycle_cancel.cancel();
-        if let Some(bootstrap) = &self.bootstrap {
-            bootstrap.seed.cancel_store_work();
-        }
-        Ok(())
+        self.begin_close();
+        self.wait_for_containment().await.map_err(Into::into)
     }
 
     fn abort(&self) {
-        let mut lifecycle = self
-            .lifecycle
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        lifecycle.state = ABORTED;
-        lifecycle.generation = lifecycle.generation.wrapping_add(1);
+        self.owned_work.seal();
+        self.lifecycle_state
+            .store(ABORTED, std::sync::atomic::Ordering::Release);
         self.lifecycle_cancel.cancel();
         if let Some(bootstrap) = &self.bootstrap {
             bootstrap.seed.cancel_store_work();
@@ -4377,7 +4685,7 @@ impl Replicator for SqlServerReplicator {
     }
 
     async fn catch_up_capability(&self) -> KubericResult<i64> {
-        let generation = self.begin_operation()?;
+        let (generation, _operation) = self.begin_operation()?;
         let admitted = self.admitted_topology();
         let native = self.native_progress_binding();
         if admitted.is_none() && native.is_none() {
@@ -4499,7 +4807,7 @@ impl PrimaryReplicator for SqlServerReplicator {
         } else {
             BootstrapConvergenceScope::FullTopology
         };
-        let generation = self.begin_operation()?;
+        let (generation, _operation) = self.begin_operation()?;
         if bootstrap_scope == BootstrapConvergenceScope::Deferred {
             drop(self.finish_operation(generation)?);
             return Ok(());
@@ -4561,9 +4869,8 @@ impl PrimaryReplicator for SqlServerReplicator {
                 }
             } else {
                 let observation = self
-                    .source
-                    .observe()
-                    .await
+                    .await_authorized(generation, self.source.observe())
+                    .await?
                     .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))?;
                 drop(self.finish_operation(generation)?);
                 let (snapshot, observed_at) = present_snapshot(observation)?;
@@ -4678,7 +4985,7 @@ impl PrimaryReplicator for SqlServerReplicator {
         if self.bootstrap.is_none() {
             return self.unsupported(ObserveOnlyOperation::BuildReplica);
         }
-        let generation = self.begin_operation()?;
+        let (generation, _operation) = self.begin_operation()?;
         self.converge_seed_build(generation, &replica)
             .await
             .map_err(KubericRuntimeError::from)
