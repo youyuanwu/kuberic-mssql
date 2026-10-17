@@ -35,6 +35,8 @@ use super::config::{ResolverConfig, RuntimeHostArgs, RuntimeHostConfig};
 use super::routes::PeerRoutes;
 
 mod retained;
+#[cfg(feature = "kuberic-testing")]
+pub use retained::TestingRuntimeCompletion;
 
 const APPLICATION_STORAGE_NAME: &str = "mssql-runtime-binding";
 
@@ -112,7 +114,61 @@ async fn run_host_with_shutdown<A>(
 where
     A: StatefulServiceReplica + 'static,
 {
-    let resolver = Arc::new(RuntimeEndpointResolver::new(&config)?);
+    start_host_with_shutdown(
+        &config,
+        application,
+        concrete,
+        storage,
+        storage_paths,
+        shutdown,
+    )?
+    .wait()
+    .await
+}
+
+#[cfg(feature = "kuberic-testing")]
+#[doc(hidden)]
+pub fn testing_start_runtime_with_application<F>(
+    config: &RuntimeHostConfig,
+    application: Arc<RuntimeHostApplication>,
+    shutdown: F,
+) -> Result<
+    (
+        impl Future<Output = Result<(), RuntimeProcessError>> + Send + 'static + use<F>,
+        TestingRuntimeCompletion,
+    ),
+    RuntimeProcessError,
+>
+where
+    F: Future<Output = Result<(), RuntimeProcessError>> + Send + 'static,
+{
+    prepare_data_root(config.data_root())?;
+    let storage = application.storage_state()?;
+    let storage_paths = application.storage_paths();
+    let waiter = start_host_with_shutdown(
+        config,
+        application.clone(),
+        Some(application),
+        storage,
+        Some(storage_paths),
+        shutdown,
+    )?;
+    let completion = waiter.testing_completion();
+    Ok((waiter.wait(), completion))
+}
+
+fn start_host_with_shutdown<A>(
+    config: &RuntimeHostConfig,
+    application: Arc<A>,
+    concrete: Option<Arc<RuntimeHostApplication>>,
+    storage: ApplicationStorageState,
+    storage_paths: Option<BTreeMap<String, std::path::PathBuf>>,
+    shutdown: impl Future<Output = Result<(), RuntimeProcessError>> + Send + 'static,
+) -> Result<retained::Waiter<A>, RuntimeProcessError>
+where
+    A: StatefulServiceReplica + 'static,
+{
+    let resolver = Arc::new(RuntimeEndpointResolver::new(config)?);
     let mut host = ReplicaHost::new(
         config.replica_process_config(),
         application.clone(),
@@ -124,7 +180,7 @@ where
     }
 
     let control_address = config.control_address();
-    retained::run(
+    Ok(retained::start(
         application,
         concrete,
         move |receiver| async move {
@@ -133,8 +189,7 @@ where
         },
         shutdown,
         config.shutdown_deadline(),
-    )
-    .await
+    ))
 }
 
 fn combine(
@@ -273,6 +328,16 @@ impl RuntimeHostApplication {
     pub fn testing_replicator(&self) -> Option<Arc<SqlServerReplicator>> {
         self.inner.replicator()
     }
+
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_gate_open_publication(
+        &self,
+        entered: std::sync::mpsc::Sender<Arc<SqlServerReplicator>>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.inner.testing_gate_open_publication(entered, release);
+    }
 }
 
 #[async_trait]
@@ -305,21 +370,23 @@ impl StatefulServiceReplica for RuntimeHostApplication {
     }
 
     async fn close(&self) -> KubericResult<()> {
-        let close = self.inner.close();
-        tokio::pin!(close);
-        let result = futures::future::poll_fn(|cx| {
-            let _entry = self
-                .terminal_entry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if self.aborted.is_cancelled() {
-                return std::task::Poll::Ready(None);
-            }
-            // The first poll publishes the service's terminal state synchronously.
-            // Serialize that entry with Abort, never the asynchronous drain.
-            close.as_mut().poll(cx).map(Some)
-        })
-        .await;
+        let result = {
+            let close = self.inner.close();
+            tokio::pin!(close);
+            futures::future::poll_fn(|cx| {
+                let _entry = self
+                    .terminal_entry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if self.aborted.is_cancelled() {
+                    return std::task::Poll::Ready(None);
+                }
+                // The first poll publishes the service's terminal state synchronously.
+                // Serialize that entry with Abort, never the asynchronous drain.
+                close.as_mut().poll(cx).map(Some)
+            })
+            .await
+        }; // Drop the old Close and its Open-attempt lock before starting a drain.
         match result {
             Some(result) => result,
             None => self.wait_for_containment().await,

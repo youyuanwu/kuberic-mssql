@@ -19,6 +19,8 @@ struct Results {
     consumed: bool,
     cancelled: bool,
     reported: bool,
+    #[cfg(feature = "kuberic-testing")]
+    diagnostic: Option<RuntimeProcessError>,
 }
 
 struct Completion {
@@ -29,6 +31,15 @@ struct Completion {
 }
 
 impl Completion {
+    fn report(&self, error: RuntimeProcessError) {
+        (self.report)(&error);
+        #[cfg(feature = "kuberic-testing")]
+        {
+            self.results.lock().unwrap().diagnostic = Some(error);
+            self.changed.send_replace(());
+        }
+    }
+
     fn new(report: Reporter) -> Arc<Self> {
         Arc::new(Self {
             results: Mutex::new(Results::default()),
@@ -75,7 +86,7 @@ impl Completion {
         };
         self.changed.send_replace(());
         if let Some(error) = diagnostic {
-            (self.report)(&error);
+            self.report(error);
         }
     }
 
@@ -101,7 +112,7 @@ impl Completion {
             self.stop.cancel();
         }
         if let Some(error) = diagnostic {
-            (self.report)(&error);
+            self.report(error);
         }
     }
 
@@ -115,14 +126,27 @@ impl Completion {
     }
 }
 
-struct Waiter<A: StatefulServiceReplica> {
+pub(super) struct Waiter<A: StatefulServiceReplica> {
     application: Arc<A>,
     completion: Arc<Completion>,
     armed: bool,
+    #[cfg(feature = "kuberic-testing")]
+    owner: Option<futures::future::Shared<futures::future::BoxFuture<'static, ()>>>,
 }
 
 impl<A: StatefulServiceReplica> Waiter<A> {
-    async fn wait(mut self) -> Outcome {
+    #[cfg(feature = "kuberic-testing")]
+    pub(super) fn testing_completion(&self) -> TestingRuntimeCompletion {
+        TestingRuntimeCompletion {
+            completion: self.completion.clone(),
+            owner: self
+                .owner
+                .clone()
+                .expect("owner was spawned before observation"),
+        }
+    }
+
+    pub(super) async fn wait(mut self) -> Outcome {
         let mut changed = self.completion.changed.subscribe();
         loop {
             let result = {
@@ -147,6 +171,45 @@ impl<A: StatefulServiceReplica> Waiter<A> {
     }
 }
 
+/// Observe the production owner's final joins without consuming its waiter result
+/// or suppressing the production fallback diagnostic.
+#[cfg(feature = "kuberic-testing")]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct TestingRuntimeCompletion {
+    completion: Arc<Completion>,
+    owner: futures::future::Shared<futures::future::BoxFuture<'static, ()>>,
+}
+
+#[cfg(feature = "kuberic-testing")]
+impl TestingRuntimeCompletion {
+    pub fn is_finished(&self) -> bool {
+        self.completion.results.lock().unwrap().completed.is_some()
+    }
+
+    pub async fn wait(&self) -> Outcome {
+        self.owner.clone().await;
+        let results = self.completion.results.lock().unwrap();
+        Completion::with_cancellation(
+            &results,
+            results
+                .completed
+                .clone()
+                .expect("joined owner published result"),
+        )
+    }
+
+    pub async fn diagnostic(&self) -> RuntimeProcessError {
+        let mut changed = self.completion.changed.subscribe();
+        loop {
+            if let Some(error) = self.completion.results.lock().unwrap().diagnostic.clone() {
+                return error;
+            }
+            changed.changed().await.expect("completion owns sender");
+        }
+    }
+}
+
 impl<A: StatefulServiceReplica> Drop for Waiter<A> {
     fn drop(&mut self) {
         if self.armed {
@@ -156,13 +219,13 @@ impl<A: StatefulServiceReplica> Drop for Waiter<A> {
     }
 }
 
-pub(super) async fn run<A, S, SF, F>(
+pub(super) fn start<A, S, SF, F>(
     application: Arc<A>,
     concrete: Option<Arc<RuntimeHostApplication>>,
     startup: S,
     shutdown: F,
     deadline: Duration,
-) -> Outcome
+) -> Waiter<A>
 where
     A: StatefulServiceReplica + 'static,
     S: FnOnce(watch::Receiver<bool>) -> SF + Send + 'static,
@@ -175,7 +238,7 @@ where
     // (normally fewer, since Abort skips Close), excluding executor scheduling.
     // Expiry publishes failure; the same owner still drives real completion.
     // None of this outlives destruction of the async runtime or the OS process.
-    start(
+    start_with_reporter(
         application,
         concrete,
         startup,
@@ -183,11 +246,9 @@ where
         deadline,
         Arc::new(|error| eprintln!("kuberic-mssql-runtime: retained cleanup: {error}")),
     )
-    .wait()
-    .await
 }
 
-fn start<A, S, SF, F>(
+fn start_with_reporter<A, S, SF, F>(
     application: Arc<A>,
     concrete: Option<Arc<RuntimeHostApplication>>,
     startup: S,
@@ -253,8 +314,10 @@ where
         application: application.clone(),
         completion: completion.clone(),
         armed: true,
+        #[cfg(feature = "kuberic-testing")]
+        owner: None,
     };
-    tokio::spawn(async move {
+    let owner = tokio::spawn(async move {
         let (ack, acknowledged) = oneshot::channel();
         let host = async {
             let mut ack = Some(ack);
@@ -296,7 +359,21 @@ where
         let (host, cleanup) = tokio::join!(host, cleanup);
         completion.publish(combine(host, cleanup, "application shutdown"), true);
     });
-    waiter
+    #[cfg(feature = "kuberic-testing")]
+    {
+        let mut waiter = waiter;
+        waiter.owner = Some(
+            async move { owner.await.expect("retained process owner joined") }
+                .boxed()
+                .shared(),
+        );
+        waiter
+    }
+    #[cfg(not(feature = "kuberic-testing"))]
+    {
+        drop(owner);
+        waiter
+    }
 }
 
 type Acknowledgement = Option<oneshot::Sender<(Outcome, bool)>>;

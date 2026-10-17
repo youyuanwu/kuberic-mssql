@@ -644,6 +644,14 @@ pub struct SqlServerService {
     open_attempt: tokio::sync::Mutex<()>,
     lifecycle: Mutex<ServiceLifecycle>,
     retained_replicator: Mutex<Option<Arc<SqlServerReplicator>>>,
+    #[cfg(feature = "kuberic-testing")]
+    open_publication_gate: Mutex<Option<OpenPublicationGate>>,
+}
+
+#[cfg(feature = "kuberic-testing")]
+struct OpenPublicationGate {
+    entered: std::sync::mpsc::Sender<Arc<SqlServerReplicator>>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 #[derive(Clone)]
@@ -769,6 +777,8 @@ impl SqlServerService {
             open_attempt: tokio::sync::Mutex::new(()),
             lifecycle: Mutex::new(ServiceLifecycle::Created),
             retained_replicator: Mutex::new(None),
+            #[cfg(feature = "kuberic-testing")]
+            open_publication_gate: Mutex::new(None),
         }
     }
 
@@ -799,6 +809,17 @@ impl SqlServerService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    pub(crate) fn testing_gate_open_publication(
+        &self,
+        entered: std::sync::mpsc::Sender<Arc<SqlServerReplicator>>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        let mut gate = self.open_publication_gate.lock().unwrap();
+        assert!(gate.is_none());
+        *gate = Some(OpenPublicationGate { entered, release });
     }
 
     /// Drains the retained MSSQL object after Close or Abort without invoking Close.
@@ -904,6 +925,16 @@ impl StatefulServiceReplica for SqlServerService {
             .create_replicator(None, None)
             .await?;
         debug_assert!(interfaces.state_replicator().is_none());
+        #[cfg(feature = "kuberic-testing")]
+        {
+            let gate = self.open_publication_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                // Hold the actual Open attempt, including its mutex, across
+                // terminal fencing. No production lifecycle authority is added.
+                gate.entered.send(replicator.clone()).unwrap();
+                gate.release.recv().unwrap();
+            }
+        }
         let mut lifecycle = self
             .lifecycle
             .lock()
