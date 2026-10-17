@@ -184,13 +184,14 @@ Successfully handled revision/removal contention is not a permanent Close
 failure. After successful drainage the cached seed-store owner is released;
 durable unresolved records are not discarded.
 
-The selected dependency does **not** expose a public custom-replicator
-containment witness/drain registration. Consequently, generic host post-Abort
+Application-facing Kuberic/SF traits are fixed and will not be changed or
+expanded for MSSQL. Kuberic's internal built-in containment witness/drain
+registration is not an application extension point. Generic host post-Abort
 or interrupted-terminal completion is not proof that MSSQL-owned descendants
-have drained. Callers retaining the actual MSSQL object can use the local wait,
-but a supported upstream integration remains deferred. No protected public
-trait is changed and no private hook, dummy provider or graceful-after-Abort
-substitute is used.
+have drained. Callers retaining the actual MSSQL object can use the local wait;
+the concrete process runner also retains and drives this local boundary within
+the existing lifecycle contracts. No private hook, dummy provider, blocking
+graceful shutdown in Abort, or graceful-after-Abort substitute is used.
 
 Server-free coverage sends actual public Epoch, same-role Role and equal-epoch
 commands, checking completed operation receipts and the actual adapter's
@@ -202,6 +203,81 @@ is preserved and asserted separately from successful local callback drainage;
 tests do not fabricate terminal progress or assume a successful post-Abort
 status report. Existing report/restart compatibility and the broader semantic
 conformance blockers remain unchanged.
+
+### Concrete Process Shutdown
+
+`run_runtime_with_shutdown` establishes an independent lifecycle owner before
+starting host work. It retains the actual MSSQL application, cooperatively
+drives startup shutdown (including a late readiness result), and joins the
+returned host completion. Dropping the calling future requests Abort and
+shutdown but does not discard those handles or the remaining local cleanup.
+
+The owner observes the application's actual Abort callback, including a
+host-initiated Abort. It does not initiate a new graceful Close after Abort.
+If Close was already pending, interruption drops that future before the owner
+uses `wait_for_containment`; this avoids retaining an Open-attempt lock while
+the new wait needs it. Successful concrete process cleanup requires actual
+local drainage, not just successful fencing or generic host completion.
+
+`KUBERIC_SHUTDOWN_DEADLINE_MS` remains a **per-stage** budget, not a total
+deadline for normal startup or operation. Applicable stages are startup-stop
+acknowledgement, host-stop acknowledgement, its post-Abort acknowledgement,
+application Close, and local drainage. Each receives one configured budget;
+repeated stop requests do not restart it. The conservative composed bounded
+acknowledgement limit is five budgets, excluding executor scheduling, and
+normally fewer because Abort skips Close.
+
+If a budget expires before actual completion, the caller receives an explicit
+failure rather than containment success. The retained owner continues the
+remaining joins, preserving available trigger/runtime, Close, timeout and local
+drainage errors. A timeout remains a failure even if late drainage succeeds.
+An eventual failure without a consuming caller is reported to stderr with the
+runtime's existing prefix; observing a test completion does not suppress that
+production diagnostic. This is stage-level error composition, not an exhaustive
+ledger of every callback or native SQL error.
+
+Continuation requires the asynchronous runtime to remain alive. The executable
+returns a failure exit code for bounded failure; subsequent runtime destruction
+or OS process termination is not a promise of later joins or diagnostics.
+Local drainage never certifies rollback of a submitted SQL effect, SQL Server
+process termination, or generic public-host post-Abort containment.
+
+Server-free concrete-runner regressions hold actual started filesystem workers,
+an entered seed submission and a registered-but-unpublished Open. They verify
+continued root exclusion and actual owner completion after release, terminal
+refusal, durable Submitting preservation with one execution, and late-error
+reporting after cancellation or a bounded response.
+
+### Fixed-API Assessment
+
+- **Graceful Close already has the required callback boundary.** The host awaits
+  replicator Close, then application Close. MSSQL drains its actual owned work
+  through those callbacks and retains join ownership if a waiter is cancelled.
+  A new application-facing drain callback is not needed for this path.
+- **Abort and interrupted-terminal evidence remain limited.** The host's retained
+  terminal cleanup owner drains its built-in runtime and any attached internal
+  witness; it cannot invoke MSSQL's inherent local wait. MSSQL's synchronous
+  Abort fences admission and requests cancellation but does not join already
+  started store/submission work. This is a remaining custom ownership boundary,
+  not evidence that Kuberic must expose another hook. The concrete process owner
+  now retains and awaits that drainage independently of its caller; a generic
+  terminal receipt alone still cannot certify it.
+- **Terminal reporting is a separate host implementation issue.** After a
+  successful terminal program, the execute response still constructs a report.
+  Both projection refresh and report projection query the registered custom
+  replicator's current progress even though it is closed. MSSQL's Closed result
+  is correct; fixing the reporting path must preserve truthful progress/history
+  semantics without another trait method, invented progress, or relabeling a
+  stale snapshot as a current observation. That fix is not implemented here.
+
+The upstream evidence is the existing
+[Close/Abort program](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/public_lifecycle_program.rs#L438-L479),
+[terminal cleanup owner](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/public_lifecycle_terminal.rs#L41-L76),
+[runtime callback binding](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/hosting.rs#L318-L347),
+and [execute response reporting](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/service.rs#L914-L929).
+The concrete MSSQL process wrapper bounds acknowledgement separately from actual
+completion and retains the existing local wait after Abort or interrupted Close.
+It does not expose that method to the generic host through a new interface.
 
 ## Adapter Boundary
 
@@ -613,8 +689,8 @@ This integration does not yet provide:
 - production endpoint certificate provisioning or rotation;
 - destructive reseed before verified target fencing;
 - a conforming role-specific public progress and retained-history model;
-- generic host custom-descendant containment after Abort or an interrupted
-  terminal operation, and successful terminal reporting;
+- generic-host certification of custom-descendant containment after Abort or an
+  interrupted terminal operation, and successful terminal reporting;
 - end-to-end public nonvoting build admission and database-progress catch-up
   proofs;
 - application read/write access fencing;

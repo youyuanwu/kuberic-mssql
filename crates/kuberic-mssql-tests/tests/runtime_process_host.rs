@@ -61,6 +61,9 @@ const TOPOLOGY_JSON: &[u8] = br#"{
 }"#;
 static HOST_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[path = "runtime_process_host/shutdown.rs"]
+mod shutdown;
+
 struct RepeatingSource {
     config: kuberic_mssql::runtime_config::ObserverConfig,
     samples: Mutex<VecDeque<InstanceSnapshot>>,
@@ -1605,7 +1608,11 @@ fn only_known_public_host_startup_races_are_retryable() {
 
 #[test]
 fn public_host_test_uses_no_kuberic_testing_authority_or_runtime_api() {
-    let source = include_str!("runtime_process_host.rs");
+    let source = [
+        include_str!("runtime_process_host.rs"),
+        include_str!("runtime_process_host/shutdown.rs"),
+    ]
+    .concat();
     let forbidden = [
         ["kuberic_runtime::test", "ing"].concat(),
         ["Sqlite", "Store"].concat(),

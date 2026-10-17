@@ -35,3 +35,6 @@ tiberius.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

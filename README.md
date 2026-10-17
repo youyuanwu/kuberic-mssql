@@ -122,9 +122,11 @@ records the upstream reporting/history blockers; production remains observe-only
 Accepted higher epochs fence predecessor dispatch and completion, including
 same-role changes. Close drains adapter-owned work; Abort fences immediately
 without waiting for graceful completion. Retained MSSQL objects expose
-`wait_for_containment` for cancellation-safe local drainage. This is not
-generic host post-Abort containment; the missing custom host hook and terminal
-reporting limitation are described in the
+`wait_for_containment` for cancellation-safe local drainage. The concrete process
+runner retains startup, host completion and local cleanup across waiter
+cancellation or bounded shutdown failure while its async runtime remains alive.
+This does not certify generic host post-Abort containment. Application-facing
+Kuberic/SF traits stay fixed; shutdown budgets and remaining limits are in the
 [lifecycle guide](docs/kuberic-progress.md#local-lifecycle-containment).
 
 With empty authorized roots, startup initializes Kuberic metadata and writes a
