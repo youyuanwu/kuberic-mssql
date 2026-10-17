@@ -392,7 +392,11 @@ async fn stop_requested(
 ) -> Outcome {
     tokio::select! {
         biased;
-        result = shutdown => result,
+        result = std::panic::AssertUnwindSafe(shutdown).catch_unwind() => {
+            result.unwrap_or_else(|_| {
+                Err(RuntimeProcessError::new("runtime shutdown trigger panicked"))
+            })
+        },
         _ = stop.cancelled() => Ok(()), // Cancellation is composed exactly once at publication.
     }
 }
@@ -915,6 +919,72 @@ mod tests {
                 "late cancelled startup failure",
             ],
         );
+        assert_eq!(diagnostics.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn panicking_shutdown_trigger_retains_late_startup_completion() {
+        let app = HeldApplication::new(false, false);
+        app.drain_release.cancel();
+        let started = CancellationToken::new();
+        let stopped = CancellationToken::new();
+        let release = CancellationToken::new();
+        let start_gate = started.clone();
+        let stop_gate = stopped.clone();
+        let release_gate = release.clone();
+        let trigger_gate = started.clone();
+        let (report, diagnostics) = diagnostics();
+        let waiter = launch(
+            app.clone(),
+            move |mut stop| async move {
+                let child = tokio::spawn(async move {
+                    start_gate.cancel();
+                    let signalled = stop.wait_for(|stopped| *stopped).await.is_ok();
+                    if signalled {
+                        stop_gate.cancel();
+                    }
+                    release_gate.cancelled().await;
+                    assert!(signalled, "cooperative startup shutdown was not signalled");
+                    Err(kuberic_runtime::host::HostError::CommandRejected(
+                        "late startup after trigger panic".into(),
+                    ))
+                });
+                child.await.unwrap()
+            },
+            async move {
+                trigger_gate.cancelled().await;
+                panic!("injected shutdown trigger panic");
+            },
+            Duration::from_secs(10),
+            report,
+        );
+        let completion = waiter.completion.clone();
+        let task = tokio::spawn(waiter.wait());
+        started.cancelled().await;
+        app.aborted.cancelled().await;
+        app.drain_entered.cancelled().await;
+        let retained = completion.observed().is_none();
+        let bounded = task.await.unwrap();
+        release.cancel();
+        let final_result = completed(&completion).await;
+        assert!(
+            retained,
+            "caught trigger panic must not discard the outstanding startup join"
+        );
+        assert!(stopped.is_cancelled());
+        contains(
+            bounded,
+            &["shutdown trigger panicked", "containment unconfirmed"],
+        );
+        contains(
+            final_result,
+            &[
+                "shutdown trigger panicked",
+                "startup cancellation exceeded",
+                "late startup after trigger panic",
+            ],
+        );
+        assert_eq!(app.closes.load(Ordering::SeqCst), 0);
         assert_eq!(diagnostics.lock().unwrap().len(), 1);
     }
 
