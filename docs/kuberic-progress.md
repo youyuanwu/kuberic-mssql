@@ -146,13 +146,62 @@ compatibility behavior. This is a known semantic gap, not a successful
 conformance gate. No dummy provider, fabricated counter, epoch fallback, or
 alternate replication log is introduced to hide the upstream constraints.
 
-The [design](design.md#kuberic-and-service-fabric-semantics) records the current
-gaps in progress, epoch-scoped work fencing, configuration/build completion,
-native endpoint/access ownership, and graceful descendant drainage.
+The [design](design.md#kuberic-and-service-fabric-semantics) records implemented
+local lifecycle containment and the remaining gaps in progress,
+configuration/build completion, native endpoint/access ownership, and generic
+host integration for custom descendant containment.
 The [roadmap](roadmap.md#stage-6a-follow-up-replicator-semantic-conformance)
 makes closing those gaps a prerequisite for planned switchover. Existing
 observation, bootstrap, and lease/fence evidence remains useful, but does not
 certify the missing semantics.
+
+## Local Lifecycle Containment
+
+Supported asynchronous adapter work captures its accepted lifecycle/epoch
+authority. A higher validated epoch retires predecessor external polling,
+worker/task dispatch and success publication, including same-role changes.
+Equal-epoch replay preserves current work. Rejected authority does not weaken
+existing native identity, lineage, role, freshness or sequence checks.
+
+Close refuses new admissions and waits for owned callbacks, blocking
+seed-store workers and seed-submission task joins. Abort refuses admissions
+and requests cancellation without waiting for graceful work or a held
+publication guard. Work that has already started remains owned; cancelling a
+caller does not cancel a started filesystem closure or prove native SQL
+rollback. Submitted seed effects keep their durable Submitting/Ambiguous
+evidence and exact-context reconciliation/exclusion.
+
+`SqlServerReplicator::wait_for_containment` and
+`SqlServerService::wait_for_containment` are inherent local asynchronous APIs
+returning `Result<(), KubericAdapterError>`.
+`RuntimeHostApplication::wait_for_containment` forwards the same local boundary
+through Kuberic's result type. Call them after Close or Abort, including after
+cancelling an earlier Close/drain waiter. Calling before terminal admission is
+an explicit invalid-configuration error. Wait cancellation retains ownership
+and completion results for retry; it does not reopen admission. Genuine store
+I/O/unsafe-state failures and worker panics remain explicit drain failures.
+Successfully handled revision/removal contention is not a permanent Close
+failure. After successful drainage the cached seed-store owner is released;
+durable unresolved records are not discarded.
+
+The selected dependency does **not** expose a public custom-replicator
+containment witness/drain registration. Consequently, generic host post-Abort
+or interrupted-terminal completion is not proof that MSSQL-owned descendants
+have drained. Callers retaining the actual MSSQL object can use the local wait,
+but a supported upstream integration remains deferred. No protected public
+trait is changed and no private hook, dummy provider or graceful-after-Abort
+substitute is used.
+
+Server-free coverage sends actual public Epoch, same-role Role and equal-epoch
+commands, checking completed operation receipts and the actual adapter's
+predecessor behavior. Actual public Close remains pending behind a held adapter
+callback and then reaches local drainage and application Close after release.
+The host subsequently constructs a progress report, which fails with
+`Unavailable`/Closed because the adapter is terminal. This RPC/report limitation
+is preserved and asserted separately from successful local callback drainage;
+tests do not fabricate terminal progress or assume a successful post-Abort
+status report. Existing report/restart compatibility and the broader semantic
+conformance blockers remain unchanged.
 
 ## Adapter Boundary
 
@@ -564,7 +613,8 @@ This integration does not yet provide:
 - production endpoint certificate provisioning or rotation;
 - destructive reseed before verified target fencing;
 - a conforming role-specific public progress and retained-history model;
-- epoch-scoped predecessor-work fencing and graceful owned-worker drainage;
+- generic host custom-descendant containment after Abort or an interrupted
+  terminal operation, and successful terminal reporting;
 - end-to-end public nonvoting build admission and database-progress catch-up
   proofs;
 - application read/write access fencing;

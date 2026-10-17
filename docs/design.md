@@ -180,10 +180,10 @@ which dependency those contracts must be checked against.
 | Area | Required semantics | Current boundary |
 |---|---|---|
 | Progress and history | Primary progress is locally durable quorum-committed progress; secondary progress is contiguous durably accepted progress. Recovery progress is election-only with access closed. Catch-up capability identifies the retained-history floor for an admitted peer, or is unknown/inapplicable. | A typed native configuration-sequence read distinguishes unavailable evidence from observed zero. Existing public callbacks retain AG-sequence/placeholder projection for hosted compatibility, not proven database-data progress or retained history. |
-| Epoch authority | Epoch barriers fence predecessor operations on primaries and secondaries, including same-role changes. | Monotonic epoch recording and close/abort generation guards do not invalidate outstanding bootstrap work when the epoch advances. |
+| Epoch authority | Epoch barriers fence predecessor operations on primaries and secondaries, including same-role changes. | Higher validated epochs retire predecessor dispatch/publication authority, including same-role changes; equal replays preserve it. Submitted effects retain their existing durable uncertainty and exclusion. |
 | Configuration and build | Successful callbacks certify the exact supported configuration. An idle build target is outside voting membership; build completion and later admission are separate. | Bootstrap callbacks can defer work or complete only the source foundation. The seed-build translator still requires a target in the frozen active-secondary layout, despite accepting idle build DTOs. |
 | Access and catch-up | Serving follows partition read/write status, not role alone. Catch-up satisfies the requested predicate for applicable current/previous configurations and any required successor. | Ordinary hosts publish no client address and do not manage SQL serving access. Catch-up callbacks explicitly reject; native synchronization alone is not a public catch-up receipt. |
-| Shutdown | Close drains owned descendants. Abort promptly fences and contains remaining work without relying on graceful completion. | Close/Abort invalidate callbacks and signal cancellation, but Close does not itself await already-started seed-store worker threads. Store serialization is not a lifecycle drain guarantee. |
+| Shutdown | Close drains owned descendants. Abort promptly fences and contains remaining work without relying on graceful completion. | Close drains tracked callbacks and actual store/submission task joins; Abort fences without waiting. Retained objects provide cancellation-safe local drainage. Generic host post-Abort/interrupted-terminal containment remains blocked by missing public custom registration. |
 | Replication endpoint | Open establishes the advertised replication endpoint and its ownership lifetime, using the native transport where appropriate. | The configured replication address is metadata only; Open does not establish or own a transport listener. |
 
 The progress contract remains a design blocker. AG sequence is valid native
@@ -215,6 +215,35 @@ dispatch and stale completion, while retaining uncertainty and successor
 exclusion for effects already submitted. Local epoch or cancellation state
 alone cannot prove that an old SQL operation or lease renewal can no longer
 apply.
+
+### Local Lifecycle Containment
+
+Adapter admission captures accepted authority, with checked boundaries at
+external-future polling, store-worker start, seed-task executor entry and
+success publication. Higher valid epochs retire that authority even when role
+is unchanged; equal epochs do not. Native identity, history, profile, freshness
+and sequence nonregression checks remain independent requirements.
+
+Owned callbacks, blocking store work and seed-submission tasks are accounted
+for independently of their caller's waiter. Close first refuses new work and
+then drains those obligations. Abort atomically refuses admissions and signals
+cancellation without waiting behind a paused publication or invoking Close.
+Service terminal states retain the constructed replicator. The inherent
+`wait_for_containment` methods on the replicator, service and runtime
+application can resume local drainage after waiter cancellation or Abort;
+calling them before terminal admission is an explicit error. Genuine store
+I/O/unsafe-state failures and worker panics remain errors on repeated drains;
+handled revision/removal contention does not poison the terminal result.
+
+This is adapter-local safety, not a complete host contract. The selected
+Kuberic dependency has no public custom-replicator witness/drain registration,
+so generic host completion after Abort or an interrupted terminal root cannot
+certify these custom descendants. No private hook or dummy built-in engine
+substitutes for that missing interface. A public Close exercises local callback
+drainage, but its subsequent progress-report construction returns
+`Unavailable`/Closed; successful local drainage is not a successful terminal
+RPC/report. Existing hosted progress values remain compatibility behavior.
+See the [lifecycle guide](kuberic-progress.md#local-lifecycle-containment).
 
 The [semantic-conformance follow-up](roadmap.md#stage-6a-follow-up-replicator-semantic-conformance)
 is required before planned switchover. Completed lease/fence experiments remain

@@ -801,6 +801,8 @@ impl SqlServerService {
             .clone()
     }
 
+    /// Drains the retained MSSQL object after Close or Abort without invoking Close.
+    /// This is local ownership evidence, not a generic Kuberic-host containment hook.
     pub async fn wait_for_containment(&self) -> Result<(), KubericAdapterError> {
         {
             let lifecycle = self
@@ -2039,6 +2041,8 @@ impl SqlServerReplicator {
         }
     }
 
+    /// Joins adapter-owned work after Close or Abort, retaining results across cancelled waits.
+    /// This neither proves SQL rollback nor replaces durable reconciliation of submitted effects.
     pub async fn wait_for_containment(&self) -> Result<(), KubericAdapterError> {
         self.owned_work.wait().await?;
         if let Some(bootstrap) = &self.bootstrap {

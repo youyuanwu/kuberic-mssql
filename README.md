@@ -119,6 +119,14 @@ publication remains hosted compatibility behavior, not proven durable-data
 progress or retained history. The [integration guide](docs/kuberic-progress.md#upstream-reporting-and-history-blockers)
 records the upstream reporting/history blockers; production remains observe-only.
 
+Accepted higher epochs fence predecessor dispatch and completion, including
+same-role changes. Close drains adapter-owned work; Abort fences immediately
+without waiting for graceful completion. Retained MSSQL objects expose
+`wait_for_containment` for cancellation-safe local drainage. This is not
+generic host post-Abort containment; the missing custom host hook and terminal
+reporting limitation are described in the
+[lifecycle guide](docs/kuberic-progress.md#local-lifecycle-containment).
+
 With empty authorized roots, startup initializes Kuberic metadata and writes a
 Public V1 activation-bound application binding. Existing mode reopens only the
 exact binding; new mode with any established, old, partial, copied, or
