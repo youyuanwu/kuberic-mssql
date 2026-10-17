@@ -265,15 +265,28 @@ SELECT
         sql: &str,
         parameters: &[&dyn ToSql],
     ) -> Result<Vec<Row>, AdminError> {
+        self.query_rows_diagnostic(sql, parameters)
+            .await
+            .map_err(|error| match error {
+                AdminError::Sql(_) => AdminError::Query,
+                other => other,
+            })
+    }
+
+    pub(crate) async fn query_rows_diagnostic(
+        &mut self,
+        sql: &str,
+        parameters: &[&dyn ToSql],
+    ) -> Result<Vec<Row>, AdminError> {
         let timeout_value = self.query_timeout;
         timeout(timeout_value, async {
             let mut stream = self
                 .client
                 .query(sql, parameters)
                 .await
-                .map_err(|_| AdminError::Query)?;
+                .map_err(diagnostic_error)?;
             let mut rows = Vec::new();
-            while let Some(item) = stream.try_next().await.map_err(|_| AdminError::Query)? {
+            while let Some(item) = stream.try_next().await.map_err(diagnostic_error)? {
                 if let QueryItem::Row(row) = item {
                     if rows.len() == 16 {
                         return Err(AdminError::MalformedResult);
@@ -285,6 +298,31 @@ SELECT
         })
         .await
         .map_err(|_| AdminError::QueryDeadline)?
+    }
+
+    pub(crate) async fn execute_diagnostic(
+        &mut self,
+        sql: &str,
+        parameters: &[&dyn ToSql],
+    ) -> Result<(), AdminError> {
+        timeout(self.query_timeout, async {
+            let mut stream = self
+                .client
+                .query(sql, parameters)
+                .await
+                .map_err(diagnostic_error)?;
+            while stream.try_next().await.map_err(diagnostic_error)?.is_some() {}
+            Ok(())
+        })
+        .await
+        .map_err(|_| AdminError::QueryDeadline)?
+    }
+}
+
+fn diagnostic_error(error: tiberius::error::Error) -> AdminError {
+    match error {
+        tiberius::error::Error::Server(error) => AdminError::Sql(error.code()),
+        _ => AdminError::Query,
     }
 }
 
@@ -298,7 +336,9 @@ pub enum AdminError {
     ConnectDeadline,
     TlsOrLogin,
     Query,
+    Sql(u32),
     QueryDeadline,
+    WriteUnconfirmed,
     MalformedResult,
     WrongIdentity,
     WrongVersion,
@@ -319,7 +359,11 @@ impl fmt::Display for AdminError {
             Self::ConnectDeadline => "administrator connection deadline exceeded",
             Self::TlsOrLogin => "verified TLS administrator login failed",
             Self::Query => "administrator SQL operation failed",
+            Self::Sql(code) => return write!(formatter, "administrator SQL error {code}"),
             Self::QueryDeadline => "administrator SQL deadline exceeded",
+            Self::WriteUnconfirmed => {
+                "administrator write was not confirmed by fresh-session readback"
+            }
             Self::MalformedResult => "administrator SQL result is malformed",
             Self::WrongIdentity => "SQL Server identity does not match the member",
             Self::WrongVersion => "SQL Server version does not match the pinned image",
@@ -394,4 +438,23 @@ pub(crate) fn required_text(row: &Row, index: usize) -> Result<String, AdminErro
     row.get::<&str, _>(index)
         .map(str::to_owned)
         .ok_or(AdminError::MalformedResult)
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn native_codes_are_structured_and_error_text_is_redacted() {
+        assert_eq!(
+            AdminError::Sql(47116).to_string(),
+            "administrator SQL error 47116"
+        );
+        let transport = std::io::Error::other("password=not-for-logs; INSERT private SQL").into();
+        let sanitized = diagnostic_error(transport);
+        assert_eq!(sanitized, AdminError::Query);
+        assert!(!format!("{sanitized:?} {sanitized}").contains("not-for-logs"));
+        assert_ne!(AdminError::QueryDeadline, AdminError::Query);
+        assert_ne!(AdminError::QueryDeadline, AdminError::Sql(47116));
+    }
 }

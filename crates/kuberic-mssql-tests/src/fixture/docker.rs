@@ -198,6 +198,8 @@ pub struct ContainerInspection {
     pub environment: Vec<String>,
     pub user: String,
     pub running: bool,
+    #[serde(default)]
+    pub started_at: String,
     pub restart_policy: String,
     pub network_mode: String,
     pub network_names: Vec<String>,
@@ -973,6 +975,7 @@ fn parse_container_inspection(text: &str) -> Result<ContainerInspection, DockerE
         environment: strings_at(&value, &["Config", "Env"])?,
         user: string_at(&value, &["Config", "User"])?,
         running: bool_at(&value, &["State", "Running"])?,
+        started_at: string_at(&value, &["State", "StartedAt"])?,
         restart_policy: string_at(&value, &["HostConfig", "RestartPolicy", "Name"])?,
         network_mode: string_at(&value, &["HostConfig", "NetworkMode"])?,
         network_names: object_at(&value, &["NetworkSettings", "Networks"])?

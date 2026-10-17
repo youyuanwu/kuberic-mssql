@@ -14,9 +14,30 @@ pub use crate::fixture::model::{
     ResourceBinding, ResourceKind, ResourceRecord, ResourceState, RunState, SanitizedFailure,
 };
 
-pub const JOURNAL_SCHEMA_VERSION: u32 = 8;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 9;
 const LEGACY_JOURNAL_SCHEMA_VERSION: u32 = 5;
-const PREVIOUS_JOURNAL_SCHEMA_VERSIONS: [u32; 2] = [6, 7];
+const PREVIOUS_JOURNAL_SCHEMA_VERSIONS: [u32; 3] = [6, 7, 8];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecyclePhase {
+    StopPending,
+    Stopped,
+    StartPending,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleExclusion {
+    pub container_id: String,
+    pub phase: LifecyclePhase,
+}
+
+impl LifecycleExclusion {
+    pub fn permits_restart(&self, container_id: &str) -> bool {
+        self.container_id == container_id && self.phase == LifecyclePhase::Stopped
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -175,6 +196,8 @@ pub struct OwnershipJournal {
     pub native_phase: NativeTopologyPhase,
     pub native_intent: Option<NativeTopologyIntent>,
     pub native_binding: Option<NativeTopologyBinding>,
+    #[serde(default)]
+    pub lifecycle_exclusion: Option<LifecycleExclusion>,
     pub resources: Vec<ResourceRecord>,
 }
 
@@ -239,6 +262,7 @@ impl OwnershipJournal {
             native_phase: NativeTopologyPhase::Absent,
             native_intent: None,
             native_binding: None,
+            lifecycle_exclusion: None,
             resources: Vec::new(),
         }
     }
@@ -246,11 +270,14 @@ impl OwnershipJournal {
     pub fn from_json(bytes: &[u8]) -> Result<Self, JournalError> {
         let document: serde_json::Value =
             serde_json::from_slice(bytes).map_err(|_| JournalError::Malformed)?;
-        if document
+        let schema = document
             .get("schema_version")
-            .and_then(serde_json::Value::as_u64)
-            == Some(u64::from(JOURNAL_SCHEMA_VERSION))
-            && document.get("native_phase").is_none()
+            .and_then(serde_json::Value::as_u64);
+        if schema.is_some_and(|version| version >= 8) && document.get("native_phase").is_none() {
+            return Err(JournalError::Malformed);
+        }
+        if schema == Some(u64::from(JOURNAL_SCHEMA_VERSION))
+            && document.get("lifecycle_exclusion").is_none()
         {
             return Err(JournalError::Malformed);
         }
@@ -262,8 +289,10 @@ impl OwnershipJournal {
             journal.schema_version = JOURNAL_SCHEMA_VERSION;
             journal.infer_legacy_native_phase();
         } else if PREVIOUS_JOURNAL_SCHEMA_VERSIONS.contains(&journal.schema_version) {
+            if journal.schema_version < 8 {
+                journal.infer_legacy_native_phase();
+            }
             journal.schema_version = JOURNAL_SCHEMA_VERSION;
-            journal.infer_legacy_native_phase();
         } else if journal.schema_version != JOURNAL_SCHEMA_VERSION {
             return Err(JournalError::UnsupportedSchema(journal.schema_version));
         }

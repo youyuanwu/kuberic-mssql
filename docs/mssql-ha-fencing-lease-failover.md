@@ -27,6 +27,10 @@ does not fence SQL Server, SQL Server's write lease does not prove that an old
 host is powered off, and changing a Service or listener only redirects new
 client connections.
 
+The implemented [Stage 6A foundation and licensed observations](design.md#lease-and-fence-foundation)
+separately record build-specific renewal, expiry, cancellation, and restart
+results. They do not enable a production renewer or failover path.
+
 For Kuberic MSSQL, the strongest precedent is therefore to follow the published
 SQL Server external-cluster protocol and retain an explicit exact-incarnation
 fence. The adapter must not reduce failover to an isolated `ALTER AVAILABILITY
@@ -79,6 +83,13 @@ The helper renews the SQL Server external write lease with:
 ```sql
 ALTER AVAILABILITY GROUP ... SET (WRITE_LEASE_VALIDITY = ...)
 ```
+
+The value is integer **seconds**. The reference enables updates with a
+`WRITE_LEASE_VALIDITY` option at AG creation; its helper reports SQL error 47116
+when updates were not enabled and advises recreating with that option. Merely
+renewing an ordinary existing fixture AG is not equivalent. The reference's
+`external_cluster=yes` session context is used for failover, not its renewal
+statement.
 
 The helper reports the resulting lease-expiry timestamp back to Pacemaker
 attributes. If availability-group configuration updates cannot commit for the
@@ -281,8 +292,12 @@ incarnation remains the accepted primary under current durable Kuberic
 authority. Losing quorum, superseding the lifecycle/configuration epoch, or
 starting shutdown must stop further renewal.
 
-Renewal needs stale-completion fencing: a delayed renewal started under an old
-epoch must not extend write authority after that epoch has been revoked.
+Renewal needs stale-completion fencing: a delayed response under an old epoch
+must not restore locally accepted authority. A previously submitted native
+renewal may still execute after local revocation; it must remain explicitly
+unresolved until drained, bounded by justified native evidence, or excluded by
+an exact-incarnation fence. Cancelling its client future is not native
+revocation.
 
 ### 3. Require an old-primary fence before replacement writes
 

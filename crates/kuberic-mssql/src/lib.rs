@@ -5,6 +5,8 @@ pub mod executor;
 pub mod instance;
 #[cfg(feature = "kuberic")]
 pub mod kuberic;
+#[cfg(feature = "kuberic")]
+pub mod lease_fence;
 pub mod monitor;
 mod mutation;
 pub mod observation;

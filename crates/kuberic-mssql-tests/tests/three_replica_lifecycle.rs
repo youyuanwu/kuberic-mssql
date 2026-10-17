@@ -691,6 +691,7 @@ fn container_request_freezes_limits_mount_labels_and_acceptance() {
             .collect(),
         user: "mssql".to_owned(),
         running: false,
+        started_at: "2026-01-01T00:00:00Z".to_owned(),
         restart_policy: "no".to_owned(),
         network_mode: "network-1".to_owned(),
         network_names: vec!["network-1".to_owned()],

@@ -29,34 +29,11 @@ exact-incarnation fence provider and passes the live partition matrix.
 The implementation should follow the findings in
 [SQL Server HA fencing, lease, and failover research](mssql-ha-fencing-lease-failover.md).
 
-### Stage 6A: Lease and Fence Foundation
-
-Define and validate the authority model before changing a native role.
-
-Planned work:
-
-- bind lease authority to the resource UID, configuration identity, AG GUID,
-  Kuberic role epoch, replica identity, and exact SQL Server start identity;
-- model lease grant, renewal, expiry, revocation, and stale-completion
-  rejection;
-- define exact-incarnation fence requests and receipts;
-- calculate one timing budget across observation, reconciliation, renewal,
-  quorum loss, lease expiry, fencing, and promotion;
-- implement server-free state-machine and fault-injection tests;
-- implement licensed experiments for `WRITE_LEASE_VALIDITY`, renewal, expiry,
-  cancellation, and SQL process restart;
-- add a fixture fence provider that stops and verifies the exact Rust-owned SQL
-  Server container incarnation; and
-- keep production lease renewal and failover unavailable.
-
-Exit criteria:
-
-- a superseded epoch cannot renew or extend write authority;
-- lease loss and observation loss are distinguishable;
-- a receipt for one SQL Server incarnation cannot fence a restarted
-  incarnation;
-- ambiguous, cancelled, and delayed operations fail closed; and
-- licensed tests establish the observed SQL Server behavior at lease expiry.
+The implemented [lease and fence foundation](design.md#lease-and-fence-foundation)
+defines the starting boundary. Before enabling a production transition, connect
+that model to durable current authority, exclude outstanding predecessor
+renewals across restart, and supply a production exact-incarnation fence.
+Fixture observations and local deadlines are not those admission proofs.
 
 ### Stage 6B: Planned Switchover
 

@@ -81,6 +81,7 @@ fn inspection(request: &ContainerRequest) -> ContainerInspection {
             .collect(),
         user: "mssql".to_owned(),
         running: false,
+        started_at: "2026-01-01T00:00:00Z".to_owned(),
         restart_policy: "no".to_owned(),
         network_mode: request.network_name.clone(),
         network_names: vec![request.network_name.clone()],
@@ -192,7 +193,7 @@ fn structured_inspection_parses_every_launch_property() {
             "Env": expected.environment,
             "User": expected.user,
         },
-        "State": {"Running": false},
+        "State": {"Running": false, "StartedAt": "2026-01-01T00:00:00Z"},
         "HostConfig": {
             "RestartPolicy": {"Name": "no"},
             "NetworkMode": expected.network_mode,

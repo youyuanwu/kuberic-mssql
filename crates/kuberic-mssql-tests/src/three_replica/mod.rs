@@ -44,16 +44,17 @@ pub use evidence::{
 };
 pub use kuberic_group::{MSSQL_FAILOVER_DELAY_SECONDS, MssqlGroupError};
 pub use member::{
-    CleanupEvidence as NativeCleanupEvidence, LaunchedMembers, NativeDataProof, NativeLaunchError,
-    NativePhaseError, ReadyMember, cleanup_three_replica_fixture,
-    create_blocked_owner_regression_fixture, launch_three_members, retry_owner_regression_fixture,
+    CleanupEvidence as NativeCleanupEvidence, FixtureFenceError, LaunchedMembers, LeaseObservation,
+    NativeDataProof, NativeLaunchError, NativePhaseError, OwnedFenceRequest, ReadyMember,
+    cleanup_three_replica_fixture, create_blocked_owner_regression_fixture, launch_three_members,
+    retry_owner_regression_fixture,
 };
 pub use model::{
     CombinedFixtureError, FailureCategory, FailureStage, IncarnationError, JOURNAL_SCHEMA_VERSION,
-    JournalError, KubericMember, NativeMemberBinding, NativeMemberIntent, NativeTopologyBinding,
-    NativeTopologyIntent, NativeTopologyPhase, OwnershipJournal, ProcessIncarnation,
-    ResourceBinding, ResourceKind, ResourceRecord, ResourceState, RunState, SanitizedFailure,
-    SqlMember, SqlMemberIncarnation, TopologyRun,
+    JournalError, KubericMember, LifecycleExclusion, LifecyclePhase, NativeMemberBinding,
+    NativeMemberIntent, NativeTopologyBinding, NativeTopologyIntent, NativeTopologyPhase,
+    OwnershipJournal, ProcessIncarnation, ResourceBinding, ResourceKind, ResourceRecord,
+    ResourceState, RunState, SanitizedFailure, SqlMember, SqlMemberIncarnation, TopologyRun,
 };
 pub use ownership::{
     AclController, AclEvidence, CommandAclController, DirectoryBinding, JournalDocument,

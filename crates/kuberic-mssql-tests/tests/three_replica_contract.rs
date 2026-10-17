@@ -310,10 +310,12 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
             .lines()
             .filter(|line| line.contains("env -u SQLSERVER_TEST_EULA_ACCEPTED"))
             .count(),
-        12
+        13
     );
     assert!(!justfile.contains("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT"));
     assert!(!justfile.contains("acknowledgement root="));
+    assert!(justfile.contains("test-live-lease-fence root=\"target/mssql-lease-fence\":"));
+    assert!(justfile.contains("cleanup-live-lease-fence root=\"target/mssql-lease-fence\":"));
     assert!(
         justfile.contains("KUBERIC_MSSQL_THREE_REPLICA_ROOT=\"$(realpath -m {{quote(root)}})\"")
     );
@@ -353,7 +355,7 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         .unwrap();
     assert_eq!(
         ci,
-        "ci: setup check test-live-one-replica test-live-three-replica test-live-three-replica-restart"
+        "ci: setup check test-live-one-replica test-live-three-replica test-live-three-replica-restart test-live-lease-fence"
     );
     assert!(
         ci.find("test-live-one-replica").unwrap() < ci.find("test-live-three-replica").unwrap()
@@ -361,6 +363,10 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
     assert!(
         ci.find("test-live-three-replica").unwrap()
             < ci.find("test-live-three-replica-restart").unwrap()
+    );
+    assert!(
+        ci.find("test-live-three-replica-restart").unwrap()
+            < ci.find("test-live-lease-fence").unwrap()
     );
     assert!(justfile.contains("cleanup: cleanup-live-one-replica cleanup-live-three-replica"));
     assert!(!justfile.contains("sqlserver_fixture.py"));
@@ -402,14 +408,17 @@ fn journal_round_trips_without_secret_values() {
 }
 
 #[test]
-fn schema_eight_serialized_shape_and_previous_schema_migration_remain_stable() {
+fn schema_nine_preserves_previous_shapes_and_adds_explicit_lifecycle_exclusion() {
     let current_bytes = include_bytes!("../fixtures/ownership-journal-schema-8.json");
     let current = OwnershipJournal::from_json(current_bytes).unwrap();
     assert_eq!(current.schema_version, JOURNAL_SCHEMA_VERSION);
     assert_eq!(current.native_phase, NativeTopologyPhase::Absent);
+    let mut expected: serde_json::Value = serde_json::from_slice(current_bytes).unwrap();
+    expected["schema_version"] = serde_json::json!(JOURNAL_SCHEMA_VERSION);
+    expected["lifecycle_exclusion"] = serde_json::Value::Null;
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&current.to_json().unwrap()).unwrap(),
-        serde_json::from_slice::<serde_json::Value>(current_bytes).unwrap()
+        expected
     );
 
     let previous_seven = OwnershipJournal::from_json(include_bytes!(
@@ -423,6 +432,34 @@ fn schema_eight_serialized_shape_and_previous_schema_migration_remain_stable() {
     ))
     .unwrap();
     assert_eq!(previous_six, current);
+}
+
+#[test]
+fn pending_native_lifecycle_exclusion_survives_owner_reentry() {
+    use kuberic_mssql_tests::three_replica::{LifecycleExclusion, LifecyclePhase};
+    let directory = tempfile::tempdir().unwrap();
+    let mut journal = OwnershipJournal::new(sample_run(directory.path()));
+    journal.lifecycle_exclusion = Some(LifecycleExclusion {
+        container_id: "exact-container".to_owned(),
+        phase: LifecyclePhase::StopPending,
+    });
+    let value = journal.to_json().unwrap();
+    let restored = OwnershipJournal::from_json(&value).unwrap();
+    assert!(
+        !restored
+            .lifecycle_exclusion
+            .unwrap()
+            .permits_restart("exact-container")
+    );
+    let mut missing: serde_json::Value = serde_json::from_slice(&value).unwrap();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("lifecycle_exclusion");
+    assert_eq!(
+        OwnershipJournal::from_json(&serde_json::to_vec(&missing).unwrap()),
+        Err(JournalError::Malformed)
+    );
 }
 
 #[test]

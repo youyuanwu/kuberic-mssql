@@ -5,14 +5,14 @@ export PATH := env_var("HOME") + "/.local/bin:" + env_var("HOME") + "/.cargo/bin
 default: check
 
 # Run the complete CI pipeline locally or on the CI runner.
-ci: setup check test-live-one-replica test-live-three-replica test-live-three-replica-restart
+ci: setup check test-live-one-replica test-live-three-replica test-live-three-replica-restart test-live-lease-fence
 
 # Install only missing/mismatched shared Rust, just and compiler prerequisites.
 setup:
     bash crates/kuberic-mssql-tests/scripts/setup_environment.sh
 
 # Release both Rust-owned fixture families.
-cleanup: cleanup-live-one-replica cleanup-live-three-replica
+cleanup: cleanup-live-one-replica cleanup-live-three-replica cleanup-live-lease-fence
 
 # Check formatting, strict Clippy, and ordinary Rust tests.
 check: fmt-check clippy test
@@ -75,6 +75,19 @@ test-live-three-replica-restart root="target/mssql-three-replica-restart":
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_same_root_restart -- --ignored --exact --test-threads=1 --nocapture
+
+# Exercise native lease expiry/restart and exact Rust-owned fixture fencing.
+test-live-lease-fence root="target/mssql-lease-fence":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_LEASE_FENCE_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_lease_fence \
+        mssql_write_lease_and_exact_fence_experiments -- --ignored --exact --test-threads=1 --nocapture
+
+# Recover only the two exactly journaled lease/fence scenario roots.
+cleanup-live-lease-fence root="target/mssql-lease-fence":
+    just cleanup-live-three-replica {{quote(root + "/expiry")}}
+    just cleanup-live-three-replica {{quote(root + "/active-restart")}}
 
 # Interrupt a real live subprocess during owned launch, recover, retry, and clean up.
 test-live-three-replica-signal root="target/mssql-three-replica-signal":

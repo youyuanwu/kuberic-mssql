@@ -378,8 +378,9 @@ just ci
 ```
 
 It runs server-free checks, the Rust one-replica observer/CLI validation, then
-the Rust three-replica topology/Kuberic validation and same-root restart
-validation. Licensed tests therefore run in the required CI job as well as
+the Rust three-replica topology/Kuberic validation, same-root restart, and
+isolated native lease/fence experiments. Licensed tests therefore run in the
+required CI job as well as
 locally when the same prerequisites are available. Both fixture families
 create only resources owned by that invocation and clean them before
 returning. Aggregate cleanup is always safe to run:
@@ -477,7 +478,15 @@ Run the exact dedicated command with an optional fixture root:
 ```bash
 just test-live-three-replica [root]
 just test-live-three-replica-restart [root]
+just test-live-lease-fence [root]
+just cleanup-live-lease-fence [root]
 ```
+
+The lease/fence recipe uses separate `expiry` and `active-restart` scenario
+roots and verifies native lease behavior, cancelled-response uncertainty,
+fresh-session write readback, and exact owned-container fencing. See the
+[foundation design and observed limitations](docs/design.md#lease-and-fence-foundation).
+Production lease renewal and failover remain disabled.
 
 For example:
 
