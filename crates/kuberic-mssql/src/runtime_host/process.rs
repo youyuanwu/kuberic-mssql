@@ -34,6 +34,8 @@ use super::binding::{RuntimeBindingError, RuntimeBindingStore};
 use super::config::{ResolverConfig, RuntimeHostArgs, RuntimeHostConfig};
 use super::routes::PeerRoutes;
 
+mod retained;
+
 const APPLICATION_STORAGE_NAME: &str = "mssql-runtime-binding";
 
 pub async fn run_from_env() -> ExitCode {
@@ -73,7 +75,15 @@ pub async fn run_runtime_with_shutdown(
     )?);
     let storage = application.storage_state()?;
     let storage_paths = application.storage_paths();
-    run_host_with_shutdown(config, application, storage, Some(storage_paths), shutdown).await
+    run_host_with_shutdown(
+        config,
+        application.clone(),
+        Some(application),
+        storage,
+        Some(storage_paths),
+        shutdown,
+    )
+    .await
 }
 
 #[cfg(feature = "kuberic-testing")]
@@ -88,12 +98,13 @@ where
     A: StatefulServiceReplica + 'static,
 {
     prepare_data_root(config.data_root())?;
-    run_host_with_shutdown(config, application, storage, storage_paths, shutdown).await
+    run_host_with_shutdown(config, application, None, storage, storage_paths, shutdown).await
 }
 
 async fn run_host_with_shutdown<A>(
     config: RuntimeHostConfig,
     application: Arc<A>,
+    concrete: Option<Arc<RuntimeHostApplication>>,
     storage: ApplicationStorageState,
     storage_paths: Option<BTreeMap<String, std::path::PathBuf>>,
     shutdown: impl Future<Output = Result<(), RuntimeProcessError>> + Send + 'static,
@@ -112,155 +123,18 @@ where
         host = host.with_application_storage_paths(storage_paths);
     }
 
-    let shutdown_deadline = config.shutdown_deadline();
     let control_address = config.control_address();
-    tokio::pin!(shutdown);
-    let (startup_shutdown, receiver) = tokio::sync::watch::channel(false);
-    let mut startup = tokio::spawn(async move {
-        let control_listener = tokio::net::TcpListener::bind(control_address).await?;
-        host.start_with_shutdown(control_listener, receiver).await
-    });
-    let (started, trigger) = tokio::select! {
-        result = &mut startup => (result, None),
-        result = &mut shutdown => {
-            startup_shutdown.send_replace(true);
-            match tokio::time::timeout(shutdown_deadline, &mut startup).await {
-                Ok(started) => (started, Some(result)),
-                Err(_) => {
-                    application.abort();
-                    let trigger = combine(
-                        result,
-                        Err(RuntimeProcessError::new(
-                            "runtime startup cancellation exceeded its deadline",
-                        )),
-                        "startup cancellation",
-                    );
-                    let termination = abort_startup_task(&mut startup, shutdown_deadline).await;
-                    let result = combine(trigger, termination, "startup task termination");
-                    return finish_application(application.as_ref(), result, shutdown_deadline)
-                        .await;
-                }
-            }
-        }
-    };
-    let mut replica = match started {
-        Ok(Ok(Some(replica))) => {
-            if let Some(trigger) = trigger {
-                return finish_shutdown(
-                    replica,
-                    application.as_ref(),
-                    None,
-                    trigger,
-                    shutdown_deadline,
-                )
-                .await;
-            }
-            replica
-        }
-        result => {
-            let startup_result = match result {
-                Ok(Ok(None)) => Ok(()),
-                Ok(Err(error)) => Err(RuntimeProcessError::host(error)),
-                Err(error) => Err(RuntimeProcessError::task(error)),
-                Ok(Ok(Some(_))) => unreachable!(),
-            };
-            let result = combine(
-                startup_result,
-                trigger.unwrap_or(Ok(())),
-                "shutdown trigger",
-            );
-            return finish_application(application.as_ref(), result, shutdown_deadline).await;
-        }
-    };
-
-    let (completion, trigger) = tokio::select! {
-        result = replica.wait() => (Some(result), Ok(())),
-        result = &mut shutdown => (None, result),
-    };
-    finish_shutdown(
-        replica,
-        application.as_ref(),
-        completion,
-        trigger,
-        shutdown_deadline,
+    retained::run(
+        application,
+        concrete,
+        move |receiver| async move {
+            let control_listener = tokio::net::TcpListener::bind(control_address).await?;
+            host.start_with_shutdown(control_listener, receiver).await
+        },
+        shutdown,
+        config.shutdown_deadline(),
     )
     .await
-}
-
-async fn finish_shutdown(
-    mut replica: RunningReplica,
-    application: &impl StatefulServiceReplica,
-    completion: Option<kuberic_runtime::host::Result<()>>,
-    trigger: Result<(), RuntimeProcessError>,
-    deadline: std::time::Duration,
-) -> Result<(), RuntimeProcessError> {
-    replica.shutdown();
-    let completion = match completion {
-        Some(result) => result.map_err(RuntimeProcessError::host),
-        None => match tokio::time::timeout(deadline, replica.wait()).await {
-            Ok(result) => result.map_err(RuntimeProcessError::host),
-            Err(_) => {
-                application.abort();
-                let joined = match tokio::time::timeout(deadline, replica.wait()).await {
-                    Ok(result) => result.map_err(RuntimeProcessError::host),
-                    Err(_) => Err(RuntimeProcessError::new(
-                        "runtime completion after abort timed out",
-                    )),
-                };
-                combine(
-                    Err(RuntimeProcessError::new(
-                        "runtime shutdown acknowledgement timed out",
-                    )),
-                    joined,
-                    "runtime completion after timeout",
-                )
-            }
-        },
-    };
-    let result = combine(completion, trigger, "shutdown trigger");
-    finish_application(application, result, deadline).await
-}
-
-async fn abort_startup_task(
-    startup: &mut tokio::task::JoinHandle<kuberic_runtime::host::Result<Option<RunningReplica>>>,
-    deadline: std::time::Duration,
-) -> Result<(), RuntimeProcessError> {
-    startup.abort();
-    match tokio::time::timeout(deadline, startup).await {
-        Ok(Err(error)) if error.is_cancelled() => Ok(()),
-        Ok(Err(error)) => Err(RuntimeProcessError::task(error)),
-        Ok(Ok(Err(error))) => Err(RuntimeProcessError::host(error)),
-        Ok(Ok(Ok(None))) => Ok(()),
-        Ok(Ok(Ok(Some(mut replica)))) => {
-            replica.shutdown();
-            match tokio::time::timeout(deadline, replica.wait()).await {
-                Ok(result) => result.map_err(RuntimeProcessError::host),
-                Err(_) => Err(RuntimeProcessError::new(
-                    "runtime startup task completion after abort timed out",
-                )),
-            }
-        }
-        Err(_) => Err(RuntimeProcessError::new(
-            "runtime startup task abort timed out",
-        )),
-    }
-}
-
-async fn finish_application(
-    application: &impl StatefulServiceReplica,
-    result: Result<(), RuntimeProcessError>,
-    deadline: std::time::Duration,
-) -> Result<(), RuntimeProcessError> {
-    let cleanup = match tokio::time::timeout(deadline, application.close()).await {
-        Ok(result) => result.map_err(RuntimeProcessError::application),
-        Err(_) => Err(RuntimeProcessError::new(
-            "runtime application shutdown timed out",
-        )),
-    };
-    if cleanup.is_err() {
-        application.abort();
-    }
-    combine(result, cleanup, "application shutdown")
 }
 
 fn combine(
@@ -280,6 +154,8 @@ fn combine(
 pub struct RuntimeHostApplication {
     inner: Arc<SqlServerService>,
     binding: RuntimeBindingStore,
+    aborted: tokio_util::sync::CancellationToken,
+    terminal_entry: std::sync::Mutex<()>,
 }
 
 impl RuntimeHostApplication {
@@ -302,7 +178,7 @@ impl RuntimeHostApplication {
             )
             .map_err(RuntimeProcessError::application)?,
         );
-        Ok(Self { inner, binding })
+        Ok(Self::new(inner, binding))
     }
 
     #[cfg(feature = "kuberic-testing")]
@@ -331,7 +207,7 @@ impl RuntimeHostApplication {
             )
             .map_err(RuntimeProcessError::application)?,
         );
-        Ok(Self { inner, binding })
+        Ok(Self::new(inner, binding))
     }
 
     #[cfg(feature = "kuberic-testing")]
@@ -362,7 +238,16 @@ impl RuntimeHostApplication {
             )
             .map_err(RuntimeProcessError::application)?,
         );
-        Ok(Self { inner, binding })
+        Ok(Self::new(inner, binding))
+    }
+
+    fn new(inner: Arc<SqlServerService>, binding: RuntimeBindingStore) -> Self {
+        Self {
+            inner,
+            binding,
+            aborted: tokio_util::sync::CancellationToken::new(),
+            terminal_entry: std::sync::Mutex::new(()),
+        }
     }
 
     pub fn storage_state(&self) -> Result<ApplicationStorageState, RuntimeProcessError> {
@@ -420,11 +305,36 @@ impl StatefulServiceReplica for RuntimeHostApplication {
     }
 
     async fn close(&self) -> KubericResult<()> {
-        self.inner.close().await
+        let close = self.inner.close();
+        tokio::pin!(close);
+        let result = futures::future::poll_fn(|cx| {
+            let _entry = self
+                .terminal_entry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.aborted.is_cancelled() {
+                return std::task::Poll::Ready(None);
+            }
+            // The first poll publishes the service's terminal state synchronously.
+            // Serialize that entry with Abort, never the asynchronous drain.
+            close.as_mut().poll(cx).map(Some)
+        })
+        .await;
+        match result {
+            Some(result) => result,
+            None => self.wait_for_containment().await,
+        }
     }
 
     fn abort(&self) {
+        let _entry = self
+            .terminal_entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.inner.abort();
+        // Publish only after fencing: another runtime worker may immediately
+        // begin the inherent wait when this token wakes it.
+        self.aborted.cancel();
     }
 }
 
@@ -538,10 +448,6 @@ impl RuntimeProcessError {
     fn application(error: impl fmt::Display) -> Self {
         Self::new(error.to_string())
     }
-
-    fn task(error: impl fmt::Display) -> Self {
-        Self::new(error.to_string())
-    }
 }
 
 impl fmt::Display for RuntimeProcessError {
@@ -586,8 +492,6 @@ async fn shutdown_signal() -> Result<(), RuntimeProcessError> {
 
 #[cfg(test)]
 mod tests {
-    use std::future::pending;
-
     use super::*;
 
     #[test]
@@ -622,19 +526,5 @@ mod tests {
             .to_string(),
             "cleanup failed"
         );
-    }
-
-    #[tokio::test]
-    async fn startup_task_abort_is_bounded() {
-        let mut startup = tokio::spawn(pending::<
-            kuberic_runtime::host::Result<Option<RunningReplica>>,
-        >());
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            abort_startup_task(&mut startup, std::time::Duration::from_millis(100)),
-        )
-        .await
-        .expect("startup task abort remains bounded")
-        .unwrap();
     }
 }

@@ -316,6 +316,45 @@ async fn startup_shutdown_failure_is_preserved_after_host_cleanup() {
 }
 
 #[tokio::test]
+async fn cancelling_concrete_runner_after_listener_start_drives_cooperative_startup_cleanup() {
+    let temporary = tempfile::tempdir().unwrap();
+    let files = files(temporary.path());
+    let args = runtime_args(temporary.path(), &files);
+    let control = args.control_address;
+    let config = RuntimeHostConfig::load(args, temporary.path())
+        .await
+        .unwrap();
+    let runner = tokio::spawn(run_runtime_with_shutdown(config, pending()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if tokio::net::TcpStream::connect(control).await.is_ok() {
+                break;
+            }
+            assert!(
+                !runner.is_finished(),
+                "concrete startup exited before listening"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("actual upstream initialization listener starts independently");
+    runner.abort();
+    assert!(runner.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if TcpListener::bind(control).is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retained owner joins cooperative startup and releases its listener");
+    assert!(!temporary.path().join("state/application").exists());
+}
+
+#[tokio::test]
 async fn runner_preserves_trigger_and_application_cleanup_failures() {
     let temporary = tempfile::tempdir().unwrap();
     let files = files(temporary.path());
