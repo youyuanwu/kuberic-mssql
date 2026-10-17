@@ -134,18 +134,13 @@ async fn experiment(fixture: &mut LaunchedMembers, restart: bool) -> Result<(), 
         }
         let write = fixture.probe_lease_write_for_test(index).await;
         eprintln!("lease expiry observation: native={observed:?}; direct_write={write:?}");
+        lease_window_remaining(expiry_deadline, Instant::now())?;
         if observed.remaining_ticks == Some(0)
             && observed.connected_replicas == baseline.connected_replicas
             && observed.synchronized_databases == baseline.synchronized_databases
             && matches!(write, Err(AdminError::Sql(988)))
         {
             return Ok(());
-        }
-        if Instant::now() >= expiry_deadline {
-            return Err(format!(
-                "native lease expiry not established: {observed:?}; write={write:?}"
-            )
-            .into());
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -158,7 +153,7 @@ async fn fresh_start(
     deadline: Instant,
 ) -> Result<LeaseObservation, TestError> {
     loop {
-        active_window_remaining(deadline, Instant::now())?;
+        lease_window_remaining(deadline, Instant::now())?;
         match fixture.observe_write_lease_for_test(index).await {
             Ok(observed) if observed.sql_start != old => return Ok(observed),
             result if Instant::now() >= deadline => {
@@ -208,7 +203,7 @@ async fn active_restart_and_fence(
     }
     let write = fixture.probe_lease_write_for_test(index).await;
     let after_write = fixture.observe_write_lease_for_test(index).await?;
-    let remaining = active_window_remaining(renewed_earliest, Instant::now())?;
+    let remaining = lease_window_remaining(renewed_earliest, Instant::now())?;
     if after_write.sql_start != fresh.sql_start {
         return Err("SQL process changed while probing post-restart writes".into());
     }
@@ -256,24 +251,24 @@ async fn active_restart_and_fence(
     Ok(())
 }
 
-fn active_window_remaining(
+fn lease_window_remaining(
     deadline: Instant,
     observed_at: Instant,
 ) -> Result<Duration, &'static str> {
     deadline
         .checked_duration_since(observed_at)
         .filter(|remaining| !remaining.is_zero())
-        .ok_or("active-lease evidence missed its conservative observation window")
+        .ok_or("native lease evidence missed its conservative observation window")
 }
 
 #[test]
-fn active_window_rejects_deadline_and_late_recovery() {
+fn lease_window_rejects_deadline_and_late_observation() {
     let origin = Instant::now();
     let deadline = origin + Duration::from_secs(120);
     assert_eq!(
-        active_window_remaining(deadline, origin),
+        lease_window_remaining(deadline, origin),
         Ok(Duration::from_secs(120))
     );
-    assert!(active_window_remaining(deadline, deadline).is_err());
-    assert!(active_window_remaining(deadline, deadline + Duration::from_secs(1)).is_err());
+    assert!(lease_window_remaining(deadline, deadline).is_err());
+    assert!(lease_window_remaining(deadline, deadline + Duration::from_secs(1)).is_err());
 }
