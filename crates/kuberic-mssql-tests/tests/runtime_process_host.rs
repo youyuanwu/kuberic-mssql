@@ -23,6 +23,7 @@ use kuberic_mssql::{
     DatabaseLineage, DecimalProgress, Guid, NativeProgress, NativeRole, Observation,
     ReplicaIdentity as SqlReplicaIdentity, ServerName, SqlIdentifier,
 };
+use kuberic_runtime::application::StatefulServiceReplica;
 use kuberic_runtime::control::proto::{self as wire, agent_control_client::AgentControlClient};
 use kuberic_runtime::control::{
     normalize_public_v1_agent_status_report, public_v1_operation_command_to_proto,
@@ -40,6 +41,7 @@ use kuberic_runtime::protocol::types::{
     ReplicaStorageIncarnationContext, ResourceUid, StorageGeneration, derive_agent_generation,
     derive_initialization_id,
 };
+use kuberic_runtime::{Replicator, RuntimeError as KubericRuntimeError};
 use tonic::{Request, transport::Channel};
 
 const TOKEN: &str = "runtime-agent-token";
@@ -97,6 +99,7 @@ struct HostAttempt {
     control: SocketAddr,
     replication: SocketAddr,
     application_root: PathBuf,
+    application: Arc<RuntimeHostApplication>,
     task: tokio::task::JoinHandle<kuberic_runtime::host::Result<RunningReplica>>,
 }
 
@@ -412,6 +415,7 @@ async fn start_attempts(root: &Path) -> Vec<HostAttempt> {
             control: controls[index],
             replication: replications[index],
             application_root,
+            application,
             task: tokio::spawn(host.start(control_listener)),
         });
     }
@@ -1040,6 +1044,64 @@ async fn public_hosts_initialize_report_and_restart_with_fresh_sessions_case() {
     stop_all(&mut restarted).await;
 }
 
+async fn service_close_cancellation_retains_actual_hosted_replicator_case() {
+    let temporary = tempfile::tempdir().unwrap();
+    let mut attempts = start_attempts(temporary.path()).await;
+    let (mut replicas, _, _) = initialize_attempts(&mut attempts).await;
+    let application = attempts[0].application.clone();
+    let replicator = application.testing_replicator().unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    replicator
+        .testing_gate_lifecycle_publication(entered_tx, release_rx)
+        .unwrap();
+    let callback = std::thread::spawn({
+        let replicator = replicator.clone();
+        move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(replicator.current_progress())
+        }
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut close = Box::pin(application.close());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut close)
+            .await
+            .is_err()
+    );
+    assert!(application.testing_replicator().is_none());
+    drop(close);
+    let mut retry = Box::pin(application.close());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut retry)
+            .await
+            .is_err()
+    );
+    application.abort();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            application.wait_for_containment()
+        )
+        .await
+        .is_err()
+    );
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        callback.join().unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    tokio::time::timeout(Duration::from_secs(5), retry)
+        .await
+        .unwrap()
+        .unwrap();
+    application.wait_for_containment().await.unwrap();
+    stop_all(&mut replicas).await;
+}
+
 async fn retained_dispatch_survives_runtime_restart_as_historical_session_evidence_case() {
     let temporary = tempfile::tempdir().unwrap();
     let mut first_attempts = start_attempts(temporary.path()).await;
@@ -1251,6 +1313,11 @@ async fn established_public_host_rejects_changed_application_path_and_topology_c
 #[test]
 fn public_hosts_initialize_report_and_restart_with_fresh_sessions() {
     run_host_test(public_hosts_initialize_report_and_restart_with_fresh_sessions_case);
+}
+
+#[test]
+fn service_close_cancellation_retains_actual_hosted_replicator() {
+    run_host_test(service_close_cancellation_retains_actual_hosted_replicator_case);
 }
 
 #[test]
