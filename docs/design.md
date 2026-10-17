@@ -166,9 +166,10 @@ each is assigned to a later stage rather than half-built now:
 
 The target is Kuberic's Service Fabric-shaped Public V1
 `Replicator`/`PrimaryReplicator` contract, not merely compatible method
-signatures or behavior copied from another database adapter. The public traits
-remain unchanged; MSSQL must satisfy their documented postconditions for each
-supported operation. This does not require a V2 Transactional Replicator or a
+signatures or behavior copied from another database adapter. Application-facing
+Kuberic/SF traits are fixed: they will not be changed or expanded for MSSQL.
+MSSQL must satisfy their documented postconditions for each supported operation.
+This does not require a V2 Transactional Replicator or a
 dummy `StateProvider`: SQL Server continues to own native replication.
 
 The [trait contracts](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/replicator/traits.rs),
@@ -183,7 +184,7 @@ which dependency those contracts must be checked against.
 | Epoch authority | Epoch barriers fence predecessor operations on primaries and secondaries, including same-role changes. | Higher validated epochs retire predecessor dispatch/publication authority, including same-role changes; equal replays preserve it. Submitted effects retain their existing durable uncertainty and exclusion. |
 | Configuration and build | Successful callbacks certify the exact supported configuration. An idle build target is outside voting membership; build completion and later admission are separate. | Bootstrap callbacks can defer work or complete only the source foundation. The seed-build translator still requires a target in the frozen active-secondary layout, despite accepting idle build DTOs. |
 | Access and catch-up | Serving follows partition read/write status, not role alone. Catch-up satisfies the requested predicate for applicable current/previous configurations and any required successor. | Ordinary hosts publish no client address and do not manage SQL serving access. Catch-up callbacks explicitly reject; native synchronization alone is not a public catch-up receipt. |
-| Shutdown | Close drains owned descendants. Abort promptly fences and contains remaining work without relying on graceful completion. | Close drains tracked callbacks and actual store/submission task joins; Abort fences without waiting. Retained objects provide cancellation-safe local drainage. Generic host post-Abort/interrupted-terminal containment remains blocked by missing public custom registration. |
+| Shutdown | Close drains owned descendants. Abort promptly fences and contains remaining work without relying on graceful completion. | Close drains tracked callbacks and actual store/submission task joins; Abort fences without waiting. Retained objects provide cancellation-safe local drainage, but generic host post-Abort/interrupted-terminal completion does not certify those joins. Ownership must be resolved within the fixed lifecycle contracts, not through a new application hook. |
 | Replication endpoint | Open establishes the advertised replication endpoint and its ownership lifetime, using the native transport where appropriate. | The configured replication address is metadata only; Open does not establish or own a transport listener. |
 
 The progress contract remains a design blocker. AG sequence is valid native
@@ -235,14 +236,22 @@ calling them before terminal admission is an explicit error. Genuine store
 I/O/unsafe-state failures and worker panics remain errors on repeated drains;
 handled revision/removal contention does not poison the terminal result.
 
-This is adapter-local safety, not a complete host contract. The selected
-Kuberic dependency has no public custom-replicator witness/drain registration,
-so generic host completion after Abort or an interrupted terminal root cannot
-certify these custom descendants. No private hook or dummy built-in engine
-substitutes for that missing interface. A public Close exercises local callback
-drainage, but its subsequent progress-report construction returns
-`Unavailable`/Closed; successful local drainage is not a successful terminal
-RPC/report. Existing hosted progress values remain compatibility behavior.
+This is adapter-local safety, not a complete host contract. Kuberic's internal
+built-in witness/drain mechanism is not an application extension point.
+Generic host completion after Abort or an interrupted terminal root cannot
+certify MSSQL's independently owned descendants. The remaining obligation is
+adapter/process ownership under the existing Close and Abort callbacks, not
+adding registration or expanding public traits. No private hook, dummy built-in
+engine, blocking graceful shutdown in Abort, or graceful-after-Abort substitute
+is introduced. Concrete MSSQL owners can use the inherent local wait, but that
+does not upgrade the generic host's evidence.
+
+A public Close exercises local callback drainage, but its subsequent
+progress-report construction returns `Unavailable`/Closed. Returning Closed
+from a terminal replicator is consistent with the existing contract; the
+host/reporting implementation must be assessed without requiring a new callback
+or fabricated terminal progress. Successful local drainage is not a successful
+terminal RPC/report. Existing hosted progress values remain compatibility behavior.
 See the [lifecycle guide](kuberic-progress.md#local-lifecycle-containment).
 
 The [semantic-conformance follow-up](roadmap.md#stage-6a-follow-up-replicator-semantic-conformance)

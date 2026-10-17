@@ -123,8 +123,8 @@ Accepted higher epochs fence predecessor dispatch and completion, including
 same-role changes. Close drains adapter-owned work; Abort fences immediately
 without waiting for graceful completion. Retained MSSQL objects expose
 `wait_for_containment` for cancellation-safe local drainage. This is not
-generic host post-Abort containment; the missing custom host hook and terminal
-reporting limitation are described in the
+generic host post-Abort containment. Application-facing Kuberic/SF traits stay
+fixed; the adapter ownership and terminal reporting limitations are described in the
 [lifecycle guide](docs/kuberic-progress.md#local-lifecycle-containment).
 
 With empty authorized roots, startup initializes Kuberic metadata and writes a

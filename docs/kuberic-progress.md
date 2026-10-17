@@ -184,13 +184,14 @@ Successfully handled revision/removal contention is not a permanent Close
 failure. After successful drainage the cached seed-store owner is released;
 durable unresolved records are not discarded.
 
-The selected dependency does **not** expose a public custom-replicator
-containment witness/drain registration. Consequently, generic host post-Abort
+Application-facing Kuberic/SF traits are fixed and will not be changed or
+expanded for MSSQL. Kuberic's internal built-in containment witness/drain
+registration is not an application extension point. Generic host post-Abort
 or interrupted-terminal completion is not proof that MSSQL-owned descendants
-have drained. Callers retaining the actual MSSQL object can use the local wait,
-but a supported upstream integration remains deferred. No protected public
-trait is changed and no private hook, dummy provider or graceful-after-Abort
-substitute is used.
+have drained. Callers retaining the actual MSSQL object can use the local wait;
+the remaining adapter/process ownership obligation must be addressed within
+the existing lifecycle contracts. No private hook, dummy provider, blocking
+graceful shutdown in Abort, or graceful-after-Abort substitute is used.
 
 Server-free coverage sends actual public Epoch, same-role Role and equal-epoch
 commands, checking completed operation receipts and the actual adapter's
@@ -202,6 +203,38 @@ is preserved and asserted separately from successful local callback drainage;
 tests do not fabricate terminal progress or assume a successful post-Abort
 status report. Existing report/restart compatibility and the broader semantic
 conformance blockers remain unchanged.
+
+### Fixed-API Assessment
+
+- **Graceful Close already has the required callback boundary.** The host awaits
+  replicator Close, then application Close. MSSQL drains its actual owned work
+  through those callbacks and retains join ownership if a waiter is cancelled.
+  A new application-facing drain callback is not needed for this path.
+- **Abort and interrupted-terminal evidence remain limited.** The host's retained
+  terminal cleanup owner drains its built-in runtime and any attached internal
+  witness; it cannot invoke MSSQL's inherent local wait. MSSQL's synchronous
+  Abort fences admission and requests cancellation but does not join already
+  started store/submission work. This is a remaining custom ownership boundary,
+  not evidence that Kuberic must expose another hook. A concrete MSSQL owner must
+  establish actual drainage before claiming it; a generic terminal receipt
+  alone cannot do so.
+- **Terminal reporting is a separate host implementation issue.** After a
+  successful terminal program, the execute response still constructs a report.
+  Both projection refresh and report projection query the registered custom
+  replicator's current progress even though it is closed. MSSQL's Closed result
+  is correct; fixing the reporting path must preserve truthful progress/history
+  semantics without another trait method, invented progress, or relabeling a
+  stale snapshot as a current observation. That fix is not implemented here.
+
+The upstream evidence is the existing
+[Close/Abort program](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/public_lifecycle_program.rs#L438-L479),
+[terminal cleanup owner](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/public_lifecycle_terminal.rs#L41-L76),
+[runtime callback binding](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/hosting.rs#L318-L347),
+and [execute response reporting](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/service.rs#L914-L929).
+The concrete MSSQL process wrapper currently bounds application Close and calls
+Abort on cleanup failure; it does not establish a separate post-Abort join
+before returning that failure. Its local wait remains available to a retaining
+owner, not to the generic host through a new interface.
 
 ## Adapter Boundary
 
@@ -613,8 +646,8 @@ This integration does not yet provide:
 - production endpoint certificate provisioning or rotation;
 - destructive reseed before verified target fencing;
 - a conforming role-specific public progress and retained-history model;
-- generic host custom-descendant containment after Abort or an interrupted
-  terminal operation, and successful terminal reporting;
+- complete custom-descendant containment after Abort or an interrupted terminal
+  operation under the fixed lifecycle contracts, and successful terminal reporting;
 - end-to-end public nonvoting build admission and database-progress catch-up
   proofs;
 - application read/write access fencing;

@@ -44,6 +44,8 @@ Close the gap between the implemented observe-only/bootstrap adapter and
 [Kuberic's documented Replicator semantics](design.md#kuberic-and-service-fabric-semantics)
 before proceeding to planned switchover. The completed lease/fence foundation
 remains implemented; this follow-up does not replace its native evidence.
+Application-facing Kuberic/SF trait APIs are fixed and must not be changed or
+expanded for this work.
 
 Planned work:
 
@@ -58,13 +60,14 @@ Planned work:
 - use separate native AG election evidence without treating configuration
   freshness as transaction durability or narrowing native `numeric(25,0)`
   positions to the public signed-64-bit slot;
-- connect adapter-local containment to the generic public host through a
-  supported custom-replicator witness/drain interface; host completion after
-  Abort or an interrupted terminal root must not certify containment without
-  waiting for actual custom descendants;
+- resolve custom descendant ownership under the existing Close/Abort contracts
+  and the concrete MSSQL process owner, without adding an application-facing
+  witness/drain hook; generic host completion after Abort or an interrupted
+  terminal root must not be treated as proof that custom descendants drained;
 - resolve terminal reporting without fabricated progress: the current public
   Close drains the adapter but its subsequent report returns
-  `Unavailable`/Closed;
+  `Unavailable`/Closed; assess the host/reporting implementation rather than
+  requiring terminal progress or another application callback;
 - separate idle nonvoting build targets from active membership, prove exact
   build completion before admission, and replace partial bootstrap success
   with the documented public configuration postconditions;
@@ -84,8 +87,9 @@ Exit criteria:
   relying on compatibility placeholders or provider-free synthetic history;
 - a superseded callback cannot dispatch new work or publish success, and
   unresolved predecessor effects cannot authorize successor writes;
-- hosted Close, Abort and shutdown preserve and await actual custom-descendant
-  containment without requiring graceful work after Abort;
+- hosted Close, Abort and shutdown satisfy the fixed lifecycle contracts, and
+  any claim of completed custom-descendant containment is backed by actual joins,
+  without requiring graceful work after Abort;
 - an idle build target does not vote, and public build/configuration completion
   certifies the exact supported postconditions;
 - unsupported operations remain explicit errors and ordinary production
