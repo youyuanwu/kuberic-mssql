@@ -6195,7 +6195,7 @@ async fn bound_admission_never_enables_mutating_or_recovery_callbacks() {
 }
 
 #[test]
-fn exact_current_capability_matches_the_locked_controller_comparison_boundary() {
+fn legacy_local_current_only_scalar_comparison_boundary() {
     fn requires_full_repair(member_progress: i64, retained_from: i64) -> bool {
         member_progress.saturating_add(1) < retained_from
     }
