@@ -12,9 +12,10 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use kuberic_mssql::instance::SqlServerInstanceManager;
 use kuberic_mssql::kuberic::{
-    KubericAdapterError, SqlServerBootstrapConfig, SqlServerObservationSource,
-    SqlServerStartIncarnation, SystemObservationClock, TargetHostEvidenceExchange,
-    TargetHostEvidenceReport, TargetHostEvidenceRequest, TestingBootstrapObservation,
+    KubericAdapterError, SqlServerBootstrapConfig, SqlServerObservationSource, SqlServerService,
+    SqlServerServiceConfig, SqlServerStartIncarnation, SystemObservationClock,
+    TargetHostEvidenceExchange, TargetHostEvidenceReport, TargetHostEvidenceRequest,
+    TestingBootstrapObservation,
 };
 use kuberic_mssql::observation::InstanceSnapshot;
 use kuberic_mssql::runtime_config::ObserverConfig;
@@ -27,9 +28,13 @@ use kuberic_mssql::tds::{
     SeedSubmissionAction, SeedSubmissionCheckpoint, SeedSubmissionProbe, TdsExecutor,
     TdsMutationExecutor,
 };
+use kuberic_mssql::topology_config::{
+    SqlServerTopologyExpectation, SqlServerTopologyMemberExpectation,
+};
 use kuberic_mssql::{
     Guid, MutationEffect, NativeRole, Observation, ObservationFailureKind, SeedDispatchEvidence,
-    SeedDispatchRequest, SqlIdentifier, SqlMutationExecutor, StandaloneDatabaseSnapshot,
+    SeedDispatchRequest, ServerName, SqlIdentifier, SqlMutationExecutor,
+    StandaloneDatabaseSnapshot,
 };
 use kuberic_runtime::application::{OpenContext, RoleChange, StatefulServiceReplica};
 use kuberic_runtime::control::proto::{self as wire, agent_control_client::AgentControlClient};
@@ -127,6 +132,7 @@ struct HostAttempt {
 }
 
 struct PublicHostShutdownFenceApplication {
+    service: Arc<SqlServerService>,
     close_entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     close_release: tokio::sync::watch::Sender<bool>,
     delay_close_entry: bool,
@@ -136,6 +142,23 @@ struct PublicHostShutdownFenceApplication {
     close_started: AtomicBool,
     close_returned: AtomicBool,
     aborts: AtomicUsize,
+}
+
+struct PublicHostFenceObservationSource(ObserverConfig);
+
+#[async_trait]
+impl SqlServerObservationSource for PublicHostFenceObservationSource {
+    fn observer_config(&self) -> &ObserverConfig {
+        &self.0
+    }
+
+    async fn observe(&self) -> Result<Observation<InstanceSnapshot>, RuntimeError> {
+        Err(RuntimeError::new(
+            ObservationFailureKind::Unsupported,
+            "public host shutdown fence",
+            "shutdown fence must not observe SQL Server",
+        ))
+    }
 }
 
 impl PublicHostShutdownFenceApplication {
@@ -175,10 +198,8 @@ async fn wait_for_public_host_release(
 
 #[async_trait]
 impl StatefulServiceReplica for PublicHostShutdownFenceApplication {
-    async fn open(self: Arc<Self>, _context: OpenContext) -> KubericResult<Arc<dyn Replicator>> {
-        Err(KubericRuntimeError::Application(
-            "shutdown fence application must not open".into(),
-        ))
+    async fn open(self: Arc<Self>, context: OpenContext) -> KubericResult<Arc<dyn Replicator>> {
+        self.service.clone().open(context).await
     }
 
     async fn change_role(&self, _role: ReplicaRole) -> KubericResult<RoleChange> {
@@ -210,6 +231,7 @@ impl StatefulServiceReplica for PublicHostShutdownFenceApplication {
 
     fn abort(&self) {
         self.aborts.fetch_add(1, Ordering::AcqRel);
+        self.service.abort();
     }
 }
 
@@ -2565,7 +2587,50 @@ async fn exercise_public_host_shutdown_fence_inner(
     let (post_release_entered_tx, post_release_entered_rx) = tokio::sync::oneshot::channel();
     let (close_release, _) = tokio::sync::watch::channel(false);
     let (post_release, _) = tokio::sync::watch::channel(false);
+    let observer = match ObserverConfig::from_json(
+        br#"{
+            "host":"sql-1.invalid",
+            "availability_group":"shutdown-fence",
+            "expected_server_name":"sql-1",
+            "replica_id":"1",
+            "incarnation":"shutdown-fence",
+            "observer_username_file":"/unused/shutdown-fence-username",
+            "observer_password_file":"/unused/shutdown-fence-password"
+        }"#,
+    ) {
+        Ok(observer) => observer,
+        Err(error) => return PublicHostFenceRun::Confirmed(Err(error.to_string())),
+    };
+    let service = (|| {
+        let members = (1..=3)
+            .map(|index| {
+                SqlServerTopologyMemberExpectation::new(
+                    ReplicaId::new(index),
+                    ServerName::new(format!("sql-{index}")).map_err(|error| error.to_string())?,
+                    format!("TCP://sql-{index}:5022"),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let expectation = SqlServerTopologyExpectation::new(ReplicaId::new(1), "1", members)
+            .map_err(|error| error.to_string())?;
+        SqlServerService::with_observation_source_and_topology(
+            SqlServerServiceConfig {
+                resource_uid: resource_uid.clone(),
+                replication_address: format!("http://{replication_address}"),
+            },
+            Arc::new(PublicHostFenceObservationSource(observer)),
+            Arc::new(SystemObservationClock),
+            expectation,
+        )
+        .map_err(|error| error.to_string())
+    })();
+    let service = match service {
+        Ok(service) => Arc::new(service),
+        Err(error) => return PublicHostFenceRun::Confirmed(Err(error)),
+    };
     let application = Arc::new(PublicHostShutdownFenceApplication {
+        service,
         close_entered: Mutex::new(Some(close_entered_tx)),
         close_release,
         delay_close_entry: injection == PublicHostFenceInjection::CloseEntryTimeoutRace,
@@ -2748,44 +2813,71 @@ async fn exercise_public_host_shutdown_fence_inner(
     tasks.running = Some(running);
 
     let close_result = async {
-        let (mut client, report) = status_at(
-            control_address,
-            &resource_uid,
-            &identity,
-            Duration::from_secs(2),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        let report =
-            normalize_public_v1_agent_status_report(report).map_err(|error| error.to_string())?;
-        let program = PublicOperationProgram::Close;
-        let command = PublicV1OperationCommand {
-            target: identity.clone(),
-            intent: PublicOperationIntent {
-                identity: report.identity,
-                operation_id: OperationId::new("public-host-shutdown-fence"),
-                revision: 1,
-                process_session_id: report.process_session_id,
-                class: PublicOperationClass::Close,
-                input_digest: program.digest(),
-                replay_disposition: program.replay_disposition(),
-                lifecycle: None,
-                program: Some(program),
-            },
-        };
-        let request = wire::ExecuteCommandRequest {
-            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
-            resource_uid: resource_uid.to_string(),
-            target: Some(identity.clone().into()),
-            expected_process_session_id: command.intent.process_session_id.to_string(),
-            command: Some(wire::execute_command_request::Command::PublicV1Operation(
-                public_v1_operation_command_to_proto(&command)
-                    .map_err(|error| error.to_string())?,
-            )),
-        };
-        Ok::<_, String>(tokio::spawn(async move {
-            client.execute(authorized(request)).await
-        }))
+        // A failed Replicator Close now skips Application Close; open it first.
+        for (revision, program) in [
+            (
+                1,
+                PublicOperationProgram::Open {
+                    replica: identity.clone(),
+                    existing: true,
+                },
+            ),
+            (2, PublicOperationProgram::Close),
+        ] {
+            let terminal = matches!(program, PublicOperationProgram::Close);
+            let (mut client, report) = status_at(
+                control_address,
+                &resource_uid,
+                &identity,
+                Duration::from_secs(2),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let report = normalize_public_v1_agent_status_report(report)
+                .map_err(|error| error.to_string())?;
+            let command = PublicV1OperationCommand {
+                target: identity.clone(),
+                intent: PublicOperationIntent {
+                    identity: report.identity,
+                    operation_id: OperationId::new(if terminal {
+                        "public-host-shutdown-fence"
+                    } else {
+                        "public-host-shutdown-fence-open"
+                    }),
+                    revision,
+                    process_session_id: report.process_session_id,
+                    class: if terminal {
+                        PublicOperationClass::Close
+                    } else {
+                        PublicOperationClass::Authority
+                    },
+                    input_digest: program.digest(),
+                    replay_disposition: program.replay_disposition(),
+                    lifecycle: None,
+                    program: Some(program),
+                },
+            };
+            let request = wire::ExecuteCommandRequest {
+                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                resource_uid: resource_uid.to_string(),
+                target: Some(identity.clone().into()),
+                expected_process_session_id: command.intent.process_session_id.to_string(),
+                command: Some(wire::execute_command_request::Command::PublicV1Operation(
+                    public_v1_operation_command_to_proto(&command)
+                        .map_err(|error| error.to_string())?,
+                )),
+            };
+            if terminal {
+                return Ok::<_, String>(tokio::spawn(async move {
+                    client.execute(authorized(request)).await
+                }));
+            }
+            tokio::time::timeout(Duration::from_secs(5), client.execute(authorized(request)))
+                .await
+                .map_err(|_| "public host open timed out".to_owned())?
+                .map_err(|error| error.to_string())?;
+        }
+        unreachable!("the Close program returns its owned client task")
     }
     .await;
 
@@ -4880,7 +4972,10 @@ mod tests {
         };
 
         let error = result.unwrap_err();
-        assert!(error.contains("released public host did not terminate"));
+        assert!(
+            error.contains("released public host did not terminate"),
+            "{error}"
+        );
         assert!(error.contains("client completed with"));
         assert!(host_root.is_dir());
         assert!(tasks.running.is_some());
