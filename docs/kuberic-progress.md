@@ -213,6 +213,9 @@ local provenance and freshness checks bracket collection. These independent
 observations are not an atomic snapshot or proof against change-and-revert.
 Normal completion, failures, caught panic and handled signals use the existing
 bounded consuming cleanup; a dropped SQL connection is not certified rollback.
+The report is serialized in memory before cleanup and emitted only after
+successful teardown, so a stalled output sink cannot retain owned SQL resources.
+Failed cleanup prevents emission and remains an execution failure.
 
 **Measured result:** an authorized three-replica run captured the exact matching
 transaction's nonzero numeric commit LSN in state 12 (being committed), followed

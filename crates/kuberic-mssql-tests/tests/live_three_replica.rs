@@ -98,14 +98,12 @@ fn three_replica_mssql_native_commit_coverage() {
                     let mut launched = launch_three_members(config)
                         .await
                         .expect("owned native fixture");
+                    let mut serialized_report = None;
                     let outcome = {
                         let experiment = AssertUnwindSafe(async {
                             launched.provision_availability_group().await?;
                             let report = launched.probe_native_commit_coverage(2).await?;
-                            let mut output = std::io::stdout().lock();
-                            serde_json::to_writer(&mut output, &report)?;
-                            writeln!(output)?;
-                            output.flush()?;
+                            serialized_report = Some(serde_json::to_vec(&report)?);
                             Ok::<(), TestError>(())
                         })
                         .catch_unwind();
@@ -117,13 +115,77 @@ fn three_replica_mssql_native_commit_coverage() {
                     };
                     let cleanup =
                         CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
-                    finish_runtime_outcome(&root, launched, outcome, &cleanup)
-                        .expect("native commit probe collection and cleanup");
+                    finish_native_commit_report(
+                        || finish_runtime_outcome(&root, launched, outcome, &cleanup),
+                        serialized_report,
+                        |bytes| {
+                            let mut output = std::io::stdout().lock();
+                            output.write_all(bytes)?;
+                            writeln!(output)?;
+                            output.flush()?;
+                            Ok(())
+                        },
+                    )
+                    .expect("native commit probe collection and cleanup");
                 });
         })
         .expect("native commit probe thread")
         .join()
         .expect("native commit probe thread panicked");
+}
+
+fn finish_native_commit_report(
+    cleanup: impl FnOnce() -> Result<(), TestError>,
+    report: Option<Vec<u8>>,
+    emit: impl FnOnce(&[u8]) -> Result<(), TestError>,
+) -> Result<(), TestError> {
+    cleanup()?;
+    let report = report.ok_or("native commit probe completed without serialized evidence")?;
+    emit(&report)
+}
+
+#[test]
+fn native_probe_teardown_precedes_stalled_output_and_output_errors_survive() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let (entered, observed) = mpsc::channel();
+    let (release, blocked) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let cleanup_flag = cleaned.clone();
+        finish_native_commit_report(
+            || {
+                cleanup_flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            Some(b"evidence".to_vec()),
+            |_| {
+                entered.send(cleaned.load(Ordering::SeqCst))?;
+                blocked.recv()?;
+                Err("native probe output failed".into())
+            },
+        )
+    });
+    let cleanup_preceded_output = observed.recv_timeout(Duration::from_secs(5));
+    let _ = release.send(());
+    let result = writer.join().expect("controlled output worker");
+    assert_eq!(cleanup_preceded_output, Ok(true));
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "native probe output failed"
+    );
+}
+
+#[test]
+fn native_probe_failed_teardown_never_enters_output() {
+    let error = finish_native_commit_report(
+        || Err("native fixture cleanup failed".into()),
+        Some(b"evidence".to_vec()),
+        |_| panic!("output must not run with unresolved fixture ownership"),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "native fixture cleanup failed");
 }
 
 fn run_three_replica_test(validate_restart: bool) {
