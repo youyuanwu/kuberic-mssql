@@ -184,7 +184,7 @@ which dependency those contracts must be checked against.
 | Epoch authority | Epoch barriers fence predecessor operations on primaries and secondaries, including same-role changes. | Higher validated epochs retire predecessor dispatch/publication authority, including same-role changes; equal replays preserve it. Submitted effects retain their existing durable uncertainty and exclusion. |
 | Configuration and build | Successful callbacks certify the exact supported configuration. An idle build target is outside voting membership; build completion and later admission are separate. | Bootstrap callbacks can defer work or complete only the source foundation. The seed-build translator still requires a target in the frozen active-secondary layout, despite accepting idle build DTOs. |
 | Access and catch-up | Serving follows partition read/write status, not role alone. Catch-up satisfies the requested predicate for applicable current/previous configurations and any required successor. | Ordinary hosts publish no client address and do not manage SQL serving access. Catch-up callbacks explicitly reject; native synchronization alone is not a public catch-up receipt. |
-| Shutdown | Close drains owned descendants. Abort promptly fences and contains remaining work without relying on graceful completion. | Close drains tracked callbacks and actual store/submission task joins; Abort fences without waiting. Retained objects provide cancellation-safe local drainage, but generic host post-Abort/interrupted-terminal completion does not certify those joins. Ownership must be resolved within the fixed lifecycle contracts, not through a new application hook. |
+| Shutdown | Close drains owned descendants. Abort promptly fences and contains remaining work without relying on graceful completion. | Close drains tracked callbacks and actual store/submission task joins; Abort fences without waiting. The concrete process runner retains startup, host and local-drain ownership across cancelled or bounded waiters while the async runtime lives. Generic host post-Abort/interrupted-terminal completion alone does not certify these joins. |
 | Replication endpoint | Open establishes the advertised replication endpoint and its ownership lifetime, using the native transport where appropriate. | The configured replication address is metadata only; Open does not establish or own a transport listener. |
 
 The progress contract remains a design blocker. AG sequence is valid native
@@ -239,12 +239,22 @@ handled revision/removal contention does not poison the terminal result.
 This is adapter-local safety, not a complete host contract. Kuberic's internal
 built-in witness/drain mechanism is not an application extension point.
 Generic host completion after Abort or an interrupted terminal root cannot
-certify MSSQL's independently owned descendants. The remaining obligation is
-adapter/process ownership under the existing Close and Abort callbacks, not
-adding registration or expanding public traits. No private hook, dummy built-in
-engine, blocking graceful shutdown in Abort, or graceful-after-Abort substitute
-is introduced. Concrete MSSQL owners can use the inherent local wait, but that
-does not upgrade the generic host's evidence.
+certify MSSQL's independently owned descendants. The concrete process runner
+instead owns the actual application, cooperative startup, host completion and
+local cleanup independently of its caller. Cancellation requests prompt Abort;
+cleanup after an actual Abort uses the inherent local wait, not a new graceful
+callback. Application Abort is observed even when invoked by the host, and an
+interrupted Close is dropped before starting the local wait.
+
+Shutdown acknowledgement remains bounded per stage. A timeout is an explicit
+unconfirmed-containment failure, while the retained owner continues actual
+startup/host/local joins while the asynchronous runtime is alive. Original
+stage errors remain failures even after late successful drainage; late errors
+without a consuming waiter are reported to stderr. Runtime destruction or OS
+termination can prevent that continuation and is not completed containment.
+No private hook, dummy built-in engine, blocking graceful shutdown in Abort,
+or application-facing API expansion is introduced. This concrete process
+ownership does not upgrade the generic host's evidence.
 
 A public Close exercises local callback drainage, but its subsequent
 progress-report construction returns `Unavailable`/Closed. Returning Closed

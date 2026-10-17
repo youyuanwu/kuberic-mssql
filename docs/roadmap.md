@@ -60,10 +60,6 @@ Planned work:
 - use separate native AG election evidence without treating configuration
   freshness as transaction durability or narrowing native `numeric(25,0)`
   positions to the public signed-64-bit slot;
-- resolve custom descendant ownership under the existing Close/Abort contracts
-  and the concrete MSSQL process owner, without adding an application-facing
-  witness/drain hook; generic host completion after Abort or an interrupted
-  terminal root must not be treated as proof that custom descendants drained;
 - resolve terminal reporting without fabricated progress: the current public
   Close drains the adapter but its subsequent report returns
   `Unavailable`/Closed; assess the host/reporting implementation rather than
