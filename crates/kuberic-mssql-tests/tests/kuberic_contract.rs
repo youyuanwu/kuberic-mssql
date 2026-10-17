@@ -4578,6 +4578,79 @@ async fn accepted_epoch_fences_predecessor_progress_and_same_role_work() {
 }
 
 #[tokio::test]
+async fn accepted_epoch_cancels_ordinary_configuration_observation_before_release() {
+    let (replicator, entered, release) = gated_bound_replicator(
+        vec![Ok(present(bound_snapshot())); 3],
+        vec![OBSERVED_AT; 12],
+        1,
+    );
+    replicator.open().await.unwrap();
+    replicator
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap();
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .update_current_replica_set_configuration(bound_replica_set())
+                .await
+        }
+    });
+    entered.await.unwrap();
+    replicator.update_epoch(Epoch::new(7, 43)).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(3), callback)
+        .await
+        .expect("retired observation must not require external release")
+        .unwrap();
+    assert!(matches!(result, Err(KubericRuntimeError::Closed)));
+    assert!(release.send(()).is_err());
+}
+
+#[tokio::test]
+async fn accepted_epoch_cancels_target_evidence_before_release() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let complete = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(SeedMutationExecutor {
+        complete: complete.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let exchange = Arc::new(ControlledTargetEvidenceExchange::with_gate(
+        [ControlledTargetEvidenceMode::Healthy],
+        entered_tx,
+        release_rx,
+    ));
+    let replicator = seed_replicator_with_executor_and_target_evidence(
+        root.path().to_owned(),
+        complete,
+        executor.clone(),
+        exchange.clone(),
+    );
+    admit_seed_replicator(&replicator).await;
+    let callback = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "retired-target-evidence"))
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    replicator.update_epoch(Epoch::new(7, 43)).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(3), callback)
+        .await
+        .expect("retired target evidence must not require external release")
+        .unwrap();
+    assert!(matches!(result, Err(KubericRuntimeError::Closed)));
+    assert!(release_tx.send(()).is_err());
+    assert!(exchange.previous_request.lock().unwrap().is_none());
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn accepted_epoch_prevents_pending_seed_store_and_spawned_task_dispatch() {
     for boundary in ["store", "intent", "spawn"] {
         let root = tempfile::tempdir().unwrap();

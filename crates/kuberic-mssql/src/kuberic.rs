@@ -3501,12 +3501,16 @@ impl SqlServerReplicator {
                 context.build_id, context.target.process_session_id
             ),
         };
-        let report = tokio::time::timeout(
-            bootstrap_remaining(deadline)?,
-            bootstrap.target_evidence.collect(&request),
-        )
-        .await
-        .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)??;
+        let report = self
+            .await_authorized(
+                generation,
+                tokio::time::timeout(
+                    bootstrap_remaining(deadline)?,
+                    bootstrap.target_evidence.collect(&request),
+                ),
+            )
+            .await?
+            .map_err(|_| KubericAdapterError::NativeConvergenceDeadline)??;
         drop(self.finish_operation(generation)?);
         let now_unix_millis = self
             .clock
@@ -4707,9 +4711,8 @@ impl PrimaryReplicator for SqlServerReplicator {
                 }
             } else {
                 let observation = self
-                    .source
-                    .observe()
-                    .await
+                    .await_authorized(generation, self.source.observe())
+                    .await?
                     .map_err(|error| KubericAdapterError::ObservationUnavailable(error.kind))?;
                 drop(self.finish_operation(generation)?);
                 let (snapshot, observed_at) = present_snapshot(observation)?;
