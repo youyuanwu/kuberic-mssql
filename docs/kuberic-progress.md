@@ -217,7 +217,8 @@ bounded consuming cleanup; a dropped SQL connection is not certified rollback.
 **Measured result:** an authorized three-replica run captured the exact matching
 transaction's nonzero numeric commit LSN in state 12 (being committed), followed
 by successful client ACK. Nineteen collection attempts included one before
-COMMIT, sixteen overlapping it and two after ACK. The post-ACK rows were absent:
+COMMIT, sixteen in the overlap-sampling phase (which can extend past ACK), and
+two in the dedicated post-ACK phase. The dedicated post-ACK rows were absent:
 the run demonstrates a usable collection window, not deterministic retention
 of completed transaction rows. Quiet collection completed without another
 marker INSERT. No replication suspension or redo-blocking control ran.
