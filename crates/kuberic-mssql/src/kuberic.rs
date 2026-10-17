@@ -1081,6 +1081,8 @@ struct SeedCoordinator {
     #[cfg(feature = "kuberic-testing")]
     dispatch_gate: Mutex<Option<SeedGate>>,
     #[cfg(feature = "kuberic-testing")]
+    submission_owner_gate: Mutex<Option<SeedGate>>,
+    #[cfg(feature = "kuberic-testing")]
     compaction_gate: Mutex<Option<SeedGate>>,
     #[cfg(feature = "kuberic-testing")]
     completion_gate: Mutex<Option<SeedGate>>,
@@ -1274,6 +1276,8 @@ impl SeedCoordinator {
             submission_gate: Mutex::new(None),
             #[cfg(feature = "kuberic-testing")]
             dispatch_gate: Mutex::new(None),
+            #[cfg(feature = "kuberic-testing")]
+            submission_owner_gate: Mutex::new(None),
             #[cfg(feature = "kuberic-testing")]
             compaction_gate: Mutex::new(None),
             #[cfg(feature = "kuberic-testing")]
@@ -1492,6 +1496,29 @@ impl SqlServerReplicator {
             .seed;
         let mut gate = seed
             .dispatch_gate
+            .lock()
+            .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?;
+        if gate.is_some() {
+            return Err(KubericAdapterError::SeedState(SeedStateError::AlreadyOwned));
+        }
+        *gate = Some(SeedGate { entered, release });
+        Ok(())
+    }
+
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub fn testing_gate_seed_submission_owner(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), KubericAdapterError> {
+        let seed = &self
+            .bootstrap
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?
+            .seed;
+        let mut gate = seed
+            .submission_owner_gate
             .lock()
             .map_err(|_| KubericAdapterError::SeedState(SeedStateError::UnsafeState))?;
         if gate.is_some() {
@@ -4045,10 +4072,16 @@ impl SqlServerReplicator {
             .submission_active
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let seed = bootstrap.seed.clone();
+        let active = ActiveSeedSubmission(seed.clone());
         let lifecycle = self.lifecycle.clone();
         #[cfg(feature = "kuberic-testing")]
+        self.await_authorized(
+            generation,
+            seed.pause_if_requested(&seed.submission_owner_gate),
+        )
+        .await??;
+        #[cfg(feature = "kuberic-testing")]
         let cancelled = self.finish_operation(generation)?.cancelled.clone();
-        let active = ActiveSeedSubmission(seed.clone());
         Ok(SeedDispatchAction::Submitted(SeedDispatchAttempt {
             request,
             task: self.owned_work.spawn(

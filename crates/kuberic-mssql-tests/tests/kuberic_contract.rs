@@ -4733,6 +4733,48 @@ async fn accepted_epoch_prevents_pending_seed_store_and_spawned_task_dispatch() 
 }
 
 #[tokio::test]
+async fn epoch_retirement_before_submission_spawn_releases_the_active_owner() {
+    let root = tempfile::tempdir().unwrap();
+    let (replicator, executor, _) = seed_replicator(root.path().to_owned());
+    admit_seed_replicator(&replicator).await;
+    let (entered, held) = oneshot::channel();
+    let (release, resumed) = oneshot::channel();
+    replicator
+        .testing_gate_seed_submission_owner(entered, resumed)
+        .unwrap();
+    let predecessor = tokio::spawn({
+        let replicator = replicator.clone();
+        async move {
+            replicator
+                .build_replica(target_build(1, "retired-submission-owner"))
+                .await
+        }
+    });
+    held.await.unwrap();
+    let retained: SeedDispatchRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("seed-dispatch-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(retained.phase(), SeedDispatchPhase::Submitting);
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    replicator.update_epoch(Epoch::new(7, 43)).await.unwrap();
+    assert!(matches!(
+        predecessor.await.unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    assert!(release.send(()).is_err());
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        replicator.build_replica(target_build(2, "reconciled-submission-owner")),
+    )
+    .await
+    .expect("same-adapter successor must reconcile proven non-submission")
+    .unwrap();
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(!root.path().join("seed-dispatch-v1.json").exists());
+}
+
+#[tokio::test]
 async fn accepted_epoch_preserves_active_seed_ambiguity_and_restart_exclusion() {
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
