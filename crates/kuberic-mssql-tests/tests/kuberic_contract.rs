@@ -4579,32 +4579,38 @@ async fn accepted_epoch_fences_predecessor_progress_and_same_role_work() {
 
 #[tokio::test]
 async fn accepted_epoch_cancels_ordinary_configuration_observation_before_release() {
-    let (replicator, entered, release) = gated_bound_replicator(
-        vec![Ok(present(bound_snapshot())); 3],
-        vec![OBSERVED_AT; 12],
-        1,
-    );
-    replicator.open().await.unwrap();
-    replicator
-        .update_current_replica_set_configuration(bound_replica_set())
-        .await
-        .unwrap();
-    let callback = tokio::spawn({
-        let replicator = replicator.clone();
-        async move {
+    for admitted in [false, true] {
+        let (replicator, entered, release) = gated_bound_replicator(
+            vec![Ok(present(bound_snapshot())); 3],
+            vec![OBSERVED_AT; 12],
+            usize::from(admitted),
+        );
+        replicator.open().await.unwrap();
+        if admitted {
             replicator
                 .update_current_replica_set_configuration(bound_replica_set())
                 .await
+                .unwrap();
         }
-    });
-    entered.await.unwrap();
-    replicator.update_epoch(Epoch::new(7, 43)).await.unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(3), callback)
-        .await
-        .expect("retired observation must not require external release")
-        .unwrap();
-    assert!(matches!(result, Err(KubericRuntimeError::Closed)));
-    assert!(release.send(()).is_err());
+        assert_eq!(replicator.admitted_topology().is_some(), admitted);
+        let callback = tokio::spawn({
+            let replicator = replicator.clone();
+            async move {
+                replicator
+                    .update_current_replica_set_configuration(bound_replica_set())
+                    .await
+            }
+        });
+        entered.await.unwrap();
+        replicator.update_epoch(Epoch::new(7, 43)).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), callback)
+            .await
+            .expect("retired observation must not require external release")
+            .unwrap();
+        assert!(matches!(result, Err(KubericRuntimeError::Closed)));
+        assert!(release.send(()).is_err());
+        assert_eq!(replicator.admitted_topology().is_some(), admitted);
+    }
 }
 
 #[tokio::test]
