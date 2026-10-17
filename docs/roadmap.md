@@ -10,6 +10,9 @@
 
 - Ordinary production construction remains observe-only until every safety gate
   for a mutation is implemented and tested.
+- Preserve Kuberic's Service Fabric-shaped public traits and satisfy their
+  documented semantics. Matching signatures or another adapter's behavior is
+  not conformance evidence.
 - SQL Server's published external-cluster protocol is the native reference for
   lease, promotion, demotion, and failover behavior.
 - Kuberic authority, SQL Server write authority, exact process incarnation,
@@ -35,21 +38,73 @@ that model to durable current authority, exclude outstanding predecessor
 renewals across restart, and supply a production exact-incarnation fence.
 Fixture observations and local deadlines are not those admission proofs.
 
+### Stage 6A Follow-up: Replicator Semantic Conformance
+
+Close the gap between the implemented observe-only/bootstrap adapter and
+[Kuberic's documented Replicator semantics](design.md#kuberic-and-service-fabric-semantics)
+before proceeding to planned switchover. The completed lease/fence foundation
+remains implemented; this follow-up does not replace its native evidence.
+
+Planned work:
+
+- establish the public progress/history model for primary committed progress,
+  secondary contiguous durable progress, access-closed recovery, and retained
+  catch-up capability, including restart, history changes and unavailable
+  evidence;
+- keep AG configuration sequence as separate native election evidence, without
+  treating it as transaction durability or narrowing native `numeric(25,0)`
+  positions to the public signed-64-bit slot;
+- bind work to exact accepted authority, fence predecessor dispatch and
+  completion on epoch changes, and preserve exclusion for ambiguous submitted
+  effects across cancellation and restart;
+- make Close drain owned descendants and Abort contain them without awaiting
+  graceful work;
+- separate idle nonvoting build targets from active membership, prove exact
+  build completion before admission, and replace partial bootstrap success
+  with the documented public configuration postconditions;
+- define native replication endpoint ownership and partition read/write
+  admission independently of role and routing;
+- exercise the supported configuration/build/lifecycle path through real
+  public `ReplicaHost` operations, not only direct test-only callbacks; and
+- verify upstream host/planner conformance, recording any unresolved blockers
+  from Kuberic's Service Fabric audit rather than copying example behavior.
+
+Exit criteria:
+
+- the progress/history model satisfies the documented semantics without
+  fabricated progress or comparisons across incompatible histories;
+- a superseded callback cannot dispatch new work or publish success, and
+  unresolved predecessor effects cannot authorize successor writes;
+- Close waits for owned work and Abort promptly establishes containment;
+- an idle build target does not vote, and public build/configuration completion
+  certifies the exact supported postconditions;
+- unsupported operations remain explicit errors and ordinary production
+  construction remains observe-only; and
+- hosted conformance coverage passes, with upstream blockers resolved before
+  enabling any dependent operation.
+
 ### Stage 6B: Planned Switchover
 
 Implement the first controlled role movement while all three replicas and the
-current primary are reachable.
+current primary are reachable. The semantic-conformance follow-up is a
+prerequisite, not an optional part of later Kubernetes integration.
 
 Planned work:
 
 - select a synchronized and healthy target at the accepted maximum AG
-  configuration sequence;
+  configuration sequence, with separate valid data-progress/history evidence;
+- implement the supported current/previous-configuration catch-up predicates
+  and required-successor condition without claiming unsupported quorum modes;
+- perform initial catch-up, revoke write access, and complete final catch-up
+  before demoting the source; keep its primary role until that work completes;
 - stop old-primary lease renewal under durable authority;
 - verify lease revocation and the required exact-incarnation fence;
 - execute the published external-cluster demotion and promotion ordering;
 - wait for exact native role, configuration, synchronization, and lineage
   postconditions;
 - grant target lease renewal only after those postconditions hold;
+- honor partition read/write admission throughout native serving and
+  revocation; role, lease renewal, or routing alone is not an access grant;
 - retain durable replay evidence for every authority-changing step; and
 - leave listener and client-routing changes outside the role transition until
   native authority is proven.
@@ -57,6 +112,8 @@ Planned work:
 Exit criteria:
 
 - planned switchover survives cancellation, lost replies, and runtime restart;
+- the actual public-host operation sequence proves catch-up before and after
+  write revocation, correct role ordering, and access refusal until admission;
 - no step can make two replicas writable;
 - replay converges from durable Kuberic and native SQL evidence; and
 - the old primary cannot regain write authority after the target is admitted.
@@ -143,7 +200,8 @@ Exit criteria:
 ## Stage 7: Controller and Kubernetes Resource Integration
 
 Integrate the completed native safety model with Kuberic's public controller
-contract.
+contract for Kubernetes resource orchestration. Public-host operation and
+access-sequencing conformance is required earlier, not deferred to this stage.
 
 Planned work:
 
