@@ -830,6 +830,15 @@ impl StatefulServiceReplica for SqlServerService {
         self.validate_resource_identity(
             &context.partition.get_partition_information().partition_id,
         )?;
+        if !matches!(
+            *self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ServiceLifecycle::Created
+        ) {
+            return Err(KubericRuntimeError::Closed);
+        }
         let _attempt = self.open_attempt.lock().await;
         if !matches!(
             *self
@@ -1962,6 +1971,15 @@ impl SqlServerReplicator {
     }
 
     fn begin_operation(&self) -> Result<(u64, OwnedOperation), KubericAdapterError> {
+        match self
+            .lifecycle_state
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            CREATED => return Err(KubericAdapterError::NotOpen),
+            CLOSED | ABORTED => return Err(KubericAdapterError::Closed),
+            OPEN => {}
+            _ => unreachable!("SQL Server replicator lifecycle is invalid"),
+        }
         let lifecycle = self
             .lifecycle
             .read()
@@ -2161,7 +2179,9 @@ impl SqlServerReplicator {
                 })
             },
             |outcome| match outcome {
-                SeedStoreWorkResult::Complete(Err(error)) => {
+                SeedStoreWorkResult::Complete(Err(error))
+                    if matches!(error, SeedStateError::Io | SeedStateError::UnsafeState) =>
+                {
                     Some(KubericAdapterError::SeedState(*error))
                 }
                 _ => None,
@@ -4486,6 +4506,13 @@ impl SqlServerReplicator {
 #[async_trait]
 impl Replicator for SqlServerReplicator {
     async fn open(&self) -> KubericResult<String> {
+        if self
+            .lifecycle_state
+            .load(std::sync::atomic::Ordering::Acquire)
+            != CREATED
+        {
+            return Err(KubericRuntimeError::Closed);
+        }
         let mut lifecycle = self
             .lifecycle
             .write()
