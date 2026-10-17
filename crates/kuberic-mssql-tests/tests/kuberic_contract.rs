@@ -3313,6 +3313,158 @@ fn application_error(error: KubericRuntimeError) -> String {
 }
 
 #[tokio::test]
+async fn native_configuration_sequence_distinguishes_unavailable_from_observed_zero() {
+    let unbound = bound_replicator_with(Vec::new(), Vec::new());
+    assert_eq!(
+        unbound.native_configuration_sequence().await.unwrap_err(),
+        KubericAdapterError::NotOpen
+    );
+    unbound.open().await.unwrap();
+    assert_eq!(unbound.native_configuration_sequence().await.unwrap(), None);
+    assert_eq!(unbound.current_progress().await.unwrap(), 0);
+    assert!(unbound.admitted_topology().is_none());
+    unbound.update_epoch(Epoch::new(7, 99)).await.unwrap();
+    assert_eq!(unbound.native_configuration_sequence().await.unwrap(), None);
+
+    let observed = opened_bound_replicator(
+        vec![
+            Ok(present(bound_snapshot_with_sequence(0, "0"))),
+            Ok(present(bound_snapshot_with_sequence(0, "0"))),
+        ],
+        vec![OBSERVED_AT; 4],
+    )
+    .await;
+    observed
+        .update_current_replica_set_configuration(bound_replica_set())
+        .await
+        .unwrap();
+    assert_eq!(
+        observed.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("0").unwrap())
+    );
+}
+
+#[tokio::test]
+async fn native_configuration_sequence_preserves_the_exact_signed_domain() {
+    for sequence in ["0", "42", "9223372036854775807"] {
+        let mut sample = snapshot(NativeRole::Primary);
+        if let Observation::Present { value, .. } = &mut sample.availability_group {
+            value.configuration_sequence = ConfigurationSequence::parse(sequence).unwrap();
+        }
+        let replicator = opened_replicator(vec![Ok(present(sample))], vec![OBSERVED_AT]).await;
+        assert_eq!(
+            replicator.native_configuration_sequence().await.unwrap(),
+            Some(ConfigurationSequence::parse(sequence).unwrap())
+        );
+        assert!(replicator.admitted_topology().is_none());
+    }
+}
+
+#[tokio::test]
+async fn native_configuration_sequence_keeps_observation_failures_explicit() {
+    let mut absent_group = snapshot(NativeRole::Primary);
+    absent_group.availability_group = Observation::Absent {
+        observed_at_unix_millis: OBSERVED_AT,
+    };
+    let cases = [
+        (
+            Ok(present(absent_group)),
+            OBSERVED_AT,
+            KubericAdapterError::AvailabilityGroupAbsent,
+        ),
+        (
+            Ok(present(snapshot(NativeRole::Primary))),
+            OBSERVED_AT + MAX_AGE + 1,
+            KubericAdapterError::ObservationStale,
+        ),
+        (
+            Ok(present(snapshot(NativeRole::Primary))),
+            OBSERVED_AT - 1,
+            KubericAdapterError::ObservationFromFuture,
+        ),
+        (
+            Err(RuntimeError::new(
+                ObservationFailureKind::Tls,
+                "transport",
+                "TLS validation failed",
+            )),
+            OBSERVED_AT,
+            KubericAdapterError::ObservationUnavailable(ObservationFailureKind::Tls),
+        ),
+    ];
+    for (sample, now, expected) in cases {
+        let replicator = opened_replicator(vec![sample], vec![now]).await;
+        assert_eq!(
+            replicator
+                .native_configuration_sequence()
+                .await
+                .unwrap_err(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_configuration_sequence_shares_nonregression_with_compatibility_progress() {
+    let replicator = opened_admitted_replicator(
+        0,
+        vec![
+            Ok(present(bound_snapshot_with_sequence(0, "43"))),
+            Ok(present(bound_snapshot_with_sequence(0, "44"))),
+            Ok(present(bound_snapshot_with_sequence(0, "43"))),
+            Ok(present(bound_snapshot_with_sequence(0, "45"))),
+        ],
+        vec![OBSERVED_AT; 10],
+    )
+    .await;
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("43").unwrap())
+    );
+    assert_eq!(replicator.current_progress().await.unwrap(), 44);
+    assert_eq!(
+        replicator
+            .native_configuration_sequence()
+            .await
+            .unwrap_err(),
+        KubericAdapterError::TopologyBindingMismatch("configuration sequence regressed")
+    );
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("45").unwrap())
+    );
+}
+
+#[tokio::test]
+async fn native_configuration_sequence_secondary_discovery_does_not_admit_membership() {
+    let mut absent = bound_snapshot_for(1);
+    absent.availability_group = Observation::Absent {
+        observed_at_unix_millis: OBSERVED_AT,
+    };
+    let replicator = bound_replicator_for(
+        1,
+        vec![
+            Ok(present(absent)),
+            Ok(present(bound_snapshot_with_sequence(1, "17"))),
+            Ok(present(bound_snapshot_with_sequence(1, "18"))),
+        ],
+        vec![OBSERVED_AT; 8],
+    );
+    replicator.open().await.unwrap();
+    replicator
+        .change_role(configuration().epoch, ReplicaRole::ActiveSecondary)
+        .await
+        .unwrap();
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("17").unwrap())
+    );
+    assert!(replicator.admitted_topology().is_none());
+    assert_eq!(replicator.current_progress().await.unwrap(), 18);
+    assert!(replicator.admitted_topology().is_none());
+}
+
+#[tokio::test]
 async fn publishes_only_the_present_configuration_sequence() {
     for (sequence, expected) in [("0", 0), ("42", 42), ("9223372036854775807", i64::MAX)] {
         let mut sample = snapshot(NativeRole::Primary);
@@ -3334,7 +3486,7 @@ async fn publishes_only_the_present_configuration_sequence() {
 }
 
 #[tokio::test]
-async fn native_progress_above_signed_range_never_becomes_generic_progress() {
+async fn native_database_positions_do_not_replace_configuration_evidence() {
     let mut sample = snapshot(NativeRole::Primary);
     let group = match &mut sample.availability_group {
         Observation::Present { value, .. } => value,
@@ -3366,7 +3518,26 @@ async fn native_progress_above_signed_range_never_becomes_generic_progress() {
             },
         }],
     });
-    let replicator = opened_replicator(vec![Ok(present(sample))], vec![OBSERVED_AT]).await;
+    let mut advanced = sample.clone();
+    if let Observation::Present { value, .. } = &mut advanced.availability_group {
+        value.databases[0].replicas[0].progress.committed_record =
+            Some(DecimalProgress::parse("9999999999999999999999998").unwrap());
+    }
+    let replicator = opened_replicator(
+        vec![
+            Ok(present(sample.clone())),
+            Ok(present(advanced)),
+            Ok(present(sample)),
+        ],
+        vec![OBSERVED_AT; 6],
+    )
+    .await;
+    for _ in 0..2 {
+        assert_eq!(
+            replicator.native_configuration_sequence().await.unwrap(),
+            Some(ConfigurationSequence::parse("42").unwrap())
+        );
+    }
     assert_eq!(replicator.current_progress().await.unwrap(), 42);
 }
 
@@ -4364,6 +4535,44 @@ async fn close_during_observation_cannot_publish_current_admission() {
 }
 
 #[tokio::test]
+async fn native_configuration_sequence_is_fenced_by_close_and_abort() {
+    for close in [true, false] {
+        let (replicator, entered, release) = gated_bound_replicator(
+            vec![Ok(present(bound_snapshot())), Ok(present(bound_snapshot()))],
+            vec![OBSERVED_AT; 4],
+            1,
+        );
+        replicator.open().await.unwrap();
+        replicator
+            .update_current_replica_set_configuration(bound_replica_set())
+            .await
+            .unwrap();
+        let task = tokio::spawn({
+            let replicator = replicator.clone();
+            async move { replicator.native_configuration_sequence().await }
+        });
+        entered.await.unwrap();
+        if close {
+            replicator.close().await.unwrap();
+        } else {
+            replicator.abort();
+        }
+        release.send(()).unwrap();
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            KubericAdapterError::Closed
+        );
+        assert_eq!(
+            replicator
+                .native_configuration_sequence()
+                .await
+                .unwrap_err(),
+            KubericAdapterError::Closed
+        );
+    }
+}
+
+#[tokio::test]
 async fn abort_during_fresh_observation_fences_progress_role_and_epoch_results() {
     for operation in ["progress", "role", "epoch"] {
         let (replicator, entered, release) = gated_bound_replicator(
@@ -4484,7 +4693,7 @@ async fn close_waits_for_preadmission_role_publication_guard() {
 
 #[tokio::test]
 async fn abort_waits_for_preadmission_progress_result_guard() {
-    for capability in [false, true] {
+    for operation in ["progress", "capability", "native"] {
         let replicator =
             opened_bound_replicator(vec![Ok(present(bound_snapshot()))], vec![OBSERVED_AT; 2])
                 .await;
@@ -4502,10 +4711,15 @@ async fn abort_waits_for_preadmission_progress_result_guard() {
                     .build()
                     .unwrap()
                     .block_on(async {
-                        if capability {
-                            replicator.catch_up_capability().await
-                        } else {
-                            replicator.current_progress().await
+                        match operation {
+                            "progress" => replicator.current_progress().await.map(Some),
+                            "capability" => replicator.catch_up_capability().await.map(Some),
+                            "native" => replicator
+                                .native_configuration_sequence()
+                                .await
+                                .map(|sequence| sequence.map(ConfigurationSequence::value))
+                                .map_err(KubericRuntimeError::from),
+                            _ => unreachable!(),
                         }
                     })
             }
@@ -4530,10 +4744,11 @@ async fn abort_waits_for_preadmission_progress_result_guard() {
 
         assert_eq!(
             callback.join().unwrap().unwrap(),
-            if capability {
-                kuberic_runtime::application::INVALID_LSN
-            } else {
-                0
+            match operation {
+                "progress" => Some(0),
+                "capability" => Some(kuberic_runtime::application::INVALID_LSN),
+                "native" => None,
+                _ => unreachable!(),
             }
         );
         abort.join().unwrap();
@@ -5899,6 +6114,7 @@ async fn supported_bound_callbacks_use_one_fresh_observation_and_no_mutation_int
                     Ok(present(bound_snapshot())),
                     Ok(present(bound_snapshot())),
                     Ok(present(bound_snapshot())),
+                    Ok(present(bound_snapshot())),
                 ]
                 .into(),
             ),
@@ -5910,7 +6126,7 @@ async fn supported_bound_callbacks_use_one_fresh_observation_and_no_mutation_int
             "replica-1.example:5022".into(),
             source.clone(),
             Arc::new(ScriptedClock {
-                times: Mutex::new(vec![OBSERVED_AT; 4].into()),
+                times: Mutex::new(vec![OBSERVED_AT; 5].into()),
             }),
             kuberic_identity(1),
             topology_expectation(),
@@ -5929,7 +6145,11 @@ async fn supported_bound_callbacks_use_one_fresh_observation_and_no_mutation_int
         .await
         .unwrap();
     assert_eq!(replicator.catch_up_capability().await.unwrap(), 42);
-    assert_eq!(source.observations.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("42").unwrap())
+    );
+    assert_eq!(source.observations.load(Ordering::SeqCst), 5);
     assert!(source.inner.samples.lock().unwrap().is_empty());
 }
 

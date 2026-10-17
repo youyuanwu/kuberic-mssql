@@ -1671,6 +1671,54 @@ impl SqlServerReplicator {
         }
     }
 
+    /// Reads the validated native AG configuration sequence, not data progress.
+    ///
+    /// `None` means the existing pre-admission path has no native association;
+    /// `Some(0)` is observed native metadata, not an empty-data-history proof.
+    /// Associated reads revalidate the binding and reject sequence regression.
+    /// An unassociated read without a topology expectation validates the native
+    /// profile but does not create a binding. Ordinary secondary discovery may
+    /// establish a native association, not public membership or readiness.
+    ///
+    /// This does not establish election quorum, promotion eligibility, database
+    /// durability, or retained catch-up history.
+    pub async fn native_configuration_sequence(
+        &self,
+    ) -> Result<Option<ConfigurationSequence>, KubericAdapterError> {
+        let generation = self.begin_operation()?;
+        let admitted = self.admitted_topology();
+        let native = self.native_progress_binding();
+        if self.expectation.is_some() && admitted.is_none() && native.is_none() {
+            if self.bootstrap.is_none()
+                && self.published_role() == Some(ReplicaRole::ActiveSecondary)
+                && let Some((topology, sequence, observed_at)) =
+                    self.observe_secondary_association(generation).await?
+            {
+                let _lifecycle = self.finish_operation(generation)?;
+                #[cfg(feature = "kuberic-testing")]
+                self.wait_for_testing_lifecycle_publication()?;
+                self.ensure_observation_fresh(observed_at)?;
+                self.publish_native_progress(topology, sequence)?;
+                return Ok(Some(sequence));
+            }
+            let _lifecycle = self.finish_operation(generation)?;
+            #[cfg(feature = "kuberic-testing")]
+            self.wait_for_testing_lifecycle_publication()?;
+            return Ok(None);
+        }
+        let (group, observed_at) = self.observed_group(generation, true, None).await?;
+        let _lifecycle = self.finish_operation(generation)?;
+        #[cfg(feature = "kuberic-testing")]
+        self.wait_for_testing_lifecycle_publication()?;
+        self.ensure_observation_fresh(observed_at)?;
+        if let Some(binding) = admitted {
+            self.publish_native_progress(binding.native_topology(), group.configuration_sequence)?;
+        } else if let Some(binding) = native {
+            self.publish_native_progress(binding.topology, group.configuration_sequence)?;
+        }
+        Ok(Some(group.configuration_sequence))
+    }
+
     pub fn admitted_topology(&self) -> Option<Arc<HealthyTopologyBinding>> {
         self.admitted_topology
             .lock()
@@ -4321,39 +4369,11 @@ impl Replicator for SqlServerReplicator {
     }
 
     async fn current_progress(&self) -> KubericResult<i64> {
-        let generation = self.begin_operation()?;
-        let admitted = self.admitted_topology();
-        let native = self.native_progress_binding();
-        if self.expectation.is_some() && admitted.is_none() && native.is_none() {
-            if self.bootstrap.is_none()
-                && self.published_role() == Some(ReplicaRole::ActiveSecondary)
-                && let Some((topology, sequence, observed_at)) =
-                    self.observe_secondary_association(generation).await?
-            {
-                let _lifecycle = self.finish_operation(generation)?;
-                #[cfg(feature = "kuberic-testing")]
-                self.wait_for_testing_lifecycle_publication()?;
-                self.ensure_observation_fresh(observed_at)?;
-                self.publish_native_progress(topology, sequence)?;
-                return Ok(sequence.value());
-            }
-            let _lifecycle = self.finish_operation(generation)?;
-            #[cfg(feature = "kuberic-testing")]
-            self.wait_for_testing_lifecycle_publication()?;
-            return Ok(0);
-        }
-        let (group, observed_at) = self.observed_group(generation, true, None).await?;
-        let value = group.configuration_sequence.value();
-        let _lifecycle = self.finish_operation(generation)?;
-        #[cfg(feature = "kuberic-testing")]
-        self.wait_for_testing_lifecycle_publication()?;
-        self.ensure_observation_fresh(observed_at)?;
-        if let Some(binding) = admitted {
-            self.publish_native_progress(binding.native_topology(), group.configuration_sequence)?;
-        } else if let Some(binding) = native {
-            self.publish_native_progress(binding.topology, group.configuration_sequence)?;
-        }
-        Ok(value)
+        // Preserve the hosted compatibility projection, not a data-history claim.
+        Ok(self
+            .native_configuration_sequence()
+            .await?
+            .map_or(0, ConfigurationSequence::value))
     }
 
     async fn catch_up_capability(&self) -> KubericResult<i64> {
