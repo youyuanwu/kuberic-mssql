@@ -4,7 +4,8 @@
 > licensed-test bootstrap convergence. Read-only TDS queries are supported;
 > bootstrap-capable test hosts can create the managed database/AG, join
 > secondaries and seed once. SQL Server process management and failover effects
-> are not enabled.
+> are not enabled. Full Kuberic/Service Fabric Replicator semantic conformance
+> is not yet established.
 >
 > **Support level:** Experimental. This is not a Microsoft-supported Kubernetes
 > high-availability solution.
@@ -78,9 +79,9 @@ validation:
 - exact SQL Server `numeric(25,0)` database progress values without narrowing
   them to Kuberic progress;
 - a dedicated signed `ConfigurationSequence` and optional Public V1 Kuberic
-  adapter that publishes validated AG configuration authority only after exact
-  native binding, while keeping lifecycle epochs and native decimal database
-  positions separate;
+  adapter that publishes validated AG configuration sequence through its
+  progress callbacks after exact native binding, while keeping lifecycle epochs
+  and native decimal database positions separate;
 - observations that distinguish present, absent, stale, and failed evidence;
 - versioned operation envelopes with canonical SHA-256 input signatures;
 - explicit destructive approvals and fence references;
@@ -106,7 +107,9 @@ source database and AG convergence, each secondary own only its local join, and
 Kuberic build authority own one group-level `ADD DATABASE` dispatch. A bound
 healthy topology reports `catch_up_capability` equal to freshly validated
 current configuration progress; it does not claim earlier retained history,
-general repair, destructive recovery, lease, or failover capability.
+general repair, destructive recovery, lease, or failover capability. These
+as-built scalar values do not establish the documented Replicator durable-data
+progress or retained-history semantics.
 
 `SqlServerEulaAcknowledgement` is the shared semantic acknowledgement contract:
 it can be constructed only from an explicit affirmative value. The production
@@ -159,6 +162,51 @@ each is assigned to a later stage rather than half-built now:
   fixture-issued evidence described below does not upgrade `FenceReference`
   into a verified production proof.
 
+## Kuberic and Service Fabric Semantics
+
+The target is Kuberic's Service Fabric-shaped Public V1
+`Replicator`/`PrimaryReplicator` contract, not merely compatible method
+signatures or behavior copied from another database adapter. The public traits
+remain unchanged; MSSQL must satisfy their documented postconditions for each
+supported operation. This does not require a V2 Transactional Replicator or a
+dummy `StateProvider`: SQL Server continues to own native replication.
+
+The [trait contracts](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/replicator/traits.rs),
+[API semantics](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/service-fabric-api-semantics.md),
+and [custom Replicator boundary](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/replicator-boundary.md)
+define the required integration boundary. The root `Cargo.toml` determines
+which dependency those contracts must be checked against.
+
+| Area | Required semantics | Current boundary |
+|---|---|---|
+| Progress and history | Primary progress is locally durable quorum-committed progress; secondary progress is contiguous durably accepted progress. Recovery progress is election-only with access closed. Catch-up capability identifies the retained-history floor for an admitted peer, or is unknown/inapplicable. | Callbacks expose AG configuration sequence, not proven database-data progress or retained history. Pre-admission zero is a placeholder, not proof of an empty durable history. |
+| Epoch authority | Epoch barriers fence predecessor operations on primaries and secondaries, including same-role changes. | Monotonic epoch recording and close/abort generation guards do not invalidate outstanding bootstrap work when the epoch advances. |
+| Configuration and build | Successful callbacks certify the exact supported configuration. An idle build target is outside voting membership; build completion and later admission are separate. | Bootstrap callbacks can defer work or complete only the source foundation. The seed-build translator still requires a target in the frozen active-secondary layout, despite accepting idle build DTOs. |
+| Access and catch-up | Serving follows partition read/write status, not role alone. Catch-up satisfies the requested predicate for applicable current/previous configurations and any required successor. | Ordinary hosts publish no client address and do not manage SQL serving access. Catch-up callbacks explicitly reject; native synchronization alone is not a public catch-up receipt. |
+| Shutdown | Close drains owned descendants. Abort promptly fences and contains remaining work without relying on graceful completion. | Close/Abort invalidate callbacks and signal cancellation, but Close does not itself await already-started seed-store worker threads. Store serialization is not a lifecycle drain guarantee. |
+| Replication endpoint | Open establishes the advertised replication endpoint and its ownership lifetime, using the native transport where appropriate. | The configured replication address is metadata only; Open does not establish or own a transport listener. |
+
+The progress contract remains a design blocker. AG sequence is valid native
+configuration/election evidence, but can remain unchanged while database
+transactions advance. It cannot stand in for data durability. Native
+`numeric(25,0)` fields also cannot be narrowed, hashed, saturated, or compared
+across fields or recovery lineages to fill the public signed-64-bit slot.
+A valid public progress/history model must be established before using these
+callbacks for data-bearing admission; unavailable capability remains
+`INVALID_LSN`, and unsupported operations must reject rather than certify an
+unproven postcondition. A conservative current-only capability is not by itself
+evidence of unsafe replication, but is not a retained-history proof.
+
+Native cancellation is not rollback. Supersession must prevent new predecessor
+dispatch and stale completion, while retaining uncertainty and successor
+exclusion for effects already submitted. Local epoch or cancellation state
+alone cannot prove that an old SQL operation or lease renewal can no longer
+apply.
+
+The [semantic-conformance follow-up](roadmap.md#stage-6a-follow-up-replicator-semantic-conformance)
+is required before planned switchover. Completed lease/fence experiments remain
+native evidence, not public lifecycle or serving-admission proof.
+
 ## Why the PostgreSQL Adapter Is Not a Drop-in Template
 
 The retired classic PostgreSQL adapter had a placeholder binary, in-memory
@@ -176,6 +224,12 @@ PostgreSQL LSNs fit a 64-bit scalar; SQL Server DMV positions are
 `numeric(25,0)` with field-specific meanings. SQL Server still needs its own
 native identity, progress, lease and role evidence, rather than copying
 PostgreSQL recovery or relying on generic scalar election ordering.
+
+The example is an architectural precedent, not a conformance oracle. Kuberic's
+[Service Fabric contract audit](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/service-fabric-contract-audit.md)
+also records upstream implementation gaps. MSSQL must verify the required
+host/planner behavior and track unresolved upstream blockers rather than
+inherit an example's behavior as proof of correctness.
 
 ## Native HA Boundary
 
@@ -350,10 +404,11 @@ different databases, or compared across incompatible recovery histories. They
 also cannot be safely narrowed, hashed, saturated, or substituted into
 Kuberic's signed 64-bit LSN slot. Every progress-bearing transition therefore
 includes both the database GUID and recovery-fork GUID. Public V1 uses the AG
-configuration sequence for its scalar history contract; any future operation
-that depends on database-native progress must still compare the appropriate
-field under exact lineage and satisfy the Stage 6 lease, fencing, and
-authenticated mutation design.
+configuration sequence in the current adapter callbacks, but that is an
+as-built limitation, not the required durable-data history contract. Any future
+operation that depends on database-native progress must compare the appropriate
+field under exact lineage and satisfy both Replicator semantic conformance and
+the Stage 6 lease, fencing, and mutation-authority requirements.
 
 The production crate now exposes repository-owned native history positions for
 future adapter integration. A position binds one exact decimal value to one
@@ -484,6 +539,8 @@ source database and AG ownership foundation without admitting a partial native
 group. A later explicit full projection completes local joins and native
 admission before freezing the binding; later omitted projections cannot clear
 it, and every supplied value must still match exactly.
+These bootstrap completion points do not certify full public configuration
+installation or nonvoting build admission.
 
 The adapter publishes conservative immutable `ReplicatorCapabilities`.
 Catch-up-specific quorum and all write authority remain unsupported.
@@ -575,7 +632,8 @@ distinct from direct SQL observation, which proves one native primary and two
 native secondaries. No client SQL service address is published and there is no
 external write lease. The fixture's marker write uses its private administrator
 connection to the directly observed native primary and is not a Kuberic
-client-access decision.
+client-access decision. The reported AG scalar is not proof of durable recovery
+progress merely because the report labels its progress role `Recovery`.
 
 Stage 3 first identifies what Kuberic's private agent store retains and what
 exact SQL Server postcondition can be reobserved after restart. The PostgreSQL
@@ -611,8 +669,10 @@ define a separate commit pin.
 Future implementation stages are maintained in the
 [Kuberic MSSQL future roadmap](roadmap.md). The roadmap contains only incomplete
 work and defines the Stage 6 lease/fencing slices, later controller integration,
-and Kubernetes end-to-end operations. This design remains the authority for the
-implemented safety and observation contract.
+and Kubernetes end-to-end operations. Replicator semantic conformance precedes
+planned switchover; public-host sequencing is not deferred to Kubernetes
+deployment. This design distinguishes the implemented safety and observation
+contract from the required semantic boundary.
 
 ## Test Gates
 

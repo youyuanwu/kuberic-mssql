@@ -2,10 +2,12 @@
 
 ## Purpose
 
-The optional Kuberic integration implements the fresh-state Public V1
-replacement `Replicator` contract. It publishes only exact validated SQL Server
-availability-group sequence progress; Kuberic lifecycle epochs and SQL-native
-database positions are independent authority domains.
+The optional Kuberic integration implements a partial fresh-state Public V1
+`Replicator` adapter. Its current progress callbacks publish validated SQL
+Server availability-group configuration sequence, not proven database-data
+progress. Kuberic lifecycle epochs and SQL-native database positions are
+independent authority domains; full Kuberic/Service Fabric semantic conformance
+is not yet established.
 
 Ordinary construction is deliberately observe-only. It can open as a Kuberic
 application, validate a requested native role, and report current progress. An
@@ -30,13 +32,15 @@ Server increments it when the primary updates availability-group configuration.
 The adapter represents it as `ConfigurationSequence`. Before configuration
 admission, `current_progress` is zero and `catch_up_capability` is
 `INVALID_LSN`. After exact AG binding, both callbacks return the current exact
-nonnegative signed 64-bit sequence. A zero sequence remains valid empty
-authority and is never promoted or fabricated. Configuration epoch is never a
-fallback progress value.
+nonnegative signed 64-bit sequence. An observed zero sequence is valid native
+metadata but is not promotable. The pre-admission zero is a placeholder, not
+proof of an empty durable data history. Configuration epoch is never a fallback
+progress value.
 
-This is the candidate Public V1 scalar-history behavior: configuration and
-promotion-authority progress. It is not evidence that an arbitrary customer
-transaction has been hardened or redone.
+This is the adapter's as-built scalar-publication behavior, not an established
+Public V1 durable-data history contract. AG sequence can remain unchanged while
+customer transactions advance; it does not prove that a transaction has been
+committed, hardened, or redone.
 
 Microsoft's public `mssql-server-ha` agent uses the same sequence:
 
@@ -67,17 +71,36 @@ The observer retains these fields independently as exact decimal values:
 - `committed_record`.
 
 They are never cast, truncated, narrowed, saturated, hashed, or substituted
-for Kuberic progress or Kuberic's signed 64-bit LSN slot. Future build, catch-up, handoff, and recovery operations must validate the
-appropriate native field and lineage explicitly. Database-native values remain
-outside Public V1's scalar history.
+for Kuberic progress or Kuberic's signed 64-bit LSN slot. Future build, catch-up,
+handoff, and recovery operations must validate the appropriate native field and
+lineage explicitly. Database-native values remain outside the current public
+scalar callbacks; a conforming progress/history model remains a design blocker.
+
+## Semantic Conformance Boundary
+
+Kuberic's SF-shaped traits require primary quorum-committed progress, secondary
+contiguous durable progress, access-closed recovery evidence, and a retained
+catch-up floor or `INVALID_LSN` for unknown/inapplicable capability. AG
+configuration sequence does not establish those data-progress postconditions.
+The public traits remain unchanged; MSSQL must align its supported behavior
+rather than redefine their meaning.
+
+The [design](design.md#kuberic-and-service-fabric-semantics) records the current
+gaps in progress, epoch-scoped work fencing, configuration/build completion,
+native endpoint/access ownership, and graceful descendant drainage.
+The [roadmap](roadmap.md#stage-6a-follow-up-replicator-semantic-conformance)
+makes closing those gaps a prerequisite for planned switchover. Existing
+observation, bootstrap, and lease/fence evidence remains useful, but does not
+certify the missing semantics.
 
 ## Adapter Boundary
 
 The `kuberic` feature enables the service, custom replicator, and factory. The
 default observer build remains independent of Kuberic.
 
-Every Kuberic progress request performs a new observation and evaluates it at
-request time. Progress is returned only when:
+Publishing an observed native AG sequence requires a new observation evaluated
+at request time. The pre-admission zero/unknown-capability path does not certify
+native data progress. Observed sequence publication requires:
 
 - the observation is successful, within the configured maximum age, and not
   future-dated;
@@ -130,12 +153,13 @@ depend on remote transport-session readiness. Identity, completed-session,
 address, epoch, role, health, synchronization, lineage, incarnation or
 freshness drift fails closed.
 
-This is a conservative current-only capability: the adapter claims no earlier
-retained configuration history. It is not a database LSN and does not imply
-replica build, repair, catch-up, data-loss recovery, lease, or failover support.
-The locked controller comparison treats a member at the current sequence or one
-behind as not requiring full repair, and a member two or more behind as
-requiring it. Contract tests preserve that exact boundary.
+This is a conservative current-only scalar: the adapter claims no earlier
+retained configuration history. It is not a demonstrated retained data-history
+floor and does not imply replica build, repair, catch-up, data-loss recovery,
+lease, or failover support. The locked controller comparison treats a member at
+the current sequence or one behind as not requiring full repair, and a member
+two or more behind as requiring it. Contract tests preserve that comparison
+boundary, not its validity as a SQL data-repair decision.
 
 The adapter declares conservative immutable `ReplicatorCapabilities`;
 catch-up-specific quorum and write authority remain unsupported. The released
@@ -158,7 +182,10 @@ test-only SQL-native convergence seam. They are not end-to-end Public V1 Build
 operations and do not prove host Build admission, receipts, or membership
 semantics. Public V1 Build evidence here is ordinary/server-free negative
 coverage: idle-build DTO validation and effect-free rejection with zero SQL
-executor calls.
+executor calls. The licensed seed-build translator currently requires its
+target in the frozen active-secondary layout. Accepting an idle DTO in that
+seam does not prove that the target is outside voting membership or that it
+can complete a real public build before admission.
 
 The native evidence model also exposes lineage- and field-scoped history
 positions. Exact decimal values can be ordered only when both positions name
@@ -180,8 +207,9 @@ Unbound and ordinary adapters reject bootstrap mutation and build operations.
 Only explicitly bootstrap-capable adapters accept initial current-configuration
 effects and target builds. Previous/current transitions, catch-up configuration
 and quorum, removal, data loss, destructive recovery, lease, switchover, and
-failover callbacks remain explicit unsupported errors. No callback returns a
-dummy success or fabricated value.
+failover callbacks remain explicit unsupported errors. Bootstrap configuration
+success can mean deferred or source-foundation convergence; it must not be
+interpreted as certification of the full public configuration postcondition.
 
 ## Ownership Model
 
@@ -470,7 +498,10 @@ This integration does not yet provide:
   initial-seed convergence;
 - production endpoint certificate provisioning or rotation;
 - destructive reseed before verified target fencing;
-- database-progress build and catch-up proofs;
+- a conforming role-specific public progress and retained-history model;
+- epoch-scoped predecessor-work fencing and graceful owned-worker drainage;
+- end-to-end public nonvoting build admission and database-progress catch-up
+  proofs;
 - application read/write access fencing;
 - production external write-lease renewal and expiry admission proofs;
 - sequence quorum collection across exact replica sessions;

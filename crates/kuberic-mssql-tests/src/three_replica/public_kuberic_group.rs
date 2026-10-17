@@ -1289,8 +1289,17 @@ impl PublicMssqlGroup {
         let configuration = configuration(native_binding, &identities, roles)?;
         let effective_policy = EffectivePolicy::fixed(3, MSSQL_FAILOVER_DELAY_SECONDS)
             .ok_or_else(|| MssqlGroupError::new("three-member policy is invalid"))?;
-        let controls: [SocketAddr; 3] = (0..3)
-            .map(|_| free_address())
+        let mut control_listeners = Vec::with_capacity(3);
+        for _ in 0..3 {
+            control_listeners.push(
+                tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .map_err(display_error)?,
+            );
+        }
+        let controls: [SocketAddr; 3] = control_listeners
+            .iter()
+            .map(|listener| listener.local_addr().map_err(display_error))
             .collect::<Result<Vec<_>, _>>()?
             .try_into()
             .map_err(|_| MssqlGroupError::new("exactly three control addresses required"))?;
@@ -1331,7 +1340,7 @@ impl PublicMssqlGroup {
             replications: &replications,
             identities: &identities,
         };
-        for index in 0..3 {
+        for (index, control_listener) in control_listeners.into_iter().enumerate() {
             let conflict_injection = PublicConflictInjection::default();
             let config = runtime_config(&config_context, index).await?;
             let application_root = config.application_root().to_owned();
@@ -1398,7 +1407,9 @@ impl PublicMssqlGroup {
             let (shutdown, receiver) = tokio::sync::watch::channel(false);
             attempts.push(HostAttempt {
                 shutdown,
-                task: Some(tokio::spawn(host.start_with_shutdown(receiver))),
+                task: Some(tokio::spawn(
+                    host.start_with_shutdown(control_listener, receiver),
+                )),
             });
             pods.push(PublicMssqlPod {
                 ordinal: index as u8 + 1,
@@ -2527,7 +2538,11 @@ async fn exercise_public_host_shutdown_fence_inner(
         instance_id: ReplicaInstanceId::new(pod_uid.as_str()),
         agent_generation: derive_agent_generation(&initialization_id),
     };
-    let control_address = match free_address() {
+    let control_listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(error) => return PublicHostFenceRun::Confirmed(Err(error.to_string())),
+    };
+    let control_address = match control_listener.local_addr() {
         Ok(address) => address,
         Err(error) => return PublicHostFenceRun::Confirmed(Err(error.to_string())),
     };
@@ -2541,7 +2556,6 @@ async fn exercise_public_host_shutdown_fence_inner(
         pod_uid: pod_uid.clone(),
         pvc_uid: pvc_uid.clone(),
         data_root: host_root.join("state"),
-        control_address,
         replication_address,
         bearer_token: AGENT_TOKEN.to_owned(),
         rpc_deadline: Duration::from_secs(2),
@@ -2574,7 +2588,9 @@ async fn exercise_public_host_shutdown_fence_inner(
     );
     let (startup_shutdown, startup_receiver) = tokio::sync::watch::channel(false);
     let startup = tokio::spawn(async move {
-        let result = host.start_with_shutdown(startup_receiver).await;
+        let result = host
+            .start_with_shutdown(control_listener, startup_receiver)
+            .await;
         if matches!(result, Ok(Some(_)))
             && let Some(mut stall) = startup_stall
         {

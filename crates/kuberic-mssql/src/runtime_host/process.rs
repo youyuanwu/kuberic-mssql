@@ -113,9 +113,13 @@ where
     }
 
     let shutdown_deadline = config.shutdown_deadline();
+    let control_address = config.control_address();
     tokio::pin!(shutdown);
     let (startup_shutdown, receiver) = tokio::sync::watch::channel(false);
-    let mut startup = tokio::spawn(host.start_with_shutdown(receiver));
+    let mut startup = tokio::spawn(async move {
+        let control_listener = tokio::net::TcpListener::bind(control_address).await?;
+        host.start_with_shutdown(control_listener, receiver).await
+    });
     let (started, trigger) = tokio::select! {
         result = &mut startup => (result, None),
         result = &mut shutdown => {

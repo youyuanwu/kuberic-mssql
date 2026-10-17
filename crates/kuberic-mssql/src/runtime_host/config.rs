@@ -310,7 +310,6 @@ impl RuntimeHostConfig {
             pod_uid: self.pod_uid.clone(),
             pvc_uid: self.pvc_uid.clone(),
             data_root: self.data_root.clone(),
-            control_address: self.control_address,
             replication_address: self.replication_address,
             bearer_token: self.bearer_token.to_string(),
             rpc_deadline: self.rpc_deadline,

@@ -343,6 +343,35 @@ async fn runner_preserves_trigger_and_application_cleanup_failures() {
 }
 
 #[tokio::test]
+async fn runner_preserves_control_bind_and_application_cleanup_failures() {
+    let temporary = tempfile::tempdir().unwrap();
+    let files = files(temporary.path());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let bind_error = TcpListener::bind(address).unwrap_err().to_string();
+    let mut args = runtime_args(temporary.path(), &files);
+    args.control_address = address;
+    let config = RuntimeHostConfig::load(args, temporary.path())
+        .await
+        .unwrap();
+    let error = testing_run_host_with_shutdown(
+        config,
+        Arc::new(CleanupApplication {
+            close_behavior: CloseBehavior::Error,
+        }),
+        ApplicationStorageState::FreshEmpty,
+        None,
+        pending(),
+    )
+    .await
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains(&bind_error), "{message}");
+    assert!(message.contains("injected application cleanup failure"));
+    assert!(!temporary.path().join("state/application").exists());
+}
+
+#[tokio::test]
 async fn runner_bounds_application_cleanup_after_shutdown() {
     let temporary = tempfile::tempdir().unwrap();
     let files = files(temporary.path());

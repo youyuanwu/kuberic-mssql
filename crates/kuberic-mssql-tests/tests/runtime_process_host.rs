@@ -405,11 +405,14 @@ async fn start_attempts(root: &Path) -> Vec<HostAttempt> {
             Arc::new(RuntimeEndpointResolver::new(&config).unwrap()),
         )
         .with_application_storage_paths(application.storage_paths());
+        let control_listener = tokio::net::TcpListener::bind(controls[index])
+            .await
+            .unwrap();
         attempts.push(HostAttempt {
             control: controls[index],
             replication: replications[index],
             application_root,
-            task: tokio::spawn(host.start()),
+            task: tokio::spawn(host.start(control_listener)),
         });
     }
 
@@ -1127,8 +1130,9 @@ async fn application_binding_without_agent_metadata_is_reported_unsafe_case() {
         Arc::new(RuntimeEndpointResolver::new(&config).unwrap()),
     )
     .with_application_storage_paths(application.storage_paths());
+    let control_listener = tokio::net::TcpListener::bind(controls[0]).await.unwrap();
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
-    let mut task = tokio::spawn(host.start_with_shutdown(receiver));
+    let mut task = tokio::spawn(host.start_with_shutdown(control_listener, receiver));
     tokio::time::sleep(Duration::from_millis(100)).await;
     if task.is_finished() {
         let result = (&mut task).await;
@@ -1196,10 +1200,11 @@ async fn established_public_host_rejects_changed_application_path_and_topology_c
         Arc::new(RuntimeEndpointResolver::new(&moved_config).unwrap()),
     )
     .with_application_storage_paths(moved_application.storage_paths());
+    let control_listener = tokio::net::TcpListener::bind(controls[0]).await.unwrap();
     let (_shutdown, receiver) = tokio::sync::watch::channel(false);
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        moved_host.start_with_shutdown(receiver),
+        moved_host.start_with_shutdown(control_listener, receiver),
     )
     .await
     .expect("changed application path is rejected promptly");
