@@ -51,8 +51,12 @@ Planned work:
   secondary contiguous durable progress, access-closed recovery, and retained
   catch-up capability, including restart, history changes and unavailable
   evidence;
-- keep AG configuration sequence as separate native election evidence, without
-  treating it as transaction durability or narrowing native `numeric(25,0)`
+- resolve the [host reporting/history constraints](kuberic-progress.md#upstream-reporting-and-history-blockers):
+  mandatory successful current progress, provider-free synthetic `first = 0`,
+  custom capability not projected into reports, and no unknown completed
+  progress range; preserve compatibility only as an explicit interim boundary;
+- use separate native AG election evidence without treating configuration
+  freshness as transaction durability or narrowing native `numeric(25,0)`
   positions to the public signed-64-bit slot;
 - bind work to exact accepted authority, fence predecessor dispatch and
   completion on epoch changes, and preserve exclusion for ambiguous submitted
@@ -73,6 +77,9 @@ Exit criteria:
 
 - the progress/history model satisfies the documented semantics without
   fabricated progress or comparisons across incompatible histories;
+- actual hosted reports and peer descriptors preserve the proven custom
+  progress/capability meaning, including unavailable evidence, rather than
+  relying on compatibility placeholders or provider-free synthetic history;
 - a superseded callback cannot dispatch new work or publish success, and
   unresolved predecessor effects cannot authorize successor writes;
 - Close waits for owned work and Abort promptly establishes containment;

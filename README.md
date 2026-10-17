@@ -104,13 +104,20 @@ Runtime identity and topology files reject unknown, duplicate, ambiguous,
 symlinked or oversized inputs. The application root contains only a private
 schema-versioned binding of non-secret identity and topology digests. Kuberic
 role and epoch authority can initially arrive before configuration admission;
-at that point progress is `0` and capability is `INVALID_LSN`. Public V1
+without native association, the usual compatibility path reports progress `0`
+and capability `INVALID_LSN`. Public V1
 current configurations describe exact ready remote active secondaries; the
 local member is recovered from runtime identity and the configuration
 descriptor, while idle build targets remain separate and require
 `INVALID_LSN`, exact build/session/storage identity, and an exact address.
 After topology admission, role and progress publication reobserve SQL Server.
 No client SQL listener or service address is published.
+
+For validated native election metadata, use the typed
+`SqlServerReplicator::native_configuration_sequence` API. Public scalar
+publication remains hosted compatibility behavior, not proven durable-data
+progress or retained history. The [integration guide](docs/kuberic-progress.md#upstream-reporting-and-history-blockers)
+records the upstream reporting/history blockers; production remains observe-only.
 
 With empty authorized roots, startup initializes Kuberic metadata and writes a
 Public V1 activation-bound application binding. Existing mode reopens only the

@@ -74,6 +74,13 @@ This matches Kuberic MSSQL's current use of
 progress. It does not make database-native `numeric(25,0)` hardened, redone, or
 committed positions interchangeable with configuration authority.
 
+The [native sequence query](https://github.com/microsoft/mssql-server-ha/blob/master/go/src/mssqlcommon/ag/lib.go#L764-L781)
+reads SQL `bigint` into Go `int64`; the integer type is not a mismatch.
+The [promotion checks](https://github.com/microsoft/mssql-server-ha/blob/master/go/src/ag-helper/main.go#L848-L879)
+require the candidate at the maximum nonzero sequence and enough positive
+reports from synchronous/configuration-only replicas. This is native election
+evidence, not a generic database-data progress or retained-history scalar.
+
 ### External write lease
 
 The resource-agent metadata exposes `primary_write_lease_duration`. The shell
@@ -107,6 +114,16 @@ cannot be tuned independently.
 The published helper's normal promotion sequence renews the external write
 lease, requests failover through SQL Server's external-cluster session context,
 and waits for the local role to become `PRIMARY`.
+
+The [normal failover path](https://github.com/microsoft/mssql-server-ha/blob/master/go/src/ag-helper/main.go#L881-L943)
+relies on SQL Server's own synchronization authorization. It explicitly handles
+SQL error 41142 for unsynchronized or unjoined databases, then waits for role
+completion and invokes monitoring. The helper's
+[secondary-monitor explanation](https://github.com/microsoft/mssql-server-ha/blob/master/go/src/ag-helper/main.go#L625-L631)
+notes that secondary DMV synchronization state after primary loss, or a
+database absent locally, cannot replace the engine's complete failover check.
+Matching sequence reports alone therefore do not authorize promotion.
+This path does not expose a generic public data-history/catch-up receipt.
 
 The SQL library sets the session context used by an external cluster manager
 before issuing either:

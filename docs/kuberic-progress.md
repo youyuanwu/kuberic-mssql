@@ -9,6 +9,11 @@ progress. Kuberic lifecycle epochs and SQL-native database positions are
 independent authority domains; full Kuberic/Service Fabric semantic conformance
 is not yet established.
 
+An explicit native configuration-sequence API separates validated election
+metadata from those compatibility callbacks. Existing hosted behavior is
+deliberately preserved; this separation does not make the public scalar
+publication conforming.
+
 Ordinary construction is deliberately observe-only. It can open as a Kuberic
 application, validate a requested native role, and report current progress. An
 explicit bootstrap-capable construction used by licensed validation can also
@@ -29,9 +34,11 @@ SQL Server exposes two different categories of progress.
 
 `sys.availability_groups.sequence_number` is a nonnegative SQL `bigint`. SQL
 Server increments it when the primary updates availability-group configuration.
-The adapter represents it as `ConfigurationSequence`. Before configuration
-admission, `current_progress` is zero and `catch_up_capability` is
-`INVALID_LSN`. After exact AG binding, both callbacks return the current exact
+The adapter represents it as `ConfigurationSequence`. Before native association
+or configuration admission, the usual compatibility path returns zero for
+`current_progress` and `INVALID_LSN` for `catch_up_capability`. Ordinary active
+secondaries can discover and bind native evidence before public admission.
+After exact AG binding, both callbacks return the current exact
 nonnegative signed 64-bit sequence. An observed zero sequence is valid native
 metadata but is not promotable. The pre-admission zero is a placeholder, not
 proof of an empty durable data history. Configuration epoch is never a fallback
@@ -50,11 +57,41 @@ Microsoft's public `mssql-server-ha` agent uses the same sequence:
 - sequence zero is not promotable;
 - a majority of required sequence reports must be available;
 - promotion then renews the external write lease and invokes SQL Server's
-  external-cluster failover path.
+  normal external-cluster failover path;
+- SQL Server can reject unsynchronized or unjoined databases; matching sequence
+  reports do not bypass that native gate; and
+- command acceptance is followed by waiting for PRIMARY and monitoring.
 
 The candidate adapter implements only local AG-sequence publication. It does
 not implement the quorum, lease, fencing, or promotion steps required for
 controller-driven role movement.
+
+### Native election evidence API
+
+With the `kuberic` feature, `SqlServerReplicator::native_configuration_sequence`
+returns `Result<Option<ConfigurationSequence>, KubericAdapterError>`:
+
+- `Some(sequence)` is exact validated native configuration metadata, including
+  observed zero and the signed-64-bit maximum;
+- `None` is the existing pre-admission path without native evidence to publish,
+  not a fabricated observation or sequence zero; and
+- lifecycle, observation, freshness, identity/profile, and applicable bound
+  topology/nonregression failures remain explicit errors.
+
+This shares the existing current-progress read path rather than adding a cache
+or another SQL query. Available reads use one fresh observation and recheck
+freshness before publication. The usual unassociated pre-admission path reads
+no SQL; ordinary active-secondary discovery may observe and establish a native
+association, but does not admit public membership or establish readiness.
+Without a topology expectation or association, the read validates the native
+profile but does not freeze a binding or acquire bound-history guarantees.
+
+The public `current_progress` callback projects this result to the existing
+`i64`, including `None -> 0`, solely for compatibility. The capability callback
+retains its additional stable-role checks and existing values. Native callers
+should use the typed API rather than infer native evidence from the public
+placeholder. Neither API result certifies an election quorum, promotion
+eligibility, database durability, or retained catch-up coverage.
 
 ### Database-native positions
 
@@ -84,6 +121,30 @@ catch-up floor or `INVALID_LSN` for unknown/inapplicable capability. AG
 configuration sequence does not establish those data-progress postconditions.
 The public traits remain unchanged; MSSQL must align its supported behavior
 rather than redefine their meaning.
+
+### Upstream reporting and history blockers
+
+The dependency selected by root `Cargo.toml` has these concrete integration
+constraints. The upstream links identify source locations, not another
+dependency pin:
+
+| Boundary | Current constraint |
+|---|---|
+| [Registered host reporting](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/hosting.rs#L637-L688) | Status/report construction requires successful custom `current_progress`. Returning an unsupported-progress error would also disable existing registered-host report-dependent bootstrap/restart journeys. |
+| [Provider-free report projection](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/hosting.rs#L644-L687) | The host synthesizes `first = 0` without a provider, or uses provider committed progress otherwise. It does not query custom `catch_up_capability` for that field. Returning `INVALID_LSN` from capability alone would not fix the report. |
+| [Completed progress validation](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/protocol/public_operations.rs#L2162-L2194) | A completed report needs nonnegative ordered endpoints; it cannot express unknown progress with `INVALID_LSN`. Peer descriptors allowing unknown values do not relax this requirement. |
+| [Public history consumers](https://github.com/youyuanwu/kuberic/blob/main/kuberic-controller/src/evaluator/public_v1_topology.rs) | Candidate selection compares report tails within accepted public history; retained rejoin uses history, storage/session/completion evidence, and report endpoints. Peer descriptors receive report `last` as current progress and `first` as capability. These are not Microsoft's native AG-sequence/quorum/failover protocol. |
+
+The remaining adapter obligation is to establish how SQL-native evidence
+corresponds to public history, role-specific durable progress, recovery-only
+election evidence, and retained catch-up coverage across restart/history changes.
+No conforming mapping is established by an AG sequence or by fitting a database
+position into `i64`. A wider integer alone would not resolve these semantics.
+
+For now, hosted scalar values and report journeys remain deliberately unchanged
+compatibility behavior. This is a known semantic gap, not a successful
+conformance gate. No dummy provider, fabricated counter, epoch fallback, or
+alternate replication log is introduced to hide the upstream constraints.
 
 The [design](design.md#kuberic-and-service-fabric-semantics) records the current
 gaps in progress, epoch-scoped work fencing, configuration/build completion,
@@ -156,10 +217,11 @@ freshness drift fails closed.
 This is a conservative current-only scalar: the adapter claims no earlier
 retained configuration history. It is not a demonstrated retained data-history
 floor and does not imply replica build, repair, catch-up, data-loss recovery,
-lease, or failover support. The locked controller comparison treats a member at
-the current sequence or one behind as not requiring full repair, and a member
-two or more behind as requiring it. Contract tests preserve that comparison
-boundary, not its validity as a SQL data-repair decision.
+lease, or failover support. The legacy arithmetic test for a member at the
+current sequence, one behind, or two behind exercises a locally defined
+comparison, not the pinned controller's actual retained-rejoin path. It is not
+controller conformance coverage or evidence for a SQL data-repair decision;
+the actual public-history consumers and report blockers are described above.
 
 The adapter declares conservative immutable `ReplicatorCapabilities`;
 catch-up-specific quorum and write authority remain unsupported. The released
@@ -368,7 +430,10 @@ authority. Reports are bracketed by fresh direct observations and must show:
 
 These contained Public V1 report roles are distinct from SQL-native topology:
 direct SQL observation still proves exactly one native primary and two native
-secondaries. No SQL external write lease is acquired. The replicated marker is
+secondaries. Recovery `[0, native sequence]` is preserved host compatibility
+projection, not proof of a public data-history range or retained floor. Native
+marker/lineage/synchronization observations remain separate evidence.
+No SQL external write lease is acquired. The replicated marker is
 written only by the fixture administrator against the directly observed native
 primary.
 
