@@ -14,10 +14,10 @@ use kuberic_mssql::runtime_host::SeedDispatchPhase;
 use kuberic_mssql_tests::three_replica::{
     CLEANUP_BUDGET, CancellationSignals, CleanupClock, CleanupCoordinator, CombinedFixtureError,
     FixtureConfig, HandledCancellationSignal, JournalStore, LaunchedMembers,
-    LicensedConflictScenario, MssqlGroupError, NativeTopologyBinding, NativeTopologyPhase,
-    OwnershipJournal, PublicBuildCommand, PublicFaultInjection, PublicMssqlGroup,
-    PublicMutationFault, ReadyMember, ResourceState, RunState, SystemCleanupClock, TopologyRun,
-    cleanup_three_replica_fixture, launch_three_members,
+    LicensedConflictScenario, MssqlGroupError, NativeCleanupEvidence, NativeTopologyBinding,
+    NativeTopologyPhase, OwnershipJournal, PublicBuildCommand, PublicFaultInjection,
+    PublicMssqlGroup, PublicMutationFault, ReadyMember, ResourceState, RunState,
+    SystemCleanupClock, TopologyRun, cleanup_three_replica_fixture, launch_three_members,
 };
 use kuberic_runtime::control::{normalize_public_v1_agent_status_report, proto};
 use kuberic_runtime::protocol::public_operations::{
@@ -207,7 +207,12 @@ fn native_probe_and_fixture_cleanup_errors_are_preserved() {
         Vec::new(),
     );
     let expected = cleanup.to_string();
-    let error = combined_error("native probe query failed".into(), cleanup);
+    let error = finish_runtime_cleanup(
+        Path::new("unused-native-probe-root"),
+        RuntimeOutcome::Completed(Ok(Err("native probe query failed".into()))),
+        Err(cleanup),
+    )
+    .unwrap_err();
     assert_eq!(
         error.to_string(),
         format!("native probe query failed; cleanup also failed: {expected}")
@@ -2553,6 +2558,14 @@ fn finish_runtime_outcome(
     cleanup: &CleanupCoordinator<SystemCleanupClock>,
 ) -> Result<(), TestError> {
     let fixture_cleanup = launched.cleanup_with_coordinator(cleanup);
+    finish_runtime_cleanup(root, outcome, fixture_cleanup)
+}
+
+fn finish_runtime_cleanup(
+    root: &Path,
+    outcome: RuntimeOutcome,
+    fixture_cleanup: Result<NativeCleanupEvidence, CombinedFixtureError>,
+) -> Result<(), TestError> {
     match (outcome, fixture_cleanup) {
         (RuntimeOutcome::Completed(Ok(Ok(()))), Ok(cleanup)) => {
             assert_eq!(cleanup.removed_container_ids.len(), 3);
