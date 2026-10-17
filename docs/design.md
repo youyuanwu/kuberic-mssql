@@ -154,10 +154,10 @@ each is assigned to a later stage rather than half-built now:
   currently bind a receipt to an exact operation ID and canonical input
   signature. They carry no issue or expiry time and no issuer verification, so
   the type system cannot yet express an expired or forged proof, and any caller
-  able to construct an envelope can construct a receipt for it. Stage 4 owns
-  receipt lifetime and issuer authentication, alongside the external lease
-  handling that gives those fields their meaning. Until then, no code path may
-  treat the presence of a receipt as evidence that fencing actually occurred.
+  able to construct an envelope can construct a receipt for it. Production
+  receipt lifetime and issuer verification remain future safety work. The
+  fixture-issued evidence described below does not upgrade `FenceReference`
+  into a verified production proof.
 
 ## Why the PostgreSQL Adapter Is Not a Drop-in Template
 
@@ -209,6 +209,105 @@ primary's lease expired or present a verified infrastructure fence that
 prevents that exact incarnation from writing or restarting. A Service update,
 readiness failure, Pod deletion request, Kubernetes Lease, or in-memory
 `PartitionState` flag is not such proof.
+
+## Lease and Fence Foundation
+
+The `kuberic`-feature [`lease_fence` module](../crates/kuberic-mssql/src/lease_fence.rs#L1)
+supplies server-free Stage 6A
+contracts, not an executor or permission to promote. `LeaseAuthority` binds the
+resource UID, configuration identity, AG name/GUID, full composite Kuberic role
+epoch, observed logical/native replica and incarnation, and exact SQL start.
+Desired-only replicas cannot satisfy this binding.
+
+[`LeaseModel`](../crates/kuberic-mssql/src/lease_fence.rs#L271) permits one
+outstanding request, uses strictly increasing operation sequences, and retains
+a monotonic-clock high-water mark even when rejecting a
+transition. Requests also carry private model-session identity: recreating a
+model cannot admit a predecessor response even if request values are reused.
+Revocation/supersession and cancellation remove local acceptance; delayed,
+expired, cancelled, duplicate, or mismatching responses cannot restore it.
+Cancellation leaves the request unresolved and blocks further dispatch by that
+model.
+
+Accepted local authority ends at submission plus validity minus margin, not
+response time plus validity. `NativeEffectHorizon` separately accounts for this
+actor's possible native submissions. Without a justified bound on actual native
+application, a lost response remains unbounded through any finite wait.
+Successful acknowledgement can bound that request's application by receipt
+time, but revocation is not native cancellation. `NoSubmissions` means only
+that this model submitted nothing; it says nothing about predecessor or other
+renewers. A fresh model starts without accepted authority or imported native
+expiry proof.
+
+[`LeaseBudget`](../crates/kuberic-mssql/src/lease_fence.rs#L129) validates positive
+timing components and checked arithmetic. Its
+renewal coverage combines observation, reconciliation/scheduling, renewal
+interval, request, quorum-loss detection, and margin; native validity must
+exceed that coverage. A conditional recovery estimate additionally includes
+native application, validity, fencing, and promotion. Without an application
+bound that estimate is unavailable. Neither the estimate nor a local deadline
+authorizes promotion.
+
+`FenceRequest` and `FenceReceipt` bind one operation to one complete authority
+identity. Receipt construction records a trusted provider's verified stop; it
+does not authenticate that provider, prevent a later administrative start, or
+connect the older operation-envelope `FenceReference` to production execution.
+
+### Licensed Fixture Evidence
+
+The test crate alone can create a lease-enabled external AG and issue
+`WRITE_LEASE_VALIDITY` updates in positive integer **seconds**. Ordinary fixture
+creation and production SQL transport are unchanged. The fixture fence uses
+its own run/configuration identity and a synthetic epoch, not durable Kuberic
+role authority.
+
+The [licensed experiments](../crates/kuberic-mssql-tests/tests/live_lease_fence.rs#L82)
+against the pinned SQL Server **17.0.5005.3** fixture established:
+
+| Experiment | Observation |
+| --- | --- |
+| Renewal | A marker write, confirmed from a fresh SQL session, succeeded beyond creation acknowledgement plus the original validity and margin, inside the renewed conservative window. |
+| Renewal cessation | Raw remaining lease reached zero and writes failed with SQL error 988, while the replica still reported `PRIMARY`/`ONLINE` and all three replicas remained connected and synchronized. |
+| Response cancellation | A delayed renewal response exceeded its client deadline; the session was discarded and fresh observations retained uncertainty rather than assuming rollback. |
+| Active-lease restart | The same container acquired fresh Docker/SQL start identities. Within the previous lease window, SQL reported `RESOLVING`/`OFFLINE`, raw remaining lease was null, and fresh-session marker readback did not confirm the attempted write. This is an unconfirmed outcome, not proof of commit, rollback, or lease persistence. |
+| Exact fixture fence | A verified stop produced matching evidence; after an explicit completed restart, old requests and a genuinely issued old receipt were rejected without stopping the replacement. |
+
+Error [988](https://learn.microsoft.com/en-us/sql/relational-databases/errors-events/mssqlserver-988-database-engine-error)
+means insufficient HA quorum, not uniquely lease expiry. The experiment
+corroborates it with unchanged replica/synchronization counts, exact identity,
+stopped renewal, and raw lease telemetry. `write_lease_remaining_ticks` is
+unsupported informational telemetry; its units are not inferred and it is not
+a production expiry API. Reported native role alone is not write admission.
+
+### Fixture Fence Limits
+
+The [fixture provider](../crates/kuberic-mssql-tests/src/three_replica/member/lease.rs#L404)
+verifies owned attributes, immutable container ID, Docker
+`StartedAt`, native AG/replica, and SQL start before stopping, then verifies the
+stopped incarnation before returning a receipt. Exclusive mutable fixture
+ownership and the lifetime root lock serialize supported lifecycle changes.
+The fixture requires restart policy `no`; arbitrary concurrent Docker
+administrators or independent restart actors are outside its guarantees. This
+is not Kubernetes, host-power, or storage fencing.
+
+Journal schema 9 persists stop/start exclusions before dispatch and migrates
+schemas 5-8. Timeout, cancellation, or ambiguous verification leaves an
+exclusion that rejects cooperating restart. Re-entry cleans up and retires the
+exact old container before creating a new run. A confirmed stop permits the
+explicit fixture restart path; it cannot turn an old receipt into evidence for
+the new incarnation.
+
+The ignored experiments run explicitly and sequentially in licensed CI:
+
+```bash
+just test-live-lease-fence [root]
+just cleanup-live-lease-fence [root]
+```
+
+Production renewal, promotion, failover, destructive recovery, and a production
+fence provider remain unavailable. Restart and partition-safe native authority,
+exclusion of every predecessor renewer, and durable transition/replay evidence
+remain admission gates for later Stage 6 work.
 
 ## Observation Contract
 
@@ -520,7 +619,8 @@ implemented safety and observation contract.
 Server-free tests
 cover profile rejection, exact progress, malformed observations, canonical
 operation vectors, duplicate/reused operation IDs, epoch regression,
-destructive approval, and fence binding. They run in the ordinary CI job as
+destructive approval, lease timing/native uncertainty, fresh-model replay,
+fence binding, and gated lifecycle exclusion/re-entry. They run in the ordinary CI job as
 `cargo test --workspace --all-features`.
 Runtime tests also cover typed DMV decoding, inconsistent snapshots,
 permissions, transport and sample deadlines, freshness, cancellation, CLI

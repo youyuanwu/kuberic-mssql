@@ -373,8 +373,8 @@ pre-association, in-flight-seeding and post-native/pre-reply windows. Every
 scenario performs exact cleanup.
 
 The required GitHub Actions check `Shared CI validation` runs `just ci`,
-including licensed one-replica, three-replica, and same-root restart
-validation, and always runs `just cleanup`. Its GitHub Actions job log is the
+including licensed one-replica, three-replica, same-root restart, and isolated
+lease/fence validation, and always runs `just cleanup`. Its GitHub Actions job log is the
 run evidence; no test logs or evidence artifacts are committed. The dependency
 source and version remain defined only by the root `Cargo.toml`.
 
@@ -450,32 +450,37 @@ Exercise handled SIGTERM, recovery, retry, and idempotent cleanup:
 just test-live-three-replica-signal [root]
 ```
 
-The three-replica happy path and same-root restart run after the one-replica
-observer/CLI validation in `just ci`. Signal, recovery, fault and conflict
-recipes remain explicit. The shipped acknowledgement example still contains
+The three-replica happy path, same-root restart, and isolated lease/fence
+experiments run after the one-replica observer/CLI validation in `just ci`.
+Signal, recovery, fault and conflict recipes remain explicit. The shipped
+acknowledgement example still contains
 `accepted: false` as documentation for the production/file-backed contract, but
 tests do not require it.
+
+The [lease/fence foundation](design.md#lease-and-fence-foundation) adds pure
+authority contracts and separate licensed SQL expiry/restart observations.
+These are not a production renewal actor or a Kuberic failover admission proof.
 
 ## Deferred Work
 
 This integration does not yet provide:
 
-- SQL Server process ownership or restart containment;
+- production SQL Server process ownership or restart containment;
 - a supported production launcher/transport for managed-database, AG, join or
   initial-seed convergence;
 - production endpoint certificate provisioning or rotation;
 - destructive reseed before verified target fencing;
 - database-progress build and catch-up proofs;
 - application read/write access fencing;
-- external write-lease renewal and expiry evidence;
+- production external write-lease renewal and expiry admission proofs;
 - sequence quorum collection across exact replica sessions;
 - planned switchover, automatic or forced failover, or data-loss recovery;
 - Kubernetes Pod, PVC, Secret, Service, listener, routing, or installation
   convergence;
 - a Kuberic sidecar;
 - Kubernetes fault testing; and
-- multi-member failure, replacement, network-partition, old-primary, or
-  write-lease-expiry testing.
+- multi-member failure, replacement, network-partition, or old-primary
+  recovery testing, including lease expiry under those faults.
 
 Those stages require separate design and safety review.
 
