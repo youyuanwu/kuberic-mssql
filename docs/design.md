@@ -179,7 +179,7 @@ which dependency those contracts must be checked against.
 
 | Area | Required semantics | Current boundary |
 |---|---|---|
-| Progress and history | Primary progress is locally durable quorum-committed progress; secondary progress is contiguous durably accepted progress. Recovery progress is election-only with access closed. Catch-up capability identifies the retained-history floor for an admitted peer, or is unknown/inapplicable. | Callbacks expose AG configuration sequence, not proven database-data progress or retained history. Pre-admission zero is a placeholder, not proof of an empty durable history. |
+| Progress and history | Primary progress is locally durable quorum-committed progress; secondary progress is contiguous durably accepted progress. Recovery progress is election-only with access closed. Catch-up capability identifies the retained-history floor for an admitted peer, or is unknown/inapplicable. | A typed native configuration-sequence read distinguishes unavailable evidence from observed zero. Existing public callbacks retain AG-sequence/placeholder projection for hosted compatibility, not proven database-data progress or retained history. |
 | Epoch authority | Epoch barriers fence predecessor operations on primaries and secondaries, including same-role changes. | Monotonic epoch recording and close/abort generation guards do not invalidate outstanding bootstrap work when the epoch advances. |
 | Configuration and build | Successful callbacks certify the exact supported configuration. An idle build target is outside voting membership; build completion and later admission are separate. | Bootstrap callbacks can defer work or complete only the source foundation. The seed-build translator still requires a target in the frozen active-secondary layout, despite accepting idle build DTOs. |
 | Access and catch-up | Serving follows partition read/write status, not role alone. Catch-up satisfies the requested predicate for applicable current/previous configurations and any required successor. | Ordinary hosts publish no client address and do not manage SQL serving access. Catch-up callbacks explicitly reject; native synchronization alone is not a public catch-up receipt. |
@@ -196,6 +196,19 @@ callbacks for data-bearing admission; unavailable capability remains
 `INVALID_LSN`, and unsupported operations must reject rather than certify an
 unproven postcondition. A conservative current-only capability is not by itself
 evidence of unsafe replication, but is not a retained-history proof.
+
+`SqlServerReplicator::native_configuration_sequence` now exposes the existing
+validated native read as an optional `ConfigurationSequence`, independently of
+the public scalar projection. It does not establish public membership,
+readiness, election quorum, or promotion authority.
+The public callback values and hosted journeys remain deliberately unchanged:
+the selected Kuberic host requires successful current progress for registered
+reports, synthesizes `first = 0` without a provider, and cannot represent an
+unknown completed progress range. It does not project custom capability into
+that report field. The [source-backed reporting/history blockers](kuberic-progress.md#upstream-reporting-and-history-blockers)
+must be resolved alongside the native/public history model, not concealed with
+a dummy provider or fabricated progress. This additive separation is not full
+semantic conformance.
 
 Native cancellation is not rollback. Supersession must prevent new predecessor
 dispatch and stale completion, while retaining uncertainty and successor
