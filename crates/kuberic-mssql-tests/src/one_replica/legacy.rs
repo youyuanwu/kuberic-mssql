@@ -175,6 +175,7 @@ mod tests {
                 environment: Vec::new(),
                 user: "mssql".to_owned(),
                 running: true,
+                started_at: "2026-01-01T00:00:00Z".to_owned(),
                 restart_policy: "no".to_owned(),
                 network_mode: "bridge".to_owned(),
                 network_names: Vec::new(),

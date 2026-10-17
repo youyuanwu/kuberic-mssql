@@ -164,15 +164,27 @@ pub(crate) async fn prepare<R: ProcessRunner>(
 }
 
 pub(crate) async fn provision<R: ProcessRunner>(
-    mut context: ProvisionContext<'_, R>,
+    context: ProvisionContext<'_, R>,
 ) -> Result<ProvisionedAvailabilityGroup, AvailabilityGroupError> {
+    provision_with_lease(context, None)
+        .await
+        .map(|(group, _)| group)
+}
+
+pub(crate) async fn provision_with_lease<R: ProcessRunner>(
+    mut context: ProvisionContext<'_, R>,
+    lease_seconds: Option<u32>,
+) -> Result<(ProvisionedAvailabilityGroup, StdInstant), AvailabilityGroupError> {
+    if lease_seconds == Some(0) {
+        return Err(AvailabilityGroupError::Intent);
+    }
     let formation_deadline = earlier(
         Instant::from_std(context.complete_deadline),
         Instant::now() + context.deadlines.availability_group,
     );
     let endpoint_evidence = prepare_endpoints_and_peers(&mut context, formation_deadline).await?;
 
-    create_and_join_group(&context, formation_deadline).await?;
+    let creation_ack = create_and_join_group(&context, formation_deadline, lease_seconds).await?;
     create_database(&context, formation_deadline).await?;
     verify_direct_read_connectivity(
         &DataContext {
@@ -187,7 +199,8 @@ pub(crate) async fn provision<R: ProcessRunner>(
     )
     .await
     .map_err(AvailabilityGroupError::Data)?;
-    finalize_topology(context, endpoint_evidence, formation_deadline).await
+    let group = finalize_topology(context, endpoint_evidence, formation_deadline).await?;
+    Ok((group, creation_ack))
 }
 
 pub(crate) async fn finalize_prepared<R: ProcessRunner>(
@@ -603,7 +616,8 @@ GRANT CONNECT ON ENDPOINT::[{endpoint}] TO [{login}];"#,
 async fn create_and_join_group<R: ProcessRunner>(
     context: &ProvisionContext<'_, R>,
     parent_deadline: Instant,
-) -> Result<(), AvailabilityGroupError> {
+    lease_seconds: Option<u32>,
+) -> Result<StdInstant, AvailabilityGroupError> {
     let group = availability_group_name(context.run);
     validated_identifier(&group).map_err(AvailabilityGroupError::Admin)?;
     let clauses = context
@@ -621,13 +635,16 @@ async fn create_and_join_group<R: ProcessRunner>(
         })
         .collect::<Vec<_>>()
         .join(",\n");
+    let lease_option = lease_seconds
+        .map(|seconds| format!(",\n    WRITE_LEASE_VALIDITY = {seconds}"))
+        .unwrap_or_default();
     let batch = format!(
         r#"
 SET NOCOUNT ON;
 CREATE AVAILABILITY GROUP [{group}]
 WITH (
     CLUSTER_TYPE = EXTERNAL,
-    REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 1
+    REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 1{lease_option}
 )
 FOR REPLICA ON
 {clauses};
@@ -635,6 +652,7 @@ ALTER AVAILABILITY GROUP [{group}] GRANT CREATE ANY DATABASE;"#
     );
     let mut primary = connect_admin(context, 0, "master", false, parent_deadline).await?;
     execute_admin(context, &mut primary, &batch, &[], parent_deadline).await?;
+    let creation_ack = StdInstant::now();
     drop(primary);
     for index in 1..3 {
         let mut secondary = connect_admin(context, index, "master", false, parent_deadline).await?;
@@ -652,7 +670,7 @@ ALTER AVAILABILITY GROUP [{group}] GRANT CREATE ANY DATABASE;"#
         )
         .await?;
     }
-    Ok(())
+    Ok(creation_ack)
 }
 
 async fn create_database<R: ProcessRunner>(

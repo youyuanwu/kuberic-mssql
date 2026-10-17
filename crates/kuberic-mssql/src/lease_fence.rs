@@ -3,7 +3,7 @@
 //! Times are monotonic durations from one runtime's origin. Native-effect
 //! horizons cover only this model's submissions, never other or prior actors.
 
-use std::{error::Error, fmt, time::Duration};
+use std::{error::Error, fmt, sync::Arc, time::Duration};
 
 use kuberic_runtime::protocol::types::Epoch;
 
@@ -223,12 +223,24 @@ impl NativeEffectHorizon {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseRequest {
+    session: LeaseSession,
     authority: LeaseAuthority,
     operation_id: OpaqueId,
     sequence: u64,
     submitted_at: Duration,
     accept_before: Duration,
 }
+
+#[derive(Debug, Clone)]
+struct LeaseSession(Arc<()>);
+
+impl PartialEq for LeaseSession {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for LeaseSession {}
 
 impl LeaseRequest {
     pub fn authority(&self) -> &LeaseAuthority {
@@ -257,6 +269,7 @@ struct PendingLease {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseModel {
+    session: LeaseSession,
     authority: LeaseAuthority,
     budget: LeaseBudget,
     last_time: Duration,
@@ -270,6 +283,7 @@ pub struct LeaseModel {
 impl LeaseModel {
     pub fn new(authority: LeaseAuthority, budget: LeaseBudget, now: Duration) -> Self {
         Self {
+            session: LeaseSession(Arc::new(())),
             authority,
             budget,
             last_time: now,
@@ -320,6 +334,7 @@ impl LeaseModel {
             None => NativeEffectHorizon::Unbounded,
         };
         let request = LeaseRequest {
+            session: self.session.clone(),
             authority: self.authority.clone(),
             operation_id,
             sequence,
@@ -339,6 +354,9 @@ impl LeaseModel {
 
     fn matching_pending(&self, request: &LeaseRequest) -> Result<&PendingLease, LeaseFenceError> {
         self.authority.matches(&request.authority)?;
+        if self.session != request.session {
+            return Err(LeaseFenceError::OperationMismatch);
+        }
         let pending = self
             .pending
             .as_ref()

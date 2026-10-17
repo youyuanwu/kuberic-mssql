@@ -53,6 +53,9 @@ use super::tls::TlsAssets;
 
 const READINESS_RETRY: Duration = Duration::from_secs(2);
 
+mod lease;
+pub use lease::{FixtureFenceError, LeaseObservation, OwnedFenceRequest};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyMember {
     pub ordinal: u8,
@@ -273,40 +276,25 @@ impl LaunchedMembers {
     pub fn restart_sql_process_for_test(&mut self, index: usize) -> Result<u16, NativeLaunchError> {
         let member = self
             .members
+            .get_mut(index)
+            .ok_or(NativeLaunchError::Ownership)?;
+        if self
+            .context
+            .containers
             .get(index)
-            .ok_or(NativeLaunchError::Ownership)?;
-        let timeout = self
-            .context
-            .limit(self.context.config.deadlines().docker_command)?;
-        self.context
-            .docker
-            .stop_container(&member.container_id, timeout)
-            .map_err(NativeLaunchError::Docker)?;
-        let timeout = self
-            .context
-            .limit(self.context.config.deadlines().docker_command)?;
-        self.context
-            .docker
-            .start_container(&member.container_id, timeout)
-            .map_err(NativeLaunchError::Docker)?;
-        let inspection = self
-            .context
-            .docker
-            .inspect_container(
-                &member.container_id,
-                self.context
-                    .limit(self.context.config.deadlines().docker_command)?,
-            )
-            .map_err(NativeLaunchError::Docker)?
-            .ok_or(NativeLaunchError::Ownership)?;
-        let host_port = inspection
-            .ports
-            .iter()
-            .find(|port| port.container_port == 1433 && port.host_ip == "127.0.0.1")
-            .map(|port| port.host_port)
-            .ok_or(NativeLaunchError::Readiness)?;
-        self.members[index].host_port = host_port;
-        Ok(host_port)
+            .and_then(|owned| owned.id.as_deref())
+            != Some(member.container_id.as_str())
+        {
+            return Err(NativeLaunchError::Ownership);
+        }
+        lease::restart_owned_member(
+            &self.context.docker,
+            member,
+            &self.context.store,
+            &mut self.context.journal,
+            self.context.deadline,
+            self.context.config.deadlines().docker_command,
+        )
     }
 
     pub async fn provision_native_topology(&mut self) -> Result<NativeDataProof, NativePhaseError> {
@@ -2935,6 +2923,7 @@ mod tests {
                 .collect(),
             user: "mssql".to_owned(),
             running,
+            started_at: "2026-01-01T00:00:00Z".to_owned(),
             restart_policy: "no".to_owned(),
             network_mode: request.network_name.clone(),
             network_names: vec![request.network_name.clone()],
@@ -3085,6 +3074,7 @@ mod tests {
                 .collect(),
             user: "mssql".to_owned(),
             running: false,
+            started_at: "2026-01-01T00:00:00Z".to_owned(),
             restart_policy: "no".to_owned(),
             network_mode: request.network_name.clone(),
             network_names: vec![request.network_name.clone()],

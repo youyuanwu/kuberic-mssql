@@ -357,6 +357,27 @@ fn native_observation_loss_and_controller_restart_do_not_prove_global_expiry() {
 }
 
 #[test]
+fn a_fresh_model_rejects_predecessor_response_even_when_request_values_are_reused() {
+    let mut predecessor = model();
+    let stale = predecessor
+        .begin(operation("reused"), 1, seconds(0))
+        .unwrap();
+    let mut successor = model();
+    let current = successor.begin(operation("reused"), 1, seconds(0)).unwrap();
+    let before = at(successor.clone(), seconds(1));
+    assert_eq!(
+        successor.acknowledge(&stale, seconds(1)),
+        Err(LeaseFenceError::OperationMismatch)
+    );
+    assert_eq!(successor, before);
+    assert_eq!(
+        predecessor.native_effect_horizon(),
+        NativeEffectHorizon::Unbounded
+    );
+    successor.acknowledge(&current, seconds(1)).unwrap();
+}
+
+#[test]
 fn every_zero_timing_component_and_insufficient_coverage_is_rejected() {
     let mut candidate = timing();
     candidate.native_application = Some(Duration::ZERO);
