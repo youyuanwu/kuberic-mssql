@@ -198,6 +198,14 @@ callbacks for data-bearing admission; unavailable capability remains
 unproven postcondition. A conservative current-only capability is not by itself
 evidence of unsafe replication, but is not a retained-history proof.
 
+The [native evidence assessment](kuberic-progress.md#native-evidence-feasibility)
+records six separate obligations and their missing proofs. Existing exact
+decimal and same-field/lineage comparison support is not a commitment,
+contiguous-prefix or retained-range certificate. The first bounded native
+investigation is [acknowledged-record coverage](kuberic-progress.md#first-native-proof-toward-switchover)
+on the exact selected successor, not a new scalar projection. Its result is
+still unproven; no runtime mapping or switchover authority is enabled.
+
 `SqlServerReplicator::native_configuration_sequence` now exposes the existing
 validated native read as an optional `ConfigurationSequence`, independently of
 the public scalar projection. It does not establish public membership,
@@ -210,6 +218,14 @@ that report field. The [source-backed reporting/history blockers](kuberic-progre
 must be resolved alongside the native/public history model, not concealed with
 a dummy provider or fabricated progress. This additive separation is not full
 semantic conformance.
+
+The upstream [SF V1 alignment plan](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/sf-v1-semantic-alignment-plan.md#L35-L84)
+distinguishes native queue commitment/receipt and catch-up capture rules from
+the selected local Kuberic definitions. Its report/consumer correction is
+future work, not a reason to reinterpret the current report fields. Built-in
+snapshot-prefix proofs are likewise not inherited by the custom SQL adapter;
+see the [implementation boundaries](kuberic-progress.md#upstream-reporting-and-history-blockers).
+Application-facing traits remain fixed throughout that upstream alignment.
 
 Native cancellation is not rollback. Supersession must prevent new predecessor
 dispatch and stale completion, while retaining uncertainty and successor

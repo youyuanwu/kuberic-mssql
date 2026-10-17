@@ -49,6 +49,12 @@ expanded for this work.
 
 Planned work:
 
+- first prove [same-history acknowledged-record coverage](kuberic-progress.md#first-native-proof-toward-switchover):
+  identify a supported acknowledged primary commit boundary and show the exact
+  selected successor's local durable prefix covers it, independently of redo.
+  Specify record/block boundary semantics and unavailable/incompatible evidence
+  before implementing a public mapping. Any licensed experiment or workload
+  activity requires separate authorization; one witness is not full conformance;
 - establish the public progress/history model for primary committed progress,
   secondary contiguous durable progress, access-closed recovery, and retained
   catch-up capability, including restart, history changes and unavailable
@@ -73,6 +79,11 @@ Planned work:
   public `ReplicaHost` operations, not only direct test-only callbacks; and
 - verify upstream host/planner conformance, recording any unresolved blockers
   from Kuberic's Service Fabric audit rather than copying example behavior.
+  Follow its [native SF V1 alignment plan](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/sf-v1-semantic-alignment-plan.md#L240-L266)
+  for coherent report/consumer changes through the fixed application APIs;
+  keep current local requirements distinct from the future native target.
+  Built-in snapshot-prefix proof fixes do not supply native SQL progress,
+  retained capability or the adapter's currently rejected catch-up callbacks.
 
 Exit criteria:
 

@@ -115,12 +115,99 @@ scalar callbacks; a conforming progress/history model remains a design blocker.
 
 ## Semantic Conformance Boundary
 
-Kuberic's SF-shaped traits require primary quorum-committed progress, secondary
+The selected Kuberic traits require primary quorum-committed progress, secondary
 contiguous durable progress, access-closed recovery evidence, and a retained
 catch-up floor or `INVALID_LSN` for unknown/inapplicable capability. AG
 configuration sequence does not establish those data-progress postconditions.
 The public traits remain unchanged; MSSQL must align its supported behavior
 rather than redefine their meaning.
+
+### Native evidence feasibility
+
+**Decision:** the existing observations support identity-checked native evidence,
+not a conforming public progress/history mapping. No new scalar or catch-up
+success is justified yet. This is a missing-proof boundary, not a conclusion
+that SQL Server or the fixed application interfaces make such a mapping impossible.
+
+The observer preserves exact decimal positions and distinguishes local rows from
+primary-reported remote rows. Remote progress does not acquire the primary's
+local recovery-fork identity
+([observation.rs:873-985](../crates/kuberic-mssql/src/observation.rs#L873-L985)).
+The existing comparison helper orders only present values of the same field,
+database and recovery fork; missing values remain unavailable and incompatible
+fields/lineages are nonorderable
+([types.rs:535-608](../crates/kuberic-mssql/src/types.rs#L535-L608)).
+Neither helper proves freshness, quorum commitment, complete-prefix coverage,
+unique storage ownership or retained transfer capability.
+
+| Obligation | Available evidence and scope | Decision and missing proof |
+|---|---|---|
+| Primary committed progress | Primary-local commit-record observation, synchronous policy and commit participation, scoped to the exact AG/database/fork and current authority. | **Unproven.** A last processed commit and required synchronous replica count do not identify an exact acknowledged boundary for the applicable public configurations and selected successor. |
+| Secondary contiguous durable progress | Target-local hardened-block, redone-record and redone-commit observations, with local lineage and SQL incarnation. | **Unproven.** A supported record-to-durable-prefix coverage rule is needed; block hardening, record redo and commit redo are not interchangeable. Primary-reported remote values are not fresh target-local proof. |
+| Access-closed recovery progress | SQL start, database/recovery identity and available local positions; recovery metadata can be unavailable. | **Unproven.** Access-closed compatibility reports do not establish a recovered durable prefix. Missing or terminal evidence must not become an empty history or an access grant. |
+| History continuity | Database/family/recovery-fork identities, fork point, public storage/session authority and existing immutable runtime binding. | **Unproven.** Bind recovered native prefix to accepted public history across restart, replacement and forks. Matching GUIDs or public history IDs alone do not prove continuity or unique ownership. |
+| Retained catch-up capability | Current positions and seed evidence; no native retained-transfer range is collected. | **Unavailable as a retained floor.** Prove that a source retains a complete required range and can transfer it to the exact admitted peer despite truncation/restart. A current tail or completed seed is not that proof. |
+| Configuration and required-successor catch-up | Exact three-replica topology and target-local seed/synchronization observations. | **Unsupported callbacks.** Both catch-up configuration and quorum waits reject. Count-one synchronous commitment does not prove coverage by a specifically marked successor or the applicable current/previous public configurations. |
+
+The raw query and identity bindings are in
+[query.rs:296-334](../crates/kuberic-mssql/src/query.rs#L296-L334) and
+[kuberic.rs:506-542](../crates/kuberic-mssql/src/kuberic.rs#L506-L542).
+The [current callback implementations](../crates/kuberic-mssql/src/kuberic.rs#L4710-L4811)
+still project AG sequence and reject catch-up; the matrix does not change them.
+Current-configuration admission supports a constrained topology/bootstrap path,
+not arbitrary changing current/previous configurations
+([kuberic.rs:4813-5013](../crates/kuberic-mssql/src/kuberic.rs#L4813-L5013)).
+
+Microsoft's [database-replica DMV documentation](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-objects/sys-dm-hadr-database-replica-states-transact-sql?view=sql-server-ver17)
+qualifies these observations: primary remote rows may be out of date;
+`last_commit_lsn` is the last commit processed on a primary and the last commit
+redone on a secondary. `last_hardened_lsn` is a padded block value, not a record
+LSN; on a synchronous primary it can describe the minimum secondary hardening
+rather than the local durable tail. The explanatory flush boundary covers
+records strictly below it, so equality or an invented subtract-one conversion
+is not a demonstrated coverage test. The DMV's `quorum_commit_lsn` and
+`quorum_commit_time` are explicitly unsupported informational fields, not a
+supported shortcut.
+
+[Synchronous commit](https://learn.microsoft.com/en-us/sql/database-engine/availability-groups/windows/availability-modes-always-on-availability-groups?view=sql-server-ver17)
+uses log-hardening acknowledgements, independently of redo.
+[Recovery metadata](https://learn.microsoft.com/en-us/sql/relational-databases/system-catalog-views/sys-database-recovery-status-transact-sql?view=sql-server-ver17)
+can be unavailable, and database GUIDs can be duplicated by copy/attach.
+[Log start/end diagnostics](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-objects/sys-dm-db-log-stats-transact-sql?view=sql-server-ver17)
+are potential source-retention inputs, not a peer-transfer guarantee; the
+documented secondary result is limited. These vendor descriptions are not
+build-specific live proof. An exact bounded scalar representation would still
+need supported ordering, history and recovery semantics; numeric width alone
+does not decide feasibility.
+
+### First native proof toward switchover
+
+The next bounded investigation is **same-history acknowledged-record coverage**:
+can a supported native mechanism identify one primary acknowledged durable
+commit record and establish that the exact selected successor's local durable
+contiguous prefix covers it?
+
+This experiment is future work requiring separately authorized licensed fixtures
+and workload activity; no new native coverage result is claimed here.
+
+1. Establish the supported link between an acknowledged transaction and the
+   sampled primary record boundary. Bind direct primary/target observations to
+   exact AG/database/family/fork, native replica/SQL start, and public
+   configuration/storage/session authority. If that link cannot be established,
+   record the missing evidence rather than infer it from a DMV column name.
+2. Establish precise record/block coverage semantics. Demonstrate covered and
+   not-yet-covered target cases, including hardening with redo still behind.
+   Record quiet/no-write observations too; do not manufacture a log operation
+   to make an observation comparable.
+3. Require unavailable/nonorderable/error outcomes for missing, stale or
+   future-dated evidence, remote-only or incompatible lineage, and replaced
+   process/storage or superseded authority. Preserve raw values and the limits
+   of the observation bracket rather than claiming an atomic snapshot.
+
+One successful witness would prove only that sampled coverage. It would not
+establish a highest public progress scalar, a retained floor, restart
+continuity, arbitrary configuration catch-up, or safe switchover. Those remain
+separate gates, alongside SQL access, lease/fence and role-transition authority.
 
 ### Upstream reporting and history blockers
 
@@ -130,9 +217,9 @@ dependency pin:
 
 | Boundary | Current constraint |
 |---|---|
-| [Registered host reporting](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/hosting.rs#L637-L688) | Status/report construction requires successful custom `current_progress`. Returning an unsupported-progress error would also disable existing registered-host report-dependent bootstrap/restart journeys. |
-| [Provider-free report projection](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/hosting.rs#L644-L687) | The host synthesizes `first = 0` without a provider, or uses provider committed progress otherwise. It does not query custom `catch_up_capability` for that field. Returning `INVALID_LSN` from capability alone would not fix the report. |
-| [Completed progress validation](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/protocol/public_operations.rs#L2162-L2194) | A completed report needs nonnegative ordered endpoints; it cannot express unknown progress with `INVALID_LSN`. Peer descriptors allowing unknown values do not relax this requirement. |
+| [Registered host reporting](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/hosting.rs#L62-L83) | Status/report construction requires successful custom `current_progress`. Returning an unsupported-progress error would also disable existing registered-host report-dependent bootstrap/restart journeys. |
+| [Provider-free report projection](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/hosting.rs#L665-L712) | The host synthesizes `first = 0` without a provider, or uses provider committed progress otherwise. It does not query custom `catch_up_capability` for that field. Returning `INVALID_LSN` from capability alone would not fix the report. |
+| [Completed progress validation](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/protocol/public_operations.rs#L2168-L2195) | A completed report needs nonnegative ordered endpoints; it cannot express unknown progress with `INVALID_LSN`. Peer descriptors allowing unknown values do not relax this requirement. |
 | [Public history consumers](https://github.com/youyuanwu/kuberic/blob/main/kuberic-controller/src/evaluator/public_v1_topology.rs) | Candidate selection compares report tails within accepted public history; retained rejoin uses history, storage/session/completion evidence, and report endpoints. Peer descriptors receive report `last` as current progress and `first` as capability. These are not Microsoft's native AG-sequence/quorum/failover protocol. |
 
 The remaining adapter obligation is to establish how SQL-native evidence
@@ -140,6 +227,22 @@ corresponds to public history, role-specific durable progress, recovery-only
 election evidence, and retained catch-up coverage across restart/history changes.
 No conforming mapping is established by an AG sequence or by fitting a database
 position into `i64`. A wider integer alone would not resolve these semantics.
+
+The built-in engine's [completed-copy prefix proof](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/replicator/stateless/mod.rs#L1625-L1764)
+handles quiet snapshot catch-up using exact live build/storage/session evidence.
+MSSQL registers a custom replicator without a StateProvider or StateReplicator
+([kuberic.rs:925-932](../crates/kuberic-mssql/src/kuberic.rs#L925-L932),
+[kuberic.rs:1007-1039](../crates/kuberic-mssql/src/kuberic.rs#L1007-L1039));
+it does not inherit that proof or gain native prefix/catch-up support from it.
+
+The upstream [SF V1 semantic-alignment plan](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/sf-v1-semantic-alignment-plan.md#L35-L84)
+also distinguishes native SF queue semantics from the current local durability
+and catch-up definitions. Its [reporting work](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/sf-v1-semantic-alignment-plan.md#L240-L266)
+calls for a coherent report/consumer correction rather than reinterpreting the
+two existing integers in place. This is a future port plan, not an implemented
+custom-adapter fix. Assess the selected contract and eventual native target
+separately; neither certifies MSSQL's missing native evidence or permits an
+application trait expansion.
 
 For now, hosted scalar values and report journeys remain deliberately unchanged
 compatibility behavior. This is a known semantic gap, not a successful
