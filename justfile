@@ -69,6 +69,14 @@ test-live-three-replica root="target/mssql-three-replica":
         CARGO_BUILD_JOBS=1 \
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_happy_path -- --ignored --exact --test-threads=1
 
+# Collect acknowledged-transaction/native-record evidence; coverage can remain explicitly blocked.
+test-live-native-commit-coverage root="target/mssql-native-commit-coverage":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
+        three_replica_mssql_native_commit_coverage -- --ignored --exact --test-threads=1 --nocapture
+
 # Validate same-root replacement of all three public Kuberic hosts.
 test-live-three-replica-restart root="target/mssql-three-replica-restart":
     env -u SQLSERVER_TEST_EULA_ACCEPTED \

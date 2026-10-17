@@ -1,4 +1,5 @@
 mod availability_group;
+mod commit_coverage;
 mod data;
 mod evidence;
 mod kuberic_group;
@@ -26,6 +27,7 @@ pub use cleanup::{
     CleanupCoordinator, CleanupError, CleanupJournal, CleanupJournalStore, CleanupReport,
     HandledCancellationSignal, SystemCleanupClock, cleanup, combine_with_cleanup,
 };
+pub use commit_coverage::{CommitCoverageError, CommitCoverageReport};
 pub use config::{
     ACKNOWLEDGEMENT_SCHEMA_VERSION, AcknowledgementSource, FixtureConfig, FixtureConfigError,
     LaunchAuthorization, PINNED_SQL_SERVER_IMAGE, ResourcePolicy, StageDeadlines,
