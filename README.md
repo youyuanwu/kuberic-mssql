@@ -495,9 +495,18 @@ Run the exact dedicated command with an optional fixture root:
 ```bash
 just test-live-three-replica [root]
 just test-live-three-replica-restart [root]
+just test-live-native-commit-coverage [root]
 just test-live-lease-fence [root]
 just cleanup-live-lease-fence [root]
 ```
+
+The native commit-record recipe uses `target/mssql-native-commit-coverage` by
+default. It runs an ignored fixture-only transaction probe and emits raw
+before/after/quiet evidence. A passing collection run can report **blocked**
+coverage; it does not enable catch-up or switchover. See the
+[implemented probe and remaining proof gates](docs/kuberic-progress.md#first-native-proof-toward-switchover).
+Recover its exact owned resources, if needed, with
+`just cleanup-live-three-replica target/mssql-native-commit-coverage`.
 
 The lease/fence recipe uses separate `expiry` and `active-restart` scenario
 roots and verifies native lease behavior, cancelled-response uncertainty,

@@ -47,14 +47,23 @@ remains implemented; this follow-up does not replace its native evidence.
 Application-facing Kuberic/SF trait APIs are fixed and must not be changed or
 expanded for this work.
 
+The bounded [native commit-record probe](kuberic-progress.md#first-native-proof-toward-switchover)
+is implemented and has captured one exact transaction's numeric commit record
+followed by client ACK, with direct before/after/quiet native samples.
+Its result remains explicitly blocked for coverage: accepted public authority/
+history and selected-target durable-prefix evaluation are not implemented.
+Covered, not-yet-covered and hardening-with-redo-lag proof scenarios remain
+unexercised; record acquisition does not complete Stage 6A.
+
 Planned work:
 
 - first prove [same-history acknowledged-record coverage](kuberic-progress.md#first-native-proof-toward-switchover):
-  identify a supported acknowledged primary commit boundary and show the exact
-  selected successor's local durable prefix covers it, independently of redo.
-  Specify record/block boundary semantics and unavailable/incompatible evidence
-  before implementing a public mapping. Any licensed experiment or workload
-  activity requires separate authorization; one witness is not full conformance;
+  build on the bounded exact-transaction probe and show the selected successor's
+  local durable prefix covers the acknowledged record independently of redo.
+  Bind the supported record/block relationship to exact current native/public
+  history and authority before implementing a public mapping. Any new licensed
+  experiment or workload activity requires authorization; one witness is not
+  full conformance;
 - establish the public progress/history model for primary committed progress,
   secondary contiguous durable progress, access-closed recovery, and retained
   catch-up capability, including restart, history changes and unavailable

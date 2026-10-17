@@ -142,8 +142,8 @@ unique storage ownership or retained transfer capability.
 
 | Obligation | Available evidence and scope | Decision and missing proof |
 |---|---|---|
-| Primary committed progress | Primary-local commit-record observation, synchronous policy and commit participation, scoped to the exact AG/database/fork and current authority. | **Unproven.** A last processed commit and required synchronous replica count do not identify an exact acknowledged boundary for the applicable public configurations and selected successor. |
-| Secondary contiguous durable progress | Target-local hardened-block, redone-record and redone-commit observations, with local lineage and SQL incarnation. | **Unproven.** A supported record-to-durable-prefix coverage rule is needed; block hardening, record redo and commit redo are not interchangeable. Primary-reported remote values are not fresh target-local proof. |
+| Primary committed progress | Primary-local aggregate commit observation, synchronous policy and commit participation; a fixture-only exact-transaction numeric commit-record probe. | **Public progress unproven.** The bounded experiment captured one transaction's commit record and subsequent ACK, not a highest quorum-committed public boundary for the applicable configurations and selected successor. |
+| Secondary contiguous durable progress | Target-local hardened-block, redone-record and redone-commit observations, with local lineage and SQL incarnation; a documented exclusive flush-prefix rule. | **Coverage not evaluated.** Apply the supported record/prefix relationship under exact current history/authority before asserting coverage; block hardening, record redo and commit redo are not interchangeable. Primary-reported remote values are not fresh target-local proof. |
 | Access-closed recovery progress | SQL start, database/recovery identity and available local positions; recovery metadata can be unavailable. | **Unproven.** Access-closed compatibility reports do not establish a recovered durable prefix. Missing or terminal evidence must not become an empty history or an access grant. |
 | History continuity | Database/family/recovery-fork identities, fork point, public storage/session authority and existing immutable runtime binding. | **Unproven.** Bind recovered native prefix to accepted public history across restart, replacement and forks. Matching GUIDs or public history IDs alone do not prove continuity or unique ownership. |
 | Retained catch-up capability | Current positions and seed evidence; no native retained-transfer range is collected. | **Unavailable as a retained floor.** Prove that a source retains a complete required range and can transfer it to the exact admitted peer despite truncation/restart. A current tail or completed seed is not that proof. |
@@ -182,27 +182,72 @@ does not decide feasibility.
 
 ### First native proof toward switchover
 
-The next bounded investigation is **same-history acknowledged-record coverage**:
-can a supported native mechanism identify one primary acknowledged durable
-commit record and establish that the exact selected successor's local durable
-contiguous prefix covers it?
+The fixture-only **native commit-record probe is implemented**. Record
+acquisition has been demonstrated; same-history acknowledged-record coverage
+by the selected successor is **not certified**.
 
-This experiment is future work requiring separately authorized licensed fixtures
-and workload activity; no new native coverage result is claimed here.
+On an explicitly authorized, qualified licensed fixture host, run:
 
-1. Establish the supported link between an acknowledged transaction and the
-   sampled primary record boundary. Bind direct primary/target observations to
-   exact AG/database/family/fork, native replica/SQL start, and public
-   configuration/storage/session authority. If that link cannot be established,
-   record the missing evidence rather than infer it from a DMV column name.
-2. Establish precise record/block coverage semantics. Demonstrate covered and
-   not-yet-covered target cases, including hardening with redo still behind.
-   Record quiet/no-write observations too; do not manufacture a log operation
-   to make an observation comparable.
-3. Require unavailable/nonorderable/error outcomes for missing, stale or
-   future-dated evidence, remote-only or incompatible lineage, and replaced
-   process/storage or superseded authority. Preserve raw values and the limits
-   of the observation bracket rather than claiming an atomic snapshot.
+```bash
+just test-live-native-commit-coverage
+# Recover only this experiment's exactly journaled resources if interrupted:
+just cleanup-live-three-replica target/mssql-native-commit-coverage
+```
+
+The exact test remains ignored by default
+([live_three_replica.rs:80-127](../crates/kuberic-mssql-tests/tests/live_three_replica.rs#L80-L127)).
+It launches only owned disposable replicas through existing license/resource
+preflight, inserts one parameterized marker, captures its transaction/database
+ID inside the transaction, and samples
+[`database_transaction_commit_lsn`](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-objects/sys-dm-tran-database-transactions-transact-sql?view=sql-server-ver17)
+on a second primary connection around COMMIT. Effective delayed durability
+must be disabled. The field identifies that transaction's commit log record;
+an aggregate primary `last_commit_lsn` is not substituted for it.
+
+The report preserves exact decimal positions, transaction state, ACK timing,
+and raw direct native snapshots of all three members before, after ACK and in
+a quiet phase with no additional experiment workload write
+([commit_coverage.rs:28-98](../crates/kuberic-mssql-tests/src/three_replica/commit_coverage.rs#L28-L98)).
+Owned container/image, SQL start, AG/configuration, replica/database/family/fork,
+local provenance and freshness checks bracket collection. These independent
+observations are not an atomic snapshot or proof against change-and-revert.
+Normal completion, failures, caught panic and handled signals use the existing
+bounded consuming cleanup; a dropped SQL connection is not certified rollback.
+
+**Measured result:** an authorized three-replica run captured the exact matching
+transaction's nonzero numeric commit LSN in state 12 (being committed), followed
+by successful client ACK. Nineteen collection attempts included one before
+COMMIT, sixteen overlapping it and two after ACK. The post-ACK rows were absent:
+the run demonstrates a usable collection window, not deterministic retention
+of completed transaction rows. Quiet collection completed without another
+marker INSERT. No replication suspension or redo-blocking control ran.
+
+Output is structured JSON through the test harness with `--nocapture`.
+`record_probe.status` distinguishes `observed` from
+`not_observed_in_bounded_window`; successful queries without a usable row are
+a collection limit, not proof that SQL Server has no supported mechanism.
+SQL/transport/parsing/deadline/output/cleanup failures remain test failures.
+Even when the record is observed, `coverage.status` is **`blocked`**:
+the native-only fixture does not collect accepted public configuration/storage/
+session authority or native/public history mapping, and does not evaluate
+selected-target durable-prefix coverage
+([commit_coverage.rs:759-791](../crates/kuberic-mssql-tests/src/three_replica/commit_coverage.rs#L759-L791)).
+A passing collection harness is not a passing coverage gate.
+
+Remaining work:
+
+1. Establish an executable acknowledged-record/selected-target durable-prefix
+   relationship under exact current native and public history/authority.
+   Microsoft's explanatory strict `record < local hardened boundary` rule is
+   documented above; this probe does not apply it as a coverage predicate.
+   Do not invent public sessions/storage generations from native fixture IDs.
+2. Demonstrate covered and not-yet-covered cases and hardening with redo still
+   behind. All three are explicitly `not_exercised` in this report. Any new
+   fixture control requires its own design/safety review and live authorization.
+3. Extend proof rejection to replaced public storage/session and superseded
+   authority when those domains are actually collected. The implemented native
+   guards reject missing, stale/future, remote-only or incompatible samples,
+   not public authority they never observed.
 
 One successful witness would prove only that sampled coverage. It would not
 establish a highest public progress scalar, a retained floor, restart
