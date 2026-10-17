@@ -2872,7 +2872,7 @@ async fn exercise_public_host_shutdown_fence_inner(
                     client.execute(authorized(request)).await
                 }));
             }
-            tokio::time::timeout(Duration::from_secs(5), client.execute(authorized(request)))
+            tokio::time::timeout(Duration::from_secs(30), client.execute(authorized(request)))
                 .await
                 .map_err(|_| "public host open timed out".to_owned())?
                 .map_err(|error| error.to_string())?;

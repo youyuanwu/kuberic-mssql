@@ -65,6 +65,31 @@ struct RepeatingSource {
     config: kuberic_mssql::runtime_config::ObserverConfig,
     samples: Mutex<VecDeque<InstanceSnapshot>>,
     fallback: InstanceSnapshot,
+    gate: Mutex<Option<ObservationGate>>,
+}
+
+struct ObservationGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl RepeatingSource {
+    fn gate_next_observation(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered, held) = tokio::sync::oneshot::channel();
+        let (release, resumed) = tokio::sync::oneshot::channel();
+        let mut gate = self.gate.lock().unwrap();
+        assert!(gate.is_none());
+        *gate = Some(ObservationGate {
+            entered,
+            release: resumed,
+        });
+        (held, release)
+    }
 }
 
 #[async_trait]
@@ -80,6 +105,13 @@ impl SqlServerObservationSource for RepeatingSource {
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| self.fallback.clone());
+        let gate = self.gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.entered.send(()).unwrap();
+            gate.release
+                .await
+                .expect("the test must release its held observation");
+        }
         Ok(Observation::Present {
             value,
             observed_at_unix_millis: OBSERVED_AT,
@@ -100,6 +132,7 @@ struct HostAttempt {
     replication: SocketAddr,
     application_root: PathBuf,
     application: Arc<RuntimeHostApplication>,
+    source: Arc<RepeatingSource>,
     task: tokio::task::JoinHandle<kuberic_runtime::host::Result<RunningReplica>>,
 }
 
@@ -395,10 +428,15 @@ async fn start_attempts(root: &Path) -> Vec<HostAttempt> {
             config: config.observer().clone(),
             samples: Mutex::new(VecDeque::new()),
             fallback: snapshot(index),
+            gate: Mutex::new(None),
         });
         let application = Arc::new(
-            RuntimeHostApplication::with_observation_source(&config, source, Arc::new(FixedClock))
-                .unwrap(),
+            RuntimeHostApplication::with_observation_source(
+                &config,
+                source.clone(),
+                Arc::new(FixedClock),
+            )
+            .unwrap(),
         );
         let application_root = config.application_root().to_owned();
         let host = ReplicaHost::new(
@@ -416,6 +454,7 @@ async fn start_attempts(root: &Path) -> Vec<HostAttempt> {
             replication: replications[index],
             application_root,
             application,
+            source,
             task: tokio::spawn(host.start(control_listener)),
         });
     }
@@ -585,12 +624,17 @@ fn program_intent(
     revision: u64,
     program: PublicOperationProgram,
 ) -> PublicOperationIntent {
+    let class = match program {
+        PublicOperationProgram::Close => PublicOperationClass::Close,
+        PublicOperationProgram::Abort => PublicOperationClass::Abort,
+        _ => PublicOperationClass::Authority,
+    };
     PublicOperationIntent {
         identity: report.identity.clone(),
         operation_id: OperationId::new(operation_id.into()),
         revision,
         process_session_id: report.process_session_id.clone(),
-        class: PublicOperationClass::Authority,
+        class,
         input_digest: program.digest(),
         replay_disposition: program.replay_disposition(),
         lifecycle: None,
@@ -1102,6 +1146,159 @@ async fn service_close_cancellation_retains_actual_hosted_replicator_case() {
     stop_all(&mut replicas).await;
 }
 
+async fn public_epoch_and_same_role_commands_fence_actual_adapter_work_case() {
+    let temporary = tempfile::tempdir().unwrap();
+    let mut attempts = start_attempts(temporary.path()).await;
+    let (mut replicas, _, _) = initialize_attempts(&mut attempts).await;
+    let replicator = attempts[0].application.testing_replicator().unwrap();
+    for (revision, program, retired, kind) in [
+        (
+            4,
+            PublicOperationProgram::Epoch {
+                epoch: Epoch::new(0, 43),
+            },
+            true,
+            wire::PublicV1CallKind::Epoch,
+        ),
+        (
+            5,
+            PublicOperationProgram::Role {
+                epoch: Epoch::new(0, 44),
+                role: ReplicaRole::Primary,
+            },
+            true,
+            wire::PublicV1CallKind::Role,
+        ),
+        (
+            6,
+            PublicOperationProgram::Epoch {
+                epoch: Epoch::new(0, 44),
+            },
+            false,
+            wire::PublicV1CallKind::Epoch,
+        ),
+    ] {
+        let (mut client, before) = status(attempts[0].control, 1).await;
+        let before = public_report(&before);
+        let operation_id = format!("hosted-authority-{revision}");
+        let request = public_operation_request(
+            0,
+            &before,
+            program_intent(&before, &operation_id, revision, program),
+        );
+        let (entered, release) = attempts[0].source.gate_next_observation();
+        let callback = tokio::spawn({
+            let replicator = replicator.clone();
+            async move { replicator.current_progress().await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), client.execute(authorized(request)))
+            .await
+            .unwrap()
+            .unwrap();
+        if retired {
+            let result = tokio::time::timeout(Duration::from_secs(5), callback)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(result, Err(KubericRuntimeError::Closed)));
+            assert!(release.send(()).is_err());
+        } else {
+            assert!(!callback.is_finished());
+            release.send(()).unwrap();
+            assert_eq!(callback.await.unwrap().unwrap(), 42);
+        }
+        let (_, after) = status(attempts[0].control, 1).await;
+        assert!(completed_success(
+            after.public_v1.as_ref().unwrap(),
+            &operation_id,
+            revision,
+            kind
+        ));
+        assert_eq!(replicator.current_progress().await.unwrap(), 42);
+    }
+    stop_all(&mut replicas).await;
+}
+
+async fn public_close_waits_for_actual_adapter_callback_drain_case() {
+    let temporary = tempfile::tempdir().unwrap();
+    let mut attempts = start_attempts(temporary.path()).await;
+    let (mut replicas, _, _) = initialize_attempts(&mut attempts).await;
+    let application = attempts[0].application.clone();
+    let replicator = application.testing_replicator().unwrap();
+    let (mut client, before) = status(attempts[0].control, 1).await;
+    let before = public_report(&before);
+    let request = public_operation_request(
+        0,
+        &before,
+        program_intent(
+            &before,
+            "hosted-local-close",
+            4,
+            PublicOperationProgram::Close,
+        ),
+    );
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    replicator
+        .testing_gate_lifecycle_publication(entered_tx, release_rx)
+        .unwrap();
+    let callback = std::thread::spawn({
+        let replicator = replicator.clone();
+        move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(replicator.current_progress())
+        }
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut close = tokio::spawn(async move { client.execute(authorized(request)).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                replicator.current_progress().await,
+                Err(KubericRuntimeError::Closed)
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the actual public Close must fence the adapter");
+    assert!(application.testing_replicator().is_some());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut close)
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), replicator.wait_for_containment())
+            .await
+            .is_err()
+    );
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        callback.join().unwrap(),
+        Err(KubericRuntimeError::Closed)
+    ));
+    let error = tokio::time::timeout(Duration::from_secs(5), close)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert!(error.message().contains("closed"));
+    assert!(application.testing_replicator().is_none());
+    application.wait_for_containment().await.unwrap();
+    stop_all(&mut replicas).await;
+}
+
 async fn retained_dispatch_survives_runtime_restart_as_historical_session_evidence_case() {
     let temporary = tempfile::tempdir().unwrap();
     let mut first_attempts = start_attempts(temporary.path()).await;
@@ -1178,6 +1375,7 @@ async fn application_binding_without_agent_metadata_is_reported_unsafe_case() {
         config: config.observer().clone(),
         samples: Mutex::new(VecDeque::new()),
         fallback: snapshot(0),
+        gate: Mutex::new(None),
     });
     let application = Arc::new(
         RuntimeHostApplication::with_observation_source(&config, source, Arc::new(FixedClock))
@@ -1246,6 +1444,7 @@ async fn established_public_host_rejects_changed_application_path_and_topology_c
         config: moved_config.observer().clone(),
         samples: Mutex::new(VecDeque::new()),
         fallback: snapshot(0),
+        gate: Mutex::new(None),
     });
     let moved_application = Arc::new(
         RuntimeHostApplication::with_observation_source(
@@ -1294,6 +1493,7 @@ async fn established_public_host_rejects_changed_application_path_and_topology_c
         config: changed_config.observer().clone(),
         samples: Mutex::new(VecDeque::new()),
         fallback: snapshot(0),
+        gate: Mutex::new(None),
     });
     let changed_application = RuntimeHostApplication::with_observation_source(
         &changed_config,
@@ -1318,6 +1518,16 @@ fn public_hosts_initialize_report_and_restart_with_fresh_sessions() {
 #[test]
 fn service_close_cancellation_retains_actual_hosted_replicator() {
     run_host_test(service_close_cancellation_retains_actual_hosted_replicator_case);
+}
+
+#[test]
+fn public_epoch_and_same_role_commands_fence_actual_adapter_work() {
+    run_host_test(public_epoch_and_same_role_commands_fence_actual_adapter_work_case);
+}
+
+#[test]
+fn public_close_waits_for_actual_adapter_callback_drain() {
+    run_host_test(public_close_waits_for_actual_adapter_callback_drain_case);
 }
 
 #[test]
