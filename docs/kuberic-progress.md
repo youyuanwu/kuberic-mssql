@@ -303,7 +303,8 @@ The record-only command/report above remains unchanged.
 
 Remaining live/public work:
 
-1. Extend the offline hosted association below to a licensed live native witness.
+1. Execute the ignored live hosted harness below under separate authorization;
+   its implementation and server-free checks are not a licensed live witness.
    Do not manufacture accepted public authority or history semantics from
    fixture labels, phase admissions or matching numeric values.
 2. Demonstrate hardening with redo still behind; that live proof remains
@@ -328,7 +329,7 @@ completion ID/revision/kind, digest/replay, configuration identity and accepted
 history/storage. Actual reports retain process session, creation identity,
 Pod/PVC storage generation and public history; an old successful completion is
 not treated as a current-configuration oracle
-([native_authority.rs:167-324](../crates/kuberic-mssql-tests/tests/runtime_process_host/native_authority.rs#L167-L324)).
+([hosted_authority.rs:224-382](../crates/kuberic-mssql-tests/src/three_replica/hosted_authority.rs#L224-L382)).
 
 The observe-only adapter accepts a secondary configuration containing exactly
 its two complete remote descriptions. Its own identity/session/address comes
@@ -344,7 +345,7 @@ cannot replace that baseline. Local DBIDs/GUIDs may legitimately differ between
 members. The native facade reuses the existing exact prefix/phase evaluators
 and rejects future transitions, a same-phase transaction predating initial
 admission, or final observations predating their admitted phase
-([hosted.rs:29-108](../crates/kuberic-mssql-tests/src/three_replica/commit_coverage/prefix/hosted.rs#L29-L108)).
+([hosted.rs:28-115](../crates/kuberic-mssql-tests/src/three_replica/commit_coverage/prefix/hosted.rs#L28-L115)).
 
 Collection has a 15-second bound. Its exclusively owned command stream brackets
 native collection with fresh same-source reports; command admission and result
@@ -353,7 +354,7 @@ Verified higher Epoch or same-role Role retires predecessor collection; equal
 and exact replay preserve the lifetime. Pending, timed-out, caller-cancelled,
 terminal or restarting authority cannot publish predecessor success. A later
 successful host receipt does not revive an unknown-outcome lifetime
-([native_authority.rs:607-750](../crates/kuberic-mssql-tests/tests/runtime_process_host/native_authority.rs#L607-L750)).
+([hosted_authority.rs:425-598](../crates/kuberic-mssql-tests/src/three_replica/hosted_authority.rs#L425-L598)).
 
 Run the diagnostic and focused secondary replay cases without SQL Server:
 
@@ -362,7 +363,7 @@ CARGO_BUILD_JOBS=1 cargo test --locked -p kuberic-mssql-tests \
   --test runtime_process_host native_authority -- --test-threads=1
 ```
 
-The tests inspect an in-memory serializable association with
+The offline journeys inspect an in-memory serializable association with
 `scope = offline_hosted_native_association`, `native_input = scripted_no_live_sql`
 and **`public_coverage.status = blocked`**. This is not a new fixture CLI or
 durable authority certificate. Actual hosted journeys cover epoch supersession,
@@ -377,6 +378,82 @@ ownership, prove new live SQL durability, or authorize catch-up/promotion.
 The licensed native-only commands/reports above are unchanged. Live hosted
 binding, redo-lag proof, public progress/retention, restart continuity and the
 reporting constraints below remain gates.
+
+#### Live hosted witness harness (not executed)
+
+An ignored live case now connects the existing **no-control** native commit
+collector to real observe-only `ReplicaHost` applications. It is implemented
+and compiled, with server-free regression coverage, but **has not been executed
+against SQL Server**. Existing native-only live proof does not satisfy this
+combined live gate.
+
+The live path preserves the primary's exact `InitialPrimary` input captured
+before dispatch and installs complete remote-only Configuration programs on
+both secondaries. It obtains real successful receipts, admitted adapter bindings
+and independent native database anchors from each owned SQL observation source.
+The raw `CommitCoverageReport` is collected inside the shared authority
+coordinator's fresh same-source public-report bracket, then adapted without
+changing its ACK, exact record, bindings or observation timestamps
+([hosted_witness.rs:31-222](../crates/kuberic-mssql-tests/src/three_replica/public_kuberic_group/hosted_witness.rs#L31-L222)).
+
+The result retains that original raw report under `native_collection` and its
+association under `association`, with `scope = live_hosted_native_association`
+and `native_input = live_owned_quiet_sql`. The original raw report's standalone
+blocked conclusion is not rewritten. Association **public coverage remains
+blocked** for progress/history mapping, retained capability, restart continuity
+and redo-lag proof. The ignored test requires `NativeSampledCoverage`:
+missing exact records/boundaries, equality, and outside-prefix results cannot
+pass. Row retention and a covered quiet sample are not guaranteed.
+
+Live publication refreshes the evaluation clock after final host reports,
+so those report requests cannot preserve stale native samples. The live
+collection allowance is bounded by the configured convergence timeout and
+remaining original fixture deadline, rather than the offline 15-second budget;
+RPC/anchor requests have five-second allowances. The existing transaction
+sub-budget remains 30 seconds. No fresh parent deadline, new SQL control,
+SUSPEND/RESUME or redo-lag workload is introduced
+([hosted_authority.rs:546-598](../crates/kuberic-mssql-tests/src/three_replica/hosted_authority.rs#L546-L598)).
+
+Host construction completes before the first spawn. An owned startup/shutdown
+guard retains pending tasks and already-started handles across cancellation
+or unwind. Both startup-result consumers preserve panicked/cancelled task and
+unconfirmed startup errors as termination-unconfirmed even when other hosts
+drain successfully. The live runner blocks fixture disposal on uncertain
+startup or shutdown; a retained waiter or MSSQL-local containment is not generic
+host termination confirmation. Successful output follows confirmed host
+shutdown and successful exact fixture teardown
+([startup.rs](../crates/kuberic-mssql-tests/src/three_replica/public_kuberic_group/startup.rs),
+[live runner](../crates/kuberic-mssql-tests/tests/live_three_replica/hosted_witness.rs)).
+
+Only after explicit licensed-execution authorization and the
+[three-replica fixture prerequisites](../README.md#three-replica-licensed-happy-path),
+select exactly this case:
+
+```bash
+KUBERIC_MSSQL_THREE_REPLICA_ROOT="$PWD/target/mssql-live-hosted-witness" \
+CARGO_BUILD_JOBS=1 cargo test --locked -p kuberic-mssql-tests \
+  --test live_three_replica hosted_witness::three_replica_mssql_live_hosted_native_witness \
+  -- --exact --ignored --nocapture --test-threads=1
+```
+
+The existing test-only fixture authorization accepts the SQL Server EULA for
+owned disposable containers; this is not authorization to run this new
+experiment or use borrowed deployments. The case remains ignored by default
+and outside `just ci`. It provisions via existing fixture APIs and observes
+through ordinary non-bootstrap hosts, not production SQL deployment behavior.
+A blocked disposal result retains ownership evidence and is not successful
+cleanup; resolve exact host ownership before using the existing fixture recovery
+procedure.
+
+The server-free selector above now also exercises frozen input versus later
+report reconstruction, complete secondary programs, raw quiet-report retention,
+source-specific output assembly and publication-clock staleness. Those cases
+use **synthetic native inputs**, including when inspecting the live output
+schema; they are not live evidence. Partial-startup cases use actual hosts
+with normal, caller-drop, timeout and both panicked-startup-consumer paths.
+Neither these checks nor a future single live association would establish
+semantic history equivalence, retained progress, accepted replacement journeys,
+redo-lag proof or lossless switchover.
 
 ### Upstream reporting and history blockers
 

@@ -62,9 +62,14 @@ supersession, restart, terminal and uncertain-command journeys reject predecesso
 evidence. This is bounded diagnostic evidence, not a live hosted witness,
 semantic public/native history mapping or production authority.
 
+The [ignored live hosted harness](kuberic-progress.md#live-hosted-witness-harness-not-executed)
+is now implemented and compiled, with server-free assembly/ownership regressions.
+It has not been executed against SQL Server; the live association proof remains
+pending and requires separate licensed-execution authorization.
+
 Planned work:
 
-- extend the offline association to bind a live [native acknowledged-record witness](kuberic-progress.md#native-prefix-coverage)
+- execute and evaluate the ignored harness to bind a live [native acknowledged-record witness](kuberic-progress.md#native-prefix-coverage)
   to exact accepted public configuration/storage/session authority and
   native/public history before implementing a public mapping or catch-up
   success. Retain native identity/incarnation and source-phase evidence; do not
