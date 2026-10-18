@@ -61,6 +61,8 @@ const TOPOLOGY_JSON: &[u8] = br#"{
 }"#;
 static HOST_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[path = "runtime_process_host/native_authority.rs"]
+mod native_authority;
 #[path = "runtime_process_host/shutdown.rs"]
 mod shutdown;
 
@@ -419,9 +421,16 @@ async fn host_config_with(
 }
 
 async fn start_attempts(root: &Path) -> Vec<HostAttempt> {
+    start_attempts_with_snapshots(root, std::array::from_fn(snapshot)).await
+}
+
+async fn start_attempts_with_snapshots(
+    root: &Path,
+    snapshots: [InstanceSnapshot; 3],
+) -> Vec<HostAttempt> {
     let (controls, replications) = free_host_addresses();
     let mut attempts = Vec::new();
-    for index in 0..3 {
+    for (index, snapshot) in snapshots.into_iter().enumerate() {
         let member_root = root.join(format!("member-{}", index + 1));
         if !member_root.exists() {
             std::fs::create_dir(&member_root).unwrap();
@@ -430,7 +439,7 @@ async fn start_attempts(root: &Path) -> Vec<HostAttempt> {
         let source = Arc::new(RepeatingSource {
             config: config.observer().clone(),
             samples: Mutex::new(VecDeque::new()),
-            fallback: snapshot(index),
+            fallback: snapshot,
             gate: Mutex::new(None),
         });
         let application = Arc::new(
@@ -1611,6 +1620,7 @@ fn public_host_test_uses_no_kuberic_testing_authority_or_runtime_api() {
     let source = [
         include_str!("runtime_process_host.rs"),
         include_str!("runtime_process_host/shutdown.rs"),
+        include_str!("runtime_process_host/native_authority.rs"),
     ]
     .concat();
     let forbidden = [
