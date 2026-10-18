@@ -16,6 +16,10 @@ use super::availability_group::{
     ProvisionedAvailabilityGroup, availability_group_name, database_name, finalize_prepared,
     prepare, provision,
 };
+use super::commit_coverage::{
+    CommitCoverageError, CommitCoverageReport, collect_native_samples, coverage_conclusion,
+    probe_acknowledged_transaction, record_probe_outcome,
+};
 use super::data::{
     DataContext, DataError, MarkerEvidence, prove_replicated_marker, verify_replicated_marker,
 };
@@ -459,6 +463,96 @@ impl LaunchedMembers {
             marker,
         )
         .await
+    }
+
+    pub async fn probe_native_commit_coverage(
+        &self,
+        selected_target_ordinal: u8,
+    ) -> Result<CommitCoverageReport, CommitCoverageError> {
+        let binding = self
+            .context
+            .journal
+            .native_binding
+            .as_ref()
+            .filter(|binding| {
+                binding.session_id == self.run.run_id
+                    && self.context.journal.native_phase
+                        == super::model::NativeTopologyPhase::Converged
+                    && self.context.journal.lifecycle_exclusion.is_none()
+                    && binding
+                        .members
+                        .iter()
+                        .enumerate()
+                        .all(|(index, member)| usize::from(member.ordinal) == index + 1)
+            })
+            .ok_or(CommitCoverageError::InvalidNativeSample)?;
+        let primary_indices = binding
+            .members
+            .iter()
+            .enumerate()
+            .filter(|(_, member)| member.role == "PRIMARY")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let [primary_index] = primary_indices.as_slice() else {
+            return Err(CommitCoverageError::InvalidNativeSample);
+        };
+        if !binding
+            .members
+            .iter()
+            .any(|member| member.ordinal == selected_target_ordinal && member.role == "SECONDARY")
+        {
+            return Err(CommitCoverageError::InvalidNativeSample);
+        }
+        let context = DataContext {
+            run: &self.run,
+            members: &self.members,
+            credentials: self
+                .context
+                .credentials
+                .as_ref()
+                .ok_or(DataError::WrongDatabase)?,
+            tls: self.context.tls.as_ref().ok_or(DataError::WrongDatabase)?,
+            deadlines: self.context.config.deadlines(),
+            complete_deadline: self.context.deadline,
+        };
+        self.verify_commit_probe_ownership()?;
+        let before = collect_native_samples(&context, binding).await?;
+        self.verify_commit_probe_ownership()?;
+        let (acknowledgement, transaction_samples) =
+            probe_acknowledged_transaction(&context, binding, *primary_index).await?;
+        let record_probe = record_probe_outcome(&transaction_samples)?;
+        let after_ack = collect_native_samples(&context, binding).await?;
+        self.verify_commit_probe_ownership()?;
+        let quiet = collect_native_samples(&context, binding).await?;
+        self.verify_commit_probe_ownership()?;
+        let coverage = coverage_conclusion(&record_probe);
+        Ok(CommitCoverageReport {
+            fixture_run_id: self.run.run_id.clone(),
+            fixture_resource_uid: self.run.resource_uid.clone(),
+            native_binding: binding.clone(),
+            primary_ordinal: binding.members[*primary_index].ordinal,
+            selected_target_ordinal,
+            acknowledgement,
+            transaction_samples,
+            record_probe,
+            before,
+            after_ack,
+            quiet,
+            coverage,
+        })
+    }
+
+    fn verify_commit_probe_ownership(&self) -> Result<(), CommitCoverageError> {
+        LaunchFrozenMemberVerifier {
+            docker: &self.context.docker,
+            containers: &self.context.containers,
+            image_id: &self.context.image_id,
+        }
+        .verify(
+            self.context.deadline,
+            self.context.config.deadlines().docker_command,
+        )
+        .map_err(CommitCoverageError::Ownership)
     }
 }
 

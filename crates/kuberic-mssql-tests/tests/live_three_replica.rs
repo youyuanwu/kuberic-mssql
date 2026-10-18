@@ -2,6 +2,7 @@
 
 use std::error::Error;
 use std::fs;
+use std::io::Write;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -13,10 +14,10 @@ use kuberic_mssql::runtime_host::SeedDispatchPhase;
 use kuberic_mssql_tests::three_replica::{
     CLEANUP_BUDGET, CancellationSignals, CleanupClock, CleanupCoordinator, CombinedFixtureError,
     FixtureConfig, HandledCancellationSignal, JournalStore, LaunchedMembers,
-    LicensedConflictScenario, MssqlGroupError, NativeTopologyBinding, NativeTopologyPhase,
-    OwnershipJournal, PublicBuildCommand, PublicFaultInjection, PublicMssqlGroup,
-    PublicMutationFault, ReadyMember, ResourceState, RunState, SystemCleanupClock, TopologyRun,
-    cleanup_three_replica_fixture, launch_three_members,
+    LicensedConflictScenario, MssqlGroupError, NativeCleanupEvidence, NativeTopologyBinding,
+    NativeTopologyPhase, OwnershipJournal, PublicBuildCommand, PublicFaultInjection,
+    PublicMssqlGroup, PublicMutationFault, ReadyMember, ResourceState, RunState,
+    SystemCleanupClock, TopologyRun, cleanup_three_replica_fixture, launch_three_members,
 };
 use kuberic_runtime::control::{normalize_public_v1_agent_status_report, proto};
 use kuberic_runtime::protocol::public_operations::{
@@ -74,6 +75,117 @@ fn three_replica_mssql_terminal_seed_conflicts() {
 #[ignore = "exercises licensed target-local build evidence windows on a qualified local Docker host"]
 fn three_replica_mssql_target_host_evidence_faults() {
     run_phase4_test(Phase4LiveTest::TargetHostEvidence);
+}
+
+#[test]
+#[ignore = "probes native commit-record evidence with a licensed owned three-replica fixture"]
+fn three_replica_mssql_native_commit_coverage() {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(32 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("native commit probe runtime")
+                .block_on(async {
+                    let mut cancellation =
+                        CancellationSignals::register().expect("cancellation signals");
+                    let root = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
+                    let config =
+                        FixtureConfig::for_test_fixture(&root).expect("test-only fixture config");
+                    let mut launched = launch_three_members(config)
+                        .await
+                        .expect("owned native fixture");
+                    let mut serialized_report = None;
+                    let outcome = {
+                        let experiment = AssertUnwindSafe(async {
+                            launched.provision_availability_group().await?;
+                            let report = launched.probe_native_commit_coverage(2).await?;
+                            serialized_report = Some(serde_json::to_vec(&report)?);
+                            Ok::<(), TestError>(())
+                        })
+                        .catch_unwind();
+                        tokio::pin!(experiment);
+                        tokio::select! {
+                            result = &mut experiment => RuntimeOutcome::Completed(result),
+                            signal = cancellation.recv() => RuntimeOutcome::Interrupted(signal),
+                        }
+                    };
+                    let cleanup =
+                        CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+                    finish_native_commit_report(
+                        || finish_runtime_outcome(&root, launched, outcome, &cleanup),
+                        serialized_report,
+                        |bytes| {
+                            let mut output = std::io::stdout().lock();
+                            output.write_all(bytes)?;
+                            writeln!(output)?;
+                            output.flush()?;
+                            Ok(())
+                        },
+                    )
+                    .expect("native commit probe collection and cleanup");
+                });
+        })
+        .expect("native commit probe thread")
+        .join()
+        .expect("native commit probe thread panicked");
+}
+
+fn finish_native_commit_report(
+    cleanup: impl FnOnce() -> Result<(), TestError>,
+    report: Option<Vec<u8>>,
+    emit: impl FnOnce(&[u8]) -> Result<(), TestError>,
+) -> Result<(), TestError> {
+    cleanup()?;
+    let report = report.ok_or("native commit probe completed without serialized evidence")?;
+    emit(&report)
+}
+
+#[test]
+fn native_probe_teardown_precedes_stalled_output_and_output_errors_survive() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let (entered, observed) = mpsc::channel();
+    let (release, blocked) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let cleanup_flag = cleaned.clone();
+        finish_native_commit_report(
+            || {
+                cleanup_flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            Some(b"evidence".to_vec()),
+            |_| {
+                entered.send(cleaned.load(Ordering::SeqCst))?;
+                blocked.recv()?;
+                Err("native probe output failed".into())
+            },
+        )
+    });
+    let cleanup_preceded_output = observed.recv_timeout(Duration::from_secs(5));
+    let _ = release.send(());
+    let result = writer.join().expect("controlled output worker");
+    assert_eq!(cleanup_preceded_output, Ok(true));
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "native probe output failed"
+    );
+}
+
+#[test]
+fn native_probe_failed_teardown_never_enters_output() {
+    let error = finish_native_commit_report(
+        || Err("native fixture cleanup failed".into()),
+        Some(b"evidence".to_vec()),
+        |_| panic!("output must not run with unresolved fixture ownership"),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "native fixture cleanup failed");
 }
 
 fn run_three_replica_test(validate_restart: bool) {
@@ -145,6 +257,27 @@ fn primary_and_shutdown_errors_are_preserved() {
     assert_eq!(
         error.to_string(),
         "report failed; shutdown also failed: shutdown failed"
+    );
+}
+
+#[test]
+fn native_probe_and_fixture_cleanup_errors_are_preserved() {
+    use kuberic_mssql_tests::three_replica::{FailureCategory, FailureStage, SanitizedFailure};
+
+    let cleanup = CombinedFixtureError::new(
+        SanitizedFailure::new(FailureStage::Cleanup, FailureCategory::OwnershipMismatch),
+        Vec::new(),
+    );
+    let expected = cleanup.to_string();
+    let error = finish_runtime_cleanup(
+        Path::new("unused-native-probe-root"),
+        RuntimeOutcome::Completed(Ok(Err("native probe query failed".into()))),
+        Err(cleanup),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!("native probe query failed; cleanup also failed: {expected}")
     );
 }
 
@@ -2487,6 +2620,14 @@ fn finish_runtime_outcome(
     cleanup: &CleanupCoordinator<SystemCleanupClock>,
 ) -> Result<(), TestError> {
     let fixture_cleanup = launched.cleanup_with_coordinator(cleanup);
+    finish_runtime_cleanup(root, outcome, fixture_cleanup)
+}
+
+fn finish_runtime_cleanup(
+    root: &Path,
+    outcome: RuntimeOutcome,
+    fixture_cleanup: Result<NativeCleanupEvidence, CombinedFixtureError>,
+) -> Result<(), TestError> {
     match (outcome, fixture_cleanup) {
         (RuntimeOutcome::Completed(Ok(Ok(()))), Ok(cleanup)) => {
             assert_eq!(cleanup.removed_container_ids.len(), 3);

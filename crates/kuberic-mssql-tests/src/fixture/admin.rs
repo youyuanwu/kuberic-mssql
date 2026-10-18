@@ -317,6 +317,22 @@ SELECT
         .await
         .map_err(|_| AdminError::QueryDeadline)?
     }
+
+    // SQLBatch permits transaction boundaries across requests; sp_executesql
+    // reports error 266 when a request changes its incoming transaction count.
+    pub(crate) async fn execute_batch(&mut self, sql: &str) -> Result<(), AdminError> {
+        timeout(self.query_timeout, async {
+            let mut stream = self
+                .client
+                .simple_query(sql)
+                .await
+                .map_err(diagnostic_error)?;
+            while stream.try_next().await.map_err(diagnostic_error)?.is_some() {}
+            Ok(())
+        })
+        .await
+        .map_err(|_| AdminError::QueryDeadline)?
+    }
 }
 
 fn diagnostic_error(error: tiberius::error::Error) -> AdminError {

@@ -282,7 +282,7 @@ pub fn validate_marker_observations(
     Err(DataError::MarkerMismatch)
 }
 
-async fn connect(
+pub(super) async fn connect(
     context: &DataContext<'_>,
     index: usize,
     database: &str,
@@ -344,7 +344,46 @@ async fn execute(
     .map_err(DataError::Admin)
 }
 
+pub(super) async fn execute_batch(
+    context: &DataContext<'_>,
+    session: &mut AdminSession,
+    sql: &str,
+    parent_deadline: Instant,
+) -> Result<(), DataError> {
+    session
+        .set_query_timeout(
+            context
+                .deadlines
+                .sql_batch
+                .min(remaining_until(parent_deadline)?),
+        )
+        .map_err(DataError::Admin)?;
+    complete_before(
+        parent_deadline,
+        context.deadlines.sql_batch,
+        session.execute_batch(sql),
+    )
+    .await
+    .map_err(map_query_limit)?
+    .map_err(DataError::Admin)
+}
+
 async fn query_rows(
+    context: &DataContext<'_>,
+    session: &mut AdminSession,
+    sql: &str,
+    parameters: &[&dyn ToSql],
+    parent_deadline: Instant,
+) -> Result<Vec<tiberius::Row>, DataError> {
+    query_rows_diagnostic(context, session, sql, parameters, parent_deadline)
+        .await
+        .map_err(|error| match error {
+            DataError::Admin(AdminError::Sql(_)) => DataError::Admin(AdminError::Query),
+            other => other,
+        })
+}
+
+pub(super) async fn query_rows_diagnostic(
     context: &DataContext<'_>,
     session: &mut AdminSession,
     sql: &str,
@@ -361,7 +400,7 @@ async fn query_rows(
     complete_before(
         parent_deadline,
         context.deadlines.sql_batch,
-        session.query_rows(sql, parameters),
+        session.query_rows_diagnostic(sql, parameters),
     )
     .await
     .map_err(map_query_limit)?
@@ -372,7 +411,7 @@ fn database_name(run: &TopologyRun) -> String {
     format!("km_db_{}", run.run_id)
 }
 
-fn random_guid() -> Result<String, DataError> {
+pub(super) fn random_guid() -> Result<String, DataError> {
     let mut bytes = [0_u8; 16];
     File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(&mut bytes))
