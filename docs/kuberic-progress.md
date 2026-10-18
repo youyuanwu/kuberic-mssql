@@ -328,7 +328,7 @@ completion ID/revision/kind, digest/replay, configuration identity and accepted
 history/storage. Actual reports retain process session, creation identity,
 Pod/PVC storage generation and public history; an old successful completion is
 not treated as a current-configuration oracle
-([native_authority.rs:223-314](../crates/kuberic-mssql-tests/tests/runtime_process_host/native_authority.rs#L223-L314)).
+([native_authority.rs:167-324](../crates/kuberic-mssql-tests/tests/runtime_process_host/native_authority.rs#L167-L324)).
 
 The observe-only adapter accepts a secondary configuration containing exactly
 its two complete remote descriptions. Its own identity/session/address comes
@@ -342,8 +342,9 @@ database identity anchors are collected from the owned observation source;
 coherently changing a witness's local DBID/database GUID or shared family/fork
 cannot replace that baseline. Local DBIDs/GUIDs may legitimately differ between
 members. The native facade reuses the existing exact prefix/phase evaluators
-and rejects future transitions or final observations predating phase admission
-([hosted.rs:29-93](../crates/kuberic-mssql-tests/src/three_replica/commit_coverage/prefix/hosted.rs#L29-L93)).
+and rejects future transitions, a same-phase transaction predating initial
+admission, or final observations predating their admitted phase
+([hosted.rs:29-108](../crates/kuberic-mssql-tests/src/three_replica/commit_coverage/prefix/hosted.rs#L29-L108)).
 
 Collection has a 15-second bound. Its exclusively owned command stream brackets
 native collection with fresh same-source reports; command admission and result
@@ -352,7 +353,7 @@ Verified higher Epoch or same-role Role retires predecessor collection; equal
 and exact replay preserve the lifetime. Pending, timed-out, caller-cancelled,
 terminal or restarting authority cannot publish predecessor success. A later
 successful host receipt does not revive an unknown-outcome lifetime
-([native_authority.rs:599-742](../crates/kuberic-mssql-tests/tests/runtime_process_host/native_authority.rs#L599-L742)).
+([native_authority.rs:607-750](../crates/kuberic-mssql-tests/tests/runtime_process_host/native_authority.rs#L607-L750)).
 
 Run the diagnostic and focused secondary replay cases without SQL Server:
 

@@ -64,6 +64,13 @@ impl NativePrefixEvidence {
             ));
         }
         if self.transitions.is_empty() {
+            if self.acknowledgement.commit_requested_at_unix_millis
+                < self.initial_observations.completed_at_unix_millis
+            {
+                return Err(CommitCoverageError::Control(
+                    "same-phase workload precedes initial phase admission",
+                ));
+            }
             if self.record_binding != self.initial_binding {
                 return Err(CommitCoverageError::Control(
                     "same-phase record binding differs from initial evidence",
@@ -132,8 +139,30 @@ mod tests {
         let mut changed = evidence.clone();
         changed.record_binding.configuration_sequence += 1;
         assert!(changed.evaluate(&members).is_err());
-        changed = evidence;
+        changed = evidence.clone();
         changed.evaluation_binding.configuration_sequence += 1;
         assert!(changed.evaluate(&members).is_err());
+        changed = evidence;
+        changed.initial_observations.requested_at_unix_millis += 100;
+        changed.initial_observations.completed_at_unix_millis += 100;
+        for sample in &mut changed.initial_observations.members {
+            sample.collection_completed_at_unix_millis += 100;
+            sample.snapshot.observed_at_unix_millis += 100;
+            let kuberic_mssql::Observation::Present {
+                observed_at_unix_millis,
+                ..
+            } = &mut sample.snapshot.availability_group
+            else {
+                unreachable!()
+            };
+            *observed_at_unix_millis += 100;
+        }
+        assert!(
+            changed
+                .evaluate(&members)
+                .unwrap_err()
+                .to_string()
+                .contains("workload precedes initial phase admission")
+        );
     }
 }

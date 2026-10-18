@@ -323,20 +323,28 @@ fn validate_configuration(
     Ok(())
 }
 
+fn scripted_snapshot(index: usize, observed_at: u64) -> InstanceSnapshot {
+    let mut value = snapshot(index);
+    value.observed_at_unix_millis = observed_at;
+    let Observation::Present {
+        value: group,
+        observed_at_unix_millis,
+    } = &mut value.availability_group
+    else {
+        unreachable!()
+    };
+    *observed_at_unix_millis = observed_at;
+    let database = &mut group.databases[0];
+    let local = database.local.as_mut().unwrap();
+    local.database_id += index as u32;
+    local.recovery.as_mut().unwrap().database_guid = Some(guid(NATIVE_IDS[index]));
+    database.replicas[0].database_id = local.database_id;
+    value
+}
+
 impl OwnedDiagnostic {
     async fn start(root: &Path) -> Self {
-        let snapshots = std::array::from_fn(|index| {
-            let mut value = snapshot(index);
-            let Observation::Present { value: group, .. } = &mut value.availability_group else {
-                unreachable!()
-            };
-            let database = &mut group.databases[0];
-            let local = database.local.as_mut().unwrap();
-            local.database_id += index as u32;
-            local.recovery.as_mut().unwrap().database_guid = Some(guid(NATIVE_IDS[index]));
-            database.replicas[0].database_id = local.database_id;
-            value
-        });
+        let snapshots = std::array::from_fn(|index| scripted_snapshot(index, OBSERVED_AT));
         let mut attempts = start_attempts_with_snapshots(root, snapshots).await;
         let (replicas, _, bootstrap_commands) = initialize_attempts(&mut attempts).await;
         let (_, configured) = current_public_reports(&attempts).await;
@@ -765,13 +773,13 @@ impl OwnedDiagnostic {
                 snapshot,
             });
         }
-        let observations = NativeSampleSet {
+        let initial_observations = NativeSampleSet {
             requested_at_unix_millis: OBSERVED_AT,
             completed_at_unix_millis: OBSERVED_AT,
             members: samples,
         };
         let members = std::array::from_fn(|index| {
-            let sample = &observations.members[index].snapshot;
+            let sample = &initial_observations.members[index].snapshot;
             let Observation::Present { value: group, .. } = &sample.availability_group else {
                 unreachable!()
             };
@@ -819,14 +827,14 @@ impl OwnedDiagnostic {
             transaction_id: "123".into(),
             database_id: 5,
             delayed_durability: "DISABLED".into(),
-            commit_requested_at_unix_millis: 900,
-            acknowledged_at_unix_millis: 950,
+            commit_requested_at_unix_millis: 1100,
+            acknowledged_at_unix_millis: 1150,
         };
         let transaction_samples = [
             (
                 "before_commit",
-                880,
-                890,
+                1080,
+                1090,
                 Some(TransactionRecordRow {
                     transaction_id: "123".into(),
                     database_id: 5,
@@ -836,8 +844,8 @@ impl OwnedDiagnostic {
             ),
             (
                 "overlap",
-                901,
-                902,
+                1101,
+                1102,
                 Some(TransactionRecordRow {
                     transaction_id: "123".into(),
                     database_id: 5,
@@ -848,8 +856,8 @@ impl OwnedDiagnostic {
                         .map_err(|error| format!("scripted record: {error}"))?,
                 }),
             ),
-            ("after_ack", 951, 952, None),
-            ("after_ack", 953, 954, None),
+            ("after_ack", 1151, 1152, None),
+            ("after_ack", 1153, 1154, None),
         ]
         .into_iter()
         .map(|(phase, requested, completed, row)| TransactionSample {
@@ -859,9 +867,21 @@ impl OwnedDiagnostic {
             row,
         })
         .collect();
+        let final_at = 1200;
+        let observations = NativeSampleSet {
+            requested_at_unix_millis: final_at,
+            completed_at_unix_millis: final_at,
+            members: (0..3)
+                .map(|index| NativeSample {
+                    ordinal: index as u8 + 1,
+                    collection_completed_at_unix_millis: final_at,
+                    snapshot: scripted_snapshot(index, final_at),
+                })
+                .collect(),
+        };
         Ok(NativePrefixEvidence {
             initial_binding: binding.clone(),
-            initial_observations: observations.clone(),
+            initial_observations,
             record_binding: binding.clone(),
             transitions: Vec::new(),
             target_ordinal: 2,
@@ -869,7 +889,7 @@ impl OwnedDiagnostic {
             transaction_samples,
             evaluation_binding: binding,
             observations,
-            evaluated_at_unix_millis: OBSERVED_AT,
+            evaluated_at_unix_millis: final_at,
         })
     }
 
