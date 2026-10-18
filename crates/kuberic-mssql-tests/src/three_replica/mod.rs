@@ -2,6 +2,7 @@ mod availability_group;
 mod commit_coverage;
 mod data;
 mod evidence;
+pub mod hosted_authority;
 mod kuberic_group;
 mod member;
 mod model;

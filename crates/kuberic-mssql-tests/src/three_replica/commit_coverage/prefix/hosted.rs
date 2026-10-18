@@ -1,4 +1,4 @@
-//! In-memory native evidence for the offline hosted diagnostic, not SQL authority.
+//! In-memory native evidence for hosted fixture diagnostics, not SQL authority.
 
 use serde::Serialize;
 
@@ -26,6 +26,24 @@ pub struct NativePrefixEvidence {
 }
 
 impl NativePrefixEvidence {
+    pub fn from_quiet_report(
+        report: &crate::three_replica::CommitCoverageReport,
+        evaluated_at_unix_millis: u64,
+    ) -> Self {
+        Self {
+            initial_binding: report.native_binding.clone(),
+            initial_observations: report.before.clone(),
+            record_binding: report.native_binding.clone(),
+            transitions: Vec::new(),
+            target_ordinal: report.selected_target_ordinal,
+            acknowledgement: report.acknowledgement.clone(),
+            transaction_samples: report.transaction_samples.clone(),
+            evaluation_binding: report.native_binding.clone(),
+            observations: report.quiet.clone(),
+            evaluated_at_unix_millis,
+        }
+    }
+
     pub fn evaluate(
         &self,
         members: &[ReadyMember; 3],
@@ -136,6 +154,51 @@ mod tests {
             evaluated_at_unix_millis: 1100,
         };
         evidence.evaluate(&members).unwrap();
+        for record in [Some("99"), Some("100"), None] {
+            use crate::three_replica::commit_coverage::{
+                CommitCoverageReport, coverage_conclusion, record_probe_outcome,
+            };
+            let (acknowledgement, transaction_samples) = receipt(record);
+            let record_probe = record_probe_outcome(&transaction_samples).unwrap();
+            let mut report = CommitCoverageReport {
+                fixture_run_id: "server-free-adapter-test".into(),
+                fixture_resource_uid: "server-free-adapter-test".into(),
+                native_binding: evidence.initial_binding.clone(),
+                primary_ordinal: 1,
+                selected_target_ordinal: 2,
+                acknowledgement,
+                transaction_samples,
+                coverage: coverage_conclusion(&record_probe),
+                record_probe,
+                before: evidence.initial_observations.clone(),
+                after_ack: evidence.observations.clone(),
+                quiet: evidence.observations.clone(),
+            };
+            let kuberic_mssql::Observation::Present { value: group, .. } =
+                &mut report.quiet.members[1].snapshot.availability_group
+            else {
+                unreachable!()
+            };
+            group.databases[0].replicas[0].progress.hardened_block =
+                Some(kuberic_mssql::DecimalProgress::parse("100").unwrap());
+            let converted = NativePrefixEvidence::from_quiet_report(&report, 1100);
+            let expected = match record {
+                Some("99") => "native_sampled_coverage",
+                Some(_) => "outside_observed_prefix",
+                None => "unavailable",
+            };
+            assert_eq!(
+                serde_json::to_value(converted.evaluate(&members).unwrap()).unwrap()["status"],
+                expected,
+            );
+            let mut changed = report;
+            changed.quiet.requested_at_unix_millis = 800;
+            assert!(
+                NativePrefixEvidence::from_quiet_report(&changed, 1100)
+                    .evaluate(&members)
+                    .is_err()
+            );
+        }
         let mut changed = evidence.clone();
         changed.record_binding.configuration_sequence += 1;
         assert!(changed.evaluate(&members).is_err());
