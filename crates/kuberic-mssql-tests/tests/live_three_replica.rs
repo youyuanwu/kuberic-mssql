@@ -80,9 +80,25 @@ fn three_replica_mssql_target_host_evidence_faults() {
 #[test]
 #[ignore = "probes native commit-record evidence with a licensed owned three-replica fixture"]
 fn three_replica_mssql_native_commit_coverage() {
+    run_native_experiment(NativeExperiment::CommitRecord);
+}
+
+#[test]
+#[ignore = "evaluates native prefixes with licensed owned-secondary HADR suspend/resume"]
+fn three_replica_mssql_native_prefix_coverage() {
+    run_native_experiment(NativeExperiment::PrefixCoverage);
+}
+
+#[derive(Clone, Copy)]
+enum NativeExperiment {
+    CommitRecord,
+    PrefixCoverage,
+}
+
+fn run_native_experiment(kind: NativeExperiment) {
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
-        .spawn(|| {
+        .spawn(move || {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .thread_stack_size(32 * 1024 * 1024)
@@ -102,8 +118,14 @@ fn three_replica_mssql_native_commit_coverage() {
                     let outcome = {
                         let experiment = AssertUnwindSafe(async {
                             launched.provision_availability_group().await?;
-                            let report = launched.probe_native_commit_coverage(2).await?;
-                            serialized_report = Some(serde_json::to_vec(&report)?);
+                            serialized_report = Some(match kind {
+                                NativeExperiment::CommitRecord => serde_json::to_vec(
+                                    &launched.probe_native_commit_coverage(2).await?,
+                                )?,
+                                NativeExperiment::PrefixCoverage => serde_json::to_vec(
+                                    &launched.probe_native_prefix_coverage(2).await?,
+                                )?,
+                            });
                             Ok::<(), TestError>(())
                         })
                         .catch_unwind();
@@ -186,6 +208,32 @@ fn native_probe_failed_teardown_never_enters_output() {
     )
     .unwrap_err();
     assert_eq!(error.to_string(), "native fixture cleanup failed");
+}
+
+#[test]
+fn native_prefix_operation_release_and_cleanup_errors_are_preserved() {
+    use kuberic_mssql_tests::three_replica::{
+        CommitCoverageError, FailureCategory, FailureStage, SanitizedFailure,
+    };
+    let primary = CommitCoverageError::Release {
+        primary: Some(Box::new(CommitCoverageError::Control("work failed"))),
+        release: Box::new(CommitCoverageError::Control("resume failed")),
+    };
+    let cleanup = CombinedFixtureError::new(
+        SanitizedFailure::new(FailureStage::Cleanup, FailureCategory::OwnershipMismatch),
+        Vec::new(),
+    );
+    let expected_cleanup = cleanup.to_string();
+    let error = finish_runtime_cleanup(
+        Path::new("unused-native-prefix-root"),
+        RuntimeOutcome::Completed(Ok(Err(Box::new(primary)))),
+        Err(cleanup),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("work failed"));
+    assert!(error.contains("resume failed"));
+    assert!(error.contains(&expected_cleanup));
 }
 
 fn run_three_replica_test(validate_restart: bool) {

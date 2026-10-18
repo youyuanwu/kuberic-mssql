@@ -283,6 +283,12 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         "test-live-native-commit-coverage root=\"target/mssql-native-commit-coverage\":"
     ));
     assert!(justfile.contains(
+        "test-live-native-prefix-coverage root=\"target/mssql-native-prefix-coverage\":"
+    ));
+    assert!(justfile.contains(
+        "three_replica_mssql_native_prefix_coverage -- --ignored --exact --test-threads=1 --nocapture"
+    ));
+    assert!(justfile.contains(
         "three_replica_mssql_native_commit_coverage -- --ignored --exact --test-threads=1 --nocapture"
     ));
     assert!(
@@ -316,7 +322,7 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
             .lines()
             .filter(|line| line.contains("env -u SQLSERVER_TEST_EULA_ACCEPTED"))
             .count(),
-        14
+        15
     );
     assert!(!justfile.contains("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT"));
     assert!(!justfile.contains("acknowledgement root="));

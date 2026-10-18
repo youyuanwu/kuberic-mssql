@@ -27,6 +27,7 @@ pub use cleanup::{
     CleanupCoordinator, CleanupError, CleanupJournal, CleanupJournalStore, CleanupReport,
     HandledCancellationSignal, SystemCleanupClock, cleanup, combine_with_cleanup,
 };
+pub use commit_coverage::prefix::NativePrefixReport;
 pub use commit_coverage::{CommitCoverageError, CommitCoverageReport};
 pub use config::{
     ACKNOWLEDGEMENT_SCHEMA_VERSION, AcknowledgementSource, FixtureConfig, FixtureConfigError,

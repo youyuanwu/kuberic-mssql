@@ -58,6 +58,7 @@ use super::tls::TlsAssets;
 const READINESS_RETRY: Duration = Duration::from_secs(2);
 
 mod lease;
+mod prefix;
 pub use lease::{FixtureFenceError, LeaseObservation, OwnedFenceRequest};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -469,6 +470,39 @@ impl LaunchedMembers {
         &self,
         selected_target_ordinal: u8,
     ) -> Result<CommitCoverageReport, CommitCoverageError> {
+        let (binding, primary_index) = self.native_probe_binding(selected_target_ordinal)?;
+        let context = self.native_probe_context(self.context.deadline)?;
+        self.verify_commit_probe_ownership()?;
+        let before = collect_native_samples(&context, binding).await?;
+        self.verify_commit_probe_ownership()?;
+        let (acknowledgement, transaction_samples) =
+            probe_acknowledged_transaction(&context, binding, primary_index).await?;
+        let record_probe = record_probe_outcome(&transaction_samples)?;
+        let after_ack = collect_native_samples(&context, binding).await?;
+        self.verify_commit_probe_ownership()?;
+        let quiet = collect_native_samples(&context, binding).await?;
+        self.verify_commit_probe_ownership()?;
+        let coverage = coverage_conclusion(&record_probe);
+        Ok(CommitCoverageReport {
+            fixture_run_id: self.run.run_id.clone(),
+            fixture_resource_uid: self.run.resource_uid.clone(),
+            native_binding: binding.clone(),
+            primary_ordinal: binding.members[primary_index].ordinal,
+            selected_target_ordinal,
+            acknowledgement,
+            transaction_samples,
+            record_probe,
+            before,
+            after_ack,
+            quiet,
+            coverage,
+        })
+    }
+
+    fn native_probe_binding(
+        &self,
+        selected_target_ordinal: u8,
+    ) -> Result<(&super::model::NativeTopologyBinding, usize), CommitCoverageError> {
         let binding = self
             .context
             .journal
@@ -503,7 +537,18 @@ impl LaunchedMembers {
         {
             return Err(CommitCoverageError::InvalidNativeSample);
         }
-        let context = DataContext {
+        Ok((binding, *primary_index))
+    }
+
+    fn verify_commit_probe_ownership(&self) -> Result<(), CommitCoverageError> {
+        self.verify_native_probe_ownership(self.context.deadline)
+    }
+
+    fn native_probe_context(
+        &self,
+        deadline: Instant,
+    ) -> Result<DataContext<'_>, CommitCoverageError> {
+        Ok(DataContext {
             run: &self.run,
             members: &self.members,
             credentials: self
@@ -513,43 +558,18 @@ impl LaunchedMembers {
                 .ok_or(DataError::WrongDatabase)?,
             tls: self.context.tls.as_ref().ok_or(DataError::WrongDatabase)?,
             deadlines: self.context.config.deadlines(),
-            complete_deadline: self.context.deadline,
-        };
-        self.verify_commit_probe_ownership()?;
-        let before = collect_native_samples(&context, binding).await?;
-        self.verify_commit_probe_ownership()?;
-        let (acknowledgement, transaction_samples) =
-            probe_acknowledged_transaction(&context, binding, *primary_index).await?;
-        let record_probe = record_probe_outcome(&transaction_samples)?;
-        let after_ack = collect_native_samples(&context, binding).await?;
-        self.verify_commit_probe_ownership()?;
-        let quiet = collect_native_samples(&context, binding).await?;
-        self.verify_commit_probe_ownership()?;
-        let coverage = coverage_conclusion(&record_probe);
-        Ok(CommitCoverageReport {
-            fixture_run_id: self.run.run_id.clone(),
-            fixture_resource_uid: self.run.resource_uid.clone(),
-            native_binding: binding.clone(),
-            primary_ordinal: binding.members[*primary_index].ordinal,
-            selected_target_ordinal,
-            acknowledgement,
-            transaction_samples,
-            record_probe,
-            before,
-            after_ack,
-            quiet,
-            coverage,
+            complete_deadline: deadline.min(self.context.deadline),
         })
     }
 
-    fn verify_commit_probe_ownership(&self) -> Result<(), CommitCoverageError> {
+    fn verify_native_probe_ownership(&self, deadline: Instant) -> Result<(), CommitCoverageError> {
         LaunchFrozenMemberVerifier {
             docker: &self.context.docker,
             containers: &self.context.containers,
             image_id: &self.context.image_id,
         }
         .verify(
-            self.context.deadline,
+            deadline.min(self.context.deadline),
             self.context.config.deadlines().docker_command,
         )
         .map_err(CommitCoverageError::Ownership)

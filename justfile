@@ -77,6 +77,14 @@ test-live-native-commit-coverage root="target/mssql-native-commit-coverage":
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
         three_replica_mssql_native_commit_coverage -- --ignored --exact --test-threads=1 --nocapture
 
+# Evaluate native-only prefix coverage around an exactly owned secondary pause/resume.
+test-live-native-prefix-coverage root="target/mssql-native-prefix-coverage":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
+        CARGO_BUILD_JOBS=1 \
+        cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
+        three_replica_mssql_native_prefix_coverage -- --ignored --exact --test-threads=1 --nocapture
+
 # Validate same-root replacement of all three public Kuberic hosts.
 test-live-three-replica-restart root="target/mssql-three-replica-restart":
     env -u SQLSERVER_TEST_EULA_ACCEPTED \
