@@ -28,6 +28,59 @@ const RELEASE_BUDGET: Duration = Duration::from_secs(60);
 const CONTROL_BUDGET: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+#[cfg(test)]
+mod admission_tests;
+
+struct FinalControlAdmission<'a> {
+    members: &'a [ReadyMember; 3],
+    binding: &'a NativeTopologyBinding,
+    target: u8,
+    action: DataMovementAction,
+    samples: &'a NativeSampleSet,
+    deadline: Instant,
+    work_deadline: Instant,
+}
+
+impl FinalControlAdmission<'_> {
+    fn validate(&self, wall_now: u64, monotonic_now: Instant) -> Result<(), CommitCoverageError> {
+        validate_sample_set(
+            self.members,
+            self.binding,
+            self.target,
+            self.samples,
+            wall_now,
+        )?;
+        if monotonic_now >= self.deadline {
+            return Err(DataError::Deadline.into());
+        }
+        if self.action == DataMovementAction::Suspend {
+            if !healthy_target(self.samples, self.binding, self.target)? {
+                return Err(CommitCoverageError::Control(
+                    "final SUSPEND sample is not healthy",
+                ));
+            }
+            if self.work_deadline.saturating_duration_since(monotonic_now) < CONTROL_BUDGET {
+                return Err(DataError::Deadline.into());
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn dispatch_after_owner_check<
+    F: std::future::Future<Output = Result<(), CommitCoverageError>>,
+>(
+    admission: FinalControlAdmission<'_>,
+    inspect_owner: impl FnOnce() -> Result<(), CommitCoverageError>,
+    clock: impl FnOnce() -> Result<(u64, Instant), CommitCoverageError>,
+    dispatch: impl FnOnce() -> F,
+) -> Result<(), CommitCoverageError> {
+    inspect_owner()?;
+    let (wall_now, monotonic_now) = clock()?;
+    admission.validate(wall_now, monotonic_now)?;
+    dispatch().await
+}
+
 struct PausedWork {
     record_binding: NativeTopologyBinding,
     acknowledgement: TransactionAcknowledgement,
@@ -226,6 +279,7 @@ struct LivePrefixBackend<'a> {
     primary_index: usize,
     target: u8,
     last_accepted_control: Option<DataMovementAction>,
+    work_deadline: Instant,
 }
 
 impl LivePrefixBackend<'_> {
@@ -336,26 +390,31 @@ impl PrefixBackend for LivePrefixBackend<'_> {
             name: "HADR pre-dispatch native admission",
             source: Box::new(source),
         })?;
-        validate_sample_set(
-            &self.owner.members,
-            self.history.current(),
-            self.target,
-            &fresh,
-            now()?,
-        )?;
-        self.verify_owner(deadline)?;
         let option = match action {
             DataMovementAction::Suspend => "SUSPEND",
             DataMovementAction::Resume => "RESUME",
         };
-        data::execute_batch(
-            &context,
-            &mut session,
-            &format!(
-                "ALTER DATABASE [{}] SET HADR {option};",
-                self.history.current().database_name
-            ),
-            deadline,
+        let sql = format!(
+            "ALTER DATABASE [{}] SET HADR {option};",
+            self.history.current().database_name
+        );
+        dispatch_after_owner_check(
+            FinalControlAdmission {
+                members: &self.owner.members,
+                binding: self.history.current(),
+                target: self.target,
+                action,
+                samples: &fresh,
+                deadline,
+                work_deadline: self.work_deadline,
+            },
+            || self.verify_owner(deadline),
+            || Ok((now()?, Instant::now())),
+            || async {
+                data::execute_batch(&context, &mut session, &sql, deadline)
+                    .await
+                    .map_err(Into::into)
+            },
         )
         .await?;
         self.last_accepted_control = Some(action);
@@ -440,6 +499,7 @@ impl LaunchedMembers {
             primary_index,
             target: selected_target_ordinal,
             last_accepted_control: None,
+            work_deadline,
         };
         let run = controlled_run(&mut backend, work_deadline, experiment_deadline).await?;
         if backend.history.transitions().len() != 2 {
