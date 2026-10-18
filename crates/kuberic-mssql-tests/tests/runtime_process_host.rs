@@ -133,6 +133,7 @@ impl ObservationClock for FixedClock {
 }
 
 struct HostAttempt {
+    config: RuntimeHostConfig,
     control: SocketAddr,
     replication: SocketAddr,
     application_root: PathBuf,
@@ -462,6 +463,7 @@ async fn start_attempts_with_snapshots(
             .await
             .unwrap();
         attempts.push(HostAttempt {
+            config,
             control: controls[index],
             replication: replications[index],
             application_root,
@@ -1621,6 +1623,8 @@ fn public_host_test_uses_no_kuberic_testing_authority_or_runtime_api() {
         include_str!("runtime_process_host.rs"),
         include_str!("runtime_process_host/shutdown.rs"),
         include_str!("runtime_process_host/native_authority.rs"),
+        include_str!("../src/three_replica/hosted_authority.rs"),
+        include_str!("../src/three_replica/public_kuberic_group/hosted_witness.rs"),
     ]
     .concat();
     let forbidden = [

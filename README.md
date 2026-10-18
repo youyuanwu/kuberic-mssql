@@ -397,7 +397,8 @@ CARGO_BUILD_JOBS=1 cargo test --locked -p kuberic-mssql-tests \
 ```
 
 It exercises exact accepted configuration/session/storage/history binding and
-stale authority rejection, not live SQL durability or public catch-up.
+stale authority rejection, retained partial-startup ownership, and synthetic
+quiet-report assembly, not live SQL durability or public catch-up.
 
 The complete local and CI pipeline is:
 
@@ -528,6 +529,13 @@ and production stays observe-only. See the
 [native proof and limits](docs/kuberic-progress.md#native-prefix-coverage).
 Recover only that root with
 `just cleanup-live-three-replica target/mssql-native-prefix-coverage`.
+
+The separate [live hosted witness harness](docs/kuberic-progress.md#live-hosted-witness-harness-not-executed)
+is implemented and compiled but has **not been executed**. Its ignored case
+connects the no-control commit probe to actual observe-only public hosts,
+requires sampled native coverage, and keeps public coverage blocked. It adds
+no SUSPEND/RESUME controls and is not included in `just ci`; the guide gives
+the exact selection command for a separately authorized licensed run.
 
 The lease/fence recipe uses separate `expiry` and `active-restart` scenario
 roots and verifies native lease behavior, cancelled-response uncertainty,

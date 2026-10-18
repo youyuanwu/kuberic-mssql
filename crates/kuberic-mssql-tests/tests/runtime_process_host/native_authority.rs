@@ -1,326 +1,51 @@
 use super::*;
 
-use kuberic_mssql::kuberic::HealthyTopologyBinding;
 use kuberic_mssql_tests::three_replica::hosted_native_prefix::{
     NativePrefixDecision, NativePrefixEvidence, NativeSample, NativeSampleSet,
     TransactionAcknowledgement, TransactionRecordRow, TransactionSample,
 };
 use kuberic_mssql_tests::three_replica::{NativeMemberBinding, NativeTopologyBinding, ReadyMember};
-use kuberic_runtime::control::normalize_execute_request;
-use kuberic_runtime::protocol::command::ProtocolCommand;
-use kuberic_runtime::protocol::public_operations::{
-    PublicConfiguration, PublicV1CallKind, PublicV1OperationCompletion, PublicV1OperationResult,
-};
+use kuberic_runtime::protocol::public_operations::{PublicV1CallKind, PublicV1OperationResult};
 use kuberic_runtime::replicator::{PrimaryReplicator, ReplicaSetConfiguration};
-use serde::Serialize;
 
-type DiagnosticResult<T> = Result<T, String>;
-
-#[derive(Clone, Debug, Serialize)]
-struct AcceptedCommand {
-    target_index: usize,
-    input: PublicOperationIntent,
-    completion: PublicV1OperationCompletion,
-}
-
-#[derive(Debug, Serialize)]
-struct HostedAssociation {
-    scope: &'static str,
-    native_input: &'static str,
-    authority_boundary: &'static str,
-    accepted_configuration: Vec<AcceptedCommand>,
-    accepted_advances: Vec<AcceptedCommand>,
-    admitted_reports: Vec<PublicV1AgentReport>,
-    final_reports: Vec<PublicV1AgentReport>,
-    native_database_anchors: Vec<NativeDatabaseAnchor>,
-    native: NativePrefixEvidence,
-    decision: NativePrefixDecision,
-    public_coverage: BlockedPublicCoverage,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-struct NativeDatabaseAnchor {
-    replica: ReplicaIdentity,
-    database_name: SqlIdentifier,
-    group_database_id: Guid,
-    local_database_id: u32,
-    database_guid: Guid,
-    family_guid: Guid,
-    recovery_fork_id: Guid,
-}
-
-impl NativeDatabaseAnchor {
-    fn from_snapshot(
-        replica: ReplicaIdentity,
-        snapshot: &InstanceSnapshot,
-    ) -> DiagnosticResult<Self> {
-        let Observation::Present { value: group, .. } = &snapshot.availability_group else {
-            return Err("independent native database anchor lacks availability group".into());
-        };
-        let [database] = group.databases.as_slice() else {
-            return Err("independent native database anchor requires one database".into());
-        };
-        let local = database
-            .local
-            .as_ref()
-            .ok_or("independent local database unavailable")?;
-        let recovery = local
-            .recovery
-            .as_ref()
-            .ok_or("independent recovery metadata unavailable")?;
-        Ok(Self {
-            replica,
-            database_name: database.identity.name.clone(),
-            group_database_id: database.identity.group_database_id.clone(),
-            local_database_id: local.database_id,
-            database_guid: recovery
-                .database_guid
-                .clone()
-                .ok_or("independent database GUID missing")?,
-            family_guid: recovery
-                .family_guid
-                .clone()
-                .ok_or("independent family GUID missing")?,
-            recovery_fork_id: recovery
-                .recovery_fork_guid
-                .clone()
-                .ok_or("independent recovery fork missing")?,
-        })
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct BlockedPublicCoverage {
-    status: &'static str,
-    missing_evidence: [&'static str; 5],
-}
-
-struct AuthorityState {
-    generation: u64,
-    epochs: [Epoch; 3],
-    report_high_water: [u64; 3],
-    pending: bool,
-    retired: Option<&'static str>,
-    advances: Vec<AcceptedCommand>,
-}
-
-struct CommandAdmission {
-    state: Arc<Mutex<AuthorityState>>,
-    finished: bool,
-}
-
-impl Drop for CommandAdmission {
-    fn drop(&mut self) {
-        if !self.finished {
-            let mut state = self.state.lock().unwrap();
-            state.pending = false;
-            state
-                .retired
-                .get_or_insert("authority command outcome is unknown");
-        }
-    }
-}
+use kuberic_mssql_tests::three_replica::hosted_authority::{
+    AcceptedCommand, DiagnosticResult, HostedAssociation, HostedAuthority, NativeDatabaseAnchor,
+    NativeInput, accepted_command, complete_remote_configuration, operation_input,
+    validate_reports,
+};
 
 struct OwnedDiagnostic {
     attempts: Vec<HostAttempt>,
     replicas: Vec<RunningReplica>,
-    baseline: Vec<PublicV1AgentReport>,
-    accepted: Vec<AcceptedCommand>,
-    bindings: Vec<Arc<HealthyTopologyBinding>>,
-    native_database_anchors: Vec<NativeDatabaseAnchor>,
-    state: Arc<Mutex<AuthorityState>>,
+    authority: HostedAuthority,
+    members: [ReadyMember; 3],
 }
 
-fn command_input(command: &PublicCommand) -> DiagnosticResult<PublicOperationIntent> {
-    let envelope = normalize_execute_request(command.request.clone())
-        .map_err(|error| format!("public operation input: {error}"))?;
-    let ProtocolCommand::PublicV1Operation(operation) = envelope.command else {
-        return Err("diagnostic requires a public operation".into());
-    };
-    if operation.target != identities()[command.target_index]
-        || command.request.resource_uid != "runtime-host-test"
-    {
-        return Err("public operation target differs".into());
-    }
-    Ok(operation.intent)
-}
+impl std::ops::Deref for OwnedDiagnostic {
+    type Target = HostedAuthority;
 
-fn operation_kind(input: &PublicOperationIntent) -> DiagnosticResult<PublicV1CallKind> {
-    if let Some(lifecycle) = &input.lifecycle {
-        return match lifecycle.recipe {
-            PublicLifecycleRecipe::InitialPrimary => Ok(PublicV1CallKind::InitialPrimary),
-            PublicLifecycleRecipe::SecondaryEpochAdvance => {
-                Ok(PublicV1CallKind::SecondaryEpochAdvance)
-            }
-            _ => Err("unsupported diagnostic lifecycle".into()),
-        };
+    fn deref(&self) -> &Self::Target {
+        &self.authority
     }
-    match input.program {
-        Some(PublicOperationProgram::Epoch { .. }) => Ok(PublicV1CallKind::Epoch),
-        Some(PublicOperationProgram::Role { .. }) => Ok(PublicV1CallKind::Role),
-        Some(PublicOperationProgram::Close) => Ok(PublicV1CallKind::Close),
-        Some(PublicOperationProgram::Configuration(_)) => Ok(PublicV1CallKind::Configuration),
-        _ => Err("unsupported diagnostic operation".into()),
-    }
-}
-
-fn accepted_command(
-    target_index: usize,
-    input: &PublicOperationIntent,
-    report: &PublicV1AgentReport,
-) -> DiagnosticResult<AcceptedCommand> {
-    input.validate().map_err(str::to_owned)?;
-    report.validate().map_err(str::to_owned)?;
-    if input.identity != report.identity || input.process_session_id != report.process_session_id {
-        return Err("operation input session/protocol differs from actual report".into());
-    }
-    let kind = operation_kind(input)?;
-    let matches = report
-        .completed_operations
-        .iter()
-        .filter(|completion| completion.operation_id == input.operation_id)
-        .collect::<Vec<_>>();
-    let [completion] = matches.as_slice() else {
-        return Err("exact successful operation completion is missing or duplicated".into());
-    };
-    let (current, previous) = match (&input.lifecycle, &input.program) {
-        (Some(lifecycle), None) => (
-            Some(lifecycle.current.configuration_id.clone()),
-            lifecycle
-                .previous
-                .as_ref()
-                .map(|previous| previous.configuration_id.clone()),
-        ),
-        (None, Some(PublicOperationProgram::Configuration(configuration))) => (
-            Some(configuration.current.configuration_id.clone()),
-            configuration
-                .previous
-                .as_ref()
-                .map(|previous| previous.configuration_id.clone()),
-        ),
-        _ => (None, None),
-    };
-    if completion.revision != input.revision
-        || completion.call_kind != kind
-        || completion.process_session_id != report.process_session_id
-        || completion.input_digest != input.input_digest
-        || completion.replay_disposition != input.replay_disposition
-        || completion.history != report.history
-        || completion.storage_incarnation != report.storage_incarnation
-        || completion.current_configuration_id != current
-        || completion.previous_configuration_id != previous
-        || completion.result != PublicV1OperationResult::Succeeded
-    {
-        return Err("operation completion provenance differs from accepted input/report".into());
-    }
-    Ok(AcceptedCommand {
-        target_index,
-        input: input.clone(),
-        completion: (*completion).clone(),
-    })
-}
-
-fn validate_reports(
-    baseline: &[PublicV1AgentReport],
-    current: &[PublicV1AgentReport],
-    high_water: &[u64; 3],
-) -> DiagnosticResult<()> {
-    if baseline.len() != 3 || current.len() != 3 {
-        return Err("exactly three hosted member reports are required".into());
-    }
-    for (index, (expected, report)) in baseline.iter().zip(current).enumerate() {
-        report.validate().map_err(str::to_owned)?;
-        if report.identity != expected.identity
-            || report.resource_uid != expected.resource_uid
-            || report.replica != expected.replica
-            || report.process_session_id != expected.process_session_id
-            || report.replicator_creation_id != expected.replicator_creation_id
-            || report.history != expected.history
-            || report.storage_incarnation != expected.storage_incarnation
-            || report.replication_address != expected.replication_address
-        {
-            return Err(format!(
-                "hosted member {} identity/session/storage/history differs",
-                index + 1
-            ));
-        }
-        if report.report_sequence <= high_water[index] {
-            return Err(format!(
-                "hosted member {} report is delayed or replayed",
-                index + 1
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn validate_configuration(
     accepted: &[AcceptedCommand],
     reports: &[PublicV1AgentReport],
 ) -> DiagnosticResult<()> {
-    if accepted.len() != 3 || reports.len() != 3 {
-        return Err("three accepted configuration receipts are required".into());
-    }
-    for (index, command) in accepted.iter().enumerate() {
-        let input = match (&command.input.lifecycle, &command.input.program) {
-            (Some(lifecycle), None)
-                if index == 0
-                    && lifecycle.recipe == PublicLifecycleRecipe::InitialPrimary
-                    && lifecycle.replica == reports[index].replica
-                    && lifecycle.epoch == configuration().epoch =>
-            {
-                PublicConfiguration {
-                    current: lifecycle.current.clone(),
-                    previous: lifecycle.previous.clone(),
-                    replicas: lifecycle.replicas.clone(),
-                }
-            }
-            (None, Some(PublicOperationProgram::Configuration(input))) => input.clone(),
-            _ => return Err("configuration receipt lacks exact supported input".into()),
-        };
-        if command.target_index != index
-            || input.current != configuration()
-            || input.previous.is_some()
-        {
-            return Err("accepted configuration descriptor/member/epoch differs".into());
-        }
-        let expected_peers = configuration()
-            .members
-            .into_iter()
-            .filter(|member| member.identity != reports[index].replica)
-            .collect::<Vec<_>>();
-        if input.replicas.len() != expected_peers.len() {
-            return Err("configuration peer membership differs".into());
-        }
-        for peer in expected_peers {
-            let report = reports
-                .iter()
-                .find(|report| report.replica == peer.identity)
-                .ok_or("configuration peer report missing")?;
-            if input
-                .replicas
-                .iter()
-                .filter(|descriptor| {
-                    descriptor.identity == report.replica
-                        && descriptor.process_session_id == report.process_session_id
-                        && descriptor.storage_incarnation.as_ref()
-                            == Some(&report.storage_incarnation)
-                        && Some(&descriptor.replication_address)
-                            == report.replication_address.as_ref()
-                        && descriptor.role == peer.role
-                })
-                .count()
-                != 1
-            {
-                return Err("configuration peer session/storage/address differs".into());
-            }
-        }
-        let observed = accepted_command(index, &command.input, &reports[index])?;
-        if observed.completion != command.completion {
-            return Err("configuration accepted receipt was replaced".into());
-        }
-    }
-    Ok(())
+    kuberic_mssql_tests::three_replica::hosted_authority::validate_configuration(
+        &configuration(),
+        accepted,
+        reports,
+    )
+}
+
+fn command_input(command: &PublicCommand) -> DiagnosticResult<PublicOperationIntent> {
+    operation_input(
+        &identities()[command.target_index],
+        "runtime-host-test",
+        &command.request,
+    )
 }
 
 fn scripted_snapshot(index: usize, observed_at: u64) -> InstanceSnapshot {
@@ -344,36 +69,19 @@ fn scripted_snapshot(index: usize, observed_at: u64) -> InstanceSnapshot {
 
 impl OwnedDiagnostic {
     async fn start(root: &Path) -> Self {
+        Self::start_with_clock(root, Arc::new(FixedClock)).await
+    }
+
+    async fn start_with_clock(root: &Path, clock: Arc<dyn ObservationClock>) -> Self {
         let snapshots = std::array::from_fn(|index| scripted_snapshot(index, OBSERVED_AT));
         let mut attempts = start_attempts_with_snapshots(root, snapshots).await;
         let (replicas, _, bootstrap_commands) = initialize_attempts(&mut attempts).await;
         let (_, configured) = current_public_reports(&attempts).await;
         let commands = (0..3)
             .map(|index| {
-                let replicas = configuration()
-                    .members
-                    .into_iter()
-                    .filter(|member| member.identity != configured[index].replica)
-                    .map(|member| {
-                        let peer = usize::try_from(member.identity.replica_id.value() - 1).unwrap();
-                        PublicReplicaDescriptor {
-                            build_id: OperationId::default(),
-                            identity: configured[peer].replica.clone(),
-                            replication_address: format!("http://{}", attempts[peer].replication),
-                            process_session_id: configured[peer].process_session_id.clone(),
-                            storage_incarnation: Some(configured[peer].storage_incarnation.clone()),
-                            role: member.role,
-                            current_progress: configured[peer].progress.last,
-                            catch_up_capability: configured[peer].progress.first,
-                            must_catchup: false,
-                        }
-                    })
-                    .collect();
-                let program = PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: configuration(),
-                    previous: None,
-                    replicas,
-                });
+                let program = PublicOperationProgram::Configuration(
+                    complete_remote_configuration(&configuration(), &configured, index).unwrap(),
+                );
                 PublicCommand {
                     target_index: index,
                     request: public_operation_request(
@@ -473,22 +181,47 @@ impl OwnedDiagnostic {
                     .unwrap(),
             );
         }
-        let state = Arc::new(Mutex::new(AuthorityState {
-            generation: 1,
-            epochs: [configuration().epoch; 3],
-            report_high_water: std::array::from_fn(|index| baseline[index].report_sequence),
-            pending: false,
-            retired: None,
-            advances: Vec::new(),
-        }));
-        Self {
-            attempts,
-            replicas,
+        let observers = attempts
+            .iter()
+            .map(|attempt| attempt.source.observer_config().clone())
+            .collect();
+        let authority = HostedAuthority::new(
+            configuration(),
             baseline,
             accepted,
             bindings,
             native_database_anchors,
-            state,
+            observers,
+            clock,
+        )
+        .unwrap();
+        let members = std::array::from_fn(|index| ReadyMember {
+            ordinal: index as u8 + 1,
+            server_name: attempts[index]
+                .source
+                .fallback
+                .instance
+                .server_name
+                .to_string(),
+            container_id: format!("scripted-not-a-container-{}", index + 1),
+            host_port: 0,
+            sql_start_time: attempts[index]
+                .source
+                .fallback
+                .instance
+                .sqlserver_start_time
+                .clone(),
+            sql_start_unix_millis: 0,
+            observer_config: PathBuf::new(),
+            admin_username: PathBuf::new(),
+            admin_password: PathBuf::new(),
+            ca_certificate: PathBuf::new(),
+        });
+        Self {
+            attempts,
+            replicas,
+            authority,
+            members,
         }
     }
 
@@ -518,42 +251,19 @@ impl OwnedDiagnostic {
         Ok(reports)
     }
 
-    fn check_lifetime(state: &AuthorityState, generation: u64) -> DiagnosticResult<()> {
-        if let Some(reason) = state.retired {
-            return Err(format!("diagnostic authority retired: {reason}"));
-        }
-        if state.pending || state.generation != generation {
-            return Err("diagnostic authority is pending or superseded".into());
-        }
-        Ok(())
-    }
-
-    fn begin_command(&self, terminal: bool) -> DiagnosticResult<CommandAdmission> {
-        let mut state = self.state.lock().unwrap();
-        Self::check_lifetime(&state, state.generation)?;
-        state.pending = true;
-        if terminal {
-            state.retired = Some("terminal dispatch");
-        }
-        Ok(CommandAdmission {
-            state: self.state.clone(),
-            finished: false,
-        })
-    }
-
     async fn dispatch(&self, command: PublicCommand) -> DiagnosticResult<()> {
         let input = command_input(&command)?;
-        let (epoch, terminal) = match &input.program {
-            Some(PublicOperationProgram::Epoch { epoch }) => (*epoch, false),
-            Some(PublicOperationProgram::Role { epoch, role })
+        let terminal = match &input.program {
+            Some(PublicOperationProgram::Epoch { .. }) => false,
+            Some(PublicOperationProgram::Role { role, .. })
                 if *role == configuration().members[command.target_index].role =>
             {
-                (*epoch, false)
+                false
             }
-            Some(PublicOperationProgram::Close) => (configuration().epoch, true),
+            Some(PublicOperationProgram::Close) => true,
             _ => return Err("unsupported owned diagnostic dispatch".into()),
         };
-        let mut admission = self.begin_command(terminal)?;
+        let admission = self.authority.begin_command(terminal)?;
         let mut client = AgentControlClient::connect(format!(
             "http://{}",
             self.attempts[command.target_index].control
@@ -568,23 +278,8 @@ impl OwnedDiagnostic {
         .map_err(|error| format!("authority dispatch deadline: {error}"))?
         .map_err(|error| format!("authority dispatch: {error}"))?;
         let reports = self.fresh_reports().await?;
-        let receipt =
-            accepted_command(command.target_index, &input, &reports[command.target_index])?;
-        let mut state = self.state.lock().unwrap();
-        validate_reports(&self.baseline, &reports, &state.report_high_water)?;
-        validate_configuration(&self.accepted, &reports)?;
-        if epoch < state.epochs[command.target_index] {
-            return Err("accepted diagnostic epoch regressed".into());
-        }
-        if epoch > state.epochs[command.target_index] {
-            state.generation += 1;
-            state.epochs[command.target_index] = epoch;
-        }
-        state.report_high_water = std::array::from_fn(|index| reports[index].report_sequence);
-        state.advances.push(receipt);
-        state.pending = false;
-        admission.finished = true;
-        Ok(())
+        self.authority
+            .complete_command(admission, command.target_index, &input, &reports)
     }
 
     fn command(&self, revision: u64, program: PublicOperationProgram) -> PublicCommand {
@@ -608,46 +303,15 @@ impl OwnedDiagnostic {
         &self,
         native: impl std::future::Future<Output = DiagnosticResult<NativePrefixEvidence>>,
     ) -> DiagnosticResult<HostedAssociation> {
-        tokio::time::timeout(Duration::from_secs(15), self.collect_inner(native))
+        self.authority
+            .collect(
+                native,
+                || self.fresh_reports(),
+                &self.members,
+                NativeInput::Scripted,
+                Duration::from_secs(15),
+            )
             .await
-            .map_err(|error| format!("hosted native association deadline: {error}"))?
-    }
-
-    async fn collect_inner(
-        &self,
-        native: impl std::future::Future<Output = DiagnosticResult<NativePrefixEvidence>>,
-    ) -> DiagnosticResult<HostedAssociation> {
-        let generation = {
-            let state = self.state.lock().unwrap();
-            Self::check_lifetime(&state, state.generation)?;
-            state.generation
-        };
-        let admitted_reports = self.fresh_reports().await?;
-        {
-            let mut state = self.state.lock().unwrap();
-            Self::check_lifetime(&state, generation)?;
-            validate_reports(&self.baseline, &admitted_reports, &state.report_high_water)?;
-            validate_configuration(&self.accepted, &admitted_reports)?;
-            state.report_high_water =
-                std::array::from_fn(|index| admitted_reports[index].report_sequence);
-        }
-        let native = native.await?;
-        self.validate_bridge(&native, &admitted_reports)?;
-        let decision = native
-            .evaluate(&ready_members(&native.initial_binding))
-            .map_err(|error| format!("native prefix evidence: {error}"))?;
-        {
-            let state = self.state.lock().unwrap();
-            Self::check_lifetime(&state, generation)?;
-        }
-        let final_reports = self.fresh_reports().await?;
-        self.publish(
-            generation,
-            admitted_reports,
-            native,
-            decision,
-            final_reports,
-        )
     }
 
     fn publish(
@@ -655,99 +319,17 @@ impl OwnedDiagnostic {
         generation: u64,
         admitted_reports: Vec<PublicV1AgentReport>,
         native: NativePrefixEvidence,
-        decision: NativePrefixDecision,
         final_reports: Vec<PublicV1AgentReport>,
     ) -> DiagnosticResult<HostedAssociation> {
-        let mut state = self.state.lock().unwrap();
-        Self::check_lifetime(&state, generation)?;
-        validate_reports(&self.baseline, &final_reports, &state.report_high_water)?;
-        validate_configuration(&self.accepted, &final_reports)?;
-        self.validate_bridge(&native, &final_reports)?;
-        state.report_high_water = std::array::from_fn(|index| final_reports[index].report_sequence);
-        Ok(HostedAssociation {
-            scope: "offline_hosted_native_association",
-            native_input: "scripted_no_live_sql",
-            authority_boundary: "exclusively_owned_command_stream_at_publication",
-            accepted_configuration: self.accepted.clone(),
-            accepted_advances: state.advances.clone(),
+        let members = ready_members(&native.initial_binding);
+        self.authority.publish(
+            generation,
             admitted_reports,
-            final_reports,
-            native_database_anchors: self.native_database_anchors.clone(),
             native,
-            decision,
-            public_coverage: BlockedPublicCoverage {
-                status: "blocked",
-                missing_evidence: [
-                    "live_native_hosted_witness",
-                    "role_specific_public_progress_and_history_mapping",
-                    "retained_transfer_capability",
-                    "durable_restart_continuity",
-                    "hardening_with_redo_lag",
-                ],
-            },
-        })
-    }
-
-    fn validate_bridge(
-        &self,
-        native: &NativePrefixEvidence,
-        reports: &[PublicV1AgentReport],
-    ) -> DiagnosticResult<()> {
-        if self.bindings.len() != 3 || reports.len() != 3 {
-            return Err("missing hosted/native member bridge".into());
-        }
-        for (index, binding) in self.bindings.iter().enumerate() {
-            let report = &reports[index];
-            let expected = &native.initial_binding.members[index];
-            let anchor = &self.native_database_anchors[index];
-            if anchor.replica != report.replica
-                || anchor.database_name.as_str() != native.initial_binding.database_name
-                || anchor.group_database_id.as_str() != native.initial_binding.group_database_id
-                || anchor.local_database_id != expected.local_database_id
-                || anchor.database_guid.as_str() != expected.database_guid
-                || anchor.family_guid.as_str() != native.initial_binding.family_guid
-                || anchor.recovery_fork_id.as_str() != native.initial_binding.recovery_fork_id
-            {
-                return Err("independent hosted native database anchor differs".into());
-            }
-            let local = binding
-                .members()
-                .iter()
-                .find(|member| member.kuberic_identity() == &report.replica)
-                .ok_or("missing adapter local member")?;
-            if binding.local_identity() != &report.replica
-                || binding.configuration() != &configuration()
-                || local.process_session_id() != &report.process_session_id
-                || Some(local.replication_address()) != report.replication_address.as_deref()
-                || local.native_replica_id().as_str() != expected.native_replica_id
-                || local.server_name().as_str() != expected.server_name
-                || local.sql_endpoint_url() != expected.endpoint_url
-                || binding.local_sql_server_start_incarnation().as_str() != expected.sql_start_time
-                || binding.availability_group().group_id.as_str()
-                    != native.initial_binding.availability_group_id
-                || binding.availability_group().name.as_str()
-                    != native.initial_binding.availability_group_name
-            {
-                return Err(format!("hosted/native member {} bridge differs", index + 1));
-            }
-            for samples in [&native.initial_observations, &native.observations] {
-                let sample = samples
-                    .members
-                    .iter()
-                    .find(|sample| sample.ordinal == expected.ordinal)
-                    .ok_or("native member observation missing")?;
-                binding
-                    .validate_snapshot(
-                        self.attempts[index].source.observer_config(),
-                        &sample.snapshot,
-                        native.evaluated_at_unix_millis,
-                        true,
-                        Some(configuration().members[index].role),
-                    )
-                    .map_err(|error| format!("adapter native history/member bridge: {error}"))?;
-            }
-        }
-        Ok(())
+            final_reports,
+            &members,
+            NativeInput::Scripted,
+        )
     }
 
     async fn scripted_native(
@@ -894,7 +476,7 @@ impl OwnedDiagnostic {
     }
 
     async fn stop(&mut self) {
-        self.state.lock().unwrap().retired = Some("host process stopping");
+        self.authority.retire();
         stop_all(&mut self.replicas).await;
     }
 }
@@ -1235,10 +817,7 @@ async fn pending_dispatch_case(await_unknown_result: bool) {
     let admitted = group.fresh_reports().await.unwrap();
     let final_reports = group.fresh_reports().await.unwrap();
     let native = group.scripted_native(Some("99")).await.unwrap();
-    let decision = native
-        .evaluate(&ready_members(&native.initial_binding))
-        .unwrap();
-    let generation = group.state.lock().unwrap().generation;
+    let generation = group.authority.generation().unwrap();
     let command = group.command(
         5,
         PublicOperationProgram::Role {
@@ -1259,7 +838,6 @@ async fn pending_dispatch_case(await_unknown_result: bool) {
                 generation,
                 admitted.clone(),
                 native.clone(),
-                decision.clone(),
                 final_reports.clone(),
             )
             .unwrap_err()
@@ -1290,7 +868,7 @@ async fn pending_dispatch_case(await_unknown_result: bool) {
     .unwrap();
     assert!(
         group
-            .publish(generation, admitted, native, decision, final_reports,)
+            .publish(generation, admitted, native, final_reports)
             .unwrap_err()
             .contains("unknown")
     );
@@ -1376,4 +954,246 @@ async fn secondary_replay_case() {
 #[test]
 fn remote_only_secondary_configuration_replay_keeps_factory_local_context() {
     run_host_test(secondary_replay_case);
+}
+
+async fn partial_startup_ownership_cases() {
+    use kuberic_mssql_tests::three_replica::{
+        PublicStartupProbeHandle, PublicStartupProbeMember, PublicStartupProbeMode,
+        exercise_partial_public_startup_cleanup,
+    };
+    for mode in 0..5 {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut group = OwnedDiagnostic::start(temporary.path()).await;
+        group.authority.retire();
+        let reports = group.fresh_reports().await.unwrap();
+        let replicators = group
+            .attempts
+            .iter()
+            .map(|attempt| attempt.application.testing_replicator().unwrap())
+            .collect::<Vec<_>>();
+        let controls = group
+            .attempts
+            .iter()
+            .map(|attempt| attempt.control)
+            .collect::<Vec<_>>();
+        let (release, held) = tokio::sync::oneshot::channel();
+        let mut held = Some(held);
+        let mut replicas = group.replicas.drain(..).map(Some).collect::<Vec<_>>();
+        let mut failed = if mode >= 3 {
+            let mut primary = replicas[0].take().unwrap();
+            primary.shutdown();
+            primary.wait().await.unwrap();
+            let task = tokio::spawn(async { panic!("injected startup task panic") });
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            Some(task)
+        } else {
+            None
+        };
+        let members = replicas
+            .into_iter()
+            .zip(group.attempts.drain(..))
+            .enumerate()
+            .map(|(index, (running, attempt))| {
+                let handle = if index == 0 && mode >= 3 {
+                    PublicStartupProbeHandle::Pending(failed.take().unwrap())
+                } else if index == 1 && mode < 3 {
+                    let running = running.unwrap();
+                    let held = held.take().unwrap();
+                    PublicStartupProbeHandle::Pending(tokio::spawn(async move {
+                        held.await.expect("release owned startup");
+                        Ok(Some(running))
+                    }))
+                } else {
+                    PublicStartupProbeHandle::Started(running.unwrap())
+                };
+                PublicStartupProbeMember {
+                    config: attempt.config,
+                    application: attempt.application.clone(),
+                    source: attempt.source.clone(),
+                    report: reports[index].clone(),
+                    handle,
+                }
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap_or_else(|_| unreachable!());
+        let (drained, mut completion) = tokio::sync::oneshot::channel();
+        let budget = if mode == 2 {
+            Duration::from_millis(20)
+        } else {
+            Duration::from_secs(5)
+        };
+        let probe_mode = match mode {
+            3 => PublicStartupProbeMode::ReadinessFailure,
+            4 => PublicStartupProbeMode::ReportFailure,
+            _ => PublicStartupProbeMode::Drain,
+        };
+        let mut cleanup = Box::pin(exercise_partial_public_startup_cleanup(
+            members, budget, drained, probe_mode,
+        ));
+        if mode >= 3 {
+            let error = cleanup.await.unwrap_err();
+            assert!(error.agent_termination_unconfirmed(), "{error}");
+            assert!(error.to_string().contains("injected startup task panic"));
+        } else if mode == 0 {
+            release.send(()).unwrap();
+            cleanup.await.unwrap();
+        } else {
+            tokio::select! {
+                result = &mut cleanup => panic!("cleanup finished before held startup: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+            assert!(matches!(
+                completion.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            if mode == 1 {
+                drop(cleanup);
+            } else {
+                assert!(cleanup.await.unwrap_err().agent_termination_unconfirmed());
+            }
+            assert!(matches!(
+                completion.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            release.send(()).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), completion)
+            .await
+            .unwrap()
+            .unwrap();
+        for (control, replicator) in controls.into_iter().zip(replicators) {
+            assert!(tokio::net::TcpStream::connect(control).await.is_err());
+            assert!(replicator.current_progress().await.is_err());
+        }
+    }
+}
+
+#[test]
+fn partial_native_authority_startup_drains_transferred_and_late_hosts() {
+    run_host_test(partial_startup_ownership_cases);
+}
+
+async fn quiet_assembly_case() {
+    use kuberic_mssql_tests::three_replica::hosted_native_prefix::{
+        CoverageConclusion, RecordProbeOutcome,
+    };
+    use kuberic_mssql_tests::three_replica::{
+        CommitCoverageReport, associate_quiet_hosted_witness,
+    };
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    struct PublicationClock(AtomicU64);
+    impl ObservationClock for PublicationClock {
+        fn now_unix_millis(&self) -> Result<u64, RuntimeError> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+    }
+    let temporary = tempfile::tempdir().unwrap();
+    let clock = Arc::new(PublicationClock(AtomicU64::new(1200)));
+    let mut group = OwnedDiagnostic::start_with_clock(temporary.path(), clock.clone()).await;
+    let original = &group.accepted[0].input;
+    let mut later = group.baseline.clone();
+    later[1].progress.last += 1;
+    let mut rebuilt = original.clone();
+    let lifecycle = rebuilt.lifecycle.as_mut().unwrap();
+    lifecycle.replicas = complete_remote_configuration(&configuration(), &later, 0)
+        .unwrap()
+        .replicas;
+    rebuilt.input_digest = lifecycle.digest();
+    assert_ne!(rebuilt.input_digest, original.input_digest);
+    assert!(accepted_command(0, &rebuilt, &later[0]).is_err());
+    accepted_command(0, original, &later[0]).unwrap();
+    for index in [1, 2] {
+        let Some(PublicOperationProgram::Configuration(input)) =
+            &group.accepted[index].input.program
+        else {
+            unreachable!()
+        };
+        assert_eq!(input.replicas.len(), 2);
+        assert!(
+            input
+                .replicas
+                .iter()
+                .any(|peer| peer.role == ReplicaRole::Primary)
+        );
+    }
+    let evidence = group.scripted_native(Some("99")).await.unwrap();
+    let raw = CommitCoverageReport {
+        fixture_run_id: "server-free-live-assembly-schema-test".into(),
+        fixture_resource_uid: "runtime-host-test".into(),
+        native_binding: evidence.initial_binding.clone(),
+        primary_ordinal: 1,
+        selected_target_ordinal: 2,
+        acknowledgement: evidence.acknowledgement.clone(),
+        transaction_samples: evidence.transaction_samples.clone(),
+        record_probe: RecordProbeOutcome::Observed {
+            commit_lsn: DecimalProgress::parse("99").unwrap(),
+        },
+        before: evidence.initial_observations.clone(),
+        after_ack: evidence.observations.clone(),
+        quiet: evidence.observations.clone(),
+        coverage: CoverageConclusion::Blocked {
+            missing_evidence: vec!["server_free_synthetic_inputs_not_live_proof"],
+            not_exercised: ["covered", "not_yet_covered", "hardening_with_redo_lag"],
+        },
+    };
+    for stale in [false, true] {
+        clock.0.store(1200, Ordering::SeqCst);
+        let calls = AtomicUsize::new(0);
+        let result = associate_quiet_hosted_witness(
+            &group.authority,
+            &group.members,
+            async {
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                Ok(raw.clone())
+            },
+            || {
+                let sequence = calls.fetch_add(1, Ordering::SeqCst);
+                let group = &group;
+                let clock = &clock;
+                async move {
+                    let reports = group.fresh_reports().await?;
+                    if stale && sequence == 1 {
+                        clock.0.store(40_000, Ordering::SeqCst);
+                    }
+                    Ok(reports)
+                }
+            },
+            Duration::from_secs(15),
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        if stale {
+            assert!(
+                result.is_err(),
+                "final reports cannot keep expired native samples fresh"
+            );
+        } else {
+            let report = result.unwrap();
+            assert_eq!(report.native_collection, raw);
+            assert_eq!(report.association.scope, "live_hosted_native_association");
+            assert_eq!(report.association.native_input, "live_owned_quiet_sql");
+            assert_eq!(report.association.public_coverage.status, "blocked");
+            assert!(
+                !report
+                    .association
+                    .public_coverage
+                    .missing_evidence
+                    .contains(&"live_native_hosted_witness")
+            );
+            assert!(matches!(
+                report.association.decision,
+                NativePrefixDecision::NativeSampledCoverage { .. }
+            ));
+        }
+    }
+    group.stop().await;
+}
+
+#[test]
+fn native_authority_quiet_assembly_preserves_frozen_inputs_and_publication_freshness() {
+    run_host_test(quiet_assembly_case);
 }

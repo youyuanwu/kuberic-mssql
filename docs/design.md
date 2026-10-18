@@ -210,7 +210,10 @@ binds scripted native inputs to actual accepted public receipts, process/
 storage/history and independently observed native database identity under an
 exclusively owned diagnostic lifetime. These results do not establish a live
 hosted witness, semantic public progress/history mapping, retained capability
-or switchover authority.
+or switchover authority. A separate
+[ignored live association harness](kuberic-progress.md#live-hosted-witness-harness-not-executed)
+now connects those mechanisms to the existing no-control native collector,
+but is compiled and server-free-tested only; its live proof remains unexecuted.
 
 `SqlServerReplicator::native_configuration_sequence` now exposes the existing
 validated native read as an optional `ConfigurationSequence`, independently of

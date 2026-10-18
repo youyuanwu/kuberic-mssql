@@ -2,6 +2,7 @@ mod availability_group;
 mod commit_coverage;
 mod data;
 mod evidence;
+pub mod hosted_authority;
 mod kuberic_group;
 mod member;
 mod model;
@@ -81,8 +82,13 @@ pub use process::{
     ProcessResult, ProcessRunner,
 };
 pub use public_kuberic_group::{
-    LicensedConflictScenario, PublicBuildCommand, PublicFaultInjection, PublicMssqlGroup,
-    PublicMssqlPod, PublicMutationFault,
+    LicensedConflictScenario, LiveHostedWitness, PublicBuildCommand, PublicFaultInjection,
+    PublicMssqlGroup, PublicMssqlPod, PublicMutationFault, associate_quiet_hosted_witness,
+};
+#[doc(hidden)]
+pub use public_kuberic_group::{
+    PublicStartupProbeHandle, PublicStartupProbeMember, PublicStartupProbeMode,
+    exercise_partial_public_startup_cleanup,
 };
 pub use secrets::CredentialFiles;
 pub use tls::TlsAssets;
