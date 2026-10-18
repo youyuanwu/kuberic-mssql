@@ -301,22 +301,81 @@ decisions are separate from **`public_coverage.status = blocked`**
 [prefix.rs:323-334](../crates/kuberic-mssql-tests/src/three_replica/commit_coverage/prefix.rs#L323-L334)).
 The record-only command/report above remains unchanged.
 
-Remaining work:
+Remaining live/public work:
 
-1. Bind native witnesses to actual accepted public configuration/storage/session
-   authority and native/public history through the fixed interfaces. Do not
-   manufacture those domains from fixture labels or phase admissions.
+1. Extend the offline hosted association below to a licensed live native witness.
+   Do not manufacture accepted public authority or history semantics from
+   fixture labels, phase admissions or matching numeric values.
 2. Demonstrate hardening with redo still behind; that live proof remains
    `not_exercised`. Offline redo independence is not such a demonstration.
    Any additional control requires design/safety review and live authorization.
-3. Establish replaced-storage/session and superseded-public-authority rejection
-   when those domains are collected, plus the role-specific public progress,
-   history and retained-transfer semantics still missing from the matrix.
+3. Demonstrate actual accepted storage/public-history replacement journeys,
+   beyond altered-evidence rejection, and establish the role-specific public
+   progress, history and retained-transfer semantics still missing from the matrix.
 
 One successful witness would prove only that sampled coverage. It would not
 establish a highest public progress scalar, a retained floor, restart
 continuity, arbitrary configuration catch-up, or safe switchover. Those remain
 separate gates, alongside SQL access, lease/fence and role-transition authority.
+
+#### Offline hosted authority association
+
+The server-free diagnostic now associates **scripted native evidence with
+actual public `ReplicaHost` authority**. It uses real initialization, the
+primary's successful `InitialPrimary` lifecycle, and successful current-only
+Configuration programs on both secondaries. Frozen inputs must match exact
+completion ID/revision/kind, digest/replay, configuration identity and accepted
+history/storage. Actual reports retain process session, creation identity,
+Pod/PVC storage generation and public history; an old successful completion is
+not treated as a current-configuration oracle
+([native_authority.rs:223-314](../crates/kuberic-mssql-tests/tests/runtime_process_host/native_authority.rs#L223-L314)).
+
+The observe-only adapter accepts a secondary configuration containing exactly
+its two complete remote descriptions. Its own identity/session/address comes
+from the bound runtime context, with remote role, completeness and local
+session/address collision checks. Native eligibility and frozen replay remain
+required; partial bootstrap deferral and SQL mutation paths are unchanged
+([compatibility.rs:834-884](../crates/kuberic-mssql/src/kuberic/compatibility.rs#L834-L884)).
+
+Each member is linked through its actual admitted adapter topology. Independent
+database identity anchors are collected from the owned observation source;
+coherently changing a witness's local DBID/database GUID or shared family/fork
+cannot replace that baseline. Local DBIDs/GUIDs may legitimately differ between
+members. The native facade reuses the existing exact prefix/phase evaluators
+and rejects future transitions or final observations predating phase admission
+([hosted.rs:29-93](../crates/kuberic-mssql-tests/src/three_replica/commit_coverage/prefix/hosted.rs#L29-L93)).
+
+Collection has a 15-second bound. Its exclusively owned command stream brackets
+native collection with fresh same-source reports; command admission and result
+publication share a short lock, never held across network/native awaits.
+Verified higher Epoch or same-role Role retires predecessor collection; equal
+and exact replay preserve the lifetime. Pending, timed-out, caller-cancelled,
+terminal or restarting authority cannot publish predecessor success. A later
+successful host receipt does not revive an unknown-outcome lifetime
+([native_authority.rs:599-742](../crates/kuberic-mssql-tests/tests/runtime_process_host/native_authority.rs#L599-L742)).
+
+Run the diagnostic and focused secondary replay cases without SQL Server:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo test --locked -p kuberic-mssql-tests \
+  --test runtime_process_host native_authority -- --test-threads=1
+```
+
+The tests inspect an in-memory serializable association with
+`scope = offline_hosted_native_association`, `native_input = scripted_no_live_sql`
+and **`public_coverage.status = blocked`**. This is not a new fixture CLI or
+durable authority certificate. Actual hosted journeys cover epoch supersession,
+same-root fresh sessions, terminal Close, pending publication, caller drop and
+an awaited nonterminal timeout. Storage/public-history replacements are
+**altered-evidence rejection cases**, not accepted replacement journeys.
+
+The diagnostic excludes out-of-band administrators and cannot rule out
+undetected change-and-revert. It does not join public history to a SQL recovery
+history as a semantic equivalence, establish exclusive production storage
+ownership, prove new live SQL durability, or authorize catch-up/promotion.
+The licensed native-only commands/reports above are unchanged. Live hosted
+binding, redo-lag proof, public progress/retention, restart continuity and the
+reporting constraints below remain gates.
 
 ### Upstream reporting and history blockers
 

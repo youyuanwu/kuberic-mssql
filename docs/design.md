@@ -182,7 +182,7 @@ which dependency those contracts must be checked against.
 |---|---|---|
 | Progress and history | Primary progress is locally durable quorum-committed progress; secondary progress is contiguous durably accepted progress. Recovery progress is election-only with access closed. Catch-up capability identifies the retained-history floor for an admitted peer, or is unknown/inapplicable. | A typed native configuration-sequence read distinguishes unavailable evidence from observed zero. Existing public callbacks retain AG-sequence/placeholder projection for hosted compatibility, not proven database-data progress or retained history. |
 | Epoch authority | Epoch barriers fence predecessor operations on primaries and secondaries, including same-role changes. | Higher validated epochs retire predecessor dispatch/publication authority, including same-role changes; equal replays preserve it. Submitted effects retain their existing durable uncertainty and exclusion. |
-| Configuration and build | Successful callbacks certify the exact supported configuration. An idle build target is outside voting membership; build completion and later admission are separate. | Bootstrap callbacks can defer work or complete only the source foundation. The seed-build translator still requires a target in the frozen active-secondary layout, despite accepting idle build DTOs. |
+| Configuration and build | Successful callbacks certify the exact supported configuration. An idle build target is outside voting membership; build completion and later admission are separate. | Healthy observe-only secondaries accept exact complete remote-peer configurations using their bound local runtime context. Bootstrap callbacks can still defer work or complete only the source foundation. The seed-build translator still requires a target in the frozen active-secondary layout, despite accepting idle build DTOs. |
 | Access and catch-up | Serving follows partition read/write status, not role alone. Catch-up satisfies the requested predicate for applicable current/previous configurations and any required successor. | Ordinary hosts publish no client address and do not manage SQL serving access. Catch-up callbacks explicitly reject; native synchronization alone is not a public catch-up receipt. |
 | Shutdown | Close drains owned descendants. Abort promptly fences and contains remaining work without relying on graceful completion. | Close drains tracked callbacks and actual store/submission task joins; Abort fences without waiting. The concrete process runner retains startup, host and local-drain ownership across cancelled or bounded waiters while the async runtime lives. Generic host post-Abort/interrupted-terminal completion alone does not certify these joins. |
 | Replication endpoint | Open establishes the advertised replication endpoint and its ownership lifetime, using the native transport where appropriate. | The configured replication address is metadata only; Open does not establish or own a transport listener. |
@@ -201,10 +201,16 @@ evidence of unsafe replication, but is not a retained-history proof.
 The [native evidence assessment](kuberic-progress.md#native-evidence-feasibility)
 records six separate obligations and their missing proofs. Existing exact
 decimal and same-field/lineage comparison support is not a commitment,
-contiguous-prefix or retained-range certificate. The first bounded native
-investigation is [acknowledged-record coverage](kuberic-progress.md#first-native-proof-toward-switchover)
-on the exact selected successor, not a new scalar projection. Its result is
-still unproven; no runtime mapping or switchover authority is enabled.
+contiguous-prefix or retained-range certificate. The bounded
+[acknowledged-record and native-prefix experiments](kuberic-progress.md#first-native-proof-toward-switchover)
+have demonstrated one exact record outside a paused target's observed prefix
+and covered after resume/quiet collection. The separate
+[offline hosted association](kuberic-progress.md#offline-hosted-authority-association)
+binds scripted native inputs to actual accepted public receipts, process/
+storage/history and independently observed native database identity under an
+exclusively owned diagnostic lifetime. These results do not establish a live
+hosted witness, semantic public progress/history mapping, retained capability
+or switchover authority.
 
 `SqlServerReplicator::native_configuration_sequence` now exposes the existing
 validated native read as an optional `ConfigurationSequence`, independently of
