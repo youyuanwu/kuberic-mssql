@@ -5,16 +5,13 @@ use kuberic_mssql_tests::three_replica::hosted_native_prefix::{
     TransactionAcknowledgement, TransactionRecordRow, TransactionSample,
 };
 use kuberic_mssql_tests::three_replica::{NativeMemberBinding, NativeTopologyBinding, ReadyMember};
-use kuberic_runtime::control::normalize_execute_request;
-use kuberic_runtime::protocol::command::ProtocolCommand;
-use kuberic_runtime::protocol::public_operations::{
-    PublicConfiguration, PublicV1CallKind, PublicV1OperationResult,
-};
+use kuberic_runtime::protocol::public_operations::{PublicV1CallKind, PublicV1OperationResult};
 use kuberic_runtime::replicator::{PrimaryReplicator, ReplicaSetConfiguration};
 
 use kuberic_mssql_tests::three_replica::hosted_authority::{
     AcceptedCommand, DiagnosticResult, HostedAssociation, HostedAuthority, NativeDatabaseAnchor,
-    NativeInput, accepted_command, validate_reports,
+    NativeInput, accepted_command, complete_remote_configuration, operation_input,
+    validate_reports,
 };
 
 struct OwnedDiagnostic {
@@ -44,17 +41,11 @@ fn validate_configuration(
 }
 
 fn command_input(command: &PublicCommand) -> DiagnosticResult<PublicOperationIntent> {
-    let envelope = normalize_execute_request(command.request.clone())
-        .map_err(|error| format!("public operation input: {error}"))?;
-    let ProtocolCommand::PublicV1Operation(operation) = envelope.command else {
-        return Err("diagnostic requires a public operation".into());
-    };
-    if operation.target != identities()[command.target_index]
-        || command.request.resource_uid != "runtime-host-test"
-    {
-        return Err("public operation target differs".into());
-    }
-    Ok(operation.intent)
+    operation_input(
+        &identities()[command.target_index],
+        "runtime-host-test",
+        &command.request,
+    )
 }
 
 fn scripted_snapshot(index: usize, observed_at: u64) -> InstanceSnapshot {
@@ -78,36 +69,19 @@ fn scripted_snapshot(index: usize, observed_at: u64) -> InstanceSnapshot {
 
 impl OwnedDiagnostic {
     async fn start(root: &Path) -> Self {
+        Self::start_with_clock(root, Arc::new(FixedClock)).await
+    }
+
+    async fn start_with_clock(root: &Path, clock: Arc<dyn ObservationClock>) -> Self {
         let snapshots = std::array::from_fn(|index| scripted_snapshot(index, OBSERVED_AT));
         let mut attempts = start_attempts_with_snapshots(root, snapshots).await;
         let (replicas, _, bootstrap_commands) = initialize_attempts(&mut attempts).await;
         let (_, configured) = current_public_reports(&attempts).await;
         let commands = (0..3)
             .map(|index| {
-                let replicas = configuration()
-                    .members
-                    .into_iter()
-                    .filter(|member| member.identity != configured[index].replica)
-                    .map(|member| {
-                        let peer = usize::try_from(member.identity.replica_id.value() - 1).unwrap();
-                        PublicReplicaDescriptor {
-                            build_id: OperationId::default(),
-                            identity: configured[peer].replica.clone(),
-                            replication_address: format!("http://{}", attempts[peer].replication),
-                            process_session_id: configured[peer].process_session_id.clone(),
-                            storage_incarnation: Some(configured[peer].storage_incarnation.clone()),
-                            role: member.role,
-                            current_progress: configured[peer].progress.last,
-                            catch_up_capability: configured[peer].progress.first,
-                            must_catchup: false,
-                        }
-                    })
-                    .collect();
-                let program = PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: configuration(),
-                    previous: None,
-                    replicas,
-                });
+                let program = PublicOperationProgram::Configuration(
+                    complete_remote_configuration(&configuration(), &configured, index).unwrap(),
+                );
                 PublicCommand {
                     target_index: index,
                     request: public_operation_request(
@@ -218,6 +192,7 @@ impl OwnedDiagnostic {
             bindings,
             native_database_anchors,
             observers,
+            clock,
         )
         .unwrap();
         let members = std::array::from_fn(|index| ReadyMember {
@@ -983,9 +958,10 @@ fn remote_only_secondary_configuration_replay_keeps_factory_local_context() {
 
 async fn partial_startup_ownership_cases() {
     use kuberic_mssql_tests::three_replica::{
-        PublicStartupProbeHandle, PublicStartupProbeMember, exercise_partial_public_startup_cleanup,
+        PublicStartupProbeHandle, PublicStartupProbeMember, PublicStartupProbeMode,
+        exercise_partial_public_startup_cleanup,
     };
-    for mode in 0..3 {
+    for mode in 0..5 {
         let temporary = tempfile::tempdir().unwrap();
         let mut group = OwnedDiagnostic::start(temporary.path()).await;
         group.authority.retire();
@@ -1002,20 +978,35 @@ async fn partial_startup_ownership_cases() {
             .collect::<Vec<_>>();
         let (release, held) = tokio::sync::oneshot::channel();
         let mut held = Some(held);
-        let members = group
-            .replicas
-            .drain(..)
+        let mut replicas = group.replicas.drain(..).map(Some).collect::<Vec<_>>();
+        let mut failed = if mode >= 3 {
+            let mut primary = replicas[0].take().unwrap();
+            primary.shutdown();
+            primary.wait().await.unwrap();
+            let task = tokio::spawn(async { panic!("injected startup task panic") });
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            Some(task)
+        } else {
+            None
+        };
+        let members = replicas
+            .into_iter()
             .zip(group.attempts.drain(..))
             .enumerate()
             .map(|(index, (running, attempt))| {
-                let handle = if index == 1 {
+                let handle = if index == 0 && mode >= 3 {
+                    PublicStartupProbeHandle::Pending(failed.take().unwrap())
+                } else if index == 1 && mode < 3 {
+                    let running = running.unwrap();
                     let held = held.take().unwrap();
                     PublicStartupProbeHandle::Pending(tokio::spawn(async move {
                         held.await.expect("release owned startup");
                         Ok(Some(running))
                     }))
                 } else {
-                    PublicStartupProbeHandle::Started(running)
+                    PublicStartupProbeHandle::Started(running.unwrap())
                 };
                 PublicStartupProbeMember {
                     config: attempt.config,
@@ -1034,10 +1025,19 @@ async fn partial_startup_ownership_cases() {
         } else {
             Duration::from_secs(5)
         };
+        let probe_mode = match mode {
+            3 => PublicStartupProbeMode::ReadinessFailure,
+            4 => PublicStartupProbeMode::ReportFailure,
+            _ => PublicStartupProbeMode::Drain,
+        };
         let mut cleanup = Box::pin(exercise_partial_public_startup_cleanup(
-            members, budget, drained,
+            members, budget, drained, probe_mode,
         ));
-        if mode == 0 {
+        if mode >= 3 {
+            let error = cleanup.await.unwrap_err();
+            assert!(error.agent_termination_unconfirmed(), "{error}");
+            assert!(error.to_string().contains("injected startup task panic"));
+        } else if mode == 0 {
             release.send(()).unwrap();
             cleanup.await.unwrap();
         } else {
@@ -1074,4 +1074,126 @@ async fn partial_startup_ownership_cases() {
 #[test]
 fn partial_native_authority_startup_drains_transferred_and_late_hosts() {
     run_host_test(partial_startup_ownership_cases);
+}
+
+async fn quiet_assembly_case() {
+    use kuberic_mssql_tests::three_replica::hosted_native_prefix::{
+        CoverageConclusion, RecordProbeOutcome,
+    };
+    use kuberic_mssql_tests::three_replica::{
+        CommitCoverageReport, associate_quiet_hosted_witness,
+    };
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    struct PublicationClock(AtomicU64);
+    impl ObservationClock for PublicationClock {
+        fn now_unix_millis(&self) -> Result<u64, RuntimeError> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+    }
+    let temporary = tempfile::tempdir().unwrap();
+    let clock = Arc::new(PublicationClock(AtomicU64::new(1200)));
+    let mut group = OwnedDiagnostic::start_with_clock(temporary.path(), clock.clone()).await;
+    let original = &group.accepted[0].input;
+    let mut later = group.baseline.clone();
+    later[1].progress.last += 1;
+    let mut rebuilt = original.clone();
+    let lifecycle = rebuilt.lifecycle.as_mut().unwrap();
+    lifecycle.replicas = complete_remote_configuration(&configuration(), &later, 0)
+        .unwrap()
+        .replicas;
+    rebuilt.input_digest = lifecycle.digest();
+    assert_ne!(rebuilt.input_digest, original.input_digest);
+    assert!(accepted_command(0, &rebuilt, &later[0]).is_err());
+    accepted_command(0, original, &later[0]).unwrap();
+    for index in [1, 2] {
+        let Some(PublicOperationProgram::Configuration(input)) =
+            &group.accepted[index].input.program
+        else {
+            unreachable!()
+        };
+        assert_eq!(input.replicas.len(), 2);
+        assert!(
+            input
+                .replicas
+                .iter()
+                .any(|peer| peer.role == ReplicaRole::Primary)
+        );
+    }
+    let evidence = group.scripted_native(Some("99")).await.unwrap();
+    let raw = CommitCoverageReport {
+        fixture_run_id: "server-free-live-assembly-schema-test".into(),
+        fixture_resource_uid: "runtime-host-test".into(),
+        native_binding: evidence.initial_binding.clone(),
+        primary_ordinal: 1,
+        selected_target_ordinal: 2,
+        acknowledgement: evidence.acknowledgement.clone(),
+        transaction_samples: evidence.transaction_samples.clone(),
+        record_probe: RecordProbeOutcome::Observed {
+            commit_lsn: DecimalProgress::parse("99").unwrap(),
+        },
+        before: evidence.initial_observations.clone(),
+        after_ack: evidence.observations.clone(),
+        quiet: evidence.observations.clone(),
+        coverage: CoverageConclusion::Blocked {
+            missing_evidence: vec!["server_free_synthetic_inputs_not_live_proof"],
+            not_exercised: ["covered", "not_yet_covered", "hardening_with_redo_lag"],
+        },
+    };
+    for stale in [false, true] {
+        clock.0.store(1200, Ordering::SeqCst);
+        let calls = AtomicUsize::new(0);
+        let result = associate_quiet_hosted_witness(
+            &group.authority,
+            &group.members,
+            async {
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                Ok(raw.clone())
+            },
+            || {
+                let sequence = calls.fetch_add(1, Ordering::SeqCst);
+                let group = &group;
+                let clock = &clock;
+                async move {
+                    let reports = group.fresh_reports().await?;
+                    if stale && sequence == 1 {
+                        clock.0.store(40_000, Ordering::SeqCst);
+                    }
+                    Ok(reports)
+                }
+            },
+            Duration::from_secs(15),
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        if stale {
+            assert!(
+                result.is_err(),
+                "final reports cannot keep expired native samples fresh"
+            );
+        } else {
+            let report = result.unwrap();
+            assert_eq!(report.native_collection, raw);
+            assert_eq!(report.association.scope, "live_hosted_native_association");
+            assert_eq!(report.association.native_input, "live_owned_quiet_sql");
+            assert_eq!(report.association.public_coverage.status, "blocked");
+            assert!(
+                !report
+                    .association
+                    .public_coverage
+                    .missing_evidence
+                    .contains(&"live_native_hosted_witness")
+            );
+            assert!(matches!(
+                report.association.decision,
+                NativePrefixDecision::NativeSampledCoverage { .. }
+            ));
+        }
+    }
+    group.stop().await;
+}
+
+#[test]
+fn native_authority_quiet_assembly_preserves_frozen_inputs_and_publication_freshness() {
+    run_host_test(quiet_assembly_case);
 }

@@ -1,12 +1,10 @@
 use super::*;
 
-use kuberic_runtime::control::normalize_execute_request;
-use kuberic_runtime::protocol::command::ProtocolCommand;
-use kuberic_runtime::protocol::public_operations::PublicConfiguration;
 use serde::Serialize;
 
 use crate::three_replica::hosted_authority::{
     HostedAssociation, HostedAuthority, NativeDatabaseAnchor, NativeInput, accepted_command,
+    complete_remote_configuration,
 };
 use crate::three_replica::hosted_native_prefix::NativePrefixEvidence;
 use crate::three_replica::{CommitCoverageReport, LaunchedMembers};
@@ -22,16 +20,47 @@ pub(super) fn operation_input(
     resource: &ResourceUid,
     request: &wire::ExecuteCommandRequest,
 ) -> Result<PublicOperationIntent, MssqlGroupError> {
-    let envelope = normalize_execute_request(request.clone()).map_err(display_error)?;
-    let ProtocolCommand::PublicV1Operation(operation) = envelope.command else {
-        return Err(MssqlGroupError::new("witness requires a public operation"));
+    crate::three_replica::hosted_authority::operation_input(
+        &pod.identity,
+        resource.as_str(),
+        request,
+    )
+    .map_err(MssqlGroupError::new)
+}
+
+pub async fn associate_quiet_hosted_witness<F, R, RF>(
+    authority: &HostedAuthority,
+    members: &[ReadyMember; 3],
+    collect: F,
+    reports: R,
+    budget: Duration,
+) -> Result<LiveHostedWitness, String>
+where
+    F: std::future::Future<Output = Result<CommitCoverageReport, String>>,
+    R: FnMut() -> RF,
+    RF: std::future::Future<Output = Result<Vec<PublicV1AgentReport>, String>>,
+{
+    let mut native_collection = None;
+    let native = async {
+        let report = collect.await?;
+        let evidence =
+            NativePrefixEvidence::from_quiet_report(&report, authority.evaluation_time()?);
+        native_collection = Some(report);
+        Ok(evidence)
     };
-    if operation.target != pod.identity || request.resource_uid != resource.as_str() {
-        return Err(MssqlGroupError::new(
-            "witness operation target/resource differs",
-        ));
-    }
-    Ok(operation.intent)
+    let association = authority
+        .collect(
+            native,
+            reports,
+            members,
+            NativeInput::LiveQuietFixture,
+            budget,
+        )
+        .await?;
+    Ok(LiveHostedWitness {
+        native_collection: native_collection.ok_or("live native collection missing")?,
+        association,
+    })
 }
 
 impl PublicMssqlGroup {
@@ -83,33 +112,8 @@ impl PublicMssqlGroup {
                 continue;
             }
             let reports = public_reports(&self.pods, self.witness_rpc_budget()?).await?;
-            let peers = self
-                .configuration
-                .members
-                .iter()
-                .filter(|member| member.identity != self.pods[index].identity)
-                .map(|member| {
-                    let report = reports
-                        .iter()
-                        .find(|report| report.replica == member.identity)
-                        .ok_or_else(|| {
-                            MssqlGroupError::new("live witness exact peer report missing")
-                        })?;
-                    Ok(PublicReplicaDescriptor {
-                        build_id: OperationId::default(),
-                        identity: report.replica.clone(),
-                        replication_address: report.replication_address.clone().ok_or_else(
-                            || MssqlGroupError::new("live witness peer address missing"),
-                        )?,
-                        process_session_id: report.process_session_id.clone(),
-                        storage_incarnation: Some(report.storage_incarnation.clone()),
-                        role: member.role,
-                        current_progress: report.progress.last,
-                        catch_up_capability: report.progress.first,
-                        must_catchup: false,
-                    })
-                })
-                .collect::<Result<Vec<_>, MssqlGroupError>>()?;
+            let configuration = complete_remote_configuration(&self.configuration, &reports, index)
+                .map_err(MssqlGroupError::new)?;
             let request = program_request(
                 &self.pods,
                 &reports,
@@ -117,11 +121,7 @@ impl PublicMssqlGroup {
                 &self.resource_uid,
                 &reports[index].process_session_id,
                 &format!("live-native-witness-configuration-{}", index + 1),
-                PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: self.configuration.clone(),
-                    previous: None,
-                    replicas: peers,
-                }),
+                PublicOperationProgram::Configuration(configuration),
             )
             .await?;
             let input = operation_input(&self.pods[index], &self.resource_uid, request.get_ref())?;
@@ -191,49 +191,37 @@ impl PublicMssqlGroup {
             bindings,
             anchors,
             observers,
+            Arc::new(SystemObservationClock),
         )
         .map_err(MssqlGroupError::new)?;
-        let mut native_collection = None;
         let native = async {
-            let report = launched
+            launched
                 .probe_native_commit_coverage(target)
                 .await
-                .map_err(|error| error.to_string())?;
-            let evidence = NativePrefixEvidence::from_quiet_report(
-                &report,
-                kuberic_mssql::instance::unix_millis().map_err(|error| error.to_string())?,
-            );
-            native_collection = Some(report);
-            Ok(evidence)
+                .map_err(|error| error.to_string())
         };
-        let association = authority
-            .collect(
-                native,
-                || async {
-                    public_reports(
-                        &self.pods,
-                        self.witness_rpc_budget()
-                            .map_err(|error| error.to_string())?,
-                    )
-                    .await
-                    .map(Vec::from)
-                    .map_err(|error| error.to_string())
-                },
-                &launched.members,
-                NativeInput::LiveQuietFixture,
-                self.operation_timeout.min(remaining(
-                    self.complete_deadline,
-                    "live witness collection",
-                )?),
-            )
-            .await;
+        let association = associate_quiet_hosted_witness(
+            &authority,
+            &launched.members,
+            native,
+            || async {
+                public_reports(
+                    &self.pods,
+                    self.witness_rpc_budget()
+                        .map_err(|error| error.to_string())?,
+                )
+                .await
+                .map(Vec::from)
+                .map_err(|error| error.to_string())
+            },
+            self.operation_timeout.min(remaining(
+                self.complete_deadline,
+                "live witness collection",
+            )?),
+        )
+        .await;
         authority.retire();
-        let association = association.map_err(MssqlGroupError::new)?;
-        Ok(LiveHostedWitness {
-            native_collection: native_collection
-                .ok_or_else(|| MssqlGroupError::new("live native collection missing"))?,
-            association,
-        })
+        association.map_err(MssqlGroupError::new)
     }
 
     fn witness_rpc_budget(&self) -> Result<Duration, MssqlGroupError> {

@@ -2,6 +2,14 @@ use super::startup::{StartupHosts, cancel_attempts};
 use super::*;
 
 #[doc(hidden)]
+#[derive(Clone, Copy)]
+pub enum PublicStartupProbeMode {
+    Drain,
+    ReadinessFailure,
+    ReportFailure,
+}
+
+#[doc(hidden)]
 pub enum PublicStartupProbeHandle {
     Started(RunningReplica),
     Pending(tokio::task::JoinHandle<kuberic_runtime::host::Result<Option<RunningReplica>>>),
@@ -21,6 +29,7 @@ pub async fn exercise_partial_public_startup_cleanup(
     members: [PublicStartupProbeMember; 3],
     budget: Duration,
     drained: tokio::sync::oneshot::Sender<()>,
+    mode: PublicStartupProbeMode,
 ) -> Result<(), MssqlGroupError> {
     let mut attempts = Vec::with_capacity(3);
     let mut pods = Vec::with_capacity(3);
@@ -61,10 +70,35 @@ pub async fn exercise_partial_public_startup_cleanup(
     owner.attempts = attempts;
     owner.drained = Some(drained);
     let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), budget);
-    cancel_attempts(
+    let primary = match mode {
+        PublicStartupProbeMode::Drain => None,
+        PublicStartupProbeMode::ReadinessFailure => Some(
+            await_started_hosts(
+                owner.pods.as_mut().expect("probe owner armed"),
+                &mut owner.attempts,
+                budget,
+            )
+            .await
+            .expect_err("probe supplies a failed startup"),
+        ),
+        PublicStartupProbeMode::ReportFailure => Some(
+            startup_reports(
+                owner.pods.as_mut().expect("probe owner armed"),
+                &mut owner.attempts,
+                budget,
+            )
+            .await
+            .expect_err("probe supplies a failed startup"),
+        ),
+    };
+    let shutdown = cancel_attempts(
         &mut owner.attempts,
         owner.pods.as_mut().expect("probe owner armed"),
         &cleanup,
     )
-    .await
+    .await;
+    match primary {
+        Some(primary) => Err(startup_failure(primary, shutdown)),
+        None => shutdown,
+    }
 }

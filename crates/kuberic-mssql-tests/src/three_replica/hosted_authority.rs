@@ -3,13 +3,16 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kuberic_mssql::kuberic::HealthyTopologyBinding;
+use kuberic_mssql::kuberic::{HealthyTopologyBinding, ObservationClock};
 use kuberic_mssql::observation::InstanceSnapshot;
 use kuberic_mssql::runtime_config::ObserverConfig;
 use kuberic_mssql::{Guid, Observation, SqlIdentifier};
+use kuberic_runtime::control::{normalize_execute_request, proto};
+use kuberic_runtime::protocol::command::ProtocolCommand;
 use kuberic_runtime::protocol::public_operations::{
     PublicConfiguration, PublicLifecycleRecipe, PublicOperationIntent, PublicOperationProgram,
-    PublicV1AgentReport, PublicV1CallKind, PublicV1OperationCompletion, PublicV1OperationResult,
+    PublicReplicaDescriptor, PublicV1AgentReport, PublicV1CallKind, PublicV1OperationCompletion,
+    PublicV1OperationResult,
 };
 use kuberic_runtime::protocol::types::{ConfigurationDescriptor, Epoch, ReplicaIdentity};
 use serde::Serialize;
@@ -138,6 +141,65 @@ pub struct HostedAuthority {
     pub native_database_anchors: Vec<NativeDatabaseAnchor>,
     observers: Vec<ObserverConfig>,
     state: Arc<Mutex<AuthorityState>>,
+    clock: Arc<dyn ObservationClock>,
+}
+
+pub fn operation_input(
+    target: &ReplicaIdentity,
+    resource: &str,
+    request: &proto::ExecuteCommandRequest,
+) -> DiagnosticResult<PublicOperationIntent> {
+    let envelope = normalize_execute_request(request.clone())
+        .map_err(|error| format!("public operation input: {error}"))?;
+    let ProtocolCommand::PublicV1Operation(operation) = envelope.command else {
+        return Err("diagnostic requires a public operation".into());
+    };
+    if &operation.target != target || request.resource_uid != resource {
+        return Err("public operation target/resource differs".into());
+    }
+    Ok(operation.intent)
+}
+
+pub fn complete_remote_configuration(
+    configuration: &ConfigurationDescriptor,
+    reports: &[PublicV1AgentReport],
+    local_index: usize,
+) -> DiagnosticResult<PublicConfiguration> {
+    if reports.len() != 3 || local_index >= 3 {
+        return Err("three reports and an exact local member are required".into());
+    }
+    let peers = configuration
+        .members
+        .iter()
+        .filter(|member| member.identity != reports[local_index].replica)
+        .map(|member| {
+            let report = reports
+                .iter()
+                .find(|report| report.replica == member.identity)
+                .ok_or("configuration peer report missing")?;
+            Ok(PublicReplicaDescriptor {
+                build_id: Default::default(),
+                identity: report.replica.clone(),
+                replication_address: report
+                    .replication_address
+                    .clone()
+                    .ok_or("configuration peer address missing")?,
+                process_session_id: report.process_session_id.clone(),
+                storage_incarnation: Some(report.storage_incarnation.clone()),
+                role: member.role,
+                current_progress: report.progress.last,
+                catch_up_capability: report.progress.first,
+                must_catchup: false,
+            })
+        })
+        .collect::<DiagnosticResult<Vec<_>>>()?;
+    let input = PublicConfiguration {
+        current: configuration.clone(),
+        previous: None,
+        replicas: peers,
+    };
+    input.validate().map_err(str::to_owned)?;
+    Ok(input)
 }
 
 fn operation_kind(input: &PublicOperationIntent) -> DiagnosticResult<PublicV1CallKind> {
@@ -326,6 +388,7 @@ impl HostedAuthority {
         bindings: Vec<Arc<HealthyTopologyBinding>>,
         native_database_anchors: Vec<NativeDatabaseAnchor>,
         observers: Vec<ObserverConfig>,
+        clock: Arc<dyn ObservationClock>,
     ) -> DiagnosticResult<Self> {
         validate_configuration(&configuration, &accepted, &baseline)?;
         if bindings.len() != 3 || native_database_anchors.len() != 3 || observers.len() != 3 {
@@ -347,7 +410,14 @@ impl HostedAuthority {
             native_database_anchors,
             observers,
             state,
+            clock,
         })
+    }
+
+    pub fn evaluation_time(&self) -> DiagnosticResult<u64> {
+        self.clock
+            .now_unix_millis()
+            .map_err(|error| format!("publication clock: {error}"))
     }
 
     fn check_lifetime(state: &AuthorityState, generation: u64) -> DiagnosticResult<()> {
@@ -485,8 +555,7 @@ impl HostedAuthority {
         let mut state = self.state.lock().unwrap();
         Self::check_lifetime(&state, generation)?;
         if matches!(source, NativeInput::LiveQuietFixture) {
-            native.evaluated_at_unix_millis = kuberic_mssql::instance::unix_millis()
-                .map_err(|error| format!("live publication clock: {error}"))?;
+            native.evaluated_at_unix_millis = self.evaluation_time()?;
         }
         validate_reports(&self.baseline, &final_reports, &state.report_high_water)?;
         validate_configuration(&self.configuration, &self.accepted, &final_reports)?;

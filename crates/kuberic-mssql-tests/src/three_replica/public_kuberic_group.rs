@@ -73,10 +73,13 @@ mod hosted_witness;
 mod startup;
 mod startup_probe;
 
-pub use hosted_witness::LiveHostedWitness;
-use startup::{StartupHosts, cancel_attempts};
+pub use hosted_witness::{LiveHostedWitness, associate_quiet_hosted_witness};
+use startup::{
+    StartupHosts, await_started_hosts, cancel_attempts, consume_startup_result, startup_failure,
+};
 pub use startup_probe::{
-    PublicStartupProbeHandle, PublicStartupProbeMember, exercise_partial_public_startup_cleanup,
+    PublicStartupProbeHandle, PublicStartupProbeMember, PublicStartupProbeMode,
+    exercise_partial_public_startup_cleanup,
 };
 
 const AGENT_TOKEN: &str = "mssql-three-replica-agent";
@@ -1534,22 +1537,7 @@ impl PublicMssqlGroup {
             } else {
                 true
             };
-            for (index, attempt) in attempts.iter_mut().enumerate() {
-                if pods[index].running.is_some() {
-                    continue;
-                }
-                let task = attempt
-                    .task
-                    .as_mut()
-                    .ok_or_else(|| MssqlGroupError::new("public host task is missing"))?;
-                let joined = timeout(operation_timeout, "public Kuberic readiness", task).await?;
-                attempt.task.take();
-                let started = joined.map_err(display_error)?;
-                let running = started
-                    .map_err(display_error)?
-                    .ok_or_else(|| MssqlGroupError::new("public Kuberic startup was cancelled"))?;
-                pods[index].running = Some(running);
-            }
+            await_started_hosts(pods, attempts, operation_timeout).await?;
             tokio::time::sleep(Duration::from_secs(5)).await;
             let (sessions, inputs) = ensure_configuration(
                 pods,
@@ -1581,12 +1569,7 @@ impl PublicMssqlGroup {
         .await;
         if let Err(error) = result {
             let shutdown = cancel_attempts(attempts, pods, cleanup).await;
-            return Err(match shutdown {
-                Ok(()) => error,
-                Err(shutdown) => MssqlGroupError::termination_unconfirmed(format!(
-                    "{error}; public Kuberic startup cleanup failed: {shutdown}"
-                )),
-            });
+            return Err(startup_failure(error, shutdown));
         }
         Ok(Self {
             resource_uid,
@@ -3477,11 +3460,12 @@ async fn startup_reports(
             ),
         }
         let outcome = {
-            let task = attempts[index]
-                .task
-                .as_mut()
-                .ok_or_else(|| MssqlGroupError::new("public host task is missing"))?;
+            let task = attempts[index].task.as_mut().ok_or_else(|| {
+                MssqlGroupError::termination_unconfirmed("public host task is missing")
+            })?;
             tokio::select! {
+                biased;
+                result = task => StartupOutcome::Task(result),
                 report = async {
                     status(&pods[index], timeout_duration)
                         .await
@@ -3489,17 +3473,13 @@ async fn startup_reports(
                 } => {
                     StartupOutcome::Report(report?)
                 }
-                result = task => StartupOutcome::Task(result),
             }
         };
         match outcome {
             StartupOutcome::Report(report) => reports.push(*report),
             StartupOutcome::Task(result) => {
                 attempts[index].task.take();
-                let running = result
-                    .map_err(display_error)?
-                    .map_err(display_error)?
-                    .ok_or_else(|| MssqlGroupError::new("public host startup was cancelled"))?;
+                let running = consume_startup_result(result)?;
                 pods[index].running = Some(running);
                 reports.push(status(&pods[index], timeout_duration).await?.1);
             }

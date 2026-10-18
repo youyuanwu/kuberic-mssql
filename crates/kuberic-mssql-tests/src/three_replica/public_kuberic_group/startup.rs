@@ -1,5 +1,51 @@
 use super::*;
 
+pub(super) fn consume_startup_result(
+    result: Result<kuberic_runtime::host::Result<Option<RunningReplica>>, tokio::task::JoinError>,
+) -> Result<RunningReplica, MssqlGroupError> {
+    result
+        .map_err(|error| {
+            MssqlGroupError::termination_unconfirmed(format!("public startup task failed: {error}"))
+        })?
+        .map_err(|error| {
+            MssqlGroupError::termination_unconfirmed(format!(
+                "public startup failed without termination confirmation: {error}"
+            ))
+        })?
+        .ok_or_else(|| MssqlGroupError::new("public host startup was cancelled"))
+}
+
+pub(super) async fn await_started_hosts(
+    pods: &mut [PublicMssqlPod; 3],
+    attempts: &mut [HostAttempt],
+    budget: Duration,
+) -> Result<(), MssqlGroupError> {
+    for (index, attempt) in attempts.iter_mut().enumerate() {
+        if pods[index].running.is_some() {
+            continue;
+        }
+        let task = attempt.task.as_mut().ok_or_else(|| {
+            MssqlGroupError::termination_unconfirmed("public host task ownership is missing")
+        })?;
+        let joined = timeout(budget, "public Kuberic readiness", task).await?;
+        attempt.task.take();
+        pods[index].running = Some(consume_startup_result(joined)?);
+    }
+    Ok(())
+}
+
+pub(super) fn startup_failure(
+    primary: MssqlGroupError,
+    shutdown: Result<(), MssqlGroupError>,
+) -> MssqlGroupError {
+    match shutdown {
+        Ok(()) => primary,
+        Err(shutdown) => MssqlGroupError::termination_unconfirmed(format!(
+            "{primary}; public Kuberic startup cleanup failed: {shutdown}"
+        )),
+    }
+}
+
 pub(super) struct StartupHosts {
     pub(super) pods: Option<[PublicMssqlPod; 3]>,
     pub(super) attempts: Vec<HostAttempt>,

@@ -83,11 +83,12 @@ pub use process::{
 };
 pub use public_kuberic_group::{
     LicensedConflictScenario, LiveHostedWitness, PublicBuildCommand, PublicFaultInjection,
-    PublicMssqlGroup, PublicMssqlPod, PublicMutationFault,
+    PublicMssqlGroup, PublicMssqlPod, PublicMutationFault, associate_quiet_hosted_witness,
 };
 #[doc(hidden)]
 pub use public_kuberic_group::{
-    PublicStartupProbeHandle, PublicStartupProbeMember, exercise_partial_public_startup_cleanup,
+    PublicStartupProbeHandle, PublicStartupProbeMember, PublicStartupProbeMode,
+    exercise_partial_public_startup_cleanup,
 };
 pub use secrets::CredentialFiles;
 pub use tls::TlsAssets;

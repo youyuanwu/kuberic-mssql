@@ -6,8 +6,8 @@ pub use super::sequence::NativeSequenceTransition;
 pub use super::{DataMovementAction, DataMovementReceipt, NativePrefixDecision};
 use super::{evaluate_prefix, sequence::NativeSequenceHistory};
 pub use crate::three_replica::commit_coverage::{
-    NativeSample, NativeSampleSet, TransactionAcknowledgement, TransactionRecordRow,
-    TransactionSample,
+    CoverageConclusion, NativeSample, NativeSampleSet, RecordProbeOutcome,
+    TransactionAcknowledgement, TransactionRecordRow, TransactionSample,
 };
 use crate::three_replica::{CommitCoverageError, NativeTopologyBinding, ReadyMember};
 
