@@ -29,6 +29,9 @@ type TestError = Box<dyn Error + Send + Sync>;
 const HAPPY_PATH_TEST: &str = "three_replica_mssql_happy_path";
 const SAME_ROOT_RESTART_TEST: &str = "three_replica_mssql_same_root_restart";
 
+#[path = "live_three_replica/hosted_witness.rs"]
+mod hosted_witness;
+
 struct PendingSeedCompaction {
     command: PublicBuildCommand,
     release: tokio::sync::oneshot::Sender<()>,
@@ -605,14 +608,13 @@ async fn execute_live_lifecycle(
             };
         }
         Err(panic) => {
-            let fixture_cleanup = launched.cleanup_with_coordinator(&startup_cleanup);
-            if let Err(cleanup) = fixture_cleanup {
-                let primary = panic_message(&panic);
-                panic!(
-                    "partial Kuberic startup panicked: {primary}; cleanup also failed: {cleanup}"
-                );
-            }
-            std::panic::resume_unwind(panic);
+            return hosted_witness::block_disposal(
+                &mut launched,
+                &format!(
+                    "partial Kuberic startup panicked: {}",
+                    panic_message(&panic),
+                ),
+            );
         }
     };
     let first_resource_uid = group.resource_uid.clone();
@@ -714,14 +716,13 @@ async fn execute_live_lifecycle(
             };
         }
         Err(panic) => {
-            let fixture_cleanup = launched.cleanup_with_coordinator(&restart_cleanup);
-            if let Err(cleanup) = fixture_cleanup {
-                let primary = panic_message(&panic);
-                panic!(
-                    "replacement Kuberic startup panicked: {primary}; cleanup also failed: {cleanup}"
-                );
-            }
-            std::panic::resume_unwind(panic);
+            return hosted_witness::block_disposal(
+                &mut launched,
+                &format!(
+                    "replacement Kuberic startup panicked: {}",
+                    panic_message(&panic),
+                ),
+            );
         }
     };
     let outcome = {
@@ -835,14 +836,13 @@ async fn execute_phase2_bootstrap_lifecycle(
             };
         }
         Err(panic) => {
-            let fixture_cleanup = launched.cleanup_with_coordinator(&startup_cleanup);
-            if let Err(cleanup) = fixture_cleanup {
-                let primary = panic_message(&panic);
-                panic!(
-                    "partial bootstrap host startup panicked: {primary}; cleanup also failed: {cleanup}"
-                );
-            }
-            std::panic::resume_unwind(panic);
+            return hosted_witness::block_disposal(
+                &mut launched,
+                &format!(
+                    "partial bootstrap host startup panicked: {}",
+                    panic_message(&panic),
+                ),
+            );
         }
     };
     let outcome = {

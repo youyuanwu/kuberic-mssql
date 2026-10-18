@@ -477,13 +477,17 @@ impl HostedAuthority {
         &self,
         generation: u64,
         admitted_reports: Vec<PublicV1AgentReport>,
-        native: NativePrefixEvidence,
+        mut native: NativePrefixEvidence,
         final_reports: Vec<PublicV1AgentReport>,
         members: &[ReadyMember; 3],
         source: NativeInput,
     ) -> DiagnosticResult<HostedAssociation> {
         let mut state = self.state.lock().unwrap();
         Self::check_lifetime(&state, generation)?;
+        if matches!(source, NativeInput::LiveQuietFixture) {
+            native.evaluated_at_unix_millis = kuberic_mssql::instance::unix_millis()
+                .map_err(|error| format!("live publication clock: {error}"))?;
+        }
         validate_reports(&self.baseline, &final_reports, &state.report_high_water)?;
         validate_configuration(&self.configuration, &self.accepted, &final_reports)?;
         self.validate_bridge(&native, &final_reports)?;

@@ -980,3 +980,98 @@ async fn secondary_replay_case() {
 fn remote_only_secondary_configuration_replay_keeps_factory_local_context() {
     run_host_test(secondary_replay_case);
 }
+
+async fn partial_startup_ownership_cases() {
+    use kuberic_mssql_tests::three_replica::{
+        PublicStartupProbeHandle, PublicStartupProbeMember, exercise_partial_public_startup_cleanup,
+    };
+    for mode in 0..3 {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut group = OwnedDiagnostic::start(temporary.path()).await;
+        group.authority.retire();
+        let reports = group.fresh_reports().await.unwrap();
+        let replicators = group
+            .attempts
+            .iter()
+            .map(|attempt| attempt.application.testing_replicator().unwrap())
+            .collect::<Vec<_>>();
+        let controls = group
+            .attempts
+            .iter()
+            .map(|attempt| attempt.control)
+            .collect::<Vec<_>>();
+        let (release, held) = tokio::sync::oneshot::channel();
+        let mut held = Some(held);
+        let members = group
+            .replicas
+            .drain(..)
+            .zip(group.attempts.drain(..))
+            .enumerate()
+            .map(|(index, (running, attempt))| {
+                let handle = if index == 1 {
+                    let held = held.take().unwrap();
+                    PublicStartupProbeHandle::Pending(tokio::spawn(async move {
+                        held.await.expect("release owned startup");
+                        Ok(Some(running))
+                    }))
+                } else {
+                    PublicStartupProbeHandle::Started(running)
+                };
+                PublicStartupProbeMember {
+                    config: attempt.config,
+                    application: attempt.application.clone(),
+                    source: attempt.source.clone(),
+                    report: reports[index].clone(),
+                    handle,
+                }
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap_or_else(|_| unreachable!());
+        let (drained, mut completion) = tokio::sync::oneshot::channel();
+        let budget = if mode == 2 {
+            Duration::from_millis(20)
+        } else {
+            Duration::from_secs(5)
+        };
+        let mut cleanup = Box::pin(exercise_partial_public_startup_cleanup(
+            members, budget, drained,
+        ));
+        if mode == 0 {
+            release.send(()).unwrap();
+            cleanup.await.unwrap();
+        } else {
+            tokio::select! {
+                result = &mut cleanup => panic!("cleanup finished before held startup: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+            assert!(matches!(
+                completion.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            if mode == 1 {
+                drop(cleanup);
+            } else {
+                assert!(cleanup.await.unwrap_err().agent_termination_unconfirmed());
+            }
+            assert!(matches!(
+                completion.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            release.send(()).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), completion)
+            .await
+            .unwrap()
+            .unwrap();
+        for (control, replicator) in controls.into_iter().zip(replicators) {
+            assert!(tokio::net::TcpStream::connect(control).await.is_err());
+            assert!(replicator.current_progress().await.is_err());
+        }
+    }
+}
+
+#[test]
+fn partial_native_authority_startup_drains_transferred_and_late_hosts() {
+    run_host_test(partial_startup_ownership_cases);
+}

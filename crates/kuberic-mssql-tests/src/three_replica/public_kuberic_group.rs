@@ -69,6 +69,16 @@ use super::kuberic_group::{MSSQL_FAILOVER_DELAY_SECONDS, MssqlGroupError};
 use super::member::ReadyMember;
 use super::model::{NativeTopologyBinding, TopologyRun};
 
+mod hosted_witness;
+mod startup;
+mod startup_probe;
+
+pub use hosted_witness::LiveHostedWitness;
+use startup::{StartupHosts, cancel_attempts};
+pub use startup_probe::{
+    PublicStartupProbeHandle, PublicStartupProbeMember, exercise_partial_public_startup_cleanup,
+};
+
 const AGENT_TOKEN: &str = "mssql-three-replica-agent";
 const PUBLIC_HOST_ATTEMPT_PREFIX: &str = "public-host-shutdown-fence";
 
@@ -105,6 +115,7 @@ pub struct PublicMssqlGroup {
     complete_deadline: Instant,
     faults: PublicFaultInjection,
     target_evidence: Arc<PublicTargetHostEvidenceExchange>,
+    configuration_inputs: Vec<(usize, PublicOperationIntent)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1339,7 +1350,7 @@ impl PublicMssqlGroup {
             members,
         )?);
 
-        let mut attempts = Vec::new();
+        let mut hosts = Vec::new();
         let mut pods = Vec::new();
         let primary_mutation_settings = if native_binding.is_none() {
             let observer = ObserverConfig::read(&members[0].observer_config)
@@ -1426,13 +1437,7 @@ impl PublicMssqlGroup {
                 Arc::new(RuntimeEndpointResolver::new(&config).map_err(display_error)?),
             )
             .with_application_storage_paths(application.storage_paths());
-            let (shutdown, receiver) = tokio::sync::watch::channel(false);
-            attempts.push(HostAttempt {
-                shutdown,
-                task: Some(tokio::spawn(
-                    host.start_with_shutdown(control_listener, receiver),
-                )),
-            });
+            hosts.push((host, control_listener));
             pods.push(PublicMssqlPod {
                 ordinal: index as u8 + 1,
                 identity: identities[index].clone(),
@@ -1452,17 +1457,30 @@ impl PublicMssqlGroup {
                 conflict_injection,
             });
         }
-        let mut pods: [PublicMssqlPod; 3] = pods
+        let pods: [PublicMssqlPod; 3] = pods
             .try_into()
             .map_err(|_| MssqlGroupError::new("exactly three public Kuberic pods required"))?;
+        let mut startup = StartupHosts::new(pods);
+        for (host, listener) in hosts {
+            let (shutdown, receiver) = tokio::sync::watch::channel(false);
+            startup.attempts.push(HostAttempt {
+                shutdown,
+                task: Some(tokio::spawn(host.start_with_shutdown(listener, receiver))),
+            });
+        }
+        let pods = startup
+            .pods
+            .as_mut()
+            .expect("startup owns all constructed pods");
+        let attempts = &mut startup.attempts;
+        let mut configuration_inputs = Vec::new();
 
         let result = async {
             if let Some(native_binding) = native_binding {
-                validate_observations(&pods, native_binding, operation_timeout, complete_deadline)
+                validate_observations(pods, native_binding, operation_timeout, complete_deadline)
                     .await?;
             }
-            let startup_reports =
-                startup_reports(&mut pods, &mut attempts, operation_timeout).await?;
+            let startup_reports = startup_reports(pods, attempts, operation_timeout).await?;
             let uninitialized = startup_reports
                 .iter()
                 .filter(|report| {
@@ -1489,7 +1507,7 @@ impl PublicMssqlGroup {
                         MssqlGroupError::new("exactly three initialization sessions required")
                     })?;
                 initialize(
-                    &pods,
+                    pods,
                     run,
                     &identities,
                     &configuration,
@@ -1520,19 +1538,12 @@ impl PublicMssqlGroup {
                 if pods[index].running.is_some() {
                     continue;
                 }
-                let mut task = attempt
+                let task = attempt
                     .task
-                    .take()
+                    .as_mut()
                     .ok_or_else(|| MssqlGroupError::new("public host task is missing"))?;
-                let joined =
-                    timeout(operation_timeout, "public Kuberic readiness", &mut task).await;
-                let joined = match joined {
-                    Ok(joined) => joined,
-                    Err(error) => {
-                        attempt.task = Some(task);
-                        return Err(error);
-                    }
-                };
+                let joined = timeout(operation_timeout, "public Kuberic readiness", task).await?;
+                attempt.task.take();
                 let started = joined.map_err(display_error)?;
                 let running = started
                     .map_err(display_error)?
@@ -1540,8 +1551,8 @@ impl PublicMssqlGroup {
                 pods[index].running = Some(running);
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
-            let sessions = ensure_configuration(
-                &pods,
+            let (sessions, inputs) = ensure_configuration(
+                pods,
                 &resource_uid,
                 &configuration,
                 operation_timeout,
@@ -1549,14 +1560,15 @@ impl PublicMssqlGroup {
                 existing,
             )
             .await?;
+            configuration_inputs = inputs;
             for (pod, session) in pods.iter_mut().zip(sessions) {
                 pod.session = session;
             }
             if prepared.is_some() {
-                admit_bootstrap_replicators(&pods, &configuration, &replications).await?;
+                admit_bootstrap_replicators(pods, &configuration, &replications).await?;
             }
             refresh_current_progress(
-                &pods,
+                pods,
                 &resource_uid,
                 &configuration,
                 operation_timeout,
@@ -1568,7 +1580,7 @@ impl PublicMssqlGroup {
         }
         .await;
         if let Err(error) = result {
-            let shutdown = cancel_attempts(&mut attempts, &mut pods, cleanup).await;
+            let shutdown = cancel_attempts(attempts, pods, cleanup).await;
             return Err(match shutdown {
                 Ok(()) => error,
                 Err(shutdown) => MssqlGroupError::termination_unconfirmed(format!(
@@ -1580,12 +1592,13 @@ impl PublicMssqlGroup {
             resource_uid,
             effective_policy,
             configuration,
-            pods,
+            pods: startup.take_pods(),
             native_binding: native_binding.cloned(),
             operation_timeout,
             complete_deadline,
             faults,
             target_evidence,
+            configuration_inputs,
         })
     }
 
@@ -2392,19 +2405,20 @@ impl PublicMssqlGroup {
     }
 
     pub async fn shutdown_with_coordinator(
-        mut self,
+        self,
         cleanup: &CleanupCoordinator<impl CleanupClock>,
     ) -> Result<(), MssqlGroupError> {
-        for pod in &self.pods {
+        let mut owner = StartupHosts::new(self.pods);
+        let pods = owner.pods.as_mut().expect("shutdown owns the three pods");
+        for pod in pods.iter() {
             if let Some(running) = &pod.running {
                 running.shutdown();
             }
         }
         let mut errors = Vec::new();
-        for pod in &mut self.pods {
-            if let Some(running) = pod.running.take() {
-                let mut running = Some(running);
-                match await_public_host_shutdown(pod.ordinal, &mut running, cleanup, || {
+        for pod in pods.iter_mut() {
+            if pod.running.is_some() {
+                match await_public_host_shutdown(pod.ordinal, &mut pod.running, cleanup, || {
                     pod.application.abort()
                 })
                 .await
@@ -2413,11 +2427,6 @@ impl PublicMssqlGroup {
                     PublicHostWait::Confirmed(Err(error)) => errors.push(error),
                     PublicHostWait::Unconfirmed(error) => {
                         errors.push(error);
-                        if let Some(mut running) = running.take() {
-                            tokio::spawn(async move {
-                                let _ = running.wait().await;
-                            });
-                        }
                     }
                 }
             }
@@ -3569,7 +3578,7 @@ async fn ensure_configuration(
     timeout_duration: Duration,
     operation_namespace: &str,
     existing: bool,
-) -> Result<[kuberic_runtime::protocol::types::ProcessSessionId; 3], MssqlGroupError> {
+) -> Result<([ProcessSessionId; 3], Vec<(usize, PublicOperationIntent)>), MssqlGroupError> {
     let deadline = tokio::time::Instant::now() + timeout_duration;
     let results = join_all((0..3).map(|index| {
         let operation_id = format!("{operation_namespace}-open-{}", index + 1);
@@ -3591,7 +3600,7 @@ async fn ensure_configuration(
         result?;
     }
     if existing {
-        return public_reports(
+        let sessions = public_reports(
             pods,
             rpc_remaining(deadline, "public contained reopen completion")?,
         )
@@ -3600,7 +3609,8 @@ async fn ensure_configuration(
         .into_iter()
         .collect::<Vec<_>>()
         .try_into()
-        .map_err(|_| MssqlGroupError::new("exactly three agent sessions required"));
+        .map_err(|_| MssqlGroupError::new("exactly three agent sessions required"))?;
+        return Ok((sessions, Vec::new()));
     }
 
     let results = join_all((1..3).map(|index| {
@@ -3624,7 +3634,7 @@ async fn ensure_configuration(
     }
     wait_for_active_secondaries(pods, deadline, operation_namespace, configuration.epoch).await?;
 
-    execute_configuration_operation(
+    let primary_input = execute_configuration_operation(
         pods,
         resource_uid,
         configuration,
@@ -3655,17 +3665,19 @@ async fn ensure_configuration(
         }
     }))
     .await;
-    for result in results {
-        result?;
+    let mut inputs = vec![(0, primary_input)];
+    for (offset, result) in results.into_iter().enumerate() {
+        inputs.push((offset + 1, result?));
     }
 
-    wait_for_configured_secondaries(pods, deadline)
+    let sessions = wait_for_configured_secondaries(pods, deadline)
         .await?
         .map(|report| report.process_session_id)
         .into_iter()
         .collect::<Vec<_>>()
         .try_into()
-        .map_err(|_| MssqlGroupError::new("exactly three agent sessions required"))
+        .map_err(|_| MssqlGroupError::new("exactly three agent sessions required"))?;
+    Ok((sessions, inputs))
 }
 
 #[derive(Clone, Copy)]
@@ -3688,7 +3700,7 @@ async fn execute_configuration_operation(
     local_index: usize,
     operation_id: &str,
     operation: ConfigurationOperation<'_>,
-) -> Result<(), MssqlGroupError> {
+) -> Result<PublicOperationIntent, MssqlGroupError> {
     loop {
         let mut client = None;
         let mut reports = Vec::new();
@@ -3767,13 +3779,15 @@ async fn execute_configuration_operation(
         };
         let mut client = client
             .ok_or_else(|| MssqlGroupError::new("public configuration client is unavailable"))?;
+        let input =
+            hosted_witness::operation_input(&pods[local_index], resource_uid, request.get_ref())?;
         match tokio::time::timeout(
             rpc_remaining(deadline, "public configuration execution")?,
             client.execute(request),
         )
         .await
         {
-            Ok(Ok(_)) => return Ok(()),
+            Ok(Ok(_)) => return Ok(input),
             Ok(Err(error)) if error.code() == tonic::Code::Cancelled => {}
             Ok(Err(error)) => {
                 return Err(MssqlGroupError::new(format!(
@@ -4489,47 +4503,6 @@ fn validate_bootstrap_snapshots(snapshots: &[InstanceSnapshot; 3]) -> Result<(),
         return Err(MssqlGroupError::new(
             "bootstrap topology does not contain exactly one primary",
         ));
-    }
-    Ok(())
-}
-
-async fn cancel_attempts(
-    attempts: &mut [HostAttempt],
-    pods: &mut [PublicMssqlPod; 3],
-    cleanup: &CleanupCoordinator<impl CleanupClock>,
-) -> Result<(), MssqlGroupError> {
-    for attempt in attempts.iter() {
-        attempt.shutdown.send_replace(true);
-    }
-    for (index, attempt) in attempts.iter_mut().enumerate() {
-        let Some(mut task) = attempt.task.take() else {
-            continue;
-        };
-        let deadline = cleanup.remaining().min(Duration::from_secs(10));
-        match tokio::time::timeout(deadline, &mut task).await {
-            Ok(Ok(Ok(Some(mut running)))) => {
-                running.shutdown();
-                tokio::time::timeout(deadline, running.wait())
-                    .await
-                    .map_err(|_| {
-                        MssqlGroupError::termination_unconfirmed("public host shutdown timed out")
-                    })?
-                    .map_err(display_error)?;
-            }
-            Ok(Ok(Ok(None))) => {}
-            Ok(Ok(Err(HostError::Runtime(KubericRuntimeError::OperationCancelled)))) => {}
-            Ok(Ok(Err(error))) => return Err(display_error(error)),
-            Ok(Err(error)) => return Err(display_error(error)),
-            Err(_) => {
-                pods[index].application.abort();
-                attempt.task = Some(task);
-                return Err(MssqlGroupError::termination_unconfirmed(format!(
-                    "member {} startup cancellation timed out",
-                    index + 1
-                )));
-            }
-        }
-        pods[index].running = None;
     }
     Ok(())
 }
