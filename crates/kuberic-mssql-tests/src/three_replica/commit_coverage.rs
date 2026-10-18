@@ -24,6 +24,14 @@ const SAMPLE_WINDOW: Duration = Duration::from_secs(2);
 const MAX_OVERLAP_SAMPLES: usize = 16;
 const MAX_SAMPLE_AGE: Duration = Duration::from_secs(30);
 
+pub(super) mod prefix;
+
+#[derive(Clone, Copy)]
+pub(super) enum NativeSamplePolicy {
+    Healthy,
+    ControlledSecondary(u8),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CommitCoverageReport {
     pub fixture_run_id: String,
@@ -126,6 +134,11 @@ pub enum CommitCoverageError {
         commit: DataError,
         sampling: Option<Box<Self>>,
     },
+    Release {
+        primary: Option<Box<Self>>,
+        release: Box<Self>,
+    },
+    Control(&'static str),
 }
 
 impl fmt::Display for CommitCoverageError {
@@ -165,6 +178,13 @@ impl fmt::Display for CommitCoverageError {
                     "native commit probe concurrent failure (commit: {commit:?}, sampling: {sampling:?})"
                 )
             }
+            Self::Release { primary, release } => {
+                write!(
+                    f,
+                    "native prefix release failed: {release}; original failure: {primary:?}"
+                )
+            }
+            Self::Control(reason) => write!(f, "native prefix control rejected: {reason}"),
         }
     }
 }
@@ -177,7 +197,7 @@ impl From<DataError> for CommitCoverageError {
     }
 }
 
-fn now() -> Result<u64, CommitCoverageError> {
+pub(super) fn now() -> Result<u64, CommitCoverageError> {
     unix_millis().map_err(|_| CommitCoverageError::Clock)
 }
 
@@ -189,67 +209,42 @@ pub(super) async fn collect_native_samples(
     context: &DataContext<'_>,
     binding: &NativeTopologyBinding,
 ) -> Result<NativeSampleSet, CommitCoverageError> {
+    collect_native_samples_for(context, binding, NativeSamplePolicy::Healthy).await
+}
+
+pub(super) async fn collect_native_samples_for(
+    context: &DataContext<'_>,
+    binding: &NativeTopologyBinding,
+    policy: NativeSamplePolicy,
+) -> Result<NativeSampleSet, CommitCoverageError> {
     let requested_at_unix_millis = now()?;
-    let parent = Instant::from_std(context.complete_deadline);
     let mut members = Vec::with_capacity(3);
     for member in context.members {
-        let config = complete_before(
-            parent,
-            context.deadlines.sql_batch,
-            ObserverConfig::read(&member.observer_config),
-        )
-        .await
-        .map_err(|_| DataError::Deadline)?
-        .map_err(|error| CommitCoverageError::Observation {
-            ordinal: member.ordinal,
-            detail: error.to_string(),
-        })?;
-        let limit = config.sample_timeout();
-        let manager =
-            SqlServerInstanceManager::new(TdsExecutor::new(config.connection().clone()), config);
-        let observation = complete_before(parent, limit, manager.observe())
-            .await
-            .map_err(|_| DataError::Deadline)?
-            .map_err(|error| CommitCoverageError::Observation {
-                ordinal: member.ordinal,
-                detail: error.to_string(),
-            })?;
-        let Observation::Present {
-            value: snapshot, ..
-        } = observation
-        else {
-            return Err(CommitCoverageError::Observation {
-                ordinal: member.ordinal,
-                detail: format!("{observation:?}"),
-            });
-        };
-        let completed = now()?;
-        validate_native_sample(
-            &snapshot,
+        let sample = observe_native_member(context, member).await?;
+        validate_native_sample_for(
+            &sample.snapshot,
             member,
             binding,
             requested_at_unix_millis,
-            completed,
+            sample.collection_completed_at_unix_millis,
+            policy,
         )
         .map_err(|reason| CommitCoverageError::RejectedNativeSample {
             reason: Box::new(reason),
-            snapshot: Box::new(snapshot.clone()),
+            snapshot: Box::new(sample.snapshot.clone()),
             expected_binding: Box::new(binding.clone()),
         })?;
-        members.push(NativeSample {
-            ordinal: member.ordinal,
-            collection_completed_at_unix_millis: completed,
-            snapshot,
-        });
+        members.push(sample);
     }
     let completed_at_unix_millis = now()?;
     for sample in &members {
-        validate_native_sample(
+        validate_native_sample_for(
             &sample.snapshot,
             &context.members[usize::from(sample.ordinal - 1)],
             binding,
             requested_at_unix_millis,
             completed_at_unix_millis,
+            policy,
         )?;
     }
     Ok(NativeSampleSet {
@@ -259,12 +254,73 @@ pub(super) async fn collect_native_samples(
     })
 }
 
+pub(super) async fn observe_native_member(
+    context: &DataContext<'_>,
+    member: &ReadyMember,
+) -> Result<NativeSample, CommitCoverageError> {
+    let parent = Instant::from_std(context.complete_deadline);
+    let config = complete_before(
+        parent,
+        context.deadlines.sql_batch,
+        ObserverConfig::read(&member.observer_config),
+    )
+    .await
+    .map_err(|_| DataError::Deadline)?
+    .map_err(|error| CommitCoverageError::Observation {
+        ordinal: member.ordinal,
+        detail: error.to_string(),
+    })?;
+    let limit = config.sample_timeout();
+    let manager =
+        SqlServerInstanceManager::new(TdsExecutor::new(config.connection().clone()), config);
+    let observation = complete_before(parent, limit, manager.observe())
+        .await
+        .map_err(|_| DataError::Deadline)?
+        .map_err(|error| CommitCoverageError::Observation {
+            ordinal: member.ordinal,
+            detail: error.to_string(),
+        })?;
+    let Observation::Present {
+        value: snapshot, ..
+    } = observation
+    else {
+        return Err(CommitCoverageError::Observation {
+            ordinal: member.ordinal,
+            detail: format!("{observation:?}"),
+        });
+    };
+    Ok(NativeSample {
+        ordinal: member.ordinal,
+        collection_completed_at_unix_millis: now()?,
+        snapshot,
+    })
+}
+
+#[cfg(test)]
 fn validate_native_sample(
     sample: &InstanceSnapshot,
     member: &ReadyMember,
     binding: &NativeTopologyBinding,
     requested: u64,
     completed: u64,
+) -> Result<(), CommitCoverageError> {
+    validate_native_sample_for(
+        sample,
+        member,
+        binding,
+        requested,
+        completed,
+        NativeSamplePolicy::Healthy,
+    )
+}
+
+pub(super) fn validate_native_sample_for(
+    sample: &InstanceSnapshot,
+    member: &ReadyMember,
+    binding: &NativeTopologyBinding,
+    requested: u64,
+    completed: u64,
+    policy: NativeSamplePolicy,
 ) -> Result<(), CommitCoverageError> {
     let invalid = CommitCoverageError::InvalidNativeSample;
     let expected = binding
@@ -387,6 +443,10 @@ fn validate_native_sample(
         });
     }
     let row = local_rows[0];
+    let controlled_secondary = matches!(
+        policy, NativeSamplePolicy::ControlledSecondary(ordinal)
+            if ordinal == member.ordinal && expected.role == "SECONDARY"
+    );
     let RecoveryLineageObservation::Local { value: lineage } = &row.lineage else {
         return Err(CommitCoverageError::NativeSample {
             ordinal: member.ordinal,
@@ -410,9 +470,11 @@ fn validate_native_sample(
         || row.database_id != expected.local_database_id
         || row.provenance != NativeProvenance::Local
         || row.is_primary_replica != Some(expected_role == NativeRole::Primary)
-        || row.is_suspended != Some(false)
-        || row.synchronization_state.as_deref() != Some("SYNCHRONIZED")
-        || row.synchronization_health.as_deref() != Some("HEALTHY")
+        || row.is_suspended.is_none()
+        || (!controlled_secondary
+            && (row.is_suspended != Some(false)
+                || row.synchronization_state.as_deref() != Some("SYNCHRONIZED")
+                || row.synchronization_health.as_deref() != Some("HEALTHY")))
         || row.database_state.as_deref() != Some("ONLINE")
     {
         return Err(CommitCoverageError::NativeSample {
@@ -791,4 +853,4 @@ pub(super) fn coverage_conclusion(record: &RecordProbeOutcome) -> CoverageConclu
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

@@ -18,7 +18,8 @@ fn guid(value: u8) -> Guid {
     Guid::parse("test", format!("{value:08x}-0000-4000-8000-000000000000")).unwrap()
 }
 
-fn bound_sample() -> (InstanceSnapshot, ReadyMember, NativeTopologyBinding) {
+pub(in crate::three_replica) fn bound_sample()
+-> (InstanceSnapshot, ReadyMember, NativeTopologyBinding) {
     let members = std::array::from_fn(|index| NativeMemberBinding {
         ordinal: (index + 1) as u8,
         server_name: format!("sql{}", index + 1),
@@ -158,6 +159,63 @@ fn bound_sample() -> (InstanceSnapshot, ReadyMember, NativeTopologyBinding) {
         },
     };
     (sample, member, binding)
+}
+
+pub(in crate::three_replica) fn bound_prefix_fixture()
+-> (NativeSampleSet, [ReadyMember; 3], NativeTopologyBinding) {
+    let (base, ready, mut binding) = bound_sample();
+    let members = std::array::from_fn(|index| {
+        let expected = &mut binding.members[index];
+        expected.local_database_id = 5 + index as u32;
+        ReadyMember {
+            ordinal: expected.ordinal,
+            server_name: expected.server_name.clone(),
+            container_id: expected.container_id.clone(),
+            sql_start_time: expected.sql_start_time.clone(),
+            ..ready.clone()
+        }
+    });
+    let samples = members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            let mut snapshot = base.clone();
+            snapshot.instance.server_name = ServerName::new(&member.server_name).unwrap();
+            snapshot.instance.property_server_name = ServerName::new(&member.server_name).unwrap();
+            let Observation::Present { value: group, .. } = &mut snapshot.availability_group else {
+                panic!()
+            };
+            group.local_replica.identity =
+                ReplicaIdentity::observed("fixture", guid(member.ordinal), "fixture").unwrap();
+            group.local_replica.role = Some(if index == 0 {
+                NativeRole::Primary
+            } else {
+                NativeRole::Secondary
+            });
+            let local = group.databases[0].local.as_mut().unwrap();
+            local.database_id = binding.members[index].local_database_id;
+            local.replica_id = guid(member.ordinal);
+            local.recovery.as_mut().unwrap().database_guid = Some(guid(10 + index as u8));
+            let row = &mut group.databases[0].replicas[0];
+            row.replica_id = guid(member.ordinal);
+            row.database_id = binding.members[index].local_database_id;
+            row.is_primary_replica = Some(index == 0);
+            NativeSample {
+                ordinal: member.ordinal,
+                collection_completed_at_unix_millis: 1050,
+                snapshot,
+            }
+        })
+        .collect();
+    (
+        NativeSampleSet {
+            requested_at_unix_millis: 990,
+            completed_at_unix_millis: 1100,
+            members: samples,
+        },
+        members,
+        binding,
+    )
 }
 
 #[test]

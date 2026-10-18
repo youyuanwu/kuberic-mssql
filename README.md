@@ -496,6 +496,7 @@ Run the exact dedicated command with an optional fixture root:
 just test-live-three-replica [root]
 just test-live-three-replica-restart [root]
 just test-live-native-commit-coverage [root]
+just test-live-native-prefix-coverage [root]
 just test-live-lease-fence [root]
 just cleanup-live-lease-fence [root]
 ```
@@ -507,6 +508,15 @@ coverage; it does not enable catch-up or switchover. See the
 [implemented probe and remaining proof gates](docs/kuberic-progress.md#first-native-proof-toward-switchover).
 Recover its exact owned resources, if needed, with
 `just cleanup-live-three-replica target/mssql-native-commit-coverage`.
+
+The native-prefix recipe uses `target/mssql-native-prefix-coverage`. Its ignored
+fixture-only experiment pauses the exact secondary, acknowledges one workload,
+resumes it and evaluates fresh lagging/covered/quiet native prefixes. Explicit
+native phases do not grant public authority: `public_coverage` remains blocked
+and production stays observe-only. See the
+[native proof and limits](docs/kuberic-progress.md#native-prefix-coverage).
+Recover only that root with
+`just cleanup-live-three-replica target/mssql-native-prefix-coverage`.
 
 The lease/fence recipe uses separate `expiry` and `active-restart` scenario
 roots and verifies native lease behavior, cancelled-response uncertainty,
