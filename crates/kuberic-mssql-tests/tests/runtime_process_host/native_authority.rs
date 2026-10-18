@@ -1197,3 +1197,147 @@ async fn quiet_assembly_case() {
 fn native_authority_quiet_assembly_preserves_frozen_inputs_and_publication_freshness() {
     run_host_test(quiet_assembly_case);
 }
+
+async fn contained_startup_case() {
+    use kuberic_mssql_tests::three_replica::hosted_authority::validate_startup_configuration;
+    use kuberic_mssql_tests::three_replica::{
+        PublicStartupProbeHandle, PublicStartupProbeMember, exercise_public_configuration_startup,
+    };
+    use kuberic_runtime::protocol::public_operations::PublicProgressRole;
+    use kuberic_runtime::protocol::types::{AccessStatus, ProcessSessionId};
+
+    let temporary = tempfile::tempdir().unwrap();
+    let mut attempts = start_attempts(temporary.path()).await;
+    let replicas = initialize_stores(&mut attempts).await;
+    let (_, initial) = current_public_reports(&attempts).await;
+    let controls = attempts
+        .iter()
+        .map(|attempt| attempt.control)
+        .collect::<Vec<_>>();
+    let members = attempts
+        .into_iter()
+        .zip(replicas)
+        .enumerate()
+        .map(|(index, (attempt, running))| PublicStartupProbeMember {
+            config: attempt.config,
+            application: attempt.application,
+            source: attempt.source,
+            report: initial[index].clone(),
+            handle: PublicStartupProbeHandle::Started(running),
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap_or_else(|_| unreachable!());
+    let (drained, completion) = tokio::sync::oneshot::channel();
+    let evidence = exercise_public_configuration_startup(
+        members,
+        &configuration(),
+        Duration::from_secs(10),
+        drained,
+    )
+    .await
+    .unwrap();
+    completion.await.unwrap();
+    validate_startup_configuration(
+        &configuration(),
+        &evidence.baseline,
+        &evidence.inputs,
+        &evidence.reports,
+    )
+    .unwrap();
+    for (report, control) in evidence.reports.iter().zip(controls) {
+        assert_eq!(report.role, ReplicaRole::None);
+        assert_eq!(report.progress.role, PublicProgressRole::Recovery);
+        assert_eq!(report.progress.first, 0);
+        assert_eq!(report.progress.last, 42);
+        assert_eq!(report.read_status, AccessStatus::NotPrimary);
+        assert_eq!(report.write_status, AccessStatus::NotPrimary);
+        assert!(tokio::net::TcpStream::connect(control).await.is_err());
+    }
+
+    for mutation in 0..16 {
+        let mut reports = evidence.reports.clone();
+        let mut inputs = evidence.inputs.clone();
+        let report = &mut reports[1];
+        let operation_id = &evidence.inputs[1].1.operation_id;
+        let receipt_index = report
+            .completed_operations
+            .iter()
+            .position(|receipt| &receipt.operation_id == operation_id)
+            .unwrap();
+        match mutation {
+            0 => {
+                report.completed_operations.remove(receipt_index);
+            }
+            1 => {
+                report.completed_operations[receipt_index].result =
+                    PublicV1OperationResult::Cancelled
+            }
+            2 => {
+                report.completed_operations[receipt_index].input_digest =
+                    PublicOperationProgram::Close.digest()
+            }
+            3 => report.completed_operations[receipt_index].revision += 1,
+            4 => report.completed_operations[receipt_index].call_kind = PublicV1CallKind::Role,
+            5 => {
+                report.process_session_id = ProcessSessionId::new("replacement");
+                for receipt in &mut report.completed_operations {
+                    receipt.process_session_id = report.process_session_id.clone();
+                }
+            }
+            6 => {
+                report.history.data_loss_number += 1;
+                for receipt in &mut report.completed_operations {
+                    receipt.history = report.history.clone();
+                }
+            }
+            7 => {
+                report.storage_incarnation.storage_generation =
+                    StorageGeneration::new("replacement");
+                for receipt in &mut report.completed_operations {
+                    receipt.storage_incarnation = report.storage_incarnation.clone();
+                }
+            }
+            8 => report.report_sequence = evidence.baseline[1].report_sequence,
+            9 => inputs[1].0 = 0,
+            10 => {
+                inputs[1].1.lifecycle.as_mut().unwrap().current = ConfigurationDescriptor::new(
+                    Epoch::new(0, configuration().epoch.configuration_number + 1),
+                    configuration().primary_id,
+                    configuration().members,
+                    2,
+                )
+            }
+            11 => inputs[1].1.lifecycle.as_mut().unwrap().replica = identities()[0].clone(),
+            12 => {
+                inputs[1].1.lifecycle.as_mut().unwrap().recipe =
+                    PublicLifecycleRecipe::InitialPrimary
+            }
+            13 => report.completed_operations[receipt_index].current_configuration_id = None,
+            14 => {
+                let lifecycle = inputs[1].1.lifecycle.as_mut().unwrap();
+                lifecycle.replicas[0].process_session_id =
+                    ProcessSessionId::new("replacement-peer");
+                inputs[1].1.input_digest = lifecycle.digest();
+                report.completed_operations[receipt_index].input_digest =
+                    inputs[1].1.input_digest.clone();
+            }
+            15 => report.replication_address = Some("http://127.0.0.1:1".into()),
+            _ => unreachable!(),
+        }
+        if matches!(mutation, 6 | 7) {
+            accepted_command(1, &inputs[1].1, report).unwrap();
+        }
+        let error =
+            validate_startup_configuration(&configuration(), &evidence.baseline, &inputs, &reports)
+                .expect_err(&format!("altered startup evidence {mutation}"));
+        if matches!(mutation, 6 | 7) {
+            assert!(error.contains("identity/session/storage/history differs"));
+        }
+    }
+}
+
+#[test]
+fn native_authority_contained_startup_uses_actual_gate_and_exact_receipts() {
+    run_host_test(contained_startup_case);
+}

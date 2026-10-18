@@ -62,19 +62,20 @@ supersession, restart, terminal and uncertain-command journeys reject predecesso
 evidence. This is bounded diagnostic evidence, not a live hosted witness,
 semantic public/native history mapping or production authority.
 
-The [ignored live hosted harness](kuberic-progress.md#live-hosted-witness-harness-not-executed)
-is now implemented and compiled, with server-free assembly/ownership regressions.
-It has not been executed against SQL Server; the live association proof remains
-pending and requires separate licensed-execution authorization.
+The [ignored live hosted witness](kuberic-progress.md#live-hosted-witness)
+has demonstrated one licensed sampled native association with exact accepted
+hosted configuration/session/storage evidence and independent native identity.
+Its corrected startup gate preserves contained roles/access. This does not
+establish semantic native/public history mapping or complete Stage 6A.
 
 Planned work:
 
-- execute and evaluate the ignored harness to bind a live [native acknowledged-record witness](kuberic-progress.md#native-prefix-coverage)
-  to exact accepted public configuration/storage/session authority and
-  native/public history before implementing a public mapping or catch-up
-  success. Retain native identity/incarnation and source-phase evidence; do not
-  promote fixture labels or higher native sequence into authority. Extend the
-  live proof to hardening ahead of redo under separately reviewed controls.
+- extend the sampled live [native acknowledged-record witness](kuberic-progress.md#native-prefix-coverage)
+  to hardening ahead of redo under separately reviewed controls, while retaining
+  exact accepted configuration/session/storage and native identity/incarnation
+  evidence. Establish semantic native/public history mapping before public
+  progress or catch-up success; do not promote fixture labels or higher native
+  sequence into authority.
   Any new licensed experiment/workload requires authorization; one witness is
   not full conformance;
 - establish the public progress/history model for primary committed progress,

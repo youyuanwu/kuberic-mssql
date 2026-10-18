@@ -14,7 +14,9 @@ use kuberic_runtime::protocol::public_operations::{
     PublicReplicaDescriptor, PublicV1AgentReport, PublicV1CallKind, PublicV1OperationCompletion,
     PublicV1OperationResult,
 };
-use kuberic_runtime::protocol::types::{ConfigurationDescriptor, Epoch, ReplicaIdentity};
+use kuberic_runtime::protocol::types::{
+    ConfigurationDescriptor, ConfigurationMember, Epoch, ReplicaIdentity, ReplicaRole,
+};
 use serde::Serialize;
 
 use super::ReadyMember;
@@ -349,33 +351,95 @@ pub fn validate_configuration(
         if expected_peers.len() != 2 || input.replicas.len() != expected_peers.len() {
             return Err("configuration peer membership differs".into());
         }
-        for peer in expected_peers {
-            let report = reports
-                .iter()
-                .find(|report| report.replica == peer.identity)
-                .ok_or("configuration peer report missing")?;
-            if input
-                .replicas
-                .iter()
-                .filter(|descriptor| {
-                    descriptor.identity == report.replica
-                        && descriptor.process_session_id == report.process_session_id
-                        && descriptor.storage_incarnation.as_ref()
-                            == Some(&report.storage_incarnation)
-                        && Some(&descriptor.replication_address)
-                            == report.replication_address.as_ref()
-                        && descriptor.role == peer.role
-                })
-                .count()
-                != 1
-            {
-                return Err("configuration peer session/storage/address differs".into());
-            }
-        }
+        validate_peer_descriptors(&expected_peers, &input.replicas, reports)?;
         let observed = accepted_command(index, &command.input, &reports[index])?;
         if observed.completion != command.completion {
             return Err("configuration accepted receipt was replaced".into());
         }
+    }
+    Ok(())
+}
+
+fn validate_peer_descriptors(
+    peers: &[&ConfigurationMember],
+    descriptors: &[PublicReplicaDescriptor],
+    reports: &[PublicV1AgentReport],
+) -> DiagnosticResult<()> {
+    if descriptors.len() != peers.len() {
+        return Err("configuration peer membership differs".into());
+    }
+    for peer in peers {
+        let report = reports
+            .iter()
+            .find(|report| report.replica == peer.identity)
+            .ok_or("configuration peer report missing")?;
+        if descriptors
+            .iter()
+            .filter(|descriptor| {
+                descriptor.identity == report.replica
+                    && descriptor.process_session_id == report.process_session_id
+                    && descriptor.storage_incarnation.as_ref() == Some(&report.storage_incarnation)
+                    && Some(&descriptor.replication_address) == report.replication_address.as_ref()
+                    && descriptor.role == peer.role
+            })
+            .count()
+            != 1
+        {
+            return Err("configuration peer session/storage/address differs".into());
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_startup_configuration(
+    configuration: &ConfigurationDescriptor,
+    baseline: &[PublicV1AgentReport; 3],
+    inputs: &[(usize, PublicOperationIntent)],
+    reports: &[PublicV1AgentReport; 3],
+) -> DiagnosticResult<()> {
+    validate_reports(
+        baseline,
+        reports,
+        &std::array::from_fn(|index| baseline[index].report_sequence),
+    )?;
+    if configuration.members.len() != 3 || inputs.len() != 3 {
+        return Err("three exact startup lifecycle inputs are required".into());
+    }
+    for (index, (target, input)) in inputs.iter().enumerate() {
+        let report = &reports[index];
+        let member = configuration
+            .members
+            .iter()
+            .find(|member| member.identity == report.replica)
+            .ok_or("startup report is not an expected configuration member")?;
+        let recipe = match member.role {
+            ReplicaRole::Primary => PublicLifecycleRecipe::InitialPrimary,
+            ReplicaRole::ActiveSecondary => PublicLifecycleRecipe::SecondaryEpochAdvance,
+            _ => return Err("startup configuration has an unsupported role".into()),
+        };
+        let lifecycle = input
+            .lifecycle
+            .as_ref()
+            .ok_or("startup receipt lacks a lifecycle input")?;
+        if *target != index
+            || input.program.is_some()
+            || lifecycle.recipe != recipe
+            || lifecycle.replica != report.replica
+            || lifecycle.epoch != configuration.epoch
+            || lifecycle.current != *configuration
+            || lifecycle.previous.is_some()
+        {
+            return Err("startup lifecycle target/recipe/configuration differs".into());
+        }
+        let peers = configuration
+            .members
+            .iter()
+            .filter(|peer| {
+                peer.role == ReplicaRole::ActiveSecondary && peer.identity != member.identity
+            })
+            .collect::<Vec<_>>();
+        validate_peer_descriptors(&peers, &lifecycle.replicas, reports)?;
+        accepted_command(index, input, report)?;
     }
     Ok(())
 }

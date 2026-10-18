@@ -2,6 +2,9 @@ use super::startup::{StartupHosts, cancel_attempts};
 use super::*;
 
 #[doc(hidden)]
+pub const PUBLIC_STARTUP_PROBE_TOKEN: &str = AGENT_TOKEN;
+
+#[doc(hidden)]
 #[derive(Clone, Copy)]
 pub enum PublicStartupProbeMode {
     Drain,
@@ -31,6 +34,43 @@ pub async fn exercise_partial_public_startup_cleanup(
     drained: tokio::sync::oneshot::Sender<()>,
     mode: PublicStartupProbeMode,
 ) -> Result<(), MssqlGroupError> {
+    let mut owner = probe_owner(members);
+    owner.drained = Some(drained);
+    let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), budget);
+    let primary = match mode {
+        PublicStartupProbeMode::Drain => None,
+        PublicStartupProbeMode::ReadinessFailure => Some(
+            await_started_hosts(
+                owner.pods.as_mut().expect("probe owner armed"),
+                &mut owner.attempts,
+                budget,
+            )
+            .await
+            .expect_err("probe supplies a failed startup"),
+        ),
+        PublicStartupProbeMode::ReportFailure => Some(
+            startup_reports(
+                owner.pods.as_mut().expect("probe owner armed"),
+                &mut owner.attempts,
+                budget,
+            )
+            .await
+            .expect_err("probe supplies a failed startup"),
+        ),
+    };
+    let shutdown = cancel_attempts(
+        &mut owner.attempts,
+        owner.pods.as_mut().expect("probe owner armed"),
+        &cleanup,
+    )
+    .await;
+    match primary {
+        Some(primary) => Err(startup_failure(primary, shutdown)),
+        None => shutdown,
+    }
+}
+
+fn probe_owner(members: [PublicStartupProbeMember; 3]) -> StartupHosts {
     let mut attempts = Vec::with_capacity(3);
     let mut pods = Vec::with_capacity(3);
     for (index, member) in members.into_iter().enumerate() {
@@ -68,37 +108,55 @@ pub async fn exercise_partial_public_startup_cleanup(
         .unwrap_or_else(|_| unreachable!("three probe members supplied"));
     let mut owner = StartupHosts::new(pods);
     owner.attempts = attempts;
+    owner
+}
+
+#[doc(hidden)]
+pub struct PublicConfigurationStartupProbe {
+    pub baseline: [PublicV1AgentReport; 3],
+    pub reports: [PublicV1AgentReport; 3],
+    pub inputs: Vec<(usize, PublicOperationIntent)>,
+}
+
+#[doc(hidden)]
+pub async fn exercise_public_configuration_startup(
+    members: [PublicStartupProbeMember; 3],
+    configuration: &ConfigurationDescriptor,
+    budget: Duration,
+    drained: tokio::sync::oneshot::Sender<()>,
+) -> Result<PublicConfigurationStartupProbe, MssqlGroupError> {
+    let mut owner = probe_owner(members);
     owner.drained = Some(drained);
+    let result = async {
+        let pods = owner.pods.as_ref().expect("probe owner armed");
+        let (_, inputs) = ensure_configuration(
+            pods,
+            &pods[0].resource_uid,
+            configuration,
+            budget,
+            "contained-startup",
+            false,
+            false,
+        )
+        .await?;
+        let baseline = public_reports(pods, budget).await?;
+        let reports = public_reports(pods, budget).await?;
+        Ok(PublicConfigurationStartupProbe {
+            baseline,
+            reports,
+            inputs,
+        })
+    }
+    .await;
     let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), budget);
-    let primary = match mode {
-        PublicStartupProbeMode::Drain => None,
-        PublicStartupProbeMode::ReadinessFailure => Some(
-            await_started_hosts(
-                owner.pods.as_mut().expect("probe owner armed"),
-                &mut owner.attempts,
-                budget,
-            )
-            .await
-            .expect_err("probe supplies a failed startup"),
-        ),
-        PublicStartupProbeMode::ReportFailure => Some(
-            startup_reports(
-                owner.pods.as_mut().expect("probe owner armed"),
-                &mut owner.attempts,
-                budget,
-            )
-            .await
-            .expect_err("probe supplies a failed startup"),
-        ),
-    };
     let shutdown = cancel_attempts(
         &mut owner.attempts,
         owner.pods.as_mut().expect("probe owner armed"),
         &cleanup,
     )
     .await;
-    match primary {
-        Some(primary) => Err(startup_failure(primary, shutdown)),
-        None => shutdown,
+    match result {
+        Err(primary) => Err(startup_failure(primary, shutdown)),
+        Ok(evidence) => shutdown.map(|()| evidence),
     }
 }

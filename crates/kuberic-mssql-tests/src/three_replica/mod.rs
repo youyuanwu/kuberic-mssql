@@ -87,8 +87,9 @@ pub use public_kuberic_group::{
 };
 #[doc(hidden)]
 pub use public_kuberic_group::{
-    PublicStartupProbeHandle, PublicStartupProbeMember, PublicStartupProbeMode,
-    exercise_partial_public_startup_cleanup,
+    PUBLIC_STARTUP_PROBE_TOKEN, PublicConfigurationStartupProbe, PublicStartupProbeHandle,
+    PublicStartupProbeMember, PublicStartupProbeMode, exercise_partial_public_startup_cleanup,
+    exercise_public_configuration_startup,
 };
 pub use secrets::CredentialFiles;
 pub use tls::TlsAssets;
