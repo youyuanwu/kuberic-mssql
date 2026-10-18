@@ -30,6 +30,24 @@ impl NativePrefixEvidence {
         &self,
         members: &[ReadyMember; 3],
     ) -> Result<NativePrefixDecision, CommitCoverageError> {
+        if self.initial_observations.completed_at_unix_millis > self.evaluated_at_unix_millis
+            || self.transitions.iter().any(|transition| {
+                transition.receipt.confirmed_at_unix_millis > self.evaluated_at_unix_millis
+            })
+        {
+            return Err(CommitCoverageError::Control(
+                "native phase evidence is from after the evaluation",
+            ));
+        }
+        let admitted_at = self.transitions.last().map_or(
+            self.initial_observations.completed_at_unix_millis,
+            |transition| transition.receipt.confirmed_at_unix_millis,
+        );
+        if self.observations.requested_at_unix_millis < admitted_at {
+            return Err(CommitCoverageError::Control(
+                "final native observation precedes its admitted phase",
+            ));
+        }
         let mut history = NativeSequenceHistory::new(
             members,
             self.initial_binding.clone(),
@@ -83,9 +101,24 @@ mod tests {
     fn hosted_facade_reuses_native_evaluation_and_rejects_phase_relabeling() {
         let (samples, members, binding) = bound_prefix_fixture();
         let (acknowledgement, transaction_samples) = receipt(Some("99"));
+        let mut initial = samples.clone();
+        initial.requested_at_unix_millis = 850;
+        initial.completed_at_unix_millis = 879;
+        for sample in &mut initial.members {
+            sample.collection_completed_at_unix_millis = 870;
+            sample.snapshot.observed_at_unix_millis = 860;
+            let kuberic_mssql::Observation::Present {
+                observed_at_unix_millis,
+                ..
+            } = &mut sample.snapshot.availability_group
+            else {
+                unreachable!()
+            };
+            *observed_at_unix_millis = 860;
+        }
         let evidence = NativePrefixEvidence {
             initial_binding: binding.clone(),
-            initial_observations: samples.clone(),
+            initial_observations: initial,
             record_binding: binding.clone(),
             transitions: Vec::new(),
             target_ordinal: 2,

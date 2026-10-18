@@ -11,6 +11,7 @@ use kuberic_runtime::protocol::command::ProtocolCommand;
 use kuberic_runtime::protocol::public_operations::{
     PublicConfiguration, PublicV1CallKind, PublicV1OperationCompletion, PublicV1OperationResult,
 };
+use kuberic_runtime::replicator::{PrimaryReplicator, ReplicaSetConfiguration};
 use serde::Serialize;
 
 type DiagnosticResult<T> = Result<T, String>;
@@ -31,9 +32,61 @@ struct HostedAssociation {
     accepted_advances: Vec<AcceptedCommand>,
     admitted_reports: Vec<PublicV1AgentReport>,
     final_reports: Vec<PublicV1AgentReport>,
+    native_database_anchors: Vec<NativeDatabaseAnchor>,
     native: NativePrefixEvidence,
     decision: NativePrefixDecision,
     public_coverage: BlockedPublicCoverage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct NativeDatabaseAnchor {
+    replica: ReplicaIdentity,
+    database_name: SqlIdentifier,
+    group_database_id: Guid,
+    local_database_id: u32,
+    database_guid: Guid,
+    family_guid: Guid,
+    recovery_fork_id: Guid,
+}
+
+impl NativeDatabaseAnchor {
+    fn from_snapshot(
+        replica: ReplicaIdentity,
+        snapshot: &InstanceSnapshot,
+    ) -> DiagnosticResult<Self> {
+        let Observation::Present { value: group, .. } = &snapshot.availability_group else {
+            return Err("independent native database anchor lacks availability group".into());
+        };
+        let [database] = group.databases.as_slice() else {
+            return Err("independent native database anchor requires one database".into());
+        };
+        let local = database
+            .local
+            .as_ref()
+            .ok_or("independent local database unavailable")?;
+        let recovery = local
+            .recovery
+            .as_ref()
+            .ok_or("independent recovery metadata unavailable")?;
+        Ok(Self {
+            replica,
+            database_name: database.identity.name.clone(),
+            group_database_id: database.identity.group_database_id.clone(),
+            local_database_id: local.database_id,
+            database_guid: recovery
+                .database_guid
+                .clone()
+                .ok_or("independent database GUID missing")?,
+            family_guid: recovery
+                .family_guid
+                .clone()
+                .ok_or("independent family GUID missing")?,
+            recovery_fork_id: recovery
+                .recovery_fork_guid
+                .clone()
+                .ok_or("independent recovery fork missing")?,
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -74,6 +127,7 @@ struct OwnedDiagnostic {
     baseline: Vec<PublicV1AgentReport>,
     accepted: Vec<AcceptedCommand>,
     bindings: Vec<Arc<HealthyTopologyBinding>>,
+    native_database_anchors: Vec<NativeDatabaseAnchor>,
     state: Arc<Mutex<AuthorityState>>,
 }
 
@@ -378,7 +432,7 @@ impl OwnedDiagnostic {
                 }
             );
         }
-        let bindings = attempts
+        let bindings: Vec<_> = attempts
             .iter()
             .map(|attempt| {
                 attempt
@@ -389,6 +443,28 @@ impl OwnedDiagnostic {
                     .unwrap()
             })
             .collect();
+        let mut native_database_anchors = Vec::with_capacity(3);
+        for (index, attempt) in attempts.iter().enumerate() {
+            let Observation::Present {
+                value: snapshot, ..
+            } = attempt.source.observe().await.unwrap()
+            else {
+                panic!("initial native anchor unavailable")
+            };
+            bindings[index]
+                .validate_snapshot(
+                    attempt.source.observer_config(),
+                    &snapshot,
+                    OBSERVED_AT,
+                    true,
+                    Some(configuration().members[index].role),
+                )
+                .unwrap();
+            native_database_anchors.push(
+                NativeDatabaseAnchor::from_snapshot(baseline[index].replica.clone(), &snapshot)
+                    .unwrap(),
+            );
+        }
         let state = Arc::new(Mutex::new(AuthorityState {
             generation: 1,
             epochs: [configuration().epoch; 3],
@@ -403,6 +479,7 @@ impl OwnedDiagnostic {
             baseline,
             accepted,
             bindings,
+            native_database_anchors,
             state,
         }
     }
@@ -587,6 +664,7 @@ impl OwnedDiagnostic {
             accepted_advances: state.advances.clone(),
             admitted_reports,
             final_reports,
+            native_database_anchors: self.native_database_anchors.clone(),
             native,
             decision,
             public_coverage: BlockedPublicCoverage {
@@ -613,6 +691,17 @@ impl OwnedDiagnostic {
         for (index, binding) in self.bindings.iter().enumerate() {
             let report = &reports[index];
             let expected = &native.initial_binding.members[index];
+            let anchor = &self.native_database_anchors[index];
+            if anchor.replica != report.replica
+                || anchor.database_name.as_str() != native.initial_binding.database_name
+                || anchor.group_database_id.as_str() != native.initial_binding.group_database_id
+                || anchor.local_database_id != expected.local_database_id
+                || anchor.database_guid.as_str() != expected.database_guid
+                || anchor.family_guid.as_str() != native.initial_binding.family_guid
+                || anchor.recovery_fork_id.as_str() != native.initial_binding.recovery_fork_id
+            {
+                return Err("independent hosted native database anchor differs".into());
+            }
             let local = binding
                 .members()
                 .iter()
@@ -1022,6 +1111,63 @@ async fn altered_evidence_cases(group: &OwnedDiagnostic) {
             "altered native evidence mutation {mutation}"
         );
     }
+    for mutation in 0..4 {
+        let mut evidence = group.scripted_native(Some("99")).await.unwrap();
+        for binding in [
+            &mut evidence.initial_binding,
+            &mut evidence.record_binding,
+            &mut evidence.evaluation_binding,
+        ] {
+            match mutation {
+                0 => binding.members[1].local_database_id += 10,
+                1 => binding.members[1].database_guid = NATIVE_IDS[0].into(),
+                2 => binding.family_guid = NATIVE_IDS[0].into(),
+                3 => binding.recovery_fork_id = NATIVE_IDS[0].into(),
+                _ => unreachable!(),
+            }
+        }
+        for samples in [
+            &mut evidence.initial_observations,
+            &mut evidence.observations,
+        ] {
+            for sample in &mut samples.members {
+                let Observation::Present { value: group, .. } =
+                    &mut sample.snapshot.availability_group
+                else {
+                    unreachable!()
+                };
+                let database = &mut group.databases[0];
+                let local = database.local.as_mut().unwrap();
+                let recovery = local.recovery.as_mut().unwrap();
+                match mutation {
+                    0 if sample.ordinal == 2 => {
+                        local.database_id += 10;
+                        database.replicas[0].database_id += 10;
+                    }
+                    1 if sample.ordinal == 2 => recovery.database_guid = Some(guid(NATIVE_IDS[0])),
+                    2 => recovery.family_guid = Some(guid(NATIVE_IDS[0])),
+                    3 => {
+                        recovery.recovery_fork_guid = Some(guid(NATIVE_IDS[0]));
+                        let RecoveryLineageObservation::Local { value: lineage } =
+                            &mut database.replicas[0].lineage
+                        else {
+                            unreachable!()
+                        };
+                        lineage.recovery_fork_id = guid(NATIVE_IDS[0]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        evidence
+            .evaluate(&ready_members(&evidence.initial_binding))
+            .unwrap();
+        let error = group.collect(async { Ok(evidence) }).await.unwrap_err();
+        assert!(
+            error.contains("independent hosted native database anchor"),
+            "coherent native mutation {mutation}: {error}"
+        );
+    }
 }
 
 async fn terminal_case() {
@@ -1063,7 +1209,7 @@ fn public_native_authority_association_rejects_terminal_publication() {
     run_host_test(terminal_case);
 }
 
-async fn pending_and_cancelled_dispatch_case() {
+async fn pending_dispatch_case(await_unknown_result: bool) {
     let temporary = tempfile::tempdir().unwrap();
     let mut group = OwnedDiagnostic::start(temporary.path()).await;
     let admitted = group.fresh_reports().await.unwrap();
@@ -1099,7 +1245,12 @@ async fn pending_and_cancelled_dispatch_case() {
             .unwrap_err()
             .contains("pending")
     );
-    drop(dispatch);
+    if await_unknown_result {
+        let error = dispatch.await.unwrap_err();
+        assert!(error.contains("authority dispatch deadline"), "{error}");
+    } else {
+        drop(dispatch);
+    }
     release.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -1133,7 +1284,76 @@ async fn pending_and_cancelled_dispatch_case() {
     group.stop().await;
 }
 
+async fn pending_and_unknown_dispatch_cases() {
+    pending_dispatch_case(false).await;
+    pending_dispatch_case(true).await;
+}
+
 #[test]
-fn public_native_authority_association_rejects_pending_and_cancelled_dispatch() {
-    run_host_test(pending_and_cancelled_dispatch_case);
+fn public_native_authority_association_rejects_pending_and_unknown_dispatch() {
+    run_host_test(pending_and_unknown_dispatch_cases);
+}
+
+async fn secondary_replay_case() {
+    let temporary = tempfile::tempdir().unwrap();
+    let mut group = OwnedDiagnostic::start(temporary.path()).await;
+    for index in [1, 2] {
+        let Some(PublicOperationProgram::Configuration(input)) =
+            &group.accepted[index].input.program
+        else {
+            unreachable!()
+        };
+        let configuration = ReplicaSetConfiguration {
+            configuration: input.current.clone(),
+            replicas: input.replicas.iter().cloned().map(Into::into).collect(),
+        };
+        let replicator = group.attempts[index]
+            .application
+            .testing_replicator()
+            .unwrap();
+        let original = replicator.admitted_topology().unwrap();
+        replicator
+            .update_current_replica_set_configuration(configuration.clone())
+            .await
+            .unwrap();
+        assert_eq!(replicator.admitted_topology().unwrap(), original);
+        let local = original
+            .members()
+            .iter()
+            .find(|member| member.kuberic_identity() == original.local_identity())
+            .unwrap();
+        assert_eq!(
+            local.process_session_id(),
+            &group.baseline[index].process_session_id
+        );
+        assert_eq!(
+            Some(local.replication_address()),
+            group.baseline[index].replication_address.as_deref()
+        );
+        for mutation in 0..2 {
+            let mut changed = configuration.clone();
+            match mutation {
+                0 => {
+                    changed.replicas[0].process_session_id =
+                        kuberic_runtime::protocol::types::ProcessSessionId::new(
+                            "replaced-remote-session",
+                        )
+                }
+                1 => changed.replicas[0].replication_address = "http://127.0.0.1:32001".into(),
+                _ => unreachable!(),
+            }
+            let error = replicator
+                .update_current_replica_set_configuration(changed)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("replay differs"), "{error}");
+            assert_eq!(replicator.admitted_topology().unwrap(), original);
+        }
+    }
+    group.stop().await;
+}
+
+#[test]
+fn remote_only_secondary_configuration_replay_keeps_factory_local_context() {
+    run_host_test(secondary_replay_case);
 }
