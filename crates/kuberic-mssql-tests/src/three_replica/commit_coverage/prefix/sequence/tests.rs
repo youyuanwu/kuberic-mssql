@@ -83,7 +83,7 @@ fn post_control_sequence_is_not_admitted_until_all_members_and_native_state_agre
 #[test]
 fn missing_ack_regression_or_changed_anchors_never_refresh_a_native_phase() {
     let (initial, members, binding) = bound_prefix_fixture();
-    for mutation in 0..6 {
+    for mutation in 0..8 {
         let mut history =
             NativeSequenceHistory::new(&members, binding.clone(), 2, &initial, 1200).unwrap();
         let mut request = suspend_request();
@@ -114,6 +114,23 @@ fn missing_ack_regression_or_changed_anchors_never_refresh_a_native_phase() {
                     Some(Guid::parse("test", "99999999-0000-4000-8000-000000000000").unwrap());
             }
             5 => request.action = DataMovementAction::Resume,
+            6 => {
+                let Observation::Present { value: group, .. } =
+                    &mut samples.members[1].snapshot.availability_group
+                else {
+                    panic!()
+                };
+                group.required_synchronized_secondaries_to_commit = 2;
+            }
+            7 => {
+                let Observation::Present { value: group, .. } =
+                    &mut samples.members[1].snapshot.availability_group
+                else {
+                    panic!()
+                };
+                group.replicas[2].replica_id =
+                    Guid::parse("test", "99999999-0000-4000-8000-000000000000").unwrap();
+            }
             _ => unreachable!(),
         }
         assert!(
