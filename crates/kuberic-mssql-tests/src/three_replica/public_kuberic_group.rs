@@ -78,8 +78,9 @@ use startup::{
     StartupHosts, await_started_hosts, cancel_attempts, consume_startup_result, startup_failure,
 };
 pub use startup_probe::{
-    PublicStartupProbeHandle, PublicStartupProbeMember, PublicStartupProbeMode,
-    exercise_partial_public_startup_cleanup,
+    PUBLIC_STARTUP_PROBE_TOKEN, PublicConfigurationStartupProbe, PublicStartupProbeHandle,
+    PublicStartupProbeMember, PublicStartupProbeMode, exercise_partial_public_startup_cleanup,
+    exercise_public_configuration_startup,
 };
 
 const AGENT_TOKEN: &str = "mssql-three-replica-agent";
@@ -1546,6 +1547,7 @@ impl PublicMssqlGroup {
                 operation_timeout,
                 operation_namespace,
                 existing,
+                native_binding.is_none(),
             )
             .await?;
             configuration_inputs = inputs;
@@ -3558,6 +3560,7 @@ async fn ensure_configuration(
     timeout_duration: Duration,
     operation_namespace: &str,
     existing: bool,
+    require_serving_secondaries: bool,
 ) -> Result<([ProcessSessionId; 3], Vec<(usize, PublicOperationIntent)>), MssqlGroupError> {
     let deadline = tokio::time::Instant::now() + timeout_duration;
     let results = join_all((0..3).map(|index| {
@@ -3612,7 +3615,9 @@ async fn ensure_configuration(
     for result in results {
         result?;
     }
-    wait_for_active_secondaries(pods, deadline, operation_namespace, configuration.epoch).await?;
+    let baseline =
+        wait_for_active_secondaries(pods, deadline, operation_namespace, configuration.epoch)
+            .await?;
 
     let primary_input = execute_configuration_operation(
         pods,
@@ -3650,13 +3655,20 @@ async fn ensure_configuration(
         inputs.push((offset + 1, result?));
     }
 
-    let sessions = wait_for_configured_secondaries(pods, deadline)
-        .await?
-        .map(|report| report.process_session_id)
-        .into_iter()
-        .collect::<Vec<_>>()
-        .try_into()
-        .map_err(|_| MssqlGroupError::new("exactly three agent sessions required"))?;
+    let sessions = wait_for_configured_secondaries(
+        pods,
+        configuration,
+        &baseline,
+        &inputs,
+        require_serving_secondaries,
+        deadline,
+    )
+    .await?
+    .map(|report| report.process_session_id)
+    .into_iter()
+    .collect::<Vec<_>>()
+    .try_into()
+    .map_err(|_| MssqlGroupError::new("exactly three agent sessions required"))?;
     Ok((sessions, inputs))
 }
 
@@ -3893,6 +3905,10 @@ async fn wait_for_active_secondaries(
 
 async fn wait_for_configured_secondaries(
     pods: &[PublicMssqlPod; 3],
+    configuration: &ConfigurationDescriptor,
+    baseline: &[PublicV1AgentReport; 3],
+    inputs: &[(usize, PublicOperationIntent)],
+    require_serving_secondaries: bool,
     deadline: tokio::time::Instant,
 ) -> Result<[PublicV1AgentReport; 3], MssqlGroupError> {
     loop {
@@ -3901,9 +3917,17 @@ async fn wait_for_configured_secondaries(
             rpc_remaining(deadline, "public configuration completion")?,
         )
         .await?;
-        if reports[1..]
-            .iter()
-            .all(|report| report.role == ReplicaRole::ActiveSecondary)
+        super::hosted_authority::validate_startup_configuration(
+            configuration,
+            baseline,
+            inputs,
+            &reports,
+        )
+        .map_err(MssqlGroupError::new)?;
+        if !require_serving_secondaries
+            || reports[1..]
+                .iter()
+                .all(|report| report.role == ReplicaRole::ActiveSecondary)
         {
             return Ok(reports);
         }

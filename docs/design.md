@@ -211,9 +211,12 @@ storage/history and independently observed native database identity under an
 exclusively owned diagnostic lifetime. These results do not establish a live
 hosted witness, semantic public progress/history mapping, retained capability
 or switchover authority. A separate
-[ignored live association harness](kuberic-progress.md#live-hosted-witness-harness-not-executed)
-now connects those mechanisms to the existing no-control native collector,
-but is compiled and server-free-tested only; its live proof remains unexecuted.
+[ignored live association harness](kuberic-progress.md#live-hosted-witness)
+has demonstrated one sampled association using the existing no-control native
+collector. Its fresh existing-native startup gate checks exact accepted
+lifecycle evidence and report continuity while preserving contained roles and
+access. This does not establish semantic public progress/history, retained
+capability, restart continuity, redo-lag proof or switchover authority.
 
 `SqlServerReplicator::native_configuration_sequence` now exposes the existing
 validated native read as an optional `ConfigurationSequence`, independently of

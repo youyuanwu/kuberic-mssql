@@ -44,7 +44,7 @@ use kuberic_runtime::protocol::types::{
 use kuberic_runtime::{Replicator, RuntimeError as KubericRuntimeError};
 use tonic::{Request, transport::Channel};
 
-const TOKEN: &str = "runtime-agent-token";
+const TOKEN: &str = kuberic_mssql_tests::three_replica::PUBLIC_STARTUP_PROBE_TOKEN;
 const OBSERVED_AT: u64 = 1_000;
 const NATIVE_IDS: [&str; 3] = [
     "11111111-1111-4111-8111-111111111111",
@@ -741,6 +741,12 @@ async fn execute_public_command(attempts: &[HostAttempt], command: &PublicComman
 async fn initialize_attempts(
     attempts: &mut [HostAttempt],
 ) -> (Vec<RunningReplica>, Vec<String>, Vec<PublicCommand>) {
+    let replicas = initialize_stores(attempts).await;
+    let (sessions, commands) = configure_attempts(attempts).await;
+    (replicas, sessions, commands)
+}
+
+async fn initialize_stores(attempts: &mut [HostAttempt]) -> Vec<RunningReplica> {
     let mut clients = Vec::new();
     let mut sessions = Vec::new();
     for (index, attempt) in attempts.iter().enumerate() {
@@ -767,8 +773,7 @@ async fn initialize_attempts(
         );
     }
     tokio::time::sleep(Duration::from_secs(5)).await;
-    let (sessions, commands) = configure_attempts(attempts).await;
-    (replicas, sessions, commands)
+    replicas
 }
 
 async fn configure_attempts(attempts: &[HostAttempt]) -> (Vec<String>, Vec<PublicCommand>) {

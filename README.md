@@ -530,10 +530,11 @@ and production stays observe-only. See the
 Recover only that root with
 `just cleanup-live-three-replica target/mssql-native-prefix-coverage`.
 
-The separate [live hosted witness harness](docs/kuberic-progress.md#live-hosted-witness-harness-not-executed)
-is implemented and compiled but has **not been executed**. Its ignored case
-connects the no-control commit probe to actual observe-only public hosts,
-requires sampled native coverage, and keeps public coverage blocked. It adds
+The separate [live hosted witness](docs/kuberic-progress.md#live-hosted-witness)
+has demonstrated one licensed sampled native association using the no-control
+commit probe and actual observe-only public hosts. Startup validates exact
+accepted lifecycle evidence without requiring serving report roles; public
+coverage remains blocked. Its ignored case adds
 no SUSPEND/RESUME controls and is not included in `just ci`; the guide gives
 the exact selection command for a separately authorized licensed run.
 

@@ -303,10 +303,9 @@ The record-only command/report above remains unchanged.
 
 Remaining live/public work:
 
-1. Execute the ignored live hosted harness below under separate authorization;
-   its implementation and server-free checks are not a licensed live witness.
-   Do not manufacture accepted public authority or history semantics from
-   fixture labels, phase admissions or matching numeric values.
+1. Establish native/public history semantics beyond the sampled live hosted
+   association below. Do not manufacture accepted public authority or history
+   semantics from fixture labels, phase admissions or matching numeric values.
 2. Demonstrate hardening with redo still behind; that live proof remains
    `not_exercised`. Offline redo independence is not such a demonstration.
    Any additional control requires design/safety review and live authorization.
@@ -314,7 +313,7 @@ Remaining live/public work:
    beyond altered-evidence rejection, and establish the role-specific public
    progress, history and retained-transfer semantics still missing from the matrix.
 
-One successful witness would prove only that sampled coverage. It would not
+The successful live witness below proves only that sampled coverage. It does not
 establish a highest public progress scalar, a retained floor, restart
 continuity, arbitrary configuration catch-up, or safe switchover. Those remain
 separate gates, alongside SQL access, lease/fence and role-transition authority.
@@ -375,17 +374,35 @@ The diagnostic excludes out-of-band administrators and cannot rule out
 undetected change-and-revert. It does not join public history to a SQL recovery
 history as a semantic equivalence, establish exclusive production storage
 ownership, prove new live SQL durability, or authorize catch-up/promotion.
-The licensed native-only commands/reports above are unchanged. Live hosted
-binding, redo-lag proof, public progress/retention, restart continuity and the
-reporting constraints below remain gates.
+The licensed native-only commands/reports above are unchanged. The sampled live
+hosted binding below does not close the redo-lag, public progress/retention,
+restart continuity or reporting gates.
 
-#### Live hosted witness harness (not executed)
+#### Live hosted witness
 
-An ignored live case now connects the existing **no-control** native commit
-collector to real observe-only `ReplicaHost` applications. It is implemented
-and compiled, with server-free regression coverage, but **has not been executed
-against SQL Server**. Existing native-only live proof does not satisfy this
-combined live gate.
+An ignored live case connects the existing **no-control** native commit
+collector to real observe-only `ReplicaHost` applications. A separately
+authorized licensed execution on 2026-10-18 proved one `NativeSampledCoverage`
+association: acknowledged commit record `44000000055200028` was strictly below
+the selected secondary's exclusive hardened boundary `44000000056000001`.
+This is one sampled live association, not semantic public/native history
+equivalence or general catch-up proof.
+
+The initial run exposed a test-support startup gate that waited for serving
+`ActiveSecondary` reports. Ordinary provider-free hosts instead remain contained
+as `None`/Recovery with `[0, native sequence]` compatibility progress and
+`NotPrimary` access. Fresh existing-native startup now validates its frozen
+`InitialPrimary`/`SecondaryEpochAdvance` inputs against exact successful
+receipts and an independent post-Open/Role, pre-lifecycle report baseline.
+It rejects changed identities, sessions, storage/history, replayed reports and
+different command/peer provenance rather than treating containment as missing
+authority. Bootstrap retains its serving-role prerequisite; established-store
+reopen is unchanged. Startup acceptance is not serving eligibility or the later
+complete-secondary-configuration proof
+([startup gate](../crates/kuberic-mssql-tests/src/three_replica/public_kuberic_group.rs#L3906-L3948),
+[startup evidence](../crates/kuberic-mssql-tests/src/three_replica/hosted_authority.rs#L394-L445)).
+The corrected live run completed host shutdown and exact fixture teardown
+before publishing output.
 
 The live path preserves the primary's exact `InitialPrimary` input captured
 before dispatch and installs complete remote-only Configuration programs on
@@ -412,7 +429,7 @@ remaining original fixture deadline, rather than the offline 15-second budget;
 RPC/anchor requests have five-second allowances. The existing transaction
 sub-budget remains 30 seconds. No fresh parent deadline, new SQL control,
 SUSPEND/RESUME or redo-lag workload is introduced
-([hosted_authority.rs:546-598](../crates/kuberic-mssql-tests/src/three_replica/hosted_authority.rs#L546-L598)).
+([hosted_authority.rs](../crates/kuberic-mssql-tests/src/three_replica/hosted_authority.rs)).
 
 Host construction completes before the first spawn. An owned startup/shutdown
 guard retains pending tasks and already-started handles across cancellation
@@ -451,7 +468,11 @@ source-specific output assembly and publication-clock staleness. Those cases
 use **synthetic native inputs**, including when inspecting the live output
 schema; they are not live evidence. Partial-startup cases use actual hosts
 with normal, caller-drop, timeout and both panicked-startup-consumer paths.
-Neither these checks nor a future single live association would establish
+The contained-startup regression invokes the actual fixture configuration
+startup path on ordinary real hosts with synthetic observations, proves
+receipt-based completion without serving access, rejects altered receipt and
+independent-baseline evidence, and joins the owned hosts.
+Neither these checks nor the single live association establishes
 semantic history equivalence, retained progress, accepted replacement journeys,
 redo-lag proof or lossless switchover.
 
