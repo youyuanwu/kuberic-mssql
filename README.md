@@ -388,6 +388,17 @@ cargo test --locked --workspace --all-features
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 ```
 
+The server-free [hosted authority diagnostic](docs/kuberic-progress.md#offline-hosted-authority-association)
+uses real public hosts with scripted native witnesses:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo test --locked -p kuberic-mssql-tests \
+  --test runtime_process_host native_authority -- --test-threads=1
+```
+
+It exercises exact accepted configuration/session/storage/history binding and
+stale authority rejection, not live SQL durability or public catch-up.
+
 The complete local and CI pipeline is:
 
 ```bash

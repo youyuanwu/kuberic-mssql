@@ -55,9 +55,16 @@ configuration changes; they are not accepted public authority/history.
 Public coverage remains blocked, and the live hardening-with-redo-lag case
 remains unexercised. A sampled native witness does not complete Stage 6A.
 
+An [offline hosted association](kuberic-progress.md#offline-hosted-authority-association)
+now binds scripted native witnesses to actual public configuration receipts,
+sessions, storage/history and independent native identity anchors. Real hosted
+supersession, restart, terminal and uncertain-command journeys reject predecessor
+evidence. This is bounded diagnostic evidence, not a live hosted witness,
+semantic public/native history mapping or production authority.
+
 Planned work:
 
-- bind the [native acknowledged-record witness](kuberic-progress.md#native-prefix-coverage)
+- extend the offline association to bind a live [native acknowledged-record witness](kuberic-progress.md#native-prefix-coverage)
   to exact accepted public configuration/storage/session authority and
   native/public history before implementing a public mapping or catch-up
   success. Retain native identity/incarnation and source-phase evidence; do not

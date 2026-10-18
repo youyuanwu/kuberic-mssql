@@ -4225,6 +4225,68 @@ async fn admitted_current_configuration_allows_only_value_identical_replay() {
     }
 }
 
+#[test]
+fn remote_only_secondary_requires_complete_exact_peers_and_local_noncollision() {
+    for local_index in [1, 2] {
+        let local = kuberic_identity(local_index as i64 + 1);
+        let address = format!("replica-{}.example:5022", local_index + 1);
+        let expectation = topology_expectation_for(local_index);
+        let mut exact = bound_replica_set();
+        exact.replicas.retain(|replica| replica.identity != local);
+        let validate = |current: &ReplicaSetConfiguration| {
+            testing_current_pin_bootstrap_descriptors(&local, &expectation, &address, current)
+        };
+        assert_eq!(validate(&exact).unwrap().len(), 3);
+        for mutation in 0..10 {
+            let mut changed = exact.clone();
+            match mutation {
+                0 => changed.replicas[0].process_session_id = ProcessSessionId::default(),
+                1 => {
+                    changed.replicas[0].process_session_id =
+                        ProcessSessionId::new("testing-local-process-session")
+                }
+                2 => changed.replicas[0].replication_address.clear(),
+                3 => changed.replicas[0].replication_address = address.clone(),
+                4 => changed.replicas[0].role = ReplicaRole::None,
+                5 => changed.replicas[0].identity = local.clone(),
+                6 => changed.replicas[0] = changed.replicas[1].clone(),
+                7 => changed.replicas[0].identity = kuberic_identity(9),
+                8 => {
+                    changed.replicas[0].process_session_id =
+                        changed.replicas[1].process_session_id.clone()
+                }
+                9 => {
+                    changed.replicas.pop();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                validate(&changed).is_err(),
+                "local {local_index} mutation {mutation}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn short_secondary_bootstrap_still_defers_without_observation_or_mutation() {
+    let (replicator, executor, source) =
+        counted_bootstrap_replicator_for(1, Vec::new(), Vec::new(), observer_config_for(1));
+    replicator.open().await.unwrap();
+    let before = source.observations.load(Ordering::SeqCst);
+    let mut partial = bound_replica_set();
+    partial
+        .replicas
+        .retain(|replica| replica.identity.replica_id != ReplicaId::new(1));
+    replicator
+        .update_current_replica_set_configuration(partial)
+        .await
+        .unwrap();
+    assert!(replicator.admitted_topology().is_none());
+    assert_eq!(source.observations.load(Ordering::SeqCst), before);
+    assert!(executor.effects.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn a_new_process_admits_fresh_sessions_for_the_same_stable_topology() {
     let first =

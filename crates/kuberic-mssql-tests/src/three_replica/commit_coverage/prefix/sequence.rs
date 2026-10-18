@@ -217,6 +217,38 @@ impl NativeSequenceHistory {
             evaluated_at,
         )
     }
+
+    pub(super) fn replay_transition(
+        &mut self,
+        members: &[ReadyMember; 3],
+        transition: &NativeSequenceTransition,
+    ) -> Result<(), CommitCoverageError> {
+        if transition.before_binding != self.current {
+            return Err(CommitCoverageError::Control(
+                "recorded transition has a different predecessor",
+            ));
+        }
+        let request = NativeControlRequest {
+            action: transition.receipt.action,
+            requested_at_unix_millis: transition.receipt.requested_at_unix_millis,
+            accepted_at_unix_millis: transition.receipt.accepted_at_unix_millis,
+            before_observations: transition.before_observations.clone(),
+        };
+        let result = self.admit_control(
+            members,
+            &request,
+            UnadmittedNativeSurvey(transition.after_observations.clone()),
+            transition.receipt.confirmed_at_unix_millis,
+        )?;
+        if !matches!(result, NativeControlAdmission::Admitted(_, _))
+            || self.transitions.last() != Some(transition)
+        {
+            return Err(CommitCoverageError::Control(
+                "recorded transition does not match admitted evidence",
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub(in crate::three_replica) fn control_complete(

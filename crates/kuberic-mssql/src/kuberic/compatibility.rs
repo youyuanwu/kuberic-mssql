@@ -831,6 +831,28 @@ fn validate_configuration_shape(
             "runtime process session is empty",
         ));
     }
+    let omits_local_secondary = local.role == ReplicaRole::ActiveSecondary
+        && current.replicas.len() == 2
+        && !current
+            .replicas
+            .iter()
+            .any(|replica| replica.identity == *runtime_identity);
+    if omits_local_secondary
+        && (validate_replication_address(replication_address).is_err()
+            || current.replicas.iter().any(|replica| {
+                replica.process_session_id.is_empty()
+                    || replica.process_session_id == *process_session_id
+                    || validate_replication_address(&replica.replication_address).is_err()
+                    || replica.replication_address == replication_address
+                    || !configuration.members.iter().any(|member| {
+                        member.identity == replica.identity && member.role == replica.role
+                    })
+            }))
+    {
+        return Err(KubericAdapterError::TopologyBindingMismatch(
+            "remote-only secondary requires exact complete peers distinct from local runtime",
+        ));
+    }
 
     for configuration_member in &configuration.members {
         if configuration_member.identity.instance_id.is_empty()
@@ -852,7 +874,7 @@ fn validate_configuration_shape(
             ));
         }
         if descriptions.is_empty() {
-            if configuration_member.role != ReplicaRole::Primary {
+            if configuration_member.role != ReplicaRole::Primary && !omits_local_secondary {
                 return Err(KubericAdapterError::TopologyBindingMismatch(
                     "only the local Primary may be omitted from remote-active descriptions",
                 ));

@@ -9,6 +9,7 @@ use super::{
 };
 use crate::three_replica::{NativeTopologyBinding, ReadyMember};
 
+pub mod hosted;
 pub(in crate::three_replica) mod sequence;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

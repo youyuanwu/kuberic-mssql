@@ -182,6 +182,55 @@ fn source_record_and_later_prefix_must_belong_to_the_known_control_chain() {
         )
         .unwrap();
     let samples = phase_samples([44; 3], 3000, false);
+    let recorded = super::super::hosted::NativePrefixEvidence {
+        initial_binding: history.initial().clone(),
+        initial_observations: initial,
+        record_binding: record_binding.clone(),
+        transitions: history.transitions().to_vec(),
+        target_ordinal: 2,
+        acknowledgement: ack.clone(),
+        transaction_samples: rows.clone(),
+        evaluation_binding: history.current().clone(),
+        observations: samples.clone(),
+        evaluated_at_unix_millis: 3020,
+    };
+    assert!(matches!(
+        recorded.evaluate(&members).unwrap(),
+        NativePrefixDecision::NativeSampledCoverage { .. }
+    ));
+    for mutation in 0..6 {
+        let mut changed = recorded.clone();
+        match mutation {
+            0 => changed.transitions[0].receipt.accepted_at_unix_millis = None,
+            1 => changed.transitions[1].after_binding.configuration_sequence += 1,
+            2 => changed.record_binding = changed.evaluation_binding.clone(),
+            3 => changed.acknowledgement.acknowledged_at_unix_millis = 2200,
+            4 => {
+                let resume = &mut changed.transitions[1];
+                resume.receipt.requested_at_unix_millis += 2000;
+                resume.receipt.accepted_at_unix_millis = resume
+                    .receipt
+                    .accepted_at_unix_millis
+                    .map(|stamp| stamp + 2000);
+                resume.receipt.confirmed_at_unix_millis += 2000;
+                resume.after_observations = phase_samples([44; 3], 4140, false);
+            }
+            5 => changed.observations = phase_samples([44; 3], 2140, false),
+            _ => unreachable!(),
+        }
+        let error = changed.evaluate(&members).unwrap_err();
+        if mutation == 4 {
+            assert!(
+                error.to_string().contains("from after the evaluation"),
+                "{error}"
+            );
+        } else if mutation == 5 {
+            assert!(
+                error.to_string().contains("precedes its admitted phase"),
+                "{error}"
+            );
+        }
+    }
     assert!(matches!(
         history
             .evaluate(&members, &record_binding, &ack, &rows, &samples, 3020,)

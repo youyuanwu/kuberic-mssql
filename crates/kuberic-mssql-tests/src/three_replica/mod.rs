@@ -28,6 +28,7 @@ pub use cleanup::{
     HandledCancellationSignal, SystemCleanupClock, cleanup, combine_with_cleanup,
 };
 pub use commit_coverage::prefix::NativePrefixReport;
+pub use commit_coverage::prefix::hosted as hosted_native_prefix;
 pub use commit_coverage::{CommitCoverageError, CommitCoverageReport};
 pub use config::{
     ACKNOWLEDGEMENT_SCHEMA_VERSION, AcknowledgementSource, FixtureConfig, FixtureConfigError,
