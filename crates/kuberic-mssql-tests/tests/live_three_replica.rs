@@ -26,8 +26,8 @@ use kuberic_runtime::protocol::public_operations::{
 use kuberic_runtime::protocol::types::{AccessStatus, ReplicaRole, ReplicaStorageIdentity};
 
 type TestError = Box<dyn Error + Send + Sync>;
-const HAPPY_PATH_TEST: &str = "three_replica_mssql_happy_path";
-const SAME_ROOT_RESTART_TEST: &str = "three_replica_mssql_same_root_restart";
+const LIFECYCLE_CHILD_TEST: &str = "three_replica_lifecycle_child";
+const CHILD_MODE_ENV: &str = "KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE";
 const FAULT_HIT_ENV: &str = "KUBERIC_MSSQL_FAULT_HIT_FILE";
 
 #[path = "live_three_replica/hosted_witness.rs"]
@@ -40,15 +40,35 @@ struct PendingSeedCompaction {
 }
 
 #[test]
-#[ignore = "auto-accepts the SQL Server EULA for this test fixture and requires a qualified local Docker host"]
-fn three_replica_mssql_happy_path() {
-    run_three_replica_test(false);
+fn three_replica_lifecycle_child() {
+    let mode = match std::env::var(CHILD_MODE_ENV) {
+        Ok(mode) => mode,
+        Err(std::env::VarError::NotPresent) => return,
+        Err(std::env::VarError::NotUnicode(_)) => panic!("invalid live SQL child mode"),
+    };
+    match mode.as_str() {
+        "happy-path" => run_three_replica_test(false),
+        "same-root-restart" => run_three_replica_test(true),
+        "native-commit" => run_native_experiment(NativeExperiment::CommitRecord),
+        _ => panic!("invalid live SQL child mode"),
+    }
 }
 
 #[test]
-#[ignore = "validates same-root Kuberic host restart with a licensed SQL Server fixture"]
-fn three_replica_mssql_same_root_restart() {
-    run_three_replica_test(true);
+fn lifecycle_child_rejects_invalid_mode_before_fixture_admission() {
+    let output = test_child_command(
+        Path::new("/unused-live-sql-child-root"),
+        "invalid",
+        None,
+        None,
+    )
+    .env_remove("KUBERIC_MSSQL_THREE_REPLICA_ROOT")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid live SQL child mode"));
 }
 
 macro_rules! phase4_case {
@@ -373,25 +393,11 @@ mod three_replica_mssql_target_host_evidence_faults {
         TargetEvidenceFault::SqlProcessRestart
     );
     phase4_case!(
-        pre_association_lineage_mismatch,
-        exercise_target_host_evidence_fault,
-        "",
-        TargetEvidenceWindow::PreAssociation,
-        TargetEvidenceFault::LineageMismatch
-    );
-    phase4_case!(
         in_flight_seeding_sql_process_restart,
         exercise_target_host_evidence_fault,
         "",
         TargetEvidenceWindow::InFlightSeeding,
         TargetEvidenceFault::SqlProcessRestart
-    );
-    phase4_case!(
-        in_flight_seeding_lineage_mismatch,
-        exercise_target_host_evidence_fault,
-        "",
-        TargetEvidenceWindow::InFlightSeeding,
-        TargetEvidenceFault::LineageMismatch
     );
     phase4_case!(
         post_native_pre_reply_sql_process_restart,
@@ -401,18 +407,12 @@ mod three_replica_mssql_target_host_evidence_faults {
         TargetEvidenceFault::SqlProcessRestart
     );
     phase4_case!(
-        post_native_pre_reply_lineage_mismatch,
+        lineage_mismatch_across_checkpoints,
         exercise_target_host_evidence_fault,
         "",
         TargetEvidenceWindow::PostNativePreReply,
         TargetEvidenceFault::LineageMismatch
     );
-}
-
-#[test]
-#[ignore = "probes native commit-record evidence with a licensed owned three-replica fixture"]
-fn three_replica_mssql_native_commit_coverage() {
-    run_native_experiment(NativeExperiment::CommitRecord);
 }
 
 #[test]
@@ -2522,11 +2522,62 @@ impl TargetEvidenceFault {
     }
 }
 
+async fn await_owned_checkpoint(
+    entered: tokio::sync::oneshot::Receiver<()>,
+    callback_owner: &mut Option<tokio::task::JoinHandle<Result<(), tonic::Status>>>,
+    label: &str,
+) -> Result<(), TestError> {
+    let completed = tokio::select! {
+        entered = entered => {
+            entered.map_err(|_| format!("{label} checkpoint sender disappeared"))?;
+            None
+        }
+        result = callback_owner.as_mut().expect("callback owner armed") => Some(result),
+        _ = tokio::time::sleep(Duration::from_secs(120)) => {
+            return Err(format!("{label} checkpoint exceeded its bounded wait").into());
+        }
+    };
+    if let Some(result) = completed {
+        callback_owner.take();
+        return Err(format!("{label} callback completed before its checkpoint: {result:?}").into());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn owned_checkpoint_wait_preserves_callback_ownership() {
+    let (_entered, receiver) = tokio::sync::oneshot::channel();
+    let mut owner = Some(tokio::spawn(async { Ok(()) }));
+    let error = await_owned_checkpoint(receiver, &mut owner, "early completion")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("callback completed before"));
+    assert!(owner.is_none());
+
+    let (entered, receiver) = tokio::sync::oneshot::channel();
+    drop(entered);
+    let mut owner = Some(tokio::spawn(std::future::pending::<
+        Result<(), tonic::Status>,
+    >()));
+    let error = await_owned_checkpoint(receiver, &mut owner, "lost checkpoint")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("checkpoint sender disappeared"));
+    let callback = owner.take().expect("pending callback owner retained");
+    callback.abort();
+    assert!(callback.await.unwrap_err().is_cancelled());
+}
+
 async fn exercise_target_host_evidence_fault(
     base_root: &Path,
     window: TargetEvidenceWindow,
     fault: TargetEvidenceFault,
 ) -> Result<(), TestError> {
+    if matches!(fault, TargetEvidenceFault::LineageMismatch)
+        && !matches!(window, TargetEvidenceWindow::PostNativePreReply)
+    {
+        return Err("synthetic lineage must retain all checkpoints before the final report".into());
+    }
     let label = format!("{}-{}", window.label(), fault.label());
     let root = base_root.join(&label);
     cleanup_three_replica_fixture(&root)?;
@@ -2581,23 +2632,37 @@ async fn exercise_target_host_evidence_fault(
                 group.testing_gate_next_target_evidence(entered_tx, release_rx)?;
             }
         }
-        callback_owner = Some(group.testing_spawn_admitted_seed_callback(&command)?);
-        let checkpoint_result = tokio::select! {
-            entered = entered_rx => {
-                entered.map_err(|_| format!("{label} checkpoint sender disappeared"))?;
-                None
-            }
-            result = callback_owner.as_mut().expect("callback owner armed") => Some(result),
-            _ = tokio::time::sleep(Duration::from_secs(120)) => {
-                return Err(format!("{label} checkpoint exceeded its bounded wait").into());
-            }
+        let preceding_checkpoints = if matches!(fault, TargetEvidenceFault::LineageMismatch) {
+            let (intent_entered, intent_receiver) = tokio::sync::oneshot::channel();
+            let (intent_release, intent_wait) = tokio::sync::oneshot::channel();
+            group.testing_gate_next_seed_intent(intent_entered, intent_wait)?;
+            let (request_entered, request_receiver) = tokio::sync::oneshot::channel();
+            let (request_release, request_wait) = tokio::sync::oneshot::channel();
+            group.testing_gate_seed_after_request(request_entered, request_wait)?;
+            Some([
+                ("seed-intent", intent_receiver, intent_release),
+                ("after-request", request_receiver, request_release),
+            ])
+        } else {
+            None
         };
-        if let Some(result) = checkpoint_result {
-            callback_owner.take();
-            return Err(
-                format!("{label} callback completed before its checkpoint: {result:?}").into(),
-            );
+        callback_owner = Some(group.testing_spawn_admitted_seed_callback(&command)?);
+        if let Some(checkpoints) = preceding_checkpoints {
+            for (checkpoint, entered, release) in checkpoints {
+                let checkpoint_label = format!("{label} {checkpoint}");
+                await_owned_checkpoint(entered, &mut callback_owner, &checkpoint_label).await?;
+                group
+                    .testing_assert_source_build_success_not_published(&command)
+                    .await?;
+                if callback_owner.as_ref().expect("callback owner armed").is_finished() {
+                    return Err(format!("{checkpoint_label} callback was not retained").into());
+                }
+                release
+                    .send(())
+                    .map_err(|_| format!("{checkpoint_label} checkpoint was not retained"))?;
+            }
         }
+        await_owned_checkpoint(entered_rx, &mut callback_owner, &label).await?;
         group
             .testing_assert_source_build_success_not_published(&command)
             .await?;
@@ -3161,38 +3226,39 @@ fn required_path(variable: &str) -> PathBuf {
 }
 
 fn spawn_live_child(root: &Path, ready: Option<&Path>) -> Child {
-    spawn_test_child(root, HAPPY_PATH_TEST, ready, None)
+    spawn_test_child(root, "happy-path", ready, None)
 }
 
 fn spawn_restart_child(root: &Path) -> Child {
-    spawn_test_child(root, SAME_ROOT_RESTART_TEST, None, None)
+    spawn_test_child(root, "same-root-restart", None, None)
 }
 
 fn spawn_test_child(
     root: &Path,
-    test_name: &str,
+    mode: &str,
     ready: Option<&Path>,
     checkpoint: Option<&str>,
 ) -> Child {
-    test_child_command(root, test_name, ready, checkpoint)
+    test_child_command(root, mode, ready, checkpoint)
         .spawn()
         .expect("spawn exact live child")
 }
 
 fn test_child_command(
     root: &Path,
-    test_name: &str,
+    mode: &str,
     ready: Option<&Path>,
     checkpoint: Option<&str>,
 ) -> Command {
     let mut command = Command::new(std::env::current_exe().expect("current live test executable"));
     command
-        .arg(test_name)
-        .arg("--ignored")
+        .arg(LIFECYCLE_CHILD_TEST)
         .arg("--exact")
         .arg("--nocapture")
         .arg("--test-threads=1")
         .env("KUBERIC_MSSQL_THREE_REPLICA_ROOT", root)
+        .env_remove(CHILD_MODE_ENV)
+        .env(CHILD_MODE_ENV, mode)
         .env_remove("KUBERIC_MSSQL_SIGNAL_READY_FILE")
         .env_remove("KUBERIC_MSSQL_FAULT_CHECKPOINT")
         .env_remove(FAULT_HIT_ENV)
@@ -3208,12 +3274,12 @@ fn test_child_command(
 }
 
 fn spawn_live_child_with_fault(root: &Path, checkpoint: &str, receipt: &Path) -> Child {
-    let test_name = if checkpoint == "fail-after-agent-restart" {
-        SAME_ROOT_RESTART_TEST
+    let mode = if checkpoint == "fail-after-agent-restart" {
+        "same-root-restart"
     } else {
-        HAPPY_PATH_TEST
+        "happy-path"
     };
-    test_child_command(root, test_name, None, Some(checkpoint))
+    test_child_command(root, mode, None, Some(checkpoint))
         .env(FAULT_HIT_ENV, receipt)
         .spawn()
         .expect("spawn checkpoint fault child")

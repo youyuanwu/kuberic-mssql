@@ -972,10 +972,11 @@ cases are decoded-observation injections consumed by production validators; its
 SQL-incarnation validator uses a real process restart plus a test gate.
 Separate terminal-seed cases perform real post-compaction association removal
 and AG recreation with zero redispatch. Target-local evidence cases use real
-target SQL process restarts and test-injected lineage mismatches at
-pre-association, in-flight-seeding and post-native/pre-reply windows. Every
-scenario performs exact cleanup. Physical restart requires an independently
-observed new SQL start, a returned narrowly classified unsafe/unavailable or
+target SQL process restarts at three distinct windows. One synthetic-lineage
+callback retains all three held-checkpoint/no-success observations before the
+single final report-seam injection; it does not model three physical fork
+changes. Every scenario performs exact cleanup. Physical restart requires an
+independently observed new SQL start, a returned narrowly classified unsafe/unavailable or
 bounded callback-budget error, and at most one seed submission. This proves
 bounded callback failure without duplicate submission, not rollback, zero
 effects or a specific incarnation-check branch; an admitted `ADD DATABASE` may
@@ -994,6 +995,11 @@ removed without dropping the separately selected handshake cases. The last
 restart-checkpoint case retains its same-root positive retry as one atomic
 journey, rather than relying on another test's order. Splitting does not
 promise lower total runtime or impose a five-minute kill deadline.
+Complete happy/restart executions are retained inside recovery retries rather
+than scheduled a second time. Hosted witness retains the complete native
+commit report; the native-only manual diagnostic keeps its separate blocked-
+coverage acceptance semantics. Manual recipes and subprocesses use one gated
+ordinary child helper, which starts no SQL without an explicit mode.
 Its GitHub Actions job log is the
 run evidence; no test logs or evidence artifacts are committed. The dependency
 source and version remain defined only by the root `Cargo.toml`.

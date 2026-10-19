@@ -288,9 +288,7 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
     assert!(justfile.contains(
         "three_replica_mssql_native_prefix_coverage -- --ignored --exact --test-threads=1 --nocapture"
     ));
-    assert!(justfile.contains(
-        "three_replica_mssql_native_commit_coverage -- --ignored --exact --test-threads=1 --nocapture"
-    ));
+    assert!(justfile.contains("KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE=native-commit"));
     assert!(
         justfile.contains(
             "test-live-three-replica-restart root=\"target/mssql-three-replica-restart\":"
@@ -332,11 +330,14 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         justfile.contains("KUBERIC_MSSQL_THREE_REPLICA_ROOT=\"$(realpath -m {{quote(root)}})\"")
     );
     assert!(justfile.contains(
-        "cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_happy_path -- --ignored --exact --test-threads=1"
+        "cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_lifecycle_child -- --exact --test-threads=1"
     ));
     assert!(justfile.contains(
-        "cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_same_root_restart -- --ignored --exact --test-threads=1 --nocapture"
+        "cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_lifecycle_child -- --exact --test-threads=1 --nocapture"
     ));
+    assert!(justfile.contains("KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE=happy-path"));
+    assert!(justfile.contains("KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE=same-root-restart"));
+    assert!(justfile.contains("-u KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE"));
     assert!(justfile.contains(
         "cargo run --locked -p kuberic-mssql-tests --bin mssql-three-replica-fixture -- cleanup --root"
     ));

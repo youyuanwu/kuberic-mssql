@@ -32,7 +32,7 @@ clippy:
 
 # Run ordinary Rust tests; live fixtures remain ignored.
 test:
-    cargo nextest run --locked --workspace --all-features --test-threads=1 --profile default
+    env -u KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE cargo nextest run --locked --workspace --all-features --test-threads=1 --profile default
     cargo test --locked --workspace --all-features --doc
 
 # Run every existing ignored SQL fixture suite, serially, with no case narrowing.
@@ -42,6 +42,7 @@ test-live-nextest root="target/mssql-nextest-live":
         -u KUBERIC_MSSQL_SEED_FAULT_FILTER \
         -u KUBERIC_MSSQL_CONFLICT_FILTER \
         -u KUBERIC_MSSQL_ONE_REPLICA_CHILD_MODE \
+        -u KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE \
         -u SQLSERVER_ONE_REPLICA_FAULT \
         -u KUBERIC_MSSQL_FAULT_CHECKPOINT \
         -u KUBERIC_MSSQL_FAULT_HIT_FILE \
@@ -89,17 +90,19 @@ test-live-one-replica-recovery root="target/mssql-one-replica-recovery":
 # Launch, validate, and clean up the dedicated real three-member topology.
 test-live-three-replica root="target/mssql-three-replica":
     env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE=happy-path \
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
-        cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_happy_path -- --ignored --exact --test-threads=1
+        cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_lifecycle_child -- --exact --test-threads=1
 
 # Collect acknowledged-transaction/native-record evidence; coverage can remain explicitly blocked.
 test-live-native-commit-coverage root="target/mssql-native-commit-coverage":
     env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE=native-commit \
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
-        three_replica_mssql_native_commit_coverage -- --ignored --exact --test-threads=1 --nocapture
+        three_replica_lifecycle_child -- --exact --test-threads=1 --nocapture
 
 # Evaluate native-only prefix coverage around an exactly owned secondary pause/resume.
 test-live-native-prefix-coverage root="target/mssql-native-prefix-coverage":
@@ -112,9 +115,10 @@ test-live-native-prefix-coverage root="target/mssql-native-prefix-coverage":
 # Validate same-root replacement of all three public Kuberic hosts.
 test-live-three-replica-restart root="target/mssql-three-replica-restart":
     env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE=same-root-restart \
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
-        cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_mssql_same_root_restart -- --ignored --exact --test-threads=1 --nocapture
+        cargo test --locked -p kuberic-mssql-tests --test live_three_replica three_replica_lifecycle_child -- --exact --test-threads=1 --nocapture
 
 # Exercise native lease expiry/restart and exact Rust-owned fixture fencing.
 test-live-lease-fence root="target/mssql-lease-fence":

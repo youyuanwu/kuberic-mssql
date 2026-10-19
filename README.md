@@ -407,7 +407,7 @@ The complete local and CI pipeline is:
 just ci
 ```
 
-It runs server-free checks, then all 64 currently ignored SQL fixture tests
+It runs server-free checks, then all 59 currently ignored SQL fixture tests
 through nextest's `live` profile and shared `live-sql` group. One-replica
 observation/recovery, three-replica happy path/restart/fault/signal/conflict/
 target-evidence, native commit/prefix, hosted witness and lease/fence suites
@@ -422,6 +422,12 @@ retained; splitting improves progress visibility, not total execution time.
 Five minutes is a normal-runtime target, not a cleanup-interrupting timeout.
 Narrow family recipes select all their named cases by prefix; use the full
 `family::case` name with `--exact` to select an individual three-replica case.
+
+Complete happy-path and same-root-restart journeys run inside recovery retries,
+not again as standalone CI tests. The hosted witness retains the full native
+commit collection. Their existing manual recipes remain available through an
+explicitly gated child helper, which runs no SQL in ordinary tests without a
+requested mode; canonical checks clear that internal mode.
 
 The same commands run locally when fixture prerequisites are available:
 
@@ -539,7 +545,7 @@ just cleanup-live-lease-fence [root]
 ```
 
 The native commit-record recipe uses `target/mssql-native-commit-coverage` by
-default. It runs an ignored fixture-only transaction probe and emits raw
+default. It explicitly runs the fixture-only native diagnostic and emits raw
 before/after/quiet evidence. A passing collection run can report **blocked**
 coverage; it does not enable catch-up or switchover. See the
 [implemented probe and remaining proof gates](docs/kuberic-progress.md#first-native-proof-toward-switchover).
@@ -643,9 +649,10 @@ process restart plus a test gate.
 The terminal-seed recipe performs real SQL association removal and AG
 recreation, then proves terminal conflict/unsafe classification, zero
 redispatch, no recreated temporary intent, and exact cleanup. The
-target-evidence recipe uses real target SQL process restarts and test-injected
-target-local lineage mismatches at the pre-association, in-flight-seeding, and
-post-native/pre-reply windows. Every scenario performs exact, idempotent
+target-evidence recipe retains three real target SQL restart windows. One
+synthetic-lineage journey holds the callback at pre-association, in-flight
+seeding and final target evidence, then injects the mismatch only at its final
+report-consumption seam. Every scenario performs exact, idempotent
 cleanup. Physical restart requires an independently observed new SQL start,
 a returned unsafe/unavailable or bounded callback-budget error, and no duplicate
 seed submission. An admitted `ADD DATABASE` may remain: callback failure does
@@ -657,10 +664,8 @@ Direct test commands remain available:
 ```bash
 cargo test --locked -p kuberic-mssql-tests --test live_one_replica \
   one_replica_mssql_observation_and_cli -- --ignored --exact --test-threads=1
-cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
-  three_replica_mssql_happy_path -- --ignored --exact --test-threads=1
-cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
-  three_replica_mssql_same_root_restart -- --ignored --exact --test-threads=1
+just test-live-three-replica
+just test-live-three-replica-restart
 ```
 
 An explicitly requested live test fails if any of its prerequisites are
