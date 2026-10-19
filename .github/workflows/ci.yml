@@ -44,29 +44,9 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-  validate-archive:
-    name: Validate exact test coverage
-    needs: build-test-artifacts
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
-        with:
-          build-warnings: ""
-          cache: false
-      - name: Bootstrap shared tools
-        run: bash crates/kuberic-mssql-tests/scripts/setup_environment.sh
-      - uses: actions/download-artifact@v8
-        with:
-          name: nextest-archive
-          path: target/nextest
-      - name: Prove exact-once tiers and all four partitions
-        run: just validate-nextest-archive "$NEXTEST_ARCHIVE"
-
   test-shards:
     name: Tests (${{ matrix.partition }}/4)
-    needs: [build-test-artifacts, validate-archive]
+    needs: build-test-artifacts
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -86,6 +66,10 @@ jobs:
         with:
           name: nextest-archive
           path: target/nextest
+      - name: Validate exact test coverage
+        if: ${{ matrix.partition == 1 }}
+        timeout-minutes: 30
+        run: just validate-nextest-archive "$NEXTEST_ARCHIVE"
       - name: Prepare isolated archive extraction
         id: extraction
         run: |
@@ -101,17 +85,15 @@ jobs:
   validation:
     name: Shared CI validation
     if: always()
-    needs: [build-test-artifacts, validate-archive, test-shards]
+    needs: [build-test-artifacts, test-shards]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Require every archive stage and worker
         env:
           BUILD_RESULT: ${{ needs.build-test-artifacts.result }}
-          COVERAGE_RESULT: ${{ needs.validate-archive.result }}
           TEST_RESULT: ${{ needs.test-shards.result }}
         run: |
-          echo "build=$BUILD_RESULT coverage=$COVERAGE_RESULT tests=$TEST_RESULT"
+          echo "build=$BUILD_RESULT tests=$TEST_RESULT"
           test "$BUILD_RESULT" = success
-          test "$COVERAGE_RESULT" = success
           test "$TEST_RESULT" = success

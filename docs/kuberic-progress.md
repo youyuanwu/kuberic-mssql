@@ -983,7 +983,8 @@ effects or a specific incarnation-check branch; an admitted `ADD DATABASE` may
 remain. Lineage mismatch still requires its strict conflict error.
 
 The required GitHub Actions check `Shared CI validation` gates a checked
-nextest archive, exact-once partition proof and four isolated test workers.
+nextest archive and four isolated test workers. Shard 1 validates exact-once
+partition coverage before its tests; shards 2–4 start without waiting.
 Each runs its ordinary slice then ignored-SQL hash partition without rebuilding,
 keeping the serial live profile and always attempting direct archived-binary
 cleanup. This includes one-replica
@@ -1043,8 +1044,9 @@ just ci
 ```
 
 The required exact PR-head GitHub Actions job `Shared CI validation` requires
-the corresponding archive producer, coverage validator and all four workers
-to pass. Workers use the same source revision, preserve serial SQL on each
+the corresponding archive producer and all four workers to pass, including
+coverage validation inside shard 1. Workers use the same source revision,
+preserve serial SQL on each
 Docker host and always attempt exact archived-binary cleanup. Local `just ci`
 remains serial; `ci-build-nextest-archive`, `validate-nextest-archive` and
 `test-nextest-archive` reproduce the separate cloud stages. Job logs are the

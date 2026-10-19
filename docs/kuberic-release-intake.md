@@ -144,9 +144,11 @@ callback task has settled; it is not host-ordering evidence.
    owns signed build and peer authorization validation. SQL Server HADR cannot
    carry Kuberic authorization tokens.
 5. Run the complete exact-head pipeline through the required GitHub Actions
-   job `Shared CI validation`. Its producer builds once, its validator proves
+   job `Shared CI validation`. Its producer builds once, shard 1 validates
    all four partitions, and four isolated workers run the complete ordinary
-   and licensed coverage without rebuilding. Local serial rehearsal remains:
+   and licensed coverage without rebuilding. Other shards do not wait for
+   coverage validation; its failure still fails shard 1 and the required gate.
+   Local serial rehearsal remains:
 
    ```bash
    just ci

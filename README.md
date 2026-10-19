@@ -418,11 +418,13 @@ Rust ignores keep ordinary Cargo server-free; the explicit live recipe uses
 
 CI follows Kuberic's build-once nextest archive pattern: one producer checks,
 compiles and uploads only the compressed binaries/metadata archive for one day.
-A validator proves exhaustive, disjoint four-way ordinary/live coverage before
-four worker jobs run ordinary `slice:i/4` and SQL `hash:i/4` partitions. Workers
+Shard 1 first proves exhaustive, disjoint four-way ordinary/live coverage;
+shards 2–4 start without waiting for it. All four workers run ordinary
+`slice:i/4` and SQL `hash:i/4` partitions. Workers
 reuse the archive without rebuilding, remap paths to their matching checkout,
 and keep SQL serial on their own isolated Docker host. The final required gate
-fails if any producer, validator or worker fails, skips or is cancelled.
+fails if the producer or any worker fails, skips or is cancelled, including
+a coverage-validation failure in shard 1.
 
 To reproduce archive stages locally, run one worker at a time:
 
@@ -472,8 +474,9 @@ argument. Recovery visits retained nested ownership journals only in its
 symlinks beneath the runner root, and delegates removal to exact-ownership cleanup.
 Failures in discovery or cleanup are reported without suppressing other
 families; live/unknown owners remain blocked. Successful cleanup retains
-terminal `Removed` journals. CI uses finite 120-minute producer, 30-minute
-validator and 90-minute worker envelopes, not worst-case recovery guarantees.
+terminal `Removed` journals. CI uses finite 120-minute producer and 90-minute
+worker envelopes, with a 30-minute coverage step in shard 1. These are not
+worst-case recovery guarantees.
 Serialization applies within each worker/invocation; fixture locks still
 govern separate invocations.
 

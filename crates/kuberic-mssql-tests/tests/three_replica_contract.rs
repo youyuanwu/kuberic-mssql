@@ -393,7 +393,21 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
     assert!(workflow.contains("path: ${{ env.NEXTEST_ARCHIVE }}"));
     assert!(workflow.contains("partition: [1, 2, 3, 4]"));
     assert!(workflow.contains("max-parallel: 4"));
-    assert!(workflow.contains("needs: [build-test-artifacts, validate-archive, test-shards]"));
+    assert!(workflow.contains("needs: [build-test-artifacts, test-shards]"));
+    assert!(!workflow.contains("\n  validate-archive:"));
+    let shards = workflow
+        .split("\n  test-shards:")
+        .nth(1)
+        .unwrap()
+        .split("\n  validation:")
+        .next()
+        .unwrap();
+    assert!(shards.contains("needs: build-test-artifacts"));
+    assert!(shards.contains("if: ${{ matrix.partition == 1 }}"));
+    assert!(
+        shards.find("run: just validate-nextest-archive").unwrap()
+            < shards.find("id: tests").unwrap()
+    );
     let cargo_config = fs::read_to_string(root.join(".cargo/config.toml")).unwrap();
     assert!(cargo_config.contains("ACCEPT_EULA = { value = \"Y\", force = true }"));
 }

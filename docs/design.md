@@ -778,8 +778,9 @@ output, and credential redaction. A dedicated server-free observer workflow
 runs these without provisioning PostgreSQL or Kubernetes.
 
 The required GitHub Actions check `Shared CI validation` gates one checked
-nextest archive, exact partition validation and four isolated workers at the
-same pull-request revision. Each worker runs an ordinary slice followed by a
+nextest archive and four isolated workers at the same pull-request revision.
+Shard 1 validates exact partition coverage; shards 2–4 do not wait for it.
+Each worker runs an ordinary slice followed by a
 serial SQL hash partition without rebuilding, and always attempts exact
 cleanup using the archived fixture binaries. Local `just ci` retains complete
 serial coverage. GitHub Actions logs are the run evidence; no archives, test
