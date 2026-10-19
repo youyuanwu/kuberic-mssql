@@ -96,10 +96,11 @@ A candidate record may describe the exact current and reviewed resolutions
 during intake, but it is not checked in as dependency authority. A change to
 `Cargo.toml` must not merge until the candidate computes `ready_to_pin` and the
 required exact PR-head GitHub Actions check `Shared CI validation` passes. That
-job runs `just ci`, including formatting, strict Clippy, locked ordinary
-nextest tests plus Cargo doctests, then every existing ignored SQL fixture
-suite in the serial nextest live profile. It always runs `just cleanup`,
-including nested exact-journal recovery for the nextest namespace.
+gate requires a checked locked test archive, exact-once ordinary/live partition
+coverage and all four isolated test workers to succeed. The producer runs
+formatting, strict Clippy and Cargo doctests; each worker runs an ordinary
+slice and serial ignored-SQL hash partition from the same archive/revision,
+then exact archived-binary cleanup including nested journal recovery.
 The GitHub Actions job log is the run evidence.
 Test logs and evidence artifacts are not committed to this repository.
 
@@ -143,7 +144,9 @@ callback task has settled; it is not host-ordering evidence.
    owns signed build and peer authorization validation. SQL Server HADR cannot
    carry Kuberic authorization tokens.
 5. Run the complete exact-head pipeline through the required GitHub Actions
-   job `Shared CI validation`, which executes:
+   job `Shared CI validation`. Its producer builds once, its validator proves
+   all four partitions, and four isolated workers run the complete ordinary
+   and licensed coverage without rebuilding. Local serial rehearsal remains:
 
    ```bash
    just ci
@@ -151,7 +154,8 @@ callback task has settled; it is not host-ordering evidence.
 
    The command performs setup, ordinary checks, licensed one-replica,
    licensed three-replica, and licensed same-root restart validation
-   sequentially. The workflow always follows it with `just cleanup`. The
+   sequentially. CI workers always attempt exact cleanup with archived
+   binaries, not Cargo rebuilds. The
    exact-head check must pass; local runs are useful before pushing but do not
    replace it. Job logs remain in GitHub Actions and are not checked in or
    uploaded as evidence artifacts. Unavailable or unrun candidate-required

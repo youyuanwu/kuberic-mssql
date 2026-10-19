@@ -16,7 +16,7 @@ cleanup:
     bash crates/kuberic-mssql-tests/scripts/cleanup_nextest_fixtures.sh --all
 
 # Check formatting, strict Clippy, and ordinary Rust tests.
-check: fmt-check clippy test
+check: fmt-check clippy test test-nextest-partitions
 
 # Build the observe-only executable.
 build:
@@ -31,28 +31,34 @@ clippy:
     cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
 # Run ordinary Rust tests; live fixtures remain ignored.
-test:
+test: test-ordinary test-doc
+
+test-ordinary:
     env -u KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE cargo nextest run --locked --workspace --all-features --test-threads=1 --profile default
+
+test-doc:
     cargo test --locked --workspace --all-features --doc
+
+test-nextest-partitions:
+    python3 -B -m unittest discover -s crates/kuberic-mssql-tests/scripts -p 'test_nextest_partitions.py' -q
+
+# Check and compile once; the four CI workers reuse this exact archive.
+ci-build-nextest-archive archive="target/nextest/mssql-tests.tar.zst": fmt-check clippy test-doc test-nextest-partitions
+    mkdir -p "$(dirname {{quote(archive)}})"
+    cargo nextest archive --locked --workspace --all-features --profile default --archive-file {{quote(archive)}}
+
+validate-nextest-archive archive="target/nextest/mssql-tests.tar.zst":
+    python3 crates/kuberic-mssql-tests/scripts/validate_nextest_partitions.py --archive-file {{quote(archive)}}
+
+test-nextest-archive archive partition extract root="target/mssql-nextest-live":
+    bash crates/kuberic-mssql-tests/scripts/run_archived_shard.sh {{quote(archive)}} {{quote(partition)}} {{quote(extract)}} {{quote(root)}}
+
+cleanup-nextest-archive extract root="target/mssql-nextest-live":
+    bash crates/kuberic-mssql-tests/scripts/cleanup_nextest_fixtures.sh {{quote(root)}} "$(realpath -m {{quote(extract)}})/target/debug"
 
 # Run every existing ignored SQL fixture suite, serially, with no case narrowing.
 test-live-nextest root="target/mssql-nextest-live":
-    env -u SQLSERVER_TEST_EULA_ACCEPTED \
-        -u KUBERIC_MSSQL_CONFIGURATION_FAULT_FILTER \
-        -u KUBERIC_MSSQL_SEED_FAULT_FILTER \
-        -u KUBERIC_MSSQL_CONFLICT_FILTER \
-        -u KUBERIC_MSSQL_ONE_REPLICA_CHILD_MODE \
-        -u KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE \
-        -u SQLSERVER_ONE_REPLICA_FAULT \
-        -u KUBERIC_MSSQL_FAULT_CHECKPOINT \
-        -u KUBERIC_MSSQL_FAULT_HIT_FILE \
-        -u KUBERIC_MSSQL_SIGNAL_READY_FILE \
-        -u KUBERIC_MSSQL_LEGACY_PROVISIONED_RESTART \
-        SQLSERVER_ONE_REPLICA_ROOT="$(realpath -m {{quote(root)}}/one-replica)" \
-        KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}}/three-replica)" \
-        KUBERIC_MSSQL_LEASE_FENCE_ROOT="$(realpath -m {{quote(root)}}/lease-fence)" \
-        CARGO_BUILD_JOBS=1 \
-        cargo nextest run --locked --workspace --all-features --profile live --run-ignored only --test-threads=1
+    bash crates/kuberic-mssql-tests/scripts/run_live_nextest.sh {{quote(root)}} cargo nextest run --locked --workspace --all-features
 
 # Recover exact journals within the nextest runner's three named fixture families.
 cleanup-live-nextest root="target/mssql-nextest-live":

@@ -448,10 +448,13 @@ fn binary_parses_records_prints_canonical_summary_and_uses_distinct_exit_statuse
     for (name, record, expected_exit, expected_outcome) in cases {
         let path = record_path(name);
         std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_kuberic-release-intake"))
-            .arg(&path)
-            .output()
-            .unwrap();
+        let output = Command::new(kuberic_mssql_tests::test_support::companion_binary(
+            "kuberic-release-intake",
+            option_env!("CARGO_BIN_EXE_kuberic-release-intake"),
+        ))
+        .arg(&path)
+        .output()
+        .unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             output.status.code(),
@@ -468,10 +471,13 @@ fn binary_parses_records_prints_canonical_summary_and_uses_distinct_exit_statuse
 
     let invalid_path = record_path("invalid");
     std::fs::write(&invalid_path, b"{not-json").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_kuberic-release-intake"))
-        .arg(&invalid_path)
-        .output()
-        .unwrap();
+    let output = Command::new(kuberic_mssql_tests::test_support::companion_binary(
+        "kuberic-release-intake",
+        option_env!("CARGO_BIN_EXE_kuberic-release-intake"),
+    ))
+    .arg(&invalid_path)
+    .output()
+    .unwrap();
     let _ = std::fs::remove_file(&invalid_path);
     assert_eq!(output.status.code(), Some(EXIT_INVALID));
     assert!(output.stdout.is_empty());
@@ -484,7 +490,7 @@ fn binary_parses_records_prints_canonical_summary_and_uses_distinct_exit_statuse
 
 fn record_path(name: &str) -> PathBuf {
     let directory =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release-intake-contract");
+        kuberic_mssql_tests::test_support::workspace_root().join("target/release-intake-contract");
     std::fs::create_dir_all(&directory).unwrap();
     directory.join(format!("{}-{name}.json", std::process::id()))
 }

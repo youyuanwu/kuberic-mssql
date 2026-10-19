@@ -122,8 +122,8 @@ fn production_and_file_negative_paths_remain_explicit() {
 
 #[test]
 fn shipped_false_acknowledgement_example_parses_but_cannot_authorize_launch() {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/eula-acknowledgement.example.json");
+    let path = kuberic_mssql_tests::test_support::manifest_dir()
+        .join("fixtures/eula-acknowledgement.example.json");
     let document: serde_json::Value =
         serde_json::from_slice(&fs::read(&path).unwrap()).expect("example is valid JSON");
     assert_eq!(document["schema_version"], 1);
@@ -267,10 +267,7 @@ fn fixture_root_must_be_absolute() {
 
 #[test]
 fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .unwrap();
+    let root = kuberic_mssql_tests::test_support::workspace_root();
     let justfile = fs::read_to_string(root.join("justfile")).unwrap();
     assert!(justfile.contains("test-live-one-replica root=\"target/mssql-one-replica\":"));
     assert!(
@@ -320,7 +317,7 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
             .lines()
             .filter(|line| line.contains("env -u SQLSERVER_TEST_EULA_ACCEPTED"))
             .count(),
-        16
+        15
     );
     assert!(!justfile.contains("KUBERIC_MSSQL_EULA_ACKNOWLEDGEMENT"));
     assert!(!justfile.contains("acknowledgement root="));
@@ -354,7 +351,10 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         "three_replica_mssql_terminal_seed_conflicts -- --ignored --test-threads=1 --nocapture"
     ));
 
-    for recipe in ["default: check", "check: fmt-check clippy test"] {
+    for recipe in [
+        "default: check",
+        "check: fmt-check clippy test test-nextest-partitions",
+    ] {
         let line = justfile.lines().find(|line| *line == recipe).unwrap();
         assert!(!line.contains("test-live-three-replica"));
         assert!(!line.contains("test-live-one-replica"));
@@ -368,9 +368,11 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         .find(|line| line.starts_with("ci:"))
         .unwrap();
     assert_eq!(ci, "ci: setup check test-live-nextest");
-    assert!(justfile.contains(
-        "cargo nextest run --locked --workspace --all-features --profile live --run-ignored only --test-threads=1"
-    ));
+    assert!(justfile.contains("run_live_nextest.sh {{quote(root)}} cargo nextest run"));
+    let live_runner =
+        fs::read_to_string(root.join("crates/kuberic-mssql-tests/scripts/run_live_nextest.sh"))
+            .unwrap();
+    assert!(live_runner.contains("--profile live --run-ignored only --test-threads=1"));
     assert!(
         justfile
             .contains("bash crates/kuberic-mssql-tests/scripts/cleanup_nextest_fixtures.sh --all")
@@ -382,18 +384,22 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
     assert!(!justfile.contains("test-live-shared"));
 
     let workflow = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
-    assert!(workflow.contains("just cleanup\n"));
+    assert!(workflow.contains("just cleanup-nextest-archive"));
     assert!(!workflow.contains("just cleanup-live-three-replica\n"));
-    assert!(!workflow.contains("upload-artifact"));
+    assert_eq!(
+        workflow.matches("uses: actions/upload-artifact@").count(),
+        1
+    );
+    assert!(workflow.contains("path: ${{ env.NEXTEST_ARCHIVE }}"));
+    assert!(workflow.contains("partition: [1, 2, 3, 4]"));
+    assert!(workflow.contains("max-parallel: 4"));
+    assert!(workflow.contains("needs: [build-test-artifacts, validate-archive, test-shards]"));
     let cargo_config = fs::read_to_string(root.join(".cargo/config.toml")).unwrap();
     assert!(cargo_config.contains("ACCEPT_EULA = { value = \"Y\", force = true }"));
 }
 
 fn nextest_cleanup_test_environment() -> (tempfile::TempDir, std::path::PathBuf) {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .unwrap();
+    let workspace = kuberic_mssql_tests::test_support::workspace_root();
     let directory = tempfile::tempdir_in(workspace.join("target")).unwrap();
     let script = workspace.join("crates/kuberic-mssql-tests/scripts/cleanup_nextest_fixtures.sh");
     (directory, script)
@@ -401,15 +407,18 @@ fn nextest_cleanup_test_environment() -> (tempfile::TempDir, std::path::PathBuf)
 
 fn fake_cleanup_tool(directory: &Path, name: &str, failure: &str) {
     let tool = directory.join(name);
-    fs::write(
+    write_test_executable(
         &tool,
         format!(
             "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$DISPATCH_LOG\"\n\
              if [[ \"$*\" == *{failure}* ]]; then exit 1; fi\n"
         ),
-    )
-    .unwrap();
-    fs::set_permissions(tool, fs::Permissions::from_mode(0o700)).unwrap();
+    );
+}
+
+fn write_test_executable(path: &Path, content: impl AsRef<[u8]>) {
+    fs::write(path, content).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 #[test]
@@ -493,6 +502,15 @@ fn nextest_cleanup_rejects_symlink_evidence_and_accepts_absent_root() {
     assert!(error.contains("nonregular fixture journal"));
     assert!(outside.join("ownership.json").exists());
     assert!(
+        !std::process::Command::new("bash")
+            .arg(script.parent().unwrap().join("run_live_nextest.sh"))
+            .arg(&root)
+            .arg("true")
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
         std::process::Command::new("bash")
             .arg(script)
             .arg(directory.path().join("absent"))
@@ -500,6 +518,185 @@ fn nextest_cleanup_rejects_symlink_evidence_and_accepts_absent_root() {
             .unwrap()
             .success()
     );
+}
+
+#[test]
+fn archived_cleanup_uses_only_direct_companions_and_preserves_failures() {
+    let (directory, script) = nextest_cleanup_test_environment();
+    let root = directory.path().join("runner");
+    for case in [
+        "one-replica",
+        "three-replica/fail-first",
+        "lease-fence/expiry",
+    ] {
+        fs::create_dir_all(root.join(case)).unwrap();
+        fs::write(root.join(case).join("ownership.json"), "{}").unwrap();
+    }
+    let binaries = directory.path().join("bin");
+    fs::create_dir(&binaries).unwrap();
+    fake_cleanup_tool(&binaries, "mssql-one-replica-fixture", "never-matches");
+    fake_cleanup_tool(&binaries, "mssql-three-replica-fixture", "fail-first");
+    fake_cleanup_tool(directory.path(), "cargo", "");
+    let log = directory.path().join("dispatch.log");
+    let run = || {
+        std::process::Command::new("bash")
+            .arg(&script)
+            .arg(&root)
+            .arg(&binaries)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", directory.path().display()),
+            )
+            .env("DISPATCH_LOG", &log)
+            .output()
+            .unwrap()
+    };
+    assert!(!run().status.success());
+    let dispatched = fs::read_to_string(&log).unwrap();
+    assert_eq!(dispatched.lines().count(), 3);
+    assert!(!dispatched.contains("run --locked"));
+    assert!(dispatched.contains(root.join("lease-fence/expiry").to_str().unwrap()));
+    fs::remove_file(binaries.join("mssql-three-replica-fixture")).unwrap();
+    let missing = run();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("mssql-three-replica-fixture"));
+    assert!(!fs::read_to_string(log).unwrap().contains("run --locked"));
+}
+
+#[test]
+fn shared_live_runner_clears_narrowing_and_forces_serial_ignored_profile() {
+    let (directory, script) = nextest_cleanup_test_environment();
+    let root = directory.path().join("runner");
+    let probe = r#"import json, os, sys
+names = ['SQLSERVER_TEST_EULA_ACCEPTED', 'KUBERIC_MSSQL_CONFIGURATION_FAULT_FILTER',
+'KUBERIC_MSSQL_SEED_FAULT_FILTER', 'KUBERIC_MSSQL_CONFLICT_FILTER',
+'KUBERIC_MSSQL_ONE_REPLICA_CHILD_MODE', 'KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE',
+'SQLSERVER_ONE_REPLICA_FAULT', 'KUBERIC_MSSQL_FAULT_CHECKPOINT',
+'KUBERIC_MSSQL_FAULT_HIT_FILE', 'KUBERIC_MSSQL_SIGNAL_READY_FILE',
+'KUBERIC_MSSQL_LEGACY_PROVISIONED_RESTART']
+print(json.dumps({'seams': {name: os.getenv(name) for name in names},
+'arguments': sys.argv[1:], 'one': os.environ['SQLSERVER_ONE_REPLICA_ROOT'],
+'three': os.environ['KUBERIC_MSSQL_THREE_REPLICA_ROOT'],
+'lease': os.environ['KUBERIC_MSSQL_LEASE_FENCE_ROOT']}))"#;
+    let mut command = std::process::Command::new("bash");
+    command
+        .arg(script.parent().unwrap().join("run_live_nextest.sh"))
+        .arg(&root)
+        .args(["python3", "-c", probe]);
+    for name in [
+        "SQLSERVER_TEST_EULA_ACCEPTED",
+        "KUBERIC_MSSQL_CONFIGURATION_FAULT_FILTER",
+        "KUBERIC_MSSQL_SEED_FAULT_FILTER",
+        "KUBERIC_MSSQL_CONFLICT_FILTER",
+        "KUBERIC_MSSQL_ONE_REPLICA_CHILD_MODE",
+        "KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE",
+        "SQLSERVER_ONE_REPLICA_FAULT",
+        "KUBERIC_MSSQL_FAULT_CHECKPOINT",
+        "KUBERIC_MSSQL_FAULT_HIT_FILE",
+        "KUBERIC_MSSQL_SIGNAL_READY_FILE",
+        "KUBERIC_MSSQL_LEGACY_PROVISIONED_RESTART",
+    ] {
+        command.env(name, "must-be-cleared");
+    }
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["seams"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| v.is_null())
+    );
+    assert_eq!(
+        report["arguments"],
+        serde_json::json!([
+            "--profile",
+            "live",
+            "--run-ignored",
+            "only",
+            "--test-threads=1"
+        ])
+    );
+    for (key, family) in [
+        ("one", "one-replica"),
+        ("three", "three-replica"),
+        ("lease", "lease-fence"),
+    ] {
+        assert_eq!(report[key], root.join(family).to_str().unwrap());
+        assert_eq!(
+            fs::metadata(root.join(family))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "new fixture family roots must remain private",
+        );
+    }
+}
+
+#[test]
+fn archived_shard_exit_cleanup_preserves_primary_failure() {
+    let (directory, script) = nextest_cleanup_test_environment();
+    let archive = directory.path().join("tests.tar.zst");
+    fs::write(&archive, "fake archive handled by fake nextest").unwrap();
+    write_test_executable(
+        &directory.path().join("cargo"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$DISPATCH_LOG"
+if [[ "$1 $2" == "nextest list" ]]; then
+  shift 2
+  while (( $# )); do
+    if [[ "$1" == --extract-to ]]; then extract="$2"; shift 2; else shift; fi
+  done
+  mkdir -p "$extract/target/debug" "$extract/target/nextest" "$FIXTURE_ROOT/three-replica"
+  printf '{}' > "$FIXTURE_ROOT/three-replica/ownership.json"
+  for binary in sqlserver-observer-test kuberic-mssql-runtime-test kuberic-release-intake mssql-one-replica-fixture mssql-three-replica-fixture; do
+    cat > "$extract/target/debug/$binary" <<'CLEANUP'
+#!/usr/bin/env bash
+printf 'cleanup:%s\n' "$*" >> "$DISPATCH_LOG"
+exit "$CLEANUP_EXIT"
+CLEANUP
+    chmod 700 "$extract/target/debug/$binary"
+  done
+  exit 0
+fi
+if [[ "$1 $2" == "nextest run" ]]; then
+  if [[ "$*" == *"--profile default"* ]]; then exit "$PRIMARY_EXIT"; fi
+  exit 0
+fi
+exit 99
+"#,
+    );
+    for (index, (primary, cleanup, expected)) in
+        [(23, 7, 23), (0, 7, 1), (0, 0, 0)].into_iter().enumerate()
+    {
+        let extract = directory.path().join(format!("extract-{index}"));
+        let fixtures = directory.path().join(format!("fixtures-{index}"));
+        let log = directory.path().join(format!("dispatch-{index}.log"));
+        let output = std::process::Command::new("bash")
+            .arg(script.parent().unwrap().join("run_archived_shard.sh"))
+            .arg(&archive)
+            .arg("1")
+            .arg(extract)
+            .arg(&fixtures)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", directory.path().display()),
+            )
+            .env("DISPATCH_LOG", &log)
+            .env("FIXTURE_ROOT", fixtures)
+            .env("PRIMARY_EXIT", primary.to_string())
+            .env("CLEANUP_EXIT", cleanup.to_string())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected), "{output:?}");
+        let dispatched = fs::read_to_string(log).unwrap();
+        assert!(dispatched.contains("cleanup:cleanup --root"));
+        assert!(!dispatched.contains("run --locked"));
+    }
 }
 
 #[test]
@@ -534,10 +731,7 @@ fn aggregate_cleanup_attempts_nextest_after_legacy_failure() {
 #[test]
 fn lease_cleanup_absence_is_noop_and_failure_does_not_suppress_second_root() {
     let (directory, _) = nextest_cleanup_test_environment();
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .unwrap();
+    let workspace = kuberic_mssql_tests::test_support::workspace_root();
     let root = directory.path().join("absent-lease");
     fake_cleanup_tool(directory.path(), "cargo", "expiry");
     let log = directory.path().join("dispatch.log");

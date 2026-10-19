@@ -5,11 +5,10 @@ use kuberic_mssql_tests::Fixture;
 use serde_json::json;
 
 fn observer_binary() -> PathBuf {
-    std::env::var_os("NEXTEST_BIN_EXE_sqlserver_observer_test")
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_sqlserver-observer-test"))
-        .map(PathBuf::from)
-        .or_else(|| option_env!("CARGO_BIN_EXE_sqlserver-observer-test").map(PathBuf::from))
-        .expect("sqlserver-observer-test binary path")
+    kuberic_mssql_tests::test_support::companion_binary(
+        "sqlserver-observer-test",
+        option_env!("CARGO_BIN_EXE_sqlserver-observer-test"),
+    )
 }
 
 fn binary() -> Command {

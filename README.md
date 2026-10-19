@@ -361,14 +361,15 @@ bash crates/kuberic-mssql-tests/scripts/setup_environment.sh
 just check
 ```
 
-`just check` runs formatting, strict Clippy, locked all-feature nextest tests
-and a separate Cargo doctest step.
+`just check` runs formatting, strict Clippy, locked all-feature nextest tests,
+a separate Cargo doctest step and the archive-partition validator's unit tests.
 Builds default to one job; an explicitly supplied `CARGO_BUILD_JOBS` is
 preserved. Licensed live tests remain ignored during ordinary Cargo execution.
-The required GitHub Actions job `Shared CI validation` runs `just ci` at the
-exact pull-request head and always follows it with `just cleanup`. Its GitHub
-Actions job log is the CI evidence; test logs and evidence artifacts are not
-committed to this repository.
+The required GitHub Actions job `Shared CI validation` gates a checked test
+archive, exact partition coverage and four isolated test workers at the same
+pull-request revision. Each worker always attempts exact archived-binary
+cleanup. GitHub Actions job logs are the CI evidence; logs, archives and fixture
+state are not committed to this repository.
 
 Future Kuberic candidates have a separate server-free readiness group and a
 versioned intake-record validator:
@@ -401,7 +402,7 @@ It exercises exact accepted configuration/session/storage/history binding and
 stale authority rejection, retained partial-startup ownership, and synthetic
 quiet-report assembly, not live SQL durability or public catch-up.
 
-The complete local and CI pipeline is:
+The complete local pipeline remains serial:
 
 ```bash
 just ci
@@ -411,9 +412,31 @@ It runs server-free checks, then all 59 currently ignored SQL fixture tests
 through nextest's `live` profile and shared `live-sql` group. One-replica
 observation/recovery, three-replica happy path/restart/fault/signal/conflict/
 target-evidence, native commit/prefix, hosted witness and lease/fence suites
-run one at a time. The unrelated privileged ACL test is not selected.
+run one at a time locally and within each CI worker. The unrelated privileged ACL test is not selected.
 Rust ignores keep ordinary Cargo server-free; the explicit live recipe uses
 `--run-ignored only`. Live failures stop further scheduling and remain failures.
+
+CI follows Kuberic's build-once nextest archive pattern: one producer checks,
+compiles and uploads only the compressed binaries/metadata archive for one day.
+A validator proves exhaustive, disjoint four-way ordinary/live coverage before
+four worker jobs run ordinary `slice:i/4` and SQL `hash:i/4` partitions. Workers
+reuse the archive without rebuilding, remap paths to their matching checkout,
+and keep SQL serial on their own isolated Docker host. The final required gate
+fails if any producer, validator or worker fails, skips or is cancelled.
+
+To reproduce archive stages locally, run one worker at a time:
+
+```bash
+just ci-build-nextest-archive
+just validate-nextest-archive
+extract="$(mktemp -d "$PWD/target/nextest-extracted.XXXXXXXXXX")"
+just test-nextest-archive target/nextest/mssql-tests.tar.zst 1 "$extract"
+just cleanup-nextest-archive "$extract"
+```
+
+Use the same source revision as the archive producer. Retain the extraction
+until cleanup succeeds; archived cleanup invokes its existing fixture binaries
+directly, not Cargo. No credentials, journals, logs or PAW files are uploaded.
 
 Long fault/handshake/conflict/target/checkpoint/lease suites use individually
 named scenario tests, so nextest reports each case's result and duration.
@@ -449,9 +472,10 @@ argument. Recovery visits retained nested ownership journals only in its
 symlinks beneath the runner root, and delegates removal to exact-ownership cleanup.
 Failures in discovery or cleanup are reported without suppressing other
 families; live/unknown owners remain blocked. Successful cleanup retains
-terminal `Removed` journals. The CI job has a 240-minute overall envelope,
-not a guarantee about every worst-case recovery path. Serialization applies
-within one nextest invocation; fixture locks still govern separate invocations.
+terminal `Removed` journals. CI uses finite 120-minute producer, 30-minute
+validator and 90-minute worker envelopes, not worst-case recovery guarantees.
+Serialization applies within each worker/invocation; fixture locks still
+govern separate invocations.
 
 The one-replica preflight requires at least 5 GiB effective available memory,
 6 GiB on its fixture filesystem and two effective CPUs. Its single container

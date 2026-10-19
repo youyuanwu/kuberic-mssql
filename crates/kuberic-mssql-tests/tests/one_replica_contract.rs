@@ -144,10 +144,13 @@ fn legacy_ownership_record_and_combined_indicators_are_refused() {
 
 #[test]
 fn cleanup_binary_rejects_invalid_commands() {
-    let output = Command::new(env!("CARGO_BIN_EXE_mssql-one-replica-fixture"))
-        .arg("invalid")
-        .output()
-        .unwrap();
+    let output = Command::new(kuberic_mssql_tests::test_support::companion_binary(
+        "mssql-one-replica-fixture",
+        option_env!("CARGO_BIN_EXE_mssql-one-replica-fixture"),
+    ))
+    .arg("invalid")
+    .output()
+    .unwrap();
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
@@ -195,10 +198,7 @@ fn cleanup_refusal_diagnostic_names_resources_and_categories() {
 
 #[test]
 fn repository_routes_one_replica_validation_without_python_fixture_helpers() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(std::path::Path::parent)
-        .unwrap();
+    let root = kuberic_mssql_tests::test_support::workspace_root();
     let justfile = fs::read_to_string(root.join("justfile")).unwrap();
     assert!(justfile.contains("test-live-one-replica root=\"target/mssql-one-replica\":"));
     assert!(
@@ -224,9 +224,15 @@ fn repository_routes_one_replica_validation_without_python_fixture_helpers() {
     }
 
     let workflow = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
-    assert!(workflow.contains("just ci"));
-    assert!(workflow.contains("just cleanup"));
-    assert!(!workflow.contains("upload-artifact"));
+    assert!(workflow.contains("just ci-build-nextest-archive"));
+    assert!(workflow.contains("just test-nextest-archive"));
+    assert!(workflow.contains("just cleanup-nextest-archive"));
+    assert_eq!(
+        workflow.matches("uses: actions/upload-artifact@").count(),
+        1
+    );
+    assert!(workflow.contains("path: ${{ env.NEXTEST_ARCHIVE }}"));
+    assert!(workflow.contains("name: Shared CI validation"));
     let cargo_config = fs::read_to_string(root.join(".cargo/config.toml")).unwrap();
     assert!(cargo_config.contains("ACCEPT_EULA = { value = \"Y\", force = true }"));
 }

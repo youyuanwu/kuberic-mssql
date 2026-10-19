@@ -22,18 +22,19 @@ async fn one_replica_mssql_observation_and_cli() {
         .unwrap_or_else(|error| panic!("one-replica launch failed: {error}"));
     let evidence = fixture
         .run_with_cleanup(std::time::Duration::from_secs(120), |member| async move {
-            run_unique_scenarios(
-                &member,
-                std::path::Path::new(env!("CARGO_BIN_EXE_sqlserver-observer-test")),
-            )
-            .await
-            .map_err(|error| {
-                SanitizedFailure::with_detail(
-                    FailureStage::Test,
-                    FailureCategory::SqlUnavailable,
-                    error.to_string(),
-                )
-            })
+            let observer = kuberic_mssql_tests::test_support::companion_binary(
+                "sqlserver-observer-test",
+                option_env!("CARGO_BIN_EXE_sqlserver-observer-test"),
+            );
+            run_unique_scenarios(&member, &observer)
+                .await
+                .map_err(|error| {
+                    SanitizedFailure::with_detail(
+                        FailureStage::Test,
+                        FailureCategory::SqlUnavailable,
+                        error.to_string(),
+                    )
+                })
         })
         .await
         .unwrap_or_else(|error| panic!("one-replica lifecycle failed: {error}"));
@@ -87,19 +88,20 @@ async fn one_replica_recovery_child() {
             let fixture = launch_one_replica(config).await.unwrap();
             let result = fixture
                 .run_with_cleanup(Duration::from_secs(120), |member| async move {
-                    run_unique_scenarios(
-                        &member,
-                        Path::new(env!("CARGO_BIN_EXE_sqlserver-observer-test")),
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| {
-                        SanitizedFailure::with_detail(
-                            FailureStage::Test,
-                            FailureCategory::SqlUnavailable,
-                            error.to_string(),
-                        )
-                    })
+                    let observer = kuberic_mssql_tests::test_support::companion_binary(
+                        "sqlserver-observer-test",
+                        option_env!("CARGO_BIN_EXE_sqlserver-observer-test"),
+                    );
+                    run_unique_scenarios(&member, &observer)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| {
+                            SanitizedFailure::with_detail(
+                                FailureStage::Test,
+                                FailureCategory::SqlUnavailable,
+                                error.to_string(),
+                            )
+                        })
                 })
                 .await;
             assert!(result.is_err());

@@ -982,9 +982,11 @@ bounded callback failure without duplicate submission, not rollback, zero
 effects or a specific incarnation-check branch; an admitted `ADD DATABASE` may
 remain. Lineage mismatch still requires its strict conflict error.
 
-The required GitHub Actions check `Shared CI validation` runs `just ci`,
-including every existing ignored SQL fixture test through nextest's serial
-live profile, and always runs `just cleanup`. This includes one-replica
+The required GitHub Actions check `Shared CI validation` gates a checked
+nextest archive, exact-once partition proof and four isolated test workers.
+Each runs its ordinary slice then ignored-SQL hash partition without rebuilding,
+keeping the serial live profile and always attempting direct archived-binary
+cleanup. This includes one-replica
 recovery, three-replica fault/signal/conflict/target evidence, native commit/
 prefix, the hosted witness and isolated lease/fence cases, not just happy
 path/restart. The unrelated privileged ACL test is not selected.
@@ -1040,10 +1042,13 @@ Run the complete server-free and Rust-owned live gates:
 just ci
 ```
 
-The required exact PR-head GitHub Actions job `Shared CI validation` runs this
-same command and always runs `just cleanup`. Licensed gates therefore execute
-in CI; their GitHub Actions job log is the evidence, not a checked-in log or
-artifact.
+The required exact PR-head GitHub Actions job `Shared CI validation` requires
+the corresponding archive producer, coverage validator and all four workers
+to pass. Workers use the same source revision, preserve serial SQL on each
+Docker host and always attempt exact archived-binary cleanup. Local `just ci`
+remains serial; `ci-build-nextest-archive`, `validate-nextest-archive` and
+`test-nextest-archive` reproduce the separate cloud stages. Job logs are the
+evidence, not checked-in logs or artifacts.
 
 Run or clean up the one-member observer/CLI path:
 

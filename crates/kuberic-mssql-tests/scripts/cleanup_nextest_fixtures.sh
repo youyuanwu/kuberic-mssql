@@ -12,8 +12,8 @@ if [[ $# == 1 && "$1" == --all ]]; then
   exit "$status"
 fi
 
-if [[ $# != 1 ]]; then
-  echo "usage: cleanup_nextest_fixtures.sh <runner-root> | --all" >&2
+if [[ $# -lt 1 || $# -gt 2 || -z "$1" ]]; then
+  echo "usage: cleanup_nextest_fixtures.sh <runner-root> [archive-binary-directory] | --all" >&2
   exit 2
 fi
 root="$(realpath -m "$1")"
@@ -23,6 +23,14 @@ fi
 if [[ ! -d "$root" ]]; then
   echo "nextest fixture root is not a directory: $root" >&2
   exit 1
+fi
+binary_directory=""
+if [[ $# == 2 ]]; then
+  if [[ -z "$2" || ! -d "$2" ]]; then
+    echo "archive binary directory is unavailable: $2" >&2
+    exit 1
+  fi
+  binary_directory="$(realpath -e "$2")"
 fi
 scratch="$(mktemp "$root/.cleanup-journals.XXXXXX")"
 trap 'rm -f -- "$scratch"' EXIT
@@ -51,8 +59,12 @@ for family in one-replica three-replica lease-fence; do
     if [[ "$family" == one-replica ]]; then
       binary=mssql-one-replica-fixture
     fi
-    if ! CARGO_BUILD_JOBS=1 cargo run --locked -p kuberic-mssql-tests --bin "$binary" \
-      -- cleanup --root "$(dirname "$journal")"; then
+    if [[ -n "$binary_directory" ]]; then
+      command=("$binary_directory/$binary")
+    else
+      command=(cargo run --locked -p kuberic-mssql-tests --bin "$binary" --)
+    fi
+    if ! CARGO_BUILD_JOBS=1 "${command[@]}" cleanup --root "$(dirname "$journal")"; then
       echo "nextest fixture cleanup failed: $journal" >&2
       status=1
     fi

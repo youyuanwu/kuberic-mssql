@@ -777,14 +777,17 @@ permissions, transport and sample deadlines, freshness, cancellation, CLI
 output, and credential redaction. A dedicated server-free observer workflow
 runs these without provisioning PostgreSQL or Kubernetes.
 
-Live tests run sequentially in the required GitHub Actions job
-`Shared CI validation`, which runs `just ci` at the exact pull-request head and
-always runs `just cleanup`, after server-free checks. GitHub Actions job logs
-are the run evidence; no test logs or evidence artifacts are committed. The
+The required GitHub Actions check `Shared CI validation` gates one checked
+nextest archive, exact partition validation and four isolated workers at the
+same pull-request revision. Each worker runs an ordinary slice followed by a
+serial SQL hash partition without rebuilding, and always attempts exact
+cleanup using the archived fixture binaries. Local `just ci` retains complete
+serial coverage. GitHub Actions logs are the run evidence; no archives, test
+logs or fixture-private state are committed. The
 nextest live profile selects every ignored SQL test in the three live binaries,
 including fault/recovery and native evidence experiments, and excludes the
 unrelated privileged ACL case. A shared `live-sql` group and the canonical
-single-threaded invocation prevent overlap within a run. Namespace recovery
+single-threaded invocation prevent overlap within a worker. Namespace recovery
 visits nested exact journals, attempts all families after failures, and retains
 Removed journal evidence; it does not bypass blocked owner checks. The
 Rust one-replica lifecycle owns one digest-pinned SQL Server 2025
