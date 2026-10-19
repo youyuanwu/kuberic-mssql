@@ -122,7 +122,7 @@ test-live-lease-fence root="target/mssql-lease-fence":
         KUBERIC_MSSQL_LEASE_FENCE_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
         cargo test --locked -p kuberic-mssql-tests --test live_lease_fence \
-        mssql_write_lease_and_exact_fence_experiments -- --ignored --exact --test-threads=1 --nocapture
+        mssql_write_lease_and_exact_fence_experiments -- --ignored --test-threads=1 --nocapture
 
 # Recover only the two exactly journaled lease/fence scenario roots.
 cleanup-live-lease-fence root="target/mssql-lease-fence":
@@ -157,7 +157,7 @@ test-live-three-replica-faults root="target/mssql-three-replica-faults":
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
-        three_replica_mssql_bootstrap_fault_boundaries -- --ignored --exact --test-threads=1 --nocapture
+        three_replica_mssql_bootstrap_fault_boundaries -- --ignored --test-threads=1 --nocapture
 
 # Exercise isolated SQL-native cases and callback observation-seam conflicts sequentially.
 test-live-three-replica-conflicts root="target/mssql-three-replica-conflicts":
@@ -165,7 +165,7 @@ test-live-three-replica-conflicts root="target/mssql-three-replica-conflicts":
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
-        three_replica_mssql_conflict_evidence -- --ignored --exact --test-threads=1 --nocapture
+        three_replica_mssql_conflict_evidence -- --ignored --test-threads=1 --nocapture
 
 # Reject post-compaction association removal and AG recreation without redispatch.
 test-live-three-replica-terminal-seed root="target/mssql-three-replica-terminal-seed":
@@ -173,7 +173,7 @@ test-live-three-replica-terminal-seed root="target/mssql-three-replica-terminal-
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
-        three_replica_mssql_terminal_seed_conflicts -- --ignored --exact --test-threads=1 --nocapture
+        three_replica_mssql_terminal_seed_conflicts -- --ignored --test-threads=1 --nocapture
 
 # Revalidate target-local lineage and SQL process incarnation at every build window.
 test-live-three-replica-target-evidence root="target/mssql-three-replica-target-evidence":
@@ -181,7 +181,7 @@ test-live-three-replica-target-evidence root="target/mssql-three-replica-target-
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
         cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
-        three_replica_mssql_target_host_evidence_faults -- --ignored --exact --test-threads=1 --nocapture
+        three_replica_mssql_target_host_evidence_faults -- --ignored --test-threads=1 --nocapture
 
 # Recover and remove only the exactly journaled real three-member topology.
 cleanup-live-three-replica root="target/mssql-three-replica":

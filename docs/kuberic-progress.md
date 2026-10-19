@@ -987,6 +987,13 @@ live profile, and always runs `just cleanup`. This includes one-replica
 recovery, three-replica fault/signal/conflict/target evidence, native commit/
 prefix, the hosted witness and isolated lease/fence cases, not just happy
 path/restart. The unrelated privileged ACL test is not selected.
+Long aggregate loops are exposed as individually named scenario tests while
+preserving fresh-fixture isolation and the single-slot SQL group. Each case
+gets its own nextest result/timing; duplicate bootstrap handshake execution is
+removed without dropping the separately selected handshake cases. The last
+restart-checkpoint case retains its same-root positive retry as one atomic
+journey, rather than relying on another test's order. Splitting does not
+promise lower total runtime or impose a five-minute kill deadline.
 Its GitHub Actions job log is the
 run evidence; no test logs or evidence artifacts are committed. The dependency
 source and version remain defined only by the root `Cargo.toml`.

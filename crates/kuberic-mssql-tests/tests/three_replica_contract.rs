@@ -344,13 +344,13 @@ fn dedicated_just_recipes_have_exact_isolated_invocation_contracts() {
         "three_replica_sigterm_during_owned_launch_is_recoverable -- --ignored --exact --test-threads=1 --nocapture"
     ));
     assert!(justfile.contains(
-        "three_replica_mssql_bootstrap_fault_boundaries -- --ignored --exact --test-threads=1 --nocapture"
+        "three_replica_mssql_bootstrap_fault_boundaries -- --ignored --test-threads=1 --nocapture"
     ));
     assert!(justfile.contains(
-        "three_replica_mssql_conflict_evidence -- --ignored --exact --test-threads=1 --nocapture"
+        "three_replica_mssql_conflict_evidence -- --ignored --test-threads=1 --nocapture"
     ));
     assert!(justfile.contains(
-        "three_replica_mssql_terminal_seed_conflicts -- --ignored --exact --test-threads=1 --nocapture"
+        "three_replica_mssql_terminal_seed_conflicts -- --ignored --test-threads=1 --nocapture"
     ));
 
     for recipe in ["default: check", "check: fmt-check clippy test"] {

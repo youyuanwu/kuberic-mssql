@@ -407,13 +407,21 @@ The complete local and CI pipeline is:
 just ci
 ```
 
-It runs server-free checks, then all 19 currently ignored SQL fixture tests
+It runs server-free checks, then all 64 currently ignored SQL fixture tests
 through nextest's `live` profile and shared `live-sql` group. One-replica
 observation/recovery, three-replica happy path/restart/fault/signal/conflict/
 target-evidence, native commit/prefix, hosted witness and lease/fence suites
 run one at a time. The unrelated privileged ACL test is not selected.
 Rust ignores keep ordinary Cargo server-free; the explicit live recipe uses
 `--run-ignored only`. Live failures stop further scheduling and remain failures.
+
+Long fault/handshake/conflict/target/checkpoint/lease suites use individually
+named scenario tests, so nextest reports each case's result and duration.
+Fresh fixtures, atomic recovery/replay journeys and serial SQL execution are
+retained; splitting improves progress visibility, not total execution time.
+Five minutes is a normal-runtime target, not a cleanup-interrupting timeout.
+Narrow family recipes select all their named cases by prefix; use the full
+`family::case` name with `--exact` to select an individual three-replica case.
 
 The same commands run locally when fixture prerequisites are available:
 
