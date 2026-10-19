@@ -5,14 +5,15 @@ export PATH := env_var("HOME") + "/.local/bin:" + env_var("HOME") + "/.cargo/bin
 default: check
 
 # Run the complete CI pipeline locally or on the CI runner.
-ci: setup check test-live-one-replica test-live-three-replica test-live-three-replica-restart test-live-lease-fence
+ci: setup check test-live-nextest
 
 # Install only missing/mismatched shared Rust, just and compiler prerequisites.
 setup:
     bash crates/kuberic-mssql-tests/scripts/setup_environment.sh
 
-# Release both Rust-owned fixture families.
-cleanup: cleanup-live-one-replica cleanup-live-three-replica cleanup-live-lease-fence
+# Attempt every owned fixture cleanup even if an earlier family fails.
+cleanup:
+    bash crates/kuberic-mssql-tests/scripts/cleanup_nextest_fixtures.sh --all
 
 # Check formatting, strict Clippy, and ordinary Rust tests.
 check: fmt-check clippy test
@@ -31,7 +32,30 @@ clippy:
 
 # Run ordinary Rust tests; live fixtures remain ignored.
 test:
-    cargo test --locked --workspace --all-features -- --test-threads=1
+    cargo nextest run --locked --workspace --all-features --test-threads=1 --profile default
+    cargo test --locked --workspace --all-features --doc
+
+# Run every existing ignored SQL fixture suite, serially, with no case narrowing.
+test-live-nextest root="target/mssql-nextest-live":
+    env -u SQLSERVER_TEST_EULA_ACCEPTED \
+        -u KUBERIC_MSSQL_CONFIGURATION_FAULT_FILTER \
+        -u KUBERIC_MSSQL_SEED_FAULT_FILTER \
+        -u KUBERIC_MSSQL_CONFLICT_FILTER \
+        -u KUBERIC_MSSQL_ONE_REPLICA_CHILD_MODE \
+        -u SQLSERVER_ONE_REPLICA_FAULT \
+        -u KUBERIC_MSSQL_FAULT_CHECKPOINT \
+        -u KUBERIC_MSSQL_FAULT_HIT_FILE \
+        -u KUBERIC_MSSQL_SIGNAL_READY_FILE \
+        -u KUBERIC_MSSQL_LEGACY_PROVISIONED_RESTART \
+        SQLSERVER_ONE_REPLICA_ROOT="$(realpath -m {{quote(root)}}/one-replica)" \
+        KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}}/three-replica)" \
+        KUBERIC_MSSQL_LEASE_FENCE_ROOT="$(realpath -m {{quote(root)}}/lease-fence)" \
+        CARGO_BUILD_JOBS=1 \
+        cargo nextest run --locked --workspace --all-features --profile live --run-ignored only --test-threads=1
+
+# Recover exact journals within the nextest runner's three named fixture families.
+cleanup-live-nextest root="target/mssql-nextest-live":
+    bash crates/kuberic-mssql-tests/scripts/cleanup_nextest_fixtures.sh "$(realpath -m {{quote(root)}})"
 
 # Run the server-free future-readiness group without changing the pinned contract.
 test-kuberic-readiness:
@@ -102,8 +126,15 @@ test-live-lease-fence root="target/mssql-lease-fence":
 
 # Recover only the two exactly journaled lease/fence scenario roots.
 cleanup-live-lease-fence root="target/mssql-lease-fence":
-    just cleanup-live-three-replica {{quote(root + "/expiry")}}
-    just cleanup-live-three-replica {{quote(root + "/active-restart")}}
+    #!/usr/bin/env bash
+    root={{quote(root)}}
+    if [[ ! -e "$root" && ! -L "$root" ]]; then
+      exit 0
+    fi
+    status=0
+    just cleanup-live-three-replica {{quote(root + "/expiry")}} || status=1
+    just cleanup-live-three-replica {{quote(root + "/active-restart")}} || status=1
+    exit "$status"
 
 # Interrupt a real live subprocess during owned launch, recover, retry, and clean up.
 test-live-three-replica-signal root="target/mssql-three-replica-signal":

@@ -28,6 +28,7 @@ use kuberic_runtime::protocol::types::{AccessStatus, ReplicaRole, ReplicaStorage
 type TestError = Box<dyn Error + Send + Sync>;
 const HAPPY_PATH_TEST: &str = "three_replica_mssql_happy_path";
 const SAME_ROOT_RESTART_TEST: &str = "three_replica_mssql_same_root_restart";
+const FAULT_HIT_ENV: &str = "KUBERIC_MSSQL_FAULT_HIT_FILE";
 
 #[path = "live_three_replica/hosted_witness.rs"]
 mod hosted_witness;
@@ -411,17 +412,27 @@ fn exercise_signal_recovery(signal: i32, signal_name: &str) {
 #[test]
 #[ignore = "auto-accepts the SQL Server EULA for this test fixture and requires a qualified local Docker host"]
 fn three_replica_post_ag_and_report_fault_checkpoints_recover() {
-    for checkpoint in [
+    for (index, checkpoint) in [
         "fail-after-ag",
         "panic-after-agent-start",
         "fail-during-report",
         "fail-after-agent-restart",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let root = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
         cleanup_three_replica_fixture(&root).expect("clean fault-checkpoint baseline");
-        let mut child = spawn_live_child_with_fault(&root, checkpoint);
+        let receipt = root.join(format!(".fault-hit-{}-{index}", std::process::id()));
+        assert!(!receipt.exists(), "checkpoint evidence must be fresh");
+        let mut child = spawn_live_child_with_fault(&root, checkpoint, &receipt);
         let status = wait_for_child_with_cleanup(&mut child, Duration::from_secs(1200), &root);
         assert!(!status.success(), "{checkpoint} must fail explicitly");
+        assert_eq!(
+            fs::read_to_string(&receipt).expect("child must reach the requested checkpoint"),
+            checkpoint,
+        );
+        fs::remove_file(receipt).expect("remove owned checkpoint receipt");
         let mut cleanup = spawn_cleanup_child(&root);
         assert!(
             wait_for_child(&mut cleanup, Duration::from_secs(240)).success(),
@@ -1294,6 +1305,12 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
     .await
     {
         Ok(group) => group,
+        Err(error) if error.agent_termination_unconfirmed() => {
+            return hosted_witness::block_disposal(
+                &mut launched,
+                &format!("pre-association startup termination unconfirmed: {error}"),
+            );
+        }
         Err(error) => {
             let cleanup = launched.cleanup_with_coordinator(&first_cleanup);
             return match cleanup {
@@ -1395,12 +1412,18 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
         &prepared,
         &launched.members,
         convergence,
-        Instant::now() + convergence,
+        launched.complete_deadline(),
         &replacement_cleanup,
     )
     .await
     {
         Ok(group) => group,
+        Err(error) if error.agent_termination_unconfirmed() => {
+            return hosted_witness::block_disposal(
+                &mut launched,
+                &format!("dispatched replacement termination unconfirmed: {error}"),
+            );
+        }
         Err(error) => {
             let cleanup = launched.cleanup_with_coordinator(&replacement_cleanup);
             return match cleanup {
@@ -1428,6 +1451,23 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
         )
     {
         return Err("dispatched replacement changed stable authority".into());
+    }
+    if fault_checkpoint("fail-after-agent-restart") {
+        let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+        if let Err(error) = replacement.shutdown_with_coordinator(&cleanup).await {
+            return hosted_witness::block_disposal(
+                &mut launched,
+                &format!("injected replacement shutdown failed: {error}"),
+            );
+        }
+        return finish_runtime_outcome(
+            root,
+            launched,
+            RuntimeOutcome::Completed(Ok(Err(
+                "injected failure after replacement agent startup".into()
+            ))),
+            &cleanup,
+        );
     }
     if replacement.testing_seed_dispatch_record()?.is_some() {
         let builds = [
@@ -1843,9 +1883,24 @@ async fn exercise_configuration_fault(
         &format!("phase4-{label}-interrupted"),
     )
     .await;
-    let error = first
-        .err()
-        .ok_or_else(|| format!("{label} unexpectedly published configuration success"))?;
+    let error = match first {
+        Err(error) => error,
+        Ok(group) => {
+            if let Err(error) = group.shutdown_with_coordinator(&first_cleanup).await {
+                return hosted_witness::block_disposal(
+                    &mut launched,
+                    &format!("{label} unexpected success could not be drained: {error}"),
+                );
+            }
+            return Err(format!("{label} unexpectedly published configuration success").into());
+        }
+    };
+    if error.agent_termination_unconfirmed() {
+        return hosted_witness::block_disposal(
+            &mut launched,
+            &format!("{label} interrupted startup termination unconfirmed: {error}"),
+        );
+    }
     let expected_effect = fault.effect_label();
     let diagnostic = error.to_string();
     if injected.hit_count() != 1
@@ -1854,23 +1909,17 @@ async fn exercise_configuration_fault(
     {
         return Err(format!("{label} did not fail at its exact injected boundary: {error}").into());
     }
-
-    let retry_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
-    let group = PublicMssqlGroup::from_prepared_with_fault(
-        &root,
-        &launched.run,
-        &prepared,
-        &launched.members,
-        launched.kuberic_convergence_timeout(),
-        Instant::now() + launched.kuberic_convergence_timeout(),
-        &retry_cleanup,
-        PublicFaultInjection::default(),
-        &format!("phase4-{label}-interrupted"),
-    )
-    .await?;
-    converge_minimal_seeded_topology(&group, &mut launched, &prepared, label).await?;
-    group.shutdown_with_coordinator(&retry_cleanup).await?;
-    let cleanup = launched.cleanup_with_coordinator(&retry_cleanup)?;
+    let dispatches = injected.mutation_dispatch_count();
+    if dispatches == 0 {
+        return Err(format!("{label} did not dispatch its injected SQL mutation").into());
+    }
+    if fault == PublicMutationFault::SourceRecoveryCompletion
+        && launched.testing_source_recovery_model().await? != "FULL"
+    {
+        return Err(format!("{label} did not retain the completed native recovery change").into());
+    }
+    let fixture_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let cleanup = launched.cleanup_with_coordinator(&fixture_cleanup)?;
     if cleanup.removed_container_ids.len() != 3 || cleanup.removed_network_id.is_empty() {
         return Err(format!("{label} cleanup did not remove the exact owned topology").into());
     }
@@ -2086,9 +2135,17 @@ async fn exercise_post_native_success_replay(root: &Path) -> Result<(), TestErro
         launched.complete_deadline(),
         &first_cleanup,
     )
-    .await?;
-    let sequence = first.bootstrap_configuration_sequence().await?;
-    wait_for_exact_reports(&first, sequence, convergence).await?;
+    .await;
+    let first = match first {
+        Ok(group) => group,
+        Err(error) if error.agent_termination_unconfirmed() => {
+            return hosted_witness::block_disposal(
+                &mut launched,
+                &format!("post-native-success startup termination unconfirmed: {error}"),
+            );
+        }
+        Err(error) => return Err(error.into()),
+    };
     let stable_resource = first.resource_uid.clone();
     let stable_policy = first.effective_policy.clone();
     let stable_configuration = first.configuration.clone();
@@ -2100,21 +2157,26 @@ async fn exercise_post_native_success_replay(root: &Path) -> Result<(), TestErro
             pod.pvc_uid.clone(),
         )
     });
-    let command =
-        first.target_build_command(1, "post-native-success-build", "post-native-success-build")?;
-    first
-        .testing_admit_target_build_authority_only(&command)
-        .await
-        .map_err(|error| format!("post-native-success target admission failed: {error}"))?;
-    let marker = {
+    let first_result = async {
+        let sequence = first.bootstrap_configuration_sequence().await?;
+        wait_for_exact_reports(&first, sequence, convergence).await?;
+        let command = first.target_build_command(
+            1,
+            "post-native-success-build",
+            "post-native-success-build",
+        )?;
+        first
+            .testing_admit_target_build_authority_only(&command)
+            .await
+            .map_err(|error| format!("post-native-success target admission failed: {error}"))?;
         first
             .testing_execute_admitted_seed_callback_with_retry(&command)
             .await
             .map_err(|error| format!("post-native-success callback failed: {error}"))?;
         if first.testing_seed_dispatch_count()? != 1 {
-            return Err(
-                "post-native-success checkpoint did not execute exactly one ADD DATABASE".into(),
-            );
+            return Err(TestError::from(
+                "post-native-success checkpoint did not execute exactly one ADD DATABASE",
+            ));
         }
         first
             .testing_assert_source_build_success_not_published(&command)
@@ -2127,14 +2189,32 @@ async fn exercise_post_native_success_replay(root: &Path) -> Result<(), TestErro
             .await?;
 
         first.testing_abort_seed_source();
-        marker
-    };
-    first
-        .testing_assert_source_build_success_not_published(&command)
-        .await?;
-    first.shutdown_with_coordinator(&first_cleanup).await?;
+        let rejected = first.testing_execute_admitted_seed_callback(&command).await;
+        match rejected {
+            Err(error)
+                if error.code() == tonic::Code::FailedPrecondition
+                    && error.message() == "bootstrap source replicator is unavailable" => {}
+            other => return Err(format!(
+                "post-native-success aborted source did not reject its callback exactly: {other:?}"
+            )
+            .into()),
+        }
+        if first.testing_seed_dispatch_count()? != 1 {
+            return Err("post-native-success aborted source dispatched additional SQL".into());
+        }
+        Ok((command, marker))
+    }
+    .await;
+    let source_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    if let Err(error) = first.shutdown_with_coordinator(&source_cleanup).await {
+        return hosted_witness::block_disposal(
+            &mut launched,
+            &format!("post-native-success source shutdown failed: {error}"),
+        );
+    }
+    let (command, marker) = first_result?;
 
-    let replacement_cleanup =
+    let replacement_startup_cleanup =
         CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
     let replacement = start_prepared_public_group_with_retry(
         root,
@@ -2142,41 +2222,75 @@ async fn exercise_post_native_success_replay(root: &Path) -> Result<(), TestErro
         &prepared,
         &launched.members,
         convergence,
-        Instant::now() + convergence,
-        &replacement_cleanup,
+        launched.complete_deadline(),
+        &replacement_startup_cleanup,
     )
-    .await?;
-    if replacement.resource_uid != stable_resource
-        || replacement.effective_policy != stable_policy
-        || replacement.configuration != stable_configuration
-        || replacement.pods.iter().zip(&stable_pods).any(
-            |(pod, (identity, role, pod_uid, pvc_uid))| {
-                &pod.identity != identity
-                    || pod.stable_role != *role
-                    || &pod.pod_uid != pod_uid
-                    || &pod.pvc_uid != pvc_uid
-            },
-        )
-    {
-        return Err("post-native-success replacement changed exact durable authority".into());
+    .await;
+    let replacement = match replacement {
+        Ok(group) => group,
+        Err(error) if error.agent_termination_unconfirmed() => {
+            return hosted_witness::block_disposal(
+                &mut launched,
+                &format!("post-native-success replacement termination unconfirmed: {error}"),
+            );
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let replay: Result<(), TestError> = async {
+        if replacement.resource_uid != stable_resource
+            || replacement.effective_policy != stable_policy
+            || replacement.configuration != stable_configuration
+            || replacement.pods.iter().zip(&stable_pods).any(
+                |(pod, (identity, role, pod_uid, pvc_uid))| {
+                    &pod.identity != identity
+                        || pod.stable_role != *role
+                        || &pod.pod_uid != pod_uid
+                        || &pod.pvc_uid != pvc_uid
+                },
+            )
+        {
+            return Err("post-native-success replacement changed exact durable authority".into());
+        }
+        replacement
+            .testing_admit_target_build_authority_only(&command)
+            .await
+            .map_err(|error| {
+                format!("post-replacement native callback admission failed: {error}")
+            })?;
+        replacement
+            .testing_execute_admitted_seed_callback_with_retry(&command)
+            .await
+            .map_err(|error| {
+                format!("native callback replay after host replacement failed: {error}")
+            })?;
+        if replacement.testing_seed_dispatch_count()? != 0 {
+            return Err("post-native-success replay issued a second ADD DATABASE".into());
+        }
+        if replacement.testing_seed_dispatch_record()?.is_some() {
+            return Err("post-native-success replay retained resolved seed authority".into());
+        }
+        let verified_marker = launched.verify_replicated_marker(&marker).await?;
+        if verified_marker != marker || verified_marker.readable_ordinals != [1, 2, 3] {
+            return Err("post-native-success replay changed the exact native result".into());
+        }
+        replacement
+            .testing_assert_source_build_success_not_published(&command)
+            .await?;
+        Ok(())
     }
-    replacement
-        .testing_execute_kuberic_build_command(&command)
-        .await
-        .map_err(|error| format!("exact build replay after host replacement failed: {error}"))?;
-    if replacement.testing_seed_dispatch_count()? != 0 {
-        return Err("post-native-success replay issued a second ADD DATABASE".into());
-    }
-    if replacement.testing_seed_dispatch_record()?.is_some() {
-        return Err("post-native-success replay retained resolved seed authority".into());
-    }
-    let verified_marker = launched.verify_replicated_marker(&marker).await?;
-    if verified_marker != marker || verified_marker.readable_ordinals != [1, 2, 3] {
-        return Err("post-native-success replay changed the exact native result".into());
-    }
-    replacement
+    .await;
+    let replacement_cleanup =
+        CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    if let Err(error) = replacement
         .shutdown_with_coordinator(&replacement_cleanup)
-        .await?;
+        .await
+    {
+        return hosted_witness::block_disposal(
+            &mut launched,
+            &format!("post-native-success replacement shutdown failed: {error}"),
+        );
+    }
+    replay?;
     let evidence = launched.cleanup_with_coordinator(&replacement_cleanup)?;
     if evidence.removed_container_ids.len() != 3 || evidence.removed_network_id.is_empty() {
         return Err("post-native-success cleanup did not remove exact owned resources".into());
@@ -2272,84 +2386,163 @@ async fn exercise_target_host_evidence_fault(
         launched.complete_deadline(),
         &cleanup,
     )
-    .await?;
-    let sequence = group.bootstrap_configuration_sequence().await?;
-    wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout()).await?;
-    let command = group.target_build_command(
-        1,
-        format!("target-evidence-{label}"),
-        format!("target-evidence-{label}"),
-    )?;
-    group
-        .testing_admit_target_build_authority_only(&command)
-        .await
-        .map_err(|error| format!("{label} target authority admission failed: {error}"))?;
+    .await;
+    let group = match group {
+        Ok(group) => group,
+        Err(error) if error.agent_termination_unconfirmed() => {
+            return hosted_witness::block_disposal(
+                &mut launched,
+                &format!("{label} startup termination unconfirmed: {error}"),
+            );
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut callback_owner = None;
+    let outcome: Result<(), TestError> = async {
+        let sequence = group.bootstrap_configuration_sequence().await?;
+        wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout()).await?;
+        let command = group.target_build_command(
+            1,
+            format!("target-evidence-{label}"),
+            format!("target-evidence-{label}"),
+        )?;
+        group
+            .testing_admit_target_build_authority_only(&command)
+            .await
+            .map_err(|error| format!("{label} target authority admission failed: {error}"))?;
 
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    match window {
-        TargetEvidenceWindow::PreAssociation => {
-            group.testing_gate_next_seed_intent(entered_tx, release_rx)?;
-        }
-        TargetEvidenceWindow::InFlightSeeding => {
-            group.testing_gate_seed_after_request(entered_tx, release_rx)?;
-        }
-        TargetEvidenceWindow::PostNativePreReply => {
-            group.testing_gate_next_target_evidence(entered_tx, release_rx)?;
-        }
-    }
-    let mut callback = group.testing_spawn_admitted_seed_callback(&command)?;
-    await_checkpoint(entered_rx, &mut callback, &label).await?;
-
-    match fault {
-        TargetEvidenceFault::SqlProcessRestart => {
-            let frozen = group.testing_frozen_secondary_start_identity()?;
-            let host_port = launched.restart_sql_process_for_test(1)?;
-            let fresh = group
-                .testing_wait_for_fresh_secondary_observation(
-                    &frozen,
-                    host_port,
-                    launched.kuberic_convergence_timeout(),
-                )
-                .await?;
-            if fresh.instance.sqlserver_start_time == frozen {
-                return Err(
-                    format!("{label} did not replace the target SQL start identity").into(),
-                );
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        match window {
+            TargetEvidenceWindow::PreAssociation => {
+                group.testing_gate_next_seed_intent(entered_tx, release_rx)?;
+            }
+            TargetEvidenceWindow::InFlightSeeding => {
+                group.testing_gate_seed_after_request(entered_tx, release_rx)?;
+            }
+            TargetEvidenceWindow::PostNativePreReply => {
+                group.testing_gate_next_target_evidence(entered_tx, release_rx)?;
             }
         }
-        TargetEvidenceFault::LineageMismatch => {
-            group.testing_inject_target_lineage_mismatch()?;
+        callback_owner = Some(group.testing_spawn_admitted_seed_callback(&command)?);
+        let checkpoint_result = tokio::select! {
+            entered = entered_rx => {
+                entered.map_err(|_| format!("{label} checkpoint sender disappeared"))?;
+                None
+            }
+            result = callback_owner.as_mut().expect("callback owner armed") => Some(result),
+            _ = tokio::time::sleep(Duration::from_secs(120)) => {
+                return Err(format!("{label} checkpoint exceeded its bounded wait").into());
+            }
+        };
+        if let Some(result) = checkpoint_result {
+            callback_owner.take();
+            return Err(
+                format!("{label} callback completed before its checkpoint: {result:?}").into(),
+            );
         }
-    }
-    release_tx
-        .send(())
-        .map_err(|_| format!("{label} checkpoint was not retained"))?;
-    let result = tokio::time::timeout(launched.kuberic_convergence_timeout(), callback)
+        group
+            .testing_assert_source_build_success_not_published(&command)
+            .await?;
+        let dispatches = group.testing_seed_dispatch_count()?;
+        if callback_owner.as_ref().expect("callback owner armed").is_finished() {
+            return Err(format!("{label} callback ended before fault initiation").into());
+        }
+        let mut verified_new_start = false;
+
+        match fault {
+            TargetEvidenceFault::SqlProcessRestart => {
+                let frozen = group.testing_frozen_secondary_start_identity()?;
+                let host_port = launched.restart_sql_process_for_test(1)?;
+                let fresh = group
+                    .testing_wait_for_fresh_secondary_observation(
+                        &frozen,
+                        host_port,
+                        launched.kuberic_convergence_timeout(),
+                    )
+                    .await?;
+                if fresh.instance.sqlserver_start_time == frozen {
+                    return Err(
+                        format!("{label} did not replace the target SQL start identity").into(),
+                    );
+                }
+                verified_new_start = true;
+            }
+            TargetEvidenceFault::LineageMismatch => {
+                group.testing_inject_target_lineage_mismatch()?;
+            }
+        }
+        release_tx
+            .send(())
+            .map_err(|_| format!("{label} checkpoint was not retained"))?;
+        let joined = tokio::time::timeout(
+            launched.kuberic_convergence_timeout(),
+            callback_owner.as_mut().expect("callback owner armed"),
+        )
         .await
-        .map_err(|_| format!("{label} callback did not terminate within its deadline"))?
-        .map_err(|error| format!("{label} callback task failed: {error}"))?;
-    let error = result
-        .err()
-        .ok_or_else(|| format!("{label} completed without current target-local evidence"))?;
-    let diagnostic = error.to_string();
-    match fault {
-        TargetEvidenceFault::SqlProcessRestart
-            if !diagnostic.contains("unsafe")
-                && !diagnostic.contains("unavailable")
-                && !diagnostic.contains("failed") =>
-        {
-            return Err(format!("{label} returned an unexpected restart error: {error}").into());
+        .map_err(|_| format!("{label} callback did not terminate within its deadline"))?;
+        callback_owner.take();
+        let result = joined.map_err(|error| format!("{label} callback task failed: {error}"))?;
+        let error = result
+            .err()
+            .ok_or_else(|| format!("{label} completed without current target-local evidence"))?;
+        let diagnostic = error.to_string();
+        match fault {
+            TargetEvidenceFault::SqlProcessRestart
+                if !target_restart_failure_is_fail_closed(
+                    fault,
+                    &error,
+                    verified_new_start,
+                    dispatches,
+                    group.testing_seed_dispatch_count()?,
+                ) =>
+            {
+                return Err(format!(
+                    "{label} did not fail closed: verified_new_start={verified_new_start}, \
+                     seed_dispatches_before={dispatches}, seed_dispatches_after={}; callback={error}",
+                    group.testing_seed_dispatch_count()?,
+                )
+                .into());
+            }
+            TargetEvidenceFault::LineageMismatch if !diagnostic.contains("conflicts") => {
+                return Err(
+                    format!("{label} returned an unexpected lineage error: {error}").into(),
+                );
+            }
+            _ => {}
         }
-        TargetEvidenceFault::LineageMismatch if !diagnostic.contains("conflicts") => {
-            return Err(format!("{label} returned an unexpected lineage error: {error}").into());
+        if matches!(fault, TargetEvidenceFault::LineageMismatch) {
+            group
+                .testing_assert_source_build_success_not_published(&command)
+                .await?;
         }
-        _ => {}
+        Ok(())
     }
-    group
-        .testing_assert_source_build_success_not_published(&command)
-        .await?;
-    group.shutdown_with_coordinator(&cleanup).await?;
+    .await;
+    let callback_shutdown = if let Some(callback) = callback_owner.take() {
+        callback.abort();
+        match callback.await {
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(tonic::Status::internal(format!(
+                "target callback cleanup failed: {error}"
+            ))),
+            Ok(Err(error)) => Err(error),
+            Ok(Ok(())) => Err(tonic::Status::failed_precondition(
+                "target callback completed after a failed evidence test",
+            )),
+        }
+    } else {
+        Ok(())
+    };
+    let outcome = combine_primary_and_shutdown(outcome, callback_shutdown);
+    let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    if let Err(error) = group.shutdown_with_coordinator(&cleanup).await {
+        return hosted_witness::block_disposal(
+            &mut launched,
+            &format!("{label} host shutdown failed: {error}"),
+        );
+    }
+    outcome?;
     let evidence = launched.cleanup_with_coordinator(&cleanup)?;
     if evidence.removed_container_ids.len() != 3 || evidence.removed_network_id.is_empty() {
         return Err(format!("{label} cleanup did not remove exact owned resources").into());
@@ -2358,6 +2551,121 @@ async fn exercise_target_host_evidence_fault(
     cleanup_three_replica_fixture(&root)?;
     assert_removed(&root);
     Ok(())
+}
+
+fn target_restart_failure_is_fail_closed(
+    fault: TargetEvidenceFault,
+    error: &tonic::Status,
+    verified_new_start: bool,
+    dispatches_before: usize,
+    dispatches_after: usize,
+) -> bool {
+    matches!(fault, TargetEvidenceFault::SqlProcessRestart)
+        && verified_new_start
+        && dispatches_before <= dispatches_after
+        && dispatches_after <= 1
+        && error.code() == tonic::Code::Internal
+        && matches!(
+            error.message(),
+            "application error: target SQL Server start identity is unsafe to continue"
+                | "application error: SQL Server observation is unavailable: Unreachable"
+                | "application error: SQL Server observation is unavailable: TimedOut"
+                | "application error: bootstrap convergence exceeded its bounded callback budget"
+        )
+}
+
+#[test]
+fn target_restart_failure_requires_real_drift_and_no_duplicate_seed() {
+    let budget = tonic::Status::internal(
+        "application error: bootstrap convergence exceeded its bounded callback budget",
+    );
+    for message in [
+        budget.message(),
+        "application error: target SQL Server start identity is unsafe to continue",
+        "application error: SQL Server observation is unavailable: Unreachable",
+        "application error: SQL Server observation is unavailable: TimedOut",
+    ] {
+        for (before, after) in [(0, 0), (0, 1), (1, 1)] {
+            assert!(target_restart_failure_is_fail_closed(
+                TargetEvidenceFault::SqlProcessRestart,
+                &tonic::Status::internal(message),
+                true,
+                before,
+                after,
+            ));
+        }
+    }
+    for (fault, error, verified, before, after) in [
+        (
+            TargetEvidenceFault::LineageMismatch,
+            budget.clone(),
+            true,
+            1,
+            1,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            budget.clone(),
+            false,
+            1,
+            1,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            budget.clone(),
+            true,
+            1,
+            2,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            budget.clone(),
+            true,
+            1,
+            0,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            budget.clone(),
+            true,
+            2,
+            2,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            tonic::Status::deadline_exceeded(budget.message()),
+            true,
+            1,
+            1,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            tonic::Status::internal("unrelated operation is unsafe or unavailable"),
+            true,
+            1,
+            1,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            tonic::Status::internal(
+                "application error: SQL Server observation is unavailable: PermissionDenied",
+            ),
+            true,
+            1,
+            1,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            tonic::Status::internal("administrator query failed"),
+            true,
+            1,
+            1,
+        ),
+    ] {
+        assert!(!target_restart_failure_is_fail_closed(
+            fault, &error, verified, before, after,
+        ));
+    }
 }
 
 async fn execute_conflict_evidence(root: &Path) -> Result<(), TestError> {
@@ -2788,6 +3096,17 @@ fn spawn_test_child(
     ready: Option<&Path>,
     checkpoint: Option<&str>,
 ) -> Child {
+    test_child_command(root, test_name, ready, checkpoint)
+        .spawn()
+        .expect("spawn exact live child")
+}
+
+fn test_child_command(
+    root: &Path,
+    test_name: &str,
+    ready: Option<&Path>,
+    checkpoint: Option<&str>,
+) -> Command {
     let mut command = Command::new(std::env::current_exe().expect("current live test executable"));
     command
         .arg(test_name)
@@ -2797,6 +3116,8 @@ fn spawn_test_child(
         .arg("--test-threads=1")
         .env("KUBERIC_MSSQL_THREE_REPLICA_ROOT", root)
         .env_remove("KUBERIC_MSSQL_SIGNAL_READY_FILE")
+        .env_remove("KUBERIC_MSSQL_FAULT_CHECKPOINT")
+        .env_remove(FAULT_HIT_ENV)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     if let Some(ready) = ready {
@@ -2805,16 +3126,19 @@ fn spawn_test_child(
     if let Some(checkpoint) = checkpoint {
         command.env("KUBERIC_MSSQL_FAULT_CHECKPOINT", checkpoint);
     }
-    command.spawn().expect("spawn exact live child")
+    command
 }
 
-fn spawn_live_child_with_fault(root: &Path, checkpoint: &str) -> Child {
+fn spawn_live_child_with_fault(root: &Path, checkpoint: &str, receipt: &Path) -> Child {
     let test_name = if checkpoint == "fail-after-agent-restart" {
         SAME_ROOT_RESTART_TEST
     } else {
         HAPPY_PATH_TEST
     };
-    spawn_test_child(root, test_name, None, Some(checkpoint))
+    test_child_command(root, test_name, None, Some(checkpoint))
+        .env(FAULT_HIT_ENV, receipt)
+        .spawn()
+        .expect("spawn checkpoint fault child")
 }
 
 fn spawn_cleanup_child(root: &Path) -> Child {
@@ -2836,7 +3160,13 @@ fn spawn_cleanup_child(root: &Path) -> Child {
 }
 
 fn fault_checkpoint(expected: &str) -> bool {
-    std::env::var("KUBERIC_MSSQL_FAULT_CHECKPOINT").as_deref() == Ok(expected)
+    if std::env::var("KUBERIC_MSSQL_FAULT_CHECKPOINT").as_deref() != Ok(expected) {
+        return false;
+    }
+    if let Some(path) = std::env::var_os(FAULT_HIT_ENV) {
+        fs::write(path, expected).expect("record reached fault checkpoint");
+    }
+    true
 }
 
 fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> Result<(), ()> {

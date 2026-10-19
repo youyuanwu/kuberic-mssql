@@ -96,9 +96,11 @@ A candidate record may describe the exact current and reviewed resolutions
 during intake, but it is not checked in as dependency authority. A change to
 `Cargo.toml` must not merge until the candidate computes `ready_to_pin` and the
 required exact PR-head GitHub Actions check `Shared CI validation` passes. That
-job runs `just ci`, including formatting, strict Clippy, full locked ordinary
-tests, licensed one-replica, three-replica, and same-root restart validation,
-and always runs `just cleanup`. The GitHub Actions job log is the run evidence.
+job runs `just ci`, including formatting, strict Clippy, locked ordinary
+nextest tests plus Cargo doctests, then every existing ignored SQL fixture
+suite in the serial nextest live profile. It always runs `just cleanup`,
+including nested exact-journal recovery for the nextest namespace.
+The GitHub Actions job log is the run evidence.
 Test logs and evidence artifacts are not committed to this repository.
 
 Repository Cargo commands force `ACCEPT_EULA=Y` through `.cargo/config.toml`

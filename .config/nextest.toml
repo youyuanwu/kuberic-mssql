@@ -1,10 +1,24 @@
+nextest-version = "0.9.146"
+
 [store]
 dir = "target/nextest"
+
+[test-groups.live-sql]
+max-threads = 1
 
 [profile.default]
 fail-fast = false
 retries = 0
 test-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary_id(=kuberic-mssql-tests::live_one_replica) | binary_id(=kuberic-mssql-tests::live_three_replica) | binary_id(=kuberic-mssql-tests::live_lease_fence)'
+test-group = "live-sql"
+
+[profile.live]
+inherits = "default"
+fail-fast = true
+default-filter = 'binary_id(=kuberic-mssql-tests::live_one_replica) | binary_id(=kuberic-mssql-tests::live_three_replica) | binary_id(=kuberic-mssql-tests::live_lease_fence)'
 
 [profile.external]
 inherits = "default"
