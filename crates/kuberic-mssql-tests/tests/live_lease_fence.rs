@@ -18,6 +18,7 @@ use kuberic_mssql_tests::three_replica::{
 type TestError = Box<dyn Error + Send + Sync>;
 const CREATION_SECONDS: u32 = 60;
 const RENEWAL_SECONDS: u32 = 120;
+const EXPIRY_RENEWAL_SECONDS: u32 = 90;
 const MARGIN: Duration = Duration::from_secs(3);
 
 #[test]
@@ -99,6 +100,11 @@ async fn run_scenario(
 }
 
 async fn experiment(fixture: &mut LaunchedMembers, restart: bool) -> Result<(), TestError> {
+    let renewal_seconds = if restart {
+        RENEWAL_SECONDS
+    } else {
+        EXPIRY_RENEWAL_SECONDS
+    };
     let formation = phase(Phase::LeaseFormation);
     let (group, creation_ack) = fixture
         .provision_write_lease_group_for_test(CREATION_SECONDS)
@@ -121,15 +127,15 @@ async fn experiment(fixture: &mut LaunchedMembers, restart: bool) -> Result<(), 
     let renewal = phase(Phase::LeaseRenewal);
     let submitted = Instant::now();
     fixture
-        .renew_write_lease_for_test(index, RENEWAL_SECONDS)
+        .renew_write_lease_for_test(index, renewal_seconds)
         .await?;
     let acknowledged = Instant::now();
     renewal.succeeded();
     eprintln!(
-        "lease baseline={baseline:?}; creation_seconds={CREATION_SECONDS}; renewal_seconds={RENEWAL_SECONDS}"
+        "lease baseline={baseline:?}; creation_seconds={CREATION_SECONDS}; renewal_seconds={renewal_seconds}"
     );
 
-    let renewed_earliest = submitted + Duration::from_secs(u64::from(RENEWAL_SECONDS)) - MARGIN;
+    let renewed_earliest = submitted + Duration::from_secs(u64::from(renewal_seconds)) - MARGIN;
     if restart {
         return active_restart_and_fence(fixture, index, &baseline, renewed_earliest).await;
     }
@@ -152,7 +158,7 @@ async fn experiment(fixture: &mut LaunchedMembers, restart: bool) -> Result<(), 
     eprintln!("lease renewal proved by direct write beyond original latest expiry");
 
     let expiry_deadline =
-        acknowledged + Duration::from_secs(u64::from(RENEWAL_SECONDS)) + Duration::from_secs(30);
+        acknowledged + Duration::from_secs(u64::from(renewal_seconds)) + Duration::from_secs(30);
     let expiry_wait = phase(Phase::RenewedExpiryWait);
     loop {
         let observed = fixture.observe_write_lease_for_test(index).await?;
