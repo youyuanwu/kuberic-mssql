@@ -41,35 +41,45 @@ cancelled=0
 forward_signal() {
   cancelled="$1"
   if kill -0 "$child" 2>/dev/null; then
-    kill "-$2" "$child" || echo "failed to forward live runner cancellation" >&2
+    kill "-$2" "$child" 2>/dev/null || cancelled=125
   fi
 }
 trap 'forward_signal 130 INT' INT
 trap 'forward_signal 143 TERM' TERM
-status=0
-while true; do
-  wait "$child" && status=0 || status=$?
-  if ! kill -0 "$child" 2>/dev/null; then
-    break
+wait_for_child() {
+  child_status=0
+  while true; do
+    wait "$child" && child_status=0 || child_status=$?
+    if ! kill -0 "$child" 2>/dev/null; then
+      break
+    fi
+  done
+  if [[ "$cancelled" -ne 0 ]]; then
+    wait "$child" && child_status=0 || child_status=$?
   fi
-done
-if [[ "$cancelled" -ne 0 ]]; then
-  wait "$child" && status=0 || status=$?
-fi
-trap - INT TERM
-if [[ "$status" -eq 0 && "$cancelled" -ne 0 ]]; then
-  status="$cancelled"
-fi
+  if [[ "$child_status" -eq 0 && "$cancelled" -ne 0 ]]; then
+    child_status="$cancelled"
+  fi
+}
+wait_for_child
+status="$child_status"
 collector_flags=()
 if [[ "$status" -ne 0 ]]; then
   collector_flags+=(--failed)
 fi
-if python3 "$script_dir/collect_phase_timings.py" "$timing_root" "${collector_flags[@]}"; then
+timeout --foreground --signal=TERM --kill-after=1s 5s \
+  python3 "$script_dir/collect_phase_timings.py" "$timing_root" "${collector_flags[@]}" &
+child=$!
+wait_for_child
+trap - INT TERM
+if [[ "$status" -eq 0 && "$cancelled" -ne 0 ]]; then
+  status="$cancelled"
+fi
+if [[ "$child_status" -eq 0 ]]; then
   exit "$status"
 else
-  collector_status=$?
   if [[ "$status" -ne 0 ]]; then
     exit "$status"
   fi
-  exit "$collector_status"
+  exit "$child_status"
 fi

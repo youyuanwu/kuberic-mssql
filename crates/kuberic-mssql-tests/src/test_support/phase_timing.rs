@@ -129,10 +129,6 @@ impl Shared {
 
     fn diagnostic_failure(&self) {
         self.failed.store(true, Ordering::Relaxed);
-        let _ = writeln!(
-            io::stderr(),
-            "MSSQL_PHASE_REPORT_ERROR: timing report failed"
-        );
     }
 
     fn persist(&self, report: &Report) -> io::Result<()> {
@@ -153,11 +149,28 @@ impl Shared {
 pub struct Session {
     shared: Arc<Shared>,
     complete: bool,
+    direct_output: bool,
 }
 
 impl Session {
     pub fn start(scenario: Scenario) -> io::Result<Self> {
-        Self::new(scenario, Attempt::Main, directory()?.as_deref())
+        let supplied = directory()?;
+        let direct_output = supplied.is_none();
+        let directory = match supplied {
+            Some(directory) => directory,
+            None => {
+                let target = super::workspace_root().join("target");
+                fs::create_dir_all(&target)?;
+                tempfile::Builder::new()
+                    .prefix(".mssql-phase-timings-")
+                    .permissions(fs::Permissions::from_mode(0o700))
+                    .tempdir_in(target.canonicalize()?)?
+                    .keep()
+            }
+        };
+        let mut session = Self::new(scenario, Attempt::Main, Some(&directory))?;
+        session.direct_output = direct_output;
+        Ok(session)
     }
 
     pub fn child() -> io::Result<Option<Self>> {
@@ -171,7 +184,8 @@ impl Session {
         if matches!(attempt, Attempt::Main) {
             return Err(invalid_context());
         }
-        Self::new(scenario, attempt, directory()?.as_deref()).map(Some)
+        let directory = directory()?.ok_or_else(invalid_context)?;
+        Self::new(scenario, attempt, Some(&directory)).map(Some)
     }
 
     fn new(scenario: Scenario, attempt: Attempt, directory: Option<&Path>) -> io::Result<Self> {
@@ -241,6 +255,7 @@ impl Session {
         Ok(Self {
             shared,
             complete: false,
+            direct_output: false,
         })
     }
 
@@ -265,6 +280,24 @@ impl Session {
             return Err(io::Error::other("incomplete or failed timing report"));
         }
         self.complete = true;
+        if self.direct_output {
+            let report = self
+                .shared
+                .report
+                .lock()
+                .map_err(|_| io::Error::other("timing context poisoned"))?;
+            for record in &report.phases {
+                writeln!(
+                    io::stderr(),
+                    "MSSQL_PHASE scenario={:?} attempt={:?} phase={:?} outcome={:?} elapsed_ms={}",
+                    report.scenario,
+                    report.attempt,
+                    record.phase,
+                    record.outcome,
+                    record.elapsed_ms,
+                )?;
+            }
+        }
         Ok(())
     }
 }
@@ -324,6 +357,9 @@ pub fn child_context(command: &mut Command, attempt: Attempt) {
                 ATTEMPT_ENV,
                 serde_json::to_string(&attempt).expect("finite timing label"),
             );
+        if let Some(sink) = &shared.sink {
+            command.env(DIRECTORY_ENV, &sink.directory);
+        }
     }
 }
 
@@ -391,19 +427,6 @@ impl PhaseGuard {
                     return;
                 };
                 record.elapsed_ms = elapsed_ms;
-                if writeln!(
-                    io::stderr(),
-                    "MSSQL_PHASE scenario={:?} attempt={:?} phase={:?} outcome={:?} elapsed_ms={}",
-                    report.scenario,
-                    report.attempt,
-                    record.phase,
-                    outcome,
-                    record.elapsed_ms,
-                )
-                .is_err()
-                {
-                    shared.diagnostic_failure();
-                }
             });
         }
     }
