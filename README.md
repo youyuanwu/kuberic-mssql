@@ -465,6 +465,18 @@ Direct Cargo live runs retain snapshots in `target/.mssql-phase-timings-*`
 and print their safe summary only after successful cleanup. Their existing
 `--nocapture` output is still raw test output, not a sanitized reporting channel.
 
+Disposal can overlap stops of eligible members within one already-owned
+three-replica fixture; SQL cases and fixtures still run serially per worker.
+Every participant needs durable cleanup intent and exact ownership checks.
+The ten-second stop grace is unchanged, errors remain failures even after
+later recovery, and dependent network/data removal waits for verified absence.
+Controlled restart and fencing retain their scalar stop path.
+
+Handled-signal and checkpoint recovery require the actual expected child cause
+and completed teardown, not just any nonzero exit. Timeout escalation cannot
+count as that expected outcome; SIGKILL requires observed SIGKILL death.
+Separate recovery and the existing full positive retries remain mandatory.
+
 Complete happy-path and same-root-restart journeys run inside recovery retries,
 not again as standalone CI tests. The hosted witness retains the full native
 commit collection. Their existing manual recipes remain available through an
