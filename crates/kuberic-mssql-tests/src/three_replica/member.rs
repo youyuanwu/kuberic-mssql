@@ -2238,185 +2238,200 @@ where
             }
             return results;
         }
-        let left = remaining;
-        let command_limit = || left().min(Duration::from_secs(30));
-        let mut eligible = vec![false; resources.len()];
-        let mut running = Vec::new();
+        let operation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let left = remaining;
+            let command_limit = || left().min(Duration::from_secs(30));
+            let mut eligible = vec![false; resources.len()];
+            let mut running = Vec::new();
 
-        for (index, resource) in resources.iter().enumerate() {
-            let container = match self.cleanup_container(resource) {
-                Ok(container) => container,
-                Err(error) => {
-                    results[index].errors.push(error);
+            for (index, resource) in resources.iter().enumerate() {
+                let container = match self.cleanup_container(resource) {
+                    Ok(container) => container,
+                    Err(error) => {
+                        results[index].errors.push(error);
+                        continue;
+                    }
+                };
+                let Some(binding) = resource.binding.as_ref() else {
+                    results[index]
+                        .errors
+                        .push(cleanup_ownership_error(resource));
                     continue;
-                }
-            };
-            let Some(binding) = resource.binding.as_ref() else {
-                results[index]
-                    .errors
-                    .push(cleanup_ownership_error(resource));
-                continue;
-            };
-            if command_limit().is_zero() {
-                results[index].errors.push(cleanup_operation_error(
-                    resource,
-                    FailureCategory::DeadlineExceeded,
-                ));
-                continue;
-            }
-            let inspection = self
-                .docker
-                .inspect_container(&binding.immutable_id, command_limit());
-            if left().is_zero() {
-                results[index].errors.push(cleanup_operation_error(
-                    resource,
-                    FailureCategory::DeadlineExceeded,
-                ));
-                continue;
-            }
-            let inspection = match inspection {
-                Ok(Some(inspection)) => inspection,
-                Ok(None) => continue,
-                Err(_) => {
+                };
+                if command_limit().is_zero() {
                     results[index].errors.push(cleanup_operation_error(
                         resource,
-                        FailureCategory::ContainerRemoval,
-                    ));
-                    continue;
-                }
-            };
-            if inspection.id != binding.immutable_id
-                || container
-                    .request
-                    .verify_inspection(&inspection, self.image_id, inspection.running)
-                    .is_err()
-            {
-                results[index]
-                    .errors
-                    .push(cleanup_ownership_error(resource));
-                continue;
-            }
-            eligible[index] = true;
-            if inspection.running {
-                running.push((index, binding.immutable_id.clone()));
-            }
-        }
-
-        if !running.is_empty() {
-            let available = left();
-            if available <= Duration::from_secs(10) + crate::fixture::process::SHUTDOWN_RESERVE {
-                for (index, _) in &running {
-                    results[*index].errors.push(cleanup_operation_error(
-                        &resources[*index],
                         FailureCategory::DeadlineExceeded,
                     ));
-                }
-            } else {
-                let ids: Vec<_> = running.iter().map(|(_, id)| id.clone()).collect();
-                if self
-                    .docker
-                    .stop_containers_for_cleanup(&ids, available)
-                    .is_err()
-                {
-                    for (index, _) in &running {
-                        results[*index].errors.push(CleanupError {
-                            resource: resources[*index].logical_name.clone(),
-                            failure: SanitizedFailure::with_detail(
-                                FailureStage::Cleanup,
-                                FailureCategory::ContainerRemoval,
-                                "container cohort stop outcome is uncertain",
-                            ),
-                        });
-                    }
-                }
-            }
-        }
-
-        for (index, resource) in resources.iter().enumerate() {
-            if !eligible[index] {
-                continue;
-            }
-            if command_limit().is_zero() {
-                results[index].errors.push(cleanup_operation_error(
-                    resource,
-                    FailureCategory::DeadlineExceeded,
-                ));
-                continue;
-            }
-            let binding = resource.binding.as_ref().expect("validated cohort binding");
-            let inspection = self
-                .docker
-                .inspect_container(&binding.immutable_id, command_limit());
-            if left().is_zero() {
-                results[index].errors.push(cleanup_operation_error(
-                    resource,
-                    FailureCategory::DeadlineExceeded,
-                ));
-                continue;
-            }
-            let inspection = match inspection {
-                Ok(Some(inspection)) => inspection,
-                Ok(None) => continue,
-                Err(_) => {
-                    results[index].errors.push(cleanup_operation_error(
-                        resource,
-                        FailureCategory::ContainerRemoval,
-                    ));
                     continue;
                 }
-            };
-            let container = match self.cleanup_container(resource) {
-                Ok(container) => container,
-                Err(error) => {
-                    results[index].errors.push(error);
-                    continue;
-                }
-            };
-            if inspection.id != binding.immutable_id
-                || container
-                    .request
-                    .verify_inspection(&inspection, self.image_id, inspection.running)
-                    .is_err()
-            {
-                results[index]
-                    .errors
-                    .push(cleanup_ownership_error(resource));
-                continue;
-            }
-            if inspection.running {
-                results[index].errors.push(CleanupError {
-                    resource: resource.logical_name.clone(),
-                    failure: SanitizedFailure::with_detail(
-                        FailureStage::Cleanup,
-                        FailureCategory::ContainerRemoval,
-                        "container remained running after cohort stop; stop is not retried",
-                    ),
-                });
-                continue;
-            }
-            let timeout = command_limit();
-            if timeout.is_zero() {
-                results[index].errors.push(cleanup_operation_error(
-                    resource,
-                    FailureCategory::DeadlineExceeded,
-                ));
-            } else {
-                if self
+                let inspection = self
                     .docker
-                    .remove_container(&binding.immutable_id, timeout)
-                    .is_err()
-                {
-                    results[index].errors.push(cleanup_operation_error(
-                        resource,
-                        FailureCategory::ContainerRemoval,
-                    ));
-                }
+                    .inspect_container(&binding.immutable_id, command_limit());
                 if left().is_zero() {
                     results[index].errors.push(cleanup_operation_error(
                         resource,
                         FailureCategory::DeadlineExceeded,
                     ));
+                    continue;
                 }
+                let inspection = match inspection {
+                    Ok(Some(inspection)) => inspection,
+                    Ok(None) => continue,
+                    Err(_) => {
+                        results[index].errors.push(cleanup_operation_error(
+                            resource,
+                            FailureCategory::ContainerRemoval,
+                        ));
+                        continue;
+                    }
+                };
+                if inspection.id != binding.immutable_id
+                    || container
+                        .request
+                        .verify_inspection(&inspection, self.image_id, inspection.running)
+                        .is_err()
+                {
+                    results[index]
+                        .errors
+                        .push(cleanup_ownership_error(resource));
+                    continue;
+                }
+                eligible[index] = true;
+                if inspection.running {
+                    running.push((index, binding.immutable_id.clone()));
+                }
+            }
+
+            if !running.is_empty() {
+                let available = left();
+                if available <= Duration::from_secs(10) + crate::fixture::process::SHUTDOWN_RESERVE
+                {
+                    for (index, _) in &running {
+                        results[*index].errors.push(cleanup_operation_error(
+                            &resources[*index],
+                            FailureCategory::DeadlineExceeded,
+                        ));
+                    }
+                } else {
+                    let ids: Vec<_> = running.iter().map(|(_, id)| id.clone()).collect();
+                    if self
+                        .docker
+                        .stop_containers_for_cleanup(&ids, available)
+                        .is_err()
+                    {
+                        for (index, _) in &running {
+                            results[*index].errors.push(CleanupError {
+                                resource: resources[*index].logical_name.clone(),
+                                failure: SanitizedFailure::with_detail(
+                                    FailureStage::Cleanup,
+                                    FailureCategory::ContainerRemoval,
+                                    "container cohort stop outcome is uncertain",
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+
+            for (index, resource) in resources.iter().enumerate() {
+                if !eligible[index] {
+                    continue;
+                }
+                if command_limit().is_zero() {
+                    results[index].errors.push(cleanup_operation_error(
+                        resource,
+                        FailureCategory::DeadlineExceeded,
+                    ));
+                    continue;
+                }
+                let binding = resource.binding.as_ref().expect("validated cohort binding");
+                let inspection = self
+                    .docker
+                    .inspect_container(&binding.immutable_id, command_limit());
+                if left().is_zero() {
+                    results[index].errors.push(cleanup_operation_error(
+                        resource,
+                        FailureCategory::DeadlineExceeded,
+                    ));
+                    continue;
+                }
+                let inspection = match inspection {
+                    Ok(Some(inspection)) => inspection,
+                    Ok(None) => continue,
+                    Err(_) => {
+                        results[index].errors.push(cleanup_operation_error(
+                            resource,
+                            FailureCategory::ContainerRemoval,
+                        ));
+                        continue;
+                    }
+                };
+                let container = match self.cleanup_container(resource) {
+                    Ok(container) => container,
+                    Err(error) => {
+                        results[index].errors.push(error);
+                        continue;
+                    }
+                };
+                if inspection.id != binding.immutable_id
+                    || container
+                        .request
+                        .verify_inspection(&inspection, self.image_id, inspection.running)
+                        .is_err()
+                {
+                    results[index]
+                        .errors
+                        .push(cleanup_ownership_error(resource));
+                    continue;
+                }
+                if inspection.running {
+                    results[index].errors.push(CleanupError {
+                        resource: resource.logical_name.clone(),
+                        failure: SanitizedFailure::with_detail(
+                            FailureStage::Cleanup,
+                            FailureCategory::ContainerRemoval,
+                            "container remained running after cohort stop; stop is not retried",
+                        ),
+                    });
+                    continue;
+                }
+                let timeout = command_limit();
+                if timeout.is_zero() {
+                    results[index].errors.push(cleanup_operation_error(
+                        resource,
+                        FailureCategory::DeadlineExceeded,
+                    ));
+                } else {
+                    if self
+                        .docker
+                        .remove_container(&binding.immutable_id, timeout)
+                        .is_err()
+                    {
+                        results[index].errors.push(cleanup_operation_error(
+                            resource,
+                            FailureCategory::ContainerRemoval,
+                        ));
+                    }
+                    if left().is_zero() {
+                        results[index].errors.push(cleanup_operation_error(
+                            resource,
+                            FailureCategory::DeadlineExceeded,
+                        ));
+                    }
+                }
+            }
+        }));
+        if operation.is_err() {
+            for (result, resource) in results.iter_mut().zip(resources) {
+                result.errors.push(CleanupError {
+                    resource: resource.logical_name.clone(),
+                    failure: SanitizedFailure::with_detail(
+                        FailureStage::Cleanup,
+                        FailureCategory::ContainerRemoval,
+                        "container cohort cleanup panicked",
+                    ),
+                });
             }
         }
         results
@@ -3155,6 +3170,7 @@ mod tests {
         stop_error: bool,
         keep_running: bool,
         replace_after_stop: bool,
+        panic_after_stop: bool,
     }
 
     impl CohortDocker {
@@ -3206,7 +3222,8 @@ mod tests {
         fn start_container(&self, _: &str, _: Duration) -> Result<(), DockerError> {
             Err(DockerError::Command)
         }
-        fn stop_container(&self, _: &str, _: Duration) -> Result<(), DockerError> {
+        fn stop_container(&self, id: &str, timeout: Duration) -> Result<(), DockerError> {
+            self.record("scalar-stop", id, timeout);
             panic!("cohort stop must not be retried as scalar")
         }
         fn inspect_container(
@@ -3215,6 +3232,15 @@ mod tests {
             timeout: Duration,
         ) -> Result<Option<ContainerInspection>, DockerError> {
             self.record("inspect", id, timeout);
+            if self.panic_after_stop
+                && self
+                    .calls
+                    .borrow()
+                    .iter()
+                    .any(|(kind, _, _)| kind == "stop-cohort")
+            {
+                panic!("post-stop inspection panic");
+            }
             Ok(self.containers.borrow().get(id).cloned())
         }
         fn supports_cleanup_stop_batch(&self) -> bool {
@@ -3288,6 +3314,7 @@ mod tests {
             stop_error: false,
             keep_running: false,
             replace_after_stop: false,
+            panic_after_stop: false,
         };
         (containers, resources, docker)
     }
@@ -3413,6 +3440,82 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn native_cohort_retains_stop_failure_when_later_inspection_panics() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("fixture");
+        let store = JournalStore::initialize(&root).unwrap();
+        let mut journal = store.create::<OwnershipJournal, _>(run(&root)).unwrap();
+        let (containers, resources, mut docker) = cohort_fixture(&root);
+        docker.stop_error = true;
+        docker.panic_after_stop = true;
+        for kind in [ResourceKind::Network, ResourceKind::DataDirectory] {
+            journal.resources.push(ResourceRecord {
+                kind,
+                logical_name: format!("dependent-{kind:?}"),
+                path: None,
+                intent: None,
+                binding: None,
+                state: ResourceState::Bound,
+            });
+        }
+        journal.resources.extend(resources.clone());
+        store.save(&journal).unwrap();
+        let coordinator = CleanupCoordinator::new(docker.clock.clone(), Duration::from_secs(180));
+        let backend = NativeCleanupBackend {
+            root: &root,
+            docker: &docker,
+            runner: &BoundedProcessRunner,
+            clock: docker.clock.clone(),
+            image_id: "image-id",
+            network: None,
+            containers: &containers,
+        };
+        let report = coordinator.cleanup(&store, &mut journal, &backend);
+        for resource in &resources {
+            for detail in [
+                "container cohort stop outcome is uncertain",
+                "container cohort cleanup panicked",
+            ] {
+                assert!(report.errors.contains(&CleanupError {
+                    resource: resource.logical_name.clone(),
+                    failure: SanitizedFailure::with_detail(
+                        FailureStage::Cleanup,
+                        FailureCategory::ContainerRemoval,
+                        detail,
+                    ),
+                }));
+            }
+        }
+        let primary = SanitizedFailure::new(FailureStage::Test, FailureCategory::SqlUnavailable);
+        let combined = combine_with_cleanup::<()>(Err(primary.clone()), &report).unwrap_err();
+        assert_eq!(combined.primary(), primary);
+        assert!(combined.to_string().contains("stop outcome is uncertain"));
+        assert!(combined.to_string().contains("cleanup panicked"));
+        let durable = store.load::<OwnershipJournal>().unwrap().unwrap();
+        assert_eq!(durable.state, RunState::Blocked);
+        assert!(
+            durable
+                .resources
+                .iter()
+                .all(|resource| resource.state == ResourceState::Blocked)
+        );
+        let calls = docker.calls.borrow();
+        assert_eq!(calls.len(), 8, "no work resumes after the inspection panic");
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(kind, _, _)| kind == "stop-cohort")
+                .count(),
+            1
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|(kind, _, _)| kind != "scalar-stop" && kind != "remove")
+        );
     }
 
     #[test]
