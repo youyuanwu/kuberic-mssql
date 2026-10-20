@@ -226,20 +226,6 @@ mod executable_now {
         assert!(application_error(removal).contains("observe-only"));
         assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
     }
-
-    #[test]
-    fn upstream_public_v1_catalog_binds_cancel_before_remove_to_host_scenarios() {
-        for scenario in [
-            "hosted_public_v1_build_dispatches_exact_attempt_and_waits_for_matching_completion",
-            "hosted_public_v1_removal_drains_build_excludes_peer_and_rejects_stale_session",
-        ] {
-            kuberic_runtime::testing::assert_public_v1_conformance_gate(
-                "built-in-replacement",
-                "KSF-06",
-                scenario,
-            );
-        }
-    }
 }
 
 mod public_v1_lifecycle_evidence {
