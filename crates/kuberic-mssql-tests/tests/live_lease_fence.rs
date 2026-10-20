@@ -9,6 +9,7 @@ use std::{
 
 use futures::FutureExt;
 use kuberic_mssql::OpaqueId;
+use kuberic_mssql_tests::test_support::phase_timing::{Phase, Scenario, Session, phase};
 use kuberic_mssql_tests::three_replica::{
     AdminError, CancellationSignals, FixtureConfig, LaunchedMembers, LeaseObservation,
     launch_three_members,
@@ -61,6 +62,11 @@ async fn run_scenario(
     signals: &mut CancellationSignals,
     restart: bool,
 ) -> Result<(), TestError> {
+    let timing = Session::start(if restart {
+        Scenario::LeaseActiveRestart
+    } else {
+        Scenario::LeaseExpiry
+    })?;
     let config = FixtureConfig::for_test_fixture(root)?;
     let mut fixture = tokio::select! {
         result = launch_three_members(config) => result?,
@@ -75,7 +81,7 @@ async fn run_scenario(
         }
     }).catch_unwind().await;
     let cleanup = fixture.cleanup();
-    match (outcome, cleanup) {
+    let result = match (outcome, cleanup) {
         (Ok(Ok(())), Ok(_)) => Ok(()),
         (Ok(Err(error)), Ok(_)) => Err(error),
         (Ok(result), Err(cleanup)) => {
@@ -85,13 +91,20 @@ async fn run_scenario(
         (Err(_), Err(cleanup)) => {
             Err(format!("lease experiment panicked; cleanup failed: {cleanup}").into())
         }
+    };
+    if result.is_ok() {
+        timing.complete()?;
     }
+    result
 }
 
 async fn experiment(fixture: &mut LaunchedMembers, restart: bool) -> Result<(), TestError> {
+    let formation = phase(Phase::LeaseFormation);
     let (group, creation_ack) = fixture
         .provision_write_lease_group_for_test(CREATION_SECONDS)
         .await?;
+    formation.succeeded();
+    let baseline_timing = phase(Phase::LeaseBaseline);
     let index = usize::from(group.evidence.primary_ordinal - 1);
     let baseline = fixture.observe_write_lease_for_test(index).await?;
     if baseline.role != "PRIMARY"
@@ -104,11 +117,14 @@ async fn experiment(fixture: &mut LaunchedMembers, restart: bool) -> Result<(), 
         );
     }
     fixture.probe_lease_write_for_test(index).await?;
+    baseline_timing.succeeded();
+    let renewal = phase(Phase::LeaseRenewal);
     let submitted = Instant::now();
     fixture
         .renew_write_lease_for_test(index, RENEWAL_SECONDS)
         .await?;
     let acknowledged = Instant::now();
+    renewal.succeeded();
     eprintln!(
         "lease baseline={baseline:?}; creation_seconds={CREATION_SECONDS}; renewal_seconds={RENEWAL_SECONDS}"
     );
@@ -124,15 +140,20 @@ async fn experiment(fixture: &mut LaunchedMembers, restart: bool) -> Result<(), 
     if original_latest >= renewed_earliest {
         return Err("no defensible window for proving native renewal extension".into());
     }
+    let original_wait = phase(Phase::OriginalExpiryWait);
     tokio::time::sleep_until(tokio::time::Instant::from_std(original_latest)).await;
+    original_wait.succeeded();
+    let extension = phase(Phase::ExtensionWrite);
     fixture.probe_lease_write_for_test(index).await?;
     if Instant::now() >= renewed_earliest {
         return Err("renewal proof write missed the conservative renewed window".into());
     }
+    extension.succeeded();
     eprintln!("lease renewal proved by direct write beyond original latest expiry");
 
     let expiry_deadline =
         acknowledged + Duration::from_secs(u64::from(RENEWAL_SECONDS)) + Duration::from_secs(30);
+    let expiry_wait = phase(Phase::RenewedExpiryWait);
     loop {
         let observed = fixture.observe_write_lease_for_test(index).await?;
         if observed.group_id != baseline.group_id
@@ -149,6 +170,7 @@ async fn experiment(fixture: &mut LaunchedMembers, restart: bool) -> Result<(), 
             && observed.synchronized_databases == baseline.synchronized_databases
             && matches!(write, Err(AdminError::Sql(988)))
         {
+            expiry_wait.succeeded();
             return Ok(());
         }
         tokio::time::sleep(Duration::from_secs(2)).await;

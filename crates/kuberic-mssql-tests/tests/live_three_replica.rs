@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use kuberic_mssql::runtime_host::SeedDispatchPhase;
+use kuberic_mssql_tests::test_support::phase_timing::{
+    self, Attempt, Phase, Scenario, Session, phase,
+};
 use kuberic_mssql_tests::three_replica::{
     CLEANUP_BUDGET, CancellationSignals, CleanupClock, CleanupCoordinator, CombinedFixtureError,
     FixtureConfig, HandledCancellationSignal, JournalStore, LaunchedMembers,
@@ -46,11 +49,21 @@ fn three_replica_lifecycle_child() {
         Err(std::env::VarError::NotPresent) => return,
         Err(std::env::VarError::NotUnicode(_)) => panic!("invalid live SQL child mode"),
     };
+    if !matches!(
+        mode.as_str(),
+        "happy-path" | "same-root-restart" | "native-commit"
+    ) {
+        panic!("invalid live SQL child mode");
+    }
+    let timing = Session::child().expect("valid child timing context");
     match mode.as_str() {
         "happy-path" => run_three_replica_test(false),
         "same-root-restart" => run_three_replica_test(true),
         "native-commit" => run_native_experiment(NativeExperiment::CommitRecord),
         _ => panic!("invalid live SQL child mode"),
+    }
+    if let Some(timing) = timing {
+        timing.complete().expect("complete child timing report");
     }
 }
 
@@ -661,6 +674,13 @@ fn three_replica_sigkill_is_recovered_by_a_separate_process() {
 }
 
 fn exercise_signal_recovery(signal: i32, signal_name: &str) {
+    let timing = Session::start(match signal {
+        libc::SIGINT => Scenario::SigintRecovery,
+        libc::SIGTERM => Scenario::SigtermRecovery,
+        libc::SIGKILL => Scenario::SigkillRecovery,
+        _ => panic!("unsupported recovery signal"),
+    })
+    .expect("start signal timing");
     let root = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
     cleanup_three_replica_fixture(&root).expect("clean baseline before signal regression");
 
@@ -672,6 +692,7 @@ fn exercise_signal_recovery(signal: i32, signal_name: &str) {
         fs::remove_file(&ready).expect("remove stale signal-ready evidence");
     }
 
+    let interruption = phase(Phase::InterruptedLaunch);
     let mut interrupted = spawn_live_child(&root, Some(&ready));
     wait_until(Duration::from_secs(30), || ready.is_file())
         .expect("subprocess did not publish handler-ready evidence");
@@ -694,28 +715,34 @@ fn exercise_signal_recovery(signal: i32, signal_name: &str) {
         !status.success(),
         "{signal_name} must make the interrupted validation fail explicitly"
     );
+    interruption.succeeded();
 
     let journal = load_journal_if_present(&root).expect("recoverable ownership journal");
     assert!(
         journal.state == RunState::Removed || !journal.resources.is_empty(),
         "{signal_name} must leave explicit cleanup or recoverable ownership evidence"
     );
+    let separate_cleanup = phase(Phase::SeparateCleanup);
     let mut cleanup = spawn_cleanup_child(&root);
     assert!(
         wait_for_child(&mut cleanup, Duration::from_secs(240)).success(),
         "separate cleanup process after {signal_name}"
     );
     assert_removed(&root);
+    separate_cleanup.succeeded();
 
+    let recovery = phase(Phase::RecoveryRetry);
     let mut retry = spawn_live_child(&root, None);
     let retry_status = wait_for_child_with_cleanup(&mut retry, Duration::from_secs(1200), &root);
     assert!(
         retry_status.success(),
         "retry after {signal_name} must succeed"
     );
+    recovery.succeeded();
     cleanup_three_replica_fixture(&root).expect("idempotent cleanup after retry");
     assert_removed(&root);
     fs::remove_file(&ready).expect("remove signal-ready evidence");
+    timing.complete().expect("complete signal timing report");
 }
 
 mod three_replica_post_ag_and_report_fault_checkpoints_recover {
@@ -747,12 +774,15 @@ mod three_replica_post_ag_and_report_fault_checkpoints_recover {
 }
 
 fn exercise_fault_checkpoint(checkpoint: &str, index: usize, retry: bool) {
+    let timing = retry
+        .then(|| Session::start(Scenario::RestartCheckpoint).expect("start checkpoint timing"));
     let base = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
     fs::create_dir_all(&base).expect("create fault-checkpoint namespace");
     let root = base.join(checkpoint);
     cleanup_three_replica_fixture(&root).expect("clean fault-checkpoint baseline");
     let receipt = root.join(format!(".fault-hit-{}-{index}", std::process::id()));
     assert!(!receipt.exists(), "checkpoint evidence must be fresh");
+    let fault_journey = phase(Phase::FaultJourney);
     let mut child = spawn_live_child_with_fault(&root, checkpoint, &receipt);
     let status = wait_for_child_with_cleanup(&mut child, Duration::from_secs(1200), &root);
     assert!(!status.success(), "{checkpoint} must fail explicitly");
@@ -761,20 +791,30 @@ fn exercise_fault_checkpoint(checkpoint: &str, index: usize, retry: bool) {
         checkpoint,
     );
     fs::remove_file(receipt).expect("remove owned checkpoint receipt");
+    fault_journey.succeeded();
+    let separate_cleanup = phase(Phase::SeparateCleanup);
     let mut cleanup = spawn_cleanup_child(&root);
     assert!(
         wait_for_child(&mut cleanup, Duration::from_secs(240)).success(),
         "cleanup process after {checkpoint}"
     );
     assert_removed(&root);
+    separate_cleanup.succeeded();
     if retry {
+        let recovery = phase(Phase::RecoveryRetry);
         let mut child = spawn_restart_child(&root);
         assert!(
             wait_for_child_with_cleanup(&mut child, Duration::from_secs(1200), &root).success(),
             "retry after fault checkpoint"
         );
+        recovery.succeeded();
         cleanup_three_replica_fixture(&root).expect("cleanup after fault-checkpoint retry");
         assert_removed(&root);
+    }
+    if let Some(timing) = timing {
+        timing
+            .complete()
+            .expect("complete checkpoint timing report");
     }
 }
 
@@ -1192,17 +1232,23 @@ async fn execute_phase2_bootstrap_lifecycle(
             if fault_checkpoint("fail-during-report") {
                 return Err::<(), TestError>("injected failure during bracketed reporting".into());
             }
+            let reports = phase(Phase::Reports);
             let sequence = group.bootstrap_configuration_sequence().await?;
             wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout())
                 .await?;
+            reports.succeeded();
+            let build = phase(Phase::Build);
             let pending = exercise_public_build_retirement_and_supersession(&group).await?;
+            let convergence = phase(Phase::NativeConvergence);
             let topology = launched
                 .finalize_prepared_availability_group(&prepared)
                 .await?;
+            convergence.succeeded();
             exercise_dispatched_build_lifecycle_commands(&group, pending).await?;
             if group.testing_seed_dispatch_count()? != 1 {
                 return Err("final replacement did not dispatch exactly one ADD DATABASE".into());
             }
+            let marker_timing = phase(Phase::Marker);
             let marker = launched
                 .commit_replicated_marker(&topology.evidence)
                 .await?;
@@ -1213,6 +1259,7 @@ async fn execute_phase2_bootstrap_lifecycle(
                     "build-owned seeding marker was not readable from all exact members".into(),
                 );
             }
+            marker_timing.succeeded();
             let peer = group.target_build_command(
                 2,
                 "native-only-seed-build-target-3",
@@ -1224,6 +1271,7 @@ async fn execute_phase2_bootstrap_lifecycle(
                     format!("native-only peer target build failed: {error}").into(),
                 );
             }
+            build.succeeded();
             Ok(())
         })
         .catch_unwind();
@@ -1662,8 +1710,11 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
         )
     });
     let first_sessions = first.pods.each_ref().map(|pod| pod.session.clone());
+    let reports = phase(Phase::Reports);
     let first_sequence = first.bootstrap_configuration_sequence().await?;
     wait_for_exact_reports(&first, first_sequence, convergence).await?;
+    reports.succeeded();
+    let build = phase(Phase::Build);
     let interrupted_build = first.target_build_command(
         1,
         "restart-dispatched-build-2",
@@ -1721,6 +1772,7 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
     ) {
         return Err("host abort made dispatched seed authority releasable".into());
     }
+    build.succeeded();
     first.shutdown_with_coordinator(&first_cleanup).await?;
     match interrupted.await {
         Ok(Err(_)) => {}
@@ -1797,6 +1849,7 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
             &cleanup,
         );
     }
+    let replacement_build = phase(Phase::Build);
     if replacement.testing_seed_dispatch_record()?.is_some() {
         let builds = [
             replacement.target_build_command(
@@ -1823,6 +1876,8 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
     if replacement.testing_seed_dispatch_record()?.is_some() {
         return Err("replacement host did not compact the dispatched seed record".into());
     }
+    replacement_build.succeeded();
+    let marker_timing = phase(Phase::Marker);
     let verified_marker = launched.verify_replicated_marker(&marker).await?;
     if verified_marker != marker
         || verified_marker.primary_ordinal != topology.evidence.primary_ordinal
@@ -1830,6 +1885,7 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
     {
         return Err("exact pre-restart marker changed after dispatched replacement".into());
     }
+    marker_timing.succeeded();
     replacement
         .shutdown_with_coordinator(&replacement_cleanup)
         .await?;
@@ -1928,10 +1984,15 @@ async fn exercise_seed_submission_fault(
     fault: PublicMutationFault,
     label: &str,
 ) -> Result<(), TestError> {
+    let timing = matches!(fault, PublicMutationFault::SeedAcceptedReplyLost)
+        .then(|| Session::start(Scenario::AcceptedReplyLost))
+        .transpose()?;
     cleanup_three_replica_fixture(root)?;
     let config = FixtureConfig::for_test_fixture(root)?;
     let mut launched = launch_three_members(config).await?;
+    let preparation = phase(Phase::PeerPreparation);
     let prepared = launched.prepare_availability_group().await?;
+    preparation.succeeded();
     let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
     let group = start_prepared_public_group_with_retry(
         root,
@@ -1943,8 +2004,10 @@ async fn exercise_seed_submission_fault(
         &cleanup,
     )
     .await?;
+    let reports = phase(Phase::Reports);
     let sequence = group.bootstrap_configuration_sequence().await?;
     wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout()).await?;
+    reports.succeeded();
     let command =
         group.target_build_command(1, format!("{label}-build"), format!("{label}-build"))?;
     group
@@ -1953,6 +2016,7 @@ async fn exercise_seed_submission_fault(
         .map_err(|error| format!("{label} target authority admission failed: {error}"))?;
 
     group.testing_arm_mutation_fault(fault);
+    let build = phase(Phase::Build);
     let first = group.testing_execute_admitted_seed_callback(&command).await;
     if group.testing_mutation_fault_hits() != 1 {
         return Err(format!(
@@ -1968,10 +2032,13 @@ async fn exercise_seed_submission_fault(
     group
         .testing_assert_source_build_success_not_published(&command)
         .await?;
+    build.succeeded();
+    let retry = phase(Phase::SeedRetry);
     group
         .testing_execute_admitted_seed_callback_with_retry(&command)
         .await
         .map_err(|error| format!("{label} safe callback retry failed: {error}"))?;
+    retry.succeeded();
     if group.testing_seed_dispatch_record()?.is_some() {
         return Err(format!("{label} retained resolved dispatch ambiguity").into());
     }
@@ -1992,9 +2059,11 @@ async fn exercise_seed_submission_fault(
         _ => {}
     }
 
+    let convergence = phase(Phase::NativeConvergence);
     let topology = launched
         .finalize_prepared_availability_group(&prepared)
         .await?;
+    convergence.succeeded();
     let peer = group.target_build_command(2, format!("{label}-peer"), format!("{label}-peer"))?;
     group
         .testing_admit_target_build_authority_only(&peer)
@@ -2004,12 +2073,14 @@ async fn exercise_seed_submission_fault(
         .testing_execute_admitted_seed_callback_with_retry(&peer)
         .await
         .map_err(|error| format!("{label} peer callback failed: {error}"))?;
+    let marker_timing = phase(Phase::Marker);
     let marker = launched
         .commit_replicated_marker(&topology.evidence)
         .await?;
     if marker.readable_ordinals != [1, 2, 3] {
         return Err(format!("{label} did not converge the exact seeded topology").into());
     }
+    marker_timing.succeeded();
     group.shutdown_with_coordinator(&cleanup).await?;
     let evidence = launched.cleanup_with_coordinator(&cleanup)?;
     if evidence.removed_container_ids.len() != 3 || evidence.removed_network_id.is_empty() {
@@ -2018,6 +2089,9 @@ async fn exercise_seed_submission_fault(
     assert_removed(root);
     cleanup_three_replica_fixture(root)?;
     assert_removed(root);
+    if let Some(timing) = timing {
+        timing.complete()?;
+    }
     Ok(())
 }
 
@@ -2573,6 +2647,10 @@ async fn exercise_target_host_evidence_fault(
     window: TargetEvidenceWindow,
     fault: TargetEvidenceFault,
 ) -> Result<(), TestError> {
+    let timing = (matches!(window, TargetEvidenceWindow::PreAssociation)
+        && matches!(fault, TargetEvidenceFault::SqlProcessRestart))
+    .then(|| Session::start(Scenario::TargetSqlRestart))
+    .transpose()?;
     if matches!(fault, TargetEvidenceFault::LineageMismatch)
         && !matches!(window, TargetEvidenceWindow::PostNativePreReply)
     {
@@ -2583,7 +2661,9 @@ async fn exercise_target_host_evidence_fault(
     cleanup_three_replica_fixture(&root)?;
     let config = FixtureConfig::for_test_fixture(&root)?;
     let mut launched = launch_three_members(config).await?;
+    let preparation = phase(Phase::PeerPreparation);
     let prepared = launched.prepare_availability_group().await?;
+    preparation.succeeded();
     let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
     let group = start_prepared_public_group_with_retry(
         &root,
@@ -2607,8 +2687,10 @@ async fn exercise_target_host_evidence_fault(
     };
     let mut callback_owner = None;
     let outcome: Result<(), TestError> = async {
+        let reports = phase(Phase::Reports);
         let sequence = group.bootstrap_configuration_sequence().await?;
         wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout()).await?;
+        reports.succeeded();
         let command = group.target_build_command(
             1,
             format!("target-evidence-{label}"),
@@ -2675,7 +2757,10 @@ async fn exercise_target_host_evidence_fault(
         match fault {
             TargetEvidenceFault::SqlProcessRestart => {
                 let frozen = group.testing_frozen_secondary_start_identity()?;
+                let restart = phase(Phase::SqlRestart);
                 let host_port = launched.restart_sql_process_for_test(1)?;
+                restart.succeeded();
+                let fresh_sql = phase(Phase::FreshSql);
                 let fresh = group
                     .testing_wait_for_fresh_secondary_observation(
                         &frozen,
@@ -2683,6 +2768,7 @@ async fn exercise_target_host_evidence_fault(
                         launched.kuberic_convergence_timeout(),
                     )
                     .await?;
+                fresh_sql.succeeded();
                 if fresh.instance.sqlserver_start_time == frozen {
                     return Err(
                         format!("{label} did not replace the target SQL start identity").into(),
@@ -2694,6 +2780,7 @@ async fn exercise_target_host_evidence_fault(
                 group.testing_inject_target_lineage_mismatch()?;
             }
         }
+        let rejection = phase(Phase::CallbackRejection);
         release_tx
             .send(())
             .map_err(|_| format!("{label} checkpoint was not retained"))?;
@@ -2738,6 +2825,7 @@ async fn exercise_target_host_evidence_fault(
                 .testing_assert_source_build_success_not_published(&command)
                 .await?;
         }
+        rejection.succeeded();
         Ok(())
     }
     .await;
@@ -2772,6 +2860,9 @@ async fn exercise_target_host_evidence_fault(
     assert_removed(&root);
     cleanup_three_replica_fixture(&root)?;
     assert_removed(&root);
+    if let Some(timing) = timing {
+        timing.complete()?;
+    }
     Ok(())
 }
 
@@ -3270,6 +3361,16 @@ fn test_child_command(
     if let Some(checkpoint) = checkpoint {
         command.env("KUBERIC_MSSQL_FAULT_CHECKPOINT", checkpoint);
     }
+    phase_timing::child_context(
+        &mut command,
+        if checkpoint.is_some() {
+            Attempt::FaultChild
+        } else if ready.is_some() {
+            Attempt::InterruptedChild
+        } else {
+            Attempt::RetryChild
+        },
+    );
     command
 }
 

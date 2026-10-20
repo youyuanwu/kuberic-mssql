@@ -587,7 +587,8 @@ names = ['SQLSERVER_TEST_EULA_ACCEPTED', 'KUBERIC_MSSQL_CONFIGURATION_FAULT_FILT
 'KUBERIC_MSSQL_ONE_REPLICA_CHILD_MODE', 'KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE',
 'SQLSERVER_ONE_REPLICA_FAULT', 'KUBERIC_MSSQL_FAULT_CHECKPOINT',
 'KUBERIC_MSSQL_FAULT_HIT_FILE', 'KUBERIC_MSSQL_SIGNAL_READY_FILE',
-'KUBERIC_MSSQL_LEGACY_PROVISIONED_RESTART']
+'KUBERIC_MSSQL_LEGACY_PROVISIONED_RESTART',
+'KUBERIC_MSSQL_PHASE_TIMING_SCENARIO', 'KUBERIC_MSSQL_PHASE_TIMING_ATTEMPT']
 print(json.dumps({'seams': {name: os.getenv(name) for name in names},
 'arguments': sys.argv[1:], 'one': os.environ['SQLSERVER_ONE_REPLICA_ROOT'],
 'three': os.environ['KUBERIC_MSSQL_THREE_REPLICA_ROOT'],
@@ -609,6 +610,8 @@ print(json.dumps({'seams': {name: os.getenv(name) for name in names},
         "KUBERIC_MSSQL_FAULT_HIT_FILE",
         "KUBERIC_MSSQL_SIGNAL_READY_FILE",
         "KUBERIC_MSSQL_LEGACY_PROVISIONED_RESTART",
+        "KUBERIC_MSSQL_PHASE_TIMING_SCENARIO",
+        "KUBERIC_MSSQL_PHASE_TIMING_ATTEMPT",
     ] {
         command.env(name, "must-be-cleared");
     }
@@ -647,6 +650,77 @@ print(json.dumps({'seams': {name: os.getenv(name) for name in names},
             0,
             "new fixture family roots must remain private",
         );
+    }
+}
+
+#[test]
+fn live_timing_collector_failure_preserves_primary_status_and_hides_content() {
+    let (directory, script) = nextest_cleanup_test_environment();
+    let probe = r#"import os, pathlib, sys
+root = pathlib.Path(os.environ['KUBERIC_MSSQL_PHASE_TIMING_DIR'])
+(root / '.required-123-0').touch(mode=0o600)
+report = root / '123-0.json'
+report.touch(mode=0o600)
+report.write_text('{"private": "PRIVATE_SENTINEL"}')
+sys.exit(int(sys.argv[1]))"#;
+    for status in [0, 77] {
+        let output = std::process::Command::new("bash")
+            .arg(script.parent().unwrap().join("run_live_nextest.sh"))
+            .arg(directory.path().join(format!("runner-{status}")))
+            .args(["python3", "-c", probe, &status.to_string()])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if status == 0 { 1 } else { status })
+        );
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("MSSQL_PHASE_REPORT_ERROR"));
+        assert!(!error.contains("PRIVATE_SENTINEL"));
+    }
+}
+
+#[test]
+fn live_timing_runner_forwards_signals_and_joins_before_reporting() {
+    use std::time::{Duration, Instant};
+    let (directory, script) = nextest_cleanup_test_environment();
+    let probe = r#"import pathlib, signal, sys
+ready, receipt = map(pathlib.Path, sys.argv[1:3])
+def stop(number, frame):
+    receipt.write_text(str(number))
+    sys.exit(42)
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+ready.touch()
+while True:
+    signal.pause()"#;
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let ready = directory.path().join(format!("ready-{signal}"));
+        let receipt = directory.path().join(format!("receipt-{signal}"));
+        let mut child = std::process::Command::new("bash")
+            .arg(script.parent().unwrap().join("run_live_nextest.sh"))
+            .arg(directory.path().join(format!("runner-{signal}")))
+            .args(["python3", "-c", probe])
+            .arg(&ready)
+            .arg(&receipt)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !ready.exists() {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!("signal probe was not ready: {:?}", output.status);
+        }
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(42));
+        assert_eq!(fs::read_to_string(receipt).unwrap(), signal.to_string());
     }
 }
 

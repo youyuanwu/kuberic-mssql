@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::test_support::phase_timing::{Phase, phase};
 use async_trait::async_trait;
 use futures::future::join_all;
 use kuberic_mssql::instance::SqlServerInstanceManager;
@@ -1313,6 +1314,7 @@ impl PublicMssqlGroup {
             faults,
             operation_namespace,
         } = options;
+        let timing = phase(Phase::PublicAssembly);
         check_deadline(complete_deadline, "public Kuberic assembly")?;
         if operation_namespace.is_empty()
             || operation_namespace.chars().any(char::is_control)
@@ -1552,7 +1554,9 @@ impl PublicMssqlGroup {
                 true
             };
             await_started_hosts(pods, attempts, operation_timeout).await?;
+            let stabilization = phase(Phase::HostStabilization);
             tokio::time::sleep(Duration::from_secs(5)).await;
+            stabilization.succeeded();
             let (sessions, inputs) = ensure_configuration(
                 pods,
                 &resource_uid,
@@ -1586,6 +1590,7 @@ impl PublicMssqlGroup {
             let shutdown = cancel_attempts(attempts, pods, cleanup).await;
             return Err(startup_failure(error, shutdown));
         }
+        timing.succeeded();
         Ok(Self {
             resource_uid,
             effective_policy,
@@ -2406,6 +2411,7 @@ impl PublicMssqlGroup {
         self,
         cleanup: &CleanupCoordinator<impl CleanupClock>,
     ) -> Result<(), MssqlGroupError> {
+        let timing = phase(Phase::HostDrain);
         let mut owner = StartupHosts::new(self.pods);
         let pods = owner.pods.as_mut().expect("shutdown owns the three pods");
         for pod in pods.iter() {
@@ -2429,13 +2435,15 @@ impl PublicMssqlGroup {
                 }
             }
         }
-        if errors.is_empty() {
+        let result = if errors.is_empty() {
             Ok(())
         } else {
             Err(MssqlGroupError::termination_unconfirmed(format!(
                 "public Kuberic shutdown failed: {errors:?}"
             )))
-        }
+        };
+        timing.result(&result);
+        result
     }
 }
 

@@ -7,6 +7,7 @@ if [[ $# -lt 2 || -z "$1" ]]; then
 fi
 root="$(realpath -m "$1")"
 shift
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -m 700 -p "$root"
 for family in one-replica three-replica lease-fence; do
   if [[ -L "$root/$family" || ( -e "$root/$family" && ! -d "$root/$family" ) ]]; then
@@ -15,7 +16,8 @@ for family in one-replica three-replica lease-fence; do
   fi
   mkdir -m 700 -p "$root/$family"
 done
-exec env -u SQLSERVER_TEST_EULA_ACCEPTED \
+timing_root="$(mktemp -d "$root/.phase-timings.XXXXXX")"
+env -u SQLSERVER_TEST_EULA_ACCEPTED \
   -u KUBERIC_MSSQL_CONFIGURATION_FAULT_FILTER \
   -u KUBERIC_MSSQL_SEED_FAULT_FILTER \
   -u KUBERIC_MSSQL_CONFLICT_FILTER \
@@ -26,8 +28,48 @@ exec env -u SQLSERVER_TEST_EULA_ACCEPTED \
   -u KUBERIC_MSSQL_FAULT_HIT_FILE \
   -u KUBERIC_MSSQL_SIGNAL_READY_FILE \
   -u KUBERIC_MSSQL_LEGACY_PROVISIONED_RESTART \
+  -u KUBERIC_MSSQL_PHASE_TIMING_SCENARIO \
+  -u KUBERIC_MSSQL_PHASE_TIMING_ATTEMPT \
   SQLSERVER_ONE_REPLICA_ROOT="$root/one-replica" \
   KUBERIC_MSSQL_THREE_REPLICA_ROOT="$root/three-replica" \
   KUBERIC_MSSQL_LEASE_FENCE_ROOT="$root/lease-fence" \
+  KUBERIC_MSSQL_PHASE_TIMING_DIR="$timing_root" \
   CARGO_BUILD_JOBS=1 \
-  "$@" --profile live --run-ignored only --test-threads=1
+  "$@" --profile live --run-ignored only --test-threads=1 &
+child=$!
+cancelled=0
+forward_signal() {
+  cancelled="$1"
+  if kill -0 "$child" 2>/dev/null; then
+    kill "-$2" "$child" || echo "failed to forward live runner cancellation" >&2
+  fi
+}
+trap 'forward_signal 130 INT' INT
+trap 'forward_signal 143 TERM' TERM
+status=0
+while true; do
+  wait "$child" && status=0 || status=$?
+  if ! kill -0 "$child" 2>/dev/null; then
+    break
+  fi
+done
+if [[ "$cancelled" -ne 0 ]]; then
+  wait "$child" && status=0 || status=$?
+fi
+trap - INT TERM
+if [[ "$status" -eq 0 && "$cancelled" -ne 0 ]]; then
+  status="$cancelled"
+fi
+collector_flags=()
+if [[ "$status" -ne 0 ]]; then
+  collector_flags+=(--failed)
+fi
+if python3 "$script_dir/collect_phase_timings.py" "$timing_root" "${collector_flags[@]}"; then
+  exit "$status"
+else
+  collector_status=$?
+  if [[ "$status" -ne 0 ]]; then
+    exit "$status"
+  fi
+  exit "$collector_status"
+fi

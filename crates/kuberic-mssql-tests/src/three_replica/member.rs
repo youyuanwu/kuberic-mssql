@@ -9,6 +9,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
+use crate::test_support::phase_timing::{Phase, phase};
 use kuberic_mssql::runtime_config::ObserverConfig;
 
 use super::availability_group::{
@@ -261,14 +262,20 @@ impl LaunchedMembers {
     }
 
     pub fn cleanup(mut self) -> Result<CleanupEvidence, CombinedFixtureError> {
-        self.context.cleanup_exact()
+        let timing = phase(Phase::Cleanup);
+        let result = self.context.cleanup_exact();
+        timing.result(&result);
+        result
     }
 
     pub fn cleanup_with_coordinator<C: CleanupClock + Clone>(
         mut self,
         coordinator: &CleanupCoordinator<C>,
     ) -> Result<CleanupEvidence, CombinedFixtureError> {
-        self.context.cleanup_exact_with_coordinator(coordinator)
+        let timing = phase(Phase::Cleanup);
+        let result = self.context.cleanup_exact_with_coordinator(coordinator);
+        timing.result(&result);
+        result
     }
 
     pub fn block_cleanup(&mut self) -> Result<(), NativeLaunchError> {
@@ -616,9 +623,10 @@ impl std::error::Error for NativePhaseError {
 pub async fn launch_three_members(
     config: FixtureConfig,
 ) -> Result<LaunchedMembers, CombinedFixtureError> {
+    let timing = phase(Phase::FixtureLaunch);
     let mut context = LaunchContext::prepare(config)
         .map_err(|error| CombinedFixtureError::new(error.sanitized(), Vec::new()))?;
-    match context.launch().await {
+    let result = match context.launch().await {
         Ok((run, network_id, members)) => Ok(LaunchedMembers {
             context,
             run,
@@ -629,7 +637,9 @@ pub async fn launch_three_members(
             let report = context.cleanup_report();
             combine_with_cleanup::<()>(Err(primary.sanitized()), &report).map(|_| unreachable!())
         }
-    }
+    };
+    timing.result(&result);
+    result
 }
 
 pub fn cleanup_three_replica_fixture(root: &Path) -> Result<CleanupEvidence, CombinedFixtureError> {
@@ -1108,6 +1118,7 @@ impl LaunchContext {
         let runner = BoundedProcessRunner;
         let docker = DockerCli::new(runner);
         let deadline = Instant::now() + config.deadlines().complete_run;
+        let timing = phase(Phase::Preflight);
         let preflight = run_preflight_with_deadline(
             &config,
             &LocalHostProbe,
@@ -1116,6 +1127,7 @@ impl LaunchContext {
             deadline,
         )
         .map_err(NativeLaunchError::Preflight)?;
+        timing.succeeded();
         let run = topology_run(store.root())?;
         let journal = store
             .create::<OwnershipJournal, _>(run)
@@ -1142,6 +1154,7 @@ impl LaunchContext {
         &mut self,
     ) -> Result<(TopologyRun, String, [ReadyMember; 3]), NativeLaunchError> {
         let run = self.journal.run.clone();
+        let assets = phase(Phase::Assets);
         self.prepare_member_directories(&run)?;
         let credentials = self.generate_credentials(&run)?;
         let hostnames = std::array::from_fn(|index| run.members[index].server_name.as_str());
@@ -1165,6 +1178,8 @@ impl LaunchContext {
         )
         .map_err(NativeLaunchError::Tls)?;
         self.write_sql_configuration(&run)?;
+        assets.succeeded();
+        let creation = phase(Phase::ContainerCreation);
         let network_name = format!("km-three-{}", run.run_id);
         let network_request = NetworkRequest {
             name: network_name.clone(),
@@ -1273,6 +1288,8 @@ impl LaunchContext {
                 .map_err(|_| NativeLaunchError::Journal)?;
         }
         self.verify_network_attachments(false)?;
+        creation.succeeded();
+        let starts = phase(Phase::ContainerStart);
         for index in 0..self.containers.len() {
             self.verify_container_directory(index)?;
             let id = self.containers[index]
@@ -1290,10 +1307,12 @@ impl LaunchContext {
             self.containers[index].frozen_running_inspection = Some(inspection);
         }
         self.verify_network_attachments(true)?;
+        starts.succeeded();
 
         let mut ready = Vec::with_capacity(3);
         let mut incarnations = Vec::with_capacity(3);
         for index in 0..3 {
+            let timing = phase([Phase::MemberOne, Phase::MemberTwo, Phase::MemberThree][index]);
             let id = self.containers[index]
                 .id
                 .as_deref()
@@ -1318,6 +1337,7 @@ impl LaunchContext {
             let evidence = self
                 .initialize_member(index, port, &run, &credentials, &tls)
                 .await?;
+            timing.succeeded();
             evidence
                 .verify(&run.members[index].server_name)
                 .map_err(NativeLaunchError::Admin)?;
