@@ -35,6 +35,8 @@ const FAULT_HIT_ENV: &str = "KUBERIC_MSSQL_FAULT_HIT_FILE";
 
 #[path = "live_three_replica/hosted_witness.rs"]
 mod hosted_witness;
+#[path = "live_three_replica/terminal.rs"]
+mod terminal;
 
 struct PendingSeedCompaction {
     command: PublicBuildCommand,
@@ -56,14 +58,36 @@ fn three_replica_lifecycle_child() {
         panic!("invalid live SQL child mode");
     }
     let timing = Session::child().expect("valid child timing context");
-    match mode.as_str() {
+    terminal::install().expect("valid terminal child context");
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| match mode.as_str() {
         "happy-path" => run_three_replica_test(false),
         "same-root-restart" => run_three_replica_test(true),
         "native-commit" => run_native_experiment(NativeExperiment::CommitRecord),
         _ => panic!("invalid live SQL child mode"),
-    }
-    if let Some(timing) = timing {
-        timing.complete().expect("complete child timing report");
+    }));
+    match outcome {
+        Ok(()) => {
+            if let Some(timing) = timing {
+                timing.complete().expect("complete child timing report");
+            }
+        }
+        Err(panic) => {
+            if terminal::is_ready() {
+                let finalized = timing.map(Session::complete_failure).transpose();
+                match finalized {
+                    Ok(_) => match terminal::publish_ready() {
+                        Ok(()) => std::process::exit(terminal::EXPECTED_EXIT),
+                        Err(error) => {
+                            eprintln!("terminal child evidence failed after teardown: {error}");
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("terminal child timing failed after teardown: {error}");
+                    }
+                }
+            }
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 
@@ -692,8 +716,18 @@ fn exercise_signal_recovery(signal: i32, signal_name: &str) {
         fs::remove_file(&ready).expect("remove stale signal-ready evidence");
     }
 
+    let terminal = (signal != libc::SIGKILL)
+        .then(|| terminal::Attempt::new(root.parent().expect("fixture parent")))
+        .transpose()
+        .expect("fresh signal terminal attempt");
     let interruption = phase(Phase::InterruptedLaunch);
-    let mut interrupted = spawn_live_child(&root, Some(&ready));
+    let mut command = test_child_command(&root, "happy-path", Some(&ready), None);
+    if let Some(terminal) = &terminal {
+        terminal
+            .configure(&mut command)
+            .expect("configure signal terminal attempt");
+    }
+    let mut interrupted = command.spawn().expect("spawn exact interrupted child");
     wait_until(Duration::from_secs(30), || ready.is_file())
         .expect("subprocess did not publish handler-ready evidence");
     wait_until(Duration::from_secs(180), || {
@@ -708,34 +742,52 @@ fn exercise_signal_recovery(signal: i32, signal_name: &str) {
     })
     .expect("subprocess never entered a journaled owned-resource phase");
 
+    let run = load_journal_if_present(&root)
+        .expect("journaled interrupted run")
+        .run
+        .run_id;
     let signal_result = unsafe { libc::kill(interrupted.id() as i32, signal) };
     assert_eq!(signal_result, 0, "send {signal_name} to live subprocess");
     let status = wait_for_child_with_cleanup(&mut interrupted, Duration::from_secs(240), &root);
-    assert!(
-        !status.success(),
-        "{signal_name} must make the interrupted validation fail explicitly"
-    );
-    interruption.succeeded();
-
-    let journal = load_journal_if_present(&root).expect("recoverable ownership journal");
-    assert!(
-        journal.state == RunState::Removed || !journal.resources.is_empty(),
-        "{signal_name} must leave explicit cleanup or recoverable ownership evidence"
-    );
+    let journal = load_journal_if_present(&root);
+    let recoverable = journal
+        .as_ref()
+        .is_some_and(|journal| journal.state == RunState::Removed || !journal.resources.is_empty());
+    let classification = if let Some(terminal) = &terminal {
+        let cause = terminal::Cause::Signal {
+            signal: if signal == libc::SIGINT {
+                terminal::Signal::Interrupt
+            } else {
+                terminal::Signal::Terminate
+            },
+        };
+        terminal.verify(status, interrupted.id(), &run, cause)
+    } else {
+        status.killed()
+    };
     let separate_cleanup = phase(Phase::SeparateCleanup);
     let mut cleanup = spawn_cleanup_child(&root);
     assert!(
         wait_for_child(&mut cleanup, Duration::from_secs(240)).success(),
-        "separate cleanup process after {signal_name}"
+        "separate cleanup process after {signal_name}; child classification: {classification:?}"
     );
     assert_removed(&root);
     separate_cleanup.succeeded();
+    assert!(
+        recoverable,
+        "{signal_name} must leave recoverable ownership evidence"
+    );
+    classification.expect("actual expected signal outcome without timeout or teardown failure");
+    interruption.succeeded();
 
     let recovery = phase(Phase::RecoveryRetry);
     let mut retry = spawn_live_child(&root, None);
     let retry_status = wait_for_child_with_cleanup(&mut retry, Duration::from_secs(1200), &root);
     assert!(
-        retry_status.success(),
+        retry_status
+            .observed()
+            .expect("retry must exit without timeout escalation")
+            .success(),
         "retry after {signal_name} must succeed"
     );
     recovery.succeeded();
@@ -782,29 +834,49 @@ fn exercise_fault_checkpoint(checkpoint: &str, index: usize, retry: bool) {
     cleanup_three_replica_fixture(&root).expect("clean fault-checkpoint baseline");
     let receipt = root.join(format!(".fault-hit-{}-{index}", std::process::id()));
     assert!(!receipt.exists(), "checkpoint evidence must be fresh");
+    let terminal = terminal::Attempt::new(&base).expect("fresh checkpoint terminal attempt");
     let fault_journey = phase(Phase::FaultJourney);
-    let mut child = spawn_live_child_with_fault(&root, checkpoint, &receipt);
+    let mut child = spawn_live_child_with_fault(&root, checkpoint, &receipt, &terminal);
     let status = wait_for_child_with_cleanup(&mut child, Duration::from_secs(1200), &root);
-    assert!(!status.success(), "{checkpoint} must fail explicitly");
-    assert_eq!(
-        fs::read_to_string(&receipt).expect("child must reach the requested checkpoint"),
-        checkpoint,
-    );
-    fs::remove_file(receipt).expect("remove owned checkpoint receipt");
-    fault_journey.succeeded();
+    let hit = fs::read_to_string(&receipt);
+    let run = load_journal_if_present(&root).map(|journal| journal.run.run_id);
+    let classification = run
+        .as_deref()
+        .ok_or("checkpoint run journal missing")
+        .and_then(|run| {
+            terminal.verify(
+                status,
+                child.id(),
+                run,
+                terminal::Cause::Checkpoint {
+                    checkpoint: terminal::Checkpoint::from_label(checkpoint)
+                        .expect("known checkpoint"),
+                },
+            )
+        });
     let separate_cleanup = phase(Phase::SeparateCleanup);
     let mut cleanup = spawn_cleanup_child(&root);
     assert!(
         wait_for_child(&mut cleanup, Duration::from_secs(240)).success(),
-        "cleanup process after {checkpoint}"
+        "cleanup process after {checkpoint}; child classification: {classification:?}"
     );
     assert_removed(&root);
     separate_cleanup.succeeded();
+    assert_eq!(
+        hit.expect("child must reach the requested checkpoint"),
+        checkpoint
+    );
+    fs::remove_file(receipt).expect("remove owned checkpoint receipt");
+    classification.expect("actual controlled checkpoint with error-free terminal teardown");
+    fault_journey.succeeded();
     if retry {
         let recovery = phase(Phase::RecoveryRetry);
         let mut child = spawn_restart_child(&root);
         assert!(
-            wait_for_child_with_cleanup(&mut child, Duration::from_secs(1200), &root).success(),
+            wait_for_child_with_cleanup(&mut child, Duration::from_secs(1200), &root)
+                .observed()
+                .expect("checkpoint retry must not time out")
+                .success(),
             "retry after fault checkpoint"
         );
         recovery.succeeded();
@@ -942,7 +1014,16 @@ async fn execute_live_lifecycle(
     }
     let topology = launched.provision_availability_group().await?;
     if fault_checkpoint("fail-after-ag") {
-        return Err("injected failure after AG provisioning".into());
+        let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+        return finish_runtime_outcome(
+            root,
+            launched,
+            RuntimeOutcome::Completed(Ok(Err(terminal::injected(
+                terminal::Checkpoint::FailAfterAg,
+                "injected failure after AG provisioning",
+            )))),
+            &cleanup,
+        );
     }
     let native_binding = launched
         .journal()
@@ -1009,12 +1090,17 @@ async fn execute_live_lifecycle(
     });
     let first_sessions = group.pods.each_ref().map(|pod| pod.session.clone());
     let first_outcome = {
+        let injected_panic = std::sync::atomic::AtomicBool::new(false);
         let runtime = AssertUnwindSafe(async {
             if fault_checkpoint("panic-after-agent-start") {
+                injected_panic.store(true, std::sync::atomic::Ordering::Relaxed);
                 panic!("injected panic after agent startup");
             }
             if fault_checkpoint("fail-during-report") {
-                return Err::<(), TestError>("injected failure during bracketed reporting".into());
+                return Err::<(), TestError>(terminal::injected(
+                    terminal::Checkpoint::FailDuringReport,
+                    "injected failure during bracketed reporting",
+                ));
             }
             wait_for_exact_reports(
                 &group,
@@ -1033,6 +1119,12 @@ async fn execute_live_lifecycle(
             Ok(())
         })
         .catch_unwind();
+        let runtime = runtime.map(|result| {
+            terminal::tag_panic(
+                result,
+                injected_panic.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        });
         tokio::pin!(runtime);
         tokio::select! {
             result = &mut runtime => RuntimeOutcome::Completed(result),
@@ -1126,7 +1218,10 @@ async fn execute_live_lifecycle(
                 .assert_superseded_sessions_rejected(&first_sessions)
                 .await?;
             if fault_checkpoint("fail-after-agent-restart") {
-                return Err("injected failure after replacement agent startup".into());
+                return Err(terminal::injected(
+                    terminal::Checkpoint::FailAfterAgentRestart,
+                    "injected failure after replacement agent startup",
+                ));
             }
             wait_for_exact_reports(
                 &restarted,
@@ -1178,7 +1273,16 @@ async fn execute_phase2_bootstrap_lifecycle(
         return Err("prepared fixture unexpectedly claimed a native topology binding".into());
     }
     if fault_checkpoint("fail-after-ag") {
-        return Err("injected failure after endpoint and peer preparation".into());
+        let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+        return finish_runtime_outcome(
+            root,
+            launched,
+            RuntimeOutcome::Completed(Ok(Err(terminal::injected(
+                terminal::Checkpoint::FailAfterAg,
+                "injected failure after endpoint and peer preparation",
+            )))),
+            &cleanup,
+        );
     }
     let startup_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
     let group = match AssertUnwindSafe(start_prepared_public_group_with_retry(
@@ -1225,12 +1329,17 @@ async fn execute_phase2_bootstrap_lifecycle(
         }
     };
     let outcome = {
+        let injected_panic = std::sync::atomic::AtomicBool::new(false);
         let runtime = AssertUnwindSafe(async {
             if fault_checkpoint("panic-after-agent-start") {
+                injected_panic.store(true, std::sync::atomic::Ordering::Relaxed);
                 panic!("injected panic after bootstrap agent startup");
             }
             if fault_checkpoint("fail-during-report") {
-                return Err::<(), TestError>("injected failure during bracketed reporting".into());
+                return Err::<(), TestError>(terminal::injected(
+                    terminal::Checkpoint::FailDuringReport,
+                    "injected failure during bracketed reporting",
+                ));
             }
             let reports = phase(Phase::Reports);
             let sequence = group.bootstrap_configuration_sequence().await?;
@@ -1275,6 +1384,12 @@ async fn execute_phase2_bootstrap_lifecycle(
             Ok(())
         })
         .catch_unwind();
+        let runtime = runtime.map(|result| {
+            terminal::tag_panic(
+                result,
+                injected_panic.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        });
         tokio::pin!(runtime);
         tokio::select! {
             result = &mut runtime => RuntimeOutcome::Completed(result),
@@ -1843,9 +1958,10 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
         return finish_runtime_outcome(
             root,
             launched,
-            RuntimeOutcome::Completed(Ok(Err(
-                "injected failure after replacement agent startup".into()
-            ))),
+            RuntimeOutcome::Completed(Ok(Err(terminal::injected(
+                terminal::Checkpoint::FailAfterAgentRestart,
+                "injected failure after replacement agent startup",
+            )))),
             &cleanup,
         );
     }
@@ -3229,6 +3345,14 @@ fn finish_runtime_cleanup(
             if let Err(cleanup) = cleanup {
                 Err(combined_error(error, cleanup))
             } else {
+                if let Some(cause) = terminal::error_cause(&error) {
+                    assert_removed(root);
+                    if let Err(evidence) = terminal::mark_ready(root, cause) {
+                        return Err(
+                            format!("{error}; terminal evidence also failed: {evidence}").into(),
+                        );
+                    }
+                }
                 Err(error)
             }
         }
@@ -3239,11 +3363,25 @@ fn finish_runtime_cleanup(
                     "three-replica lifecycle panicked: {primary}; cleanup also failed: {cleanup}"
                 );
             }
+            let (panic, cause) = terminal::unpack_panic(panic);
+            if let Some(cause) = cause {
+                assert_removed(root);
+                if let Err(evidence) = terminal::mark_ready(root, cause) {
+                    eprintln!("terminal panic evidence failed after teardown: {evidence}");
+                }
+            }
             std::panic::resume_unwind(panic);
         }
         (RuntimeOutcome::Completed(Ok(Ok(()))), Err(error)) => Err(Box::new(error)),
         (RuntimeOutcome::Interrupted(signal), Ok(_)) => {
-            Err(format!("three-replica lifecycle interrupted by {signal:?}").into())
+            assert_removed(root);
+            let primary = format!("three-replica lifecycle interrupted by {signal:?}");
+            match terminal::mark_ready(root, terminal::Cause::signal(signal)) {
+                Ok(()) => Err(primary.into()),
+                Err(evidence) => {
+                    Err(format!("{primary}; terminal evidence also failed: {evidence}").into())
+                }
+            }
         }
         (RuntimeOutcome::Interrupted(signal), Err(cleanup)) => Err(format!(
             "three-replica lifecycle interrupted by {signal:?}; cleanup also failed: {cleanup}"
@@ -3290,6 +3428,7 @@ where
 }
 
 fn panic_message(panic: &Box<dyn std::any::Any + Send + 'static>) -> String {
+    let panic = terminal::original_panic(panic);
     panic
         .downcast_ref::<String>()
         .cloned()
@@ -3353,6 +3492,8 @@ fn test_child_command(
         .env_remove("KUBERIC_MSSQL_SIGNAL_READY_FILE")
         .env_remove("KUBERIC_MSSQL_FAULT_CHECKPOINT")
         .env_remove(FAULT_HIT_ENV)
+        .env_remove(terminal::CONTEXT_ENV)
+        .env_remove("KUBERIC_MSSQL_LEGACY_PROVISIONED_RESTART")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     if let Some(ready) = ready {
@@ -3374,16 +3515,23 @@ fn test_child_command(
     command
 }
 
-fn spawn_live_child_with_fault(root: &Path, checkpoint: &str, receipt: &Path) -> Child {
+fn spawn_live_child_with_fault(
+    root: &Path,
+    checkpoint: &str,
+    receipt: &Path,
+    terminal: &terminal::Attempt,
+) -> Child {
     let mode = if checkpoint == "fail-after-agent-restart" {
         "same-root-restart"
     } else {
         "happy-path"
     };
-    test_child_command(root, mode, None, Some(checkpoint))
-        .env(FAULT_HIT_ENV, receipt)
-        .spawn()
-        .expect("spawn checkpoint fault child")
+    let mut command = test_child_command(root, mode, None, Some(checkpoint));
+    command.env(FAULT_HIT_ENV, receipt);
+    terminal
+        .configure(&mut command)
+        .expect("configure checkpoint terminal attempt");
+    command.spawn().expect("spawn checkpoint fault child")
 }
 
 fn spawn_cleanup_child(root: &Path) -> Child {
@@ -3441,11 +3589,15 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> ExitStatus {
     }
 }
 
-fn wait_for_child_with_cleanup(child: &mut Child, timeout: Duration, root: &Path) -> ExitStatus {
+fn wait_for_child_with_cleanup(
+    child: &mut Child,
+    timeout: Duration,
+    root: &Path,
+) -> terminal::ChildExit {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait().expect("poll live child") {
-            return status;
+            return terminal::ChildExit::Observed(status);
         }
         if Instant::now() >= deadline {
             child.kill().expect("kill timed-out live child");
@@ -3455,10 +3607,30 @@ fn wait_for_child_with_cleanup(child: &mut Child, timeout: Duration, root: &Path
                 wait_for_child(&mut cleanup, Duration::from_secs(240)).success(),
                 "exact cleanup after timed-out live child"
             );
-            return status;
+            return terminal::ChildExit::Escalated(status);
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+fn timeout_escalation_reaps_and_recovers_but_is_not_an_expected_exit() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory =
+        tempfile::tempdir_in(kuberic_mssql_tests::test_support::workspace_root().join("target"))
+            .unwrap();
+    let root = directory.path().join("empty-fixture");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut child = Command::new("sleep")
+        .arg("5")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let outcome = wait_for_child_with_cleanup(&mut child, Duration::from_millis(20), &root);
+    assert!(outcome.observed().is_err());
+    assert!(child.try_wait().unwrap().is_some());
 }
 
 fn load_journal_if_present(root: &Path) -> Option<OwnershipJournal> {

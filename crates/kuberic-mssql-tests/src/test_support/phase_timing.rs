@@ -259,24 +259,32 @@ impl Session {
         })
     }
 
-    pub fn complete(mut self) -> io::Result<()> {
+    pub fn complete(self) -> io::Result<()> {
+        self.finish(Outcome::Succeeded)
+    }
+
+    pub fn complete_failure(self) -> io::Result<()> {
+        self.finish(Outcome::Failed)
+    }
+
+    fn finish(mut self, outcome: Outcome) -> io::Result<()> {
         self.shared.update(|report| {
             if report
                 .phases
                 .iter()
                 .all(|phase| phase.outcome != Outcome::Running)
             {
-                report.outcome = Outcome::Succeeded;
+                report.outcome = outcome;
             }
         });
-        let succeeded = self
+        let finished = self
             .shared
             .report
             .lock()
             .map_err(|_| io::Error::other("timing context poisoned"))?
             .outcome
-            == Outcome::Succeeded;
-        if self.shared.failed.load(Ordering::Relaxed) || !succeeded {
+            == outcome;
+        if self.shared.failed.load(Ordering::Relaxed) || !finished {
             return Err(io::Error::other("incomplete or failed timing report"));
         }
         self.complete = true;
@@ -492,6 +500,29 @@ mod tests {
         session.complete().unwrap();
         assert_eq!(report(directory.path())["outcome"], "succeeded");
         assert_eq!(report(directory.path())["phases"][0]["outcome"], "failed");
+    }
+
+    #[test]
+    fn finalized_negative_outcome_is_not_rewritten_by_subsequent_unwind() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let result = std::panic::catch_unwind(|| {
+            let session = Session::create(
+                Scenario::RestartCheckpoint,
+                Attempt::FaultChild,
+                Some(directory.path()),
+            )
+            .unwrap();
+            phase_in(Some(session.shared.clone()), Phase::Cleanup).succeeded();
+            session.complete_failure().unwrap();
+            panic!("expected child exit");
+        });
+        assert!(result.is_err());
+        assert_eq!(report(directory.path())["outcome"], "failed");
+        assert_eq!(
+            report(directory.path())["phases"][0]["outcome"],
+            "succeeded"
+        );
     }
 
     #[test]
