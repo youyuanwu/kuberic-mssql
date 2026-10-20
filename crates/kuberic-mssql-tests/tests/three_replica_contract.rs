@@ -587,7 +587,9 @@ names = ['SQLSERVER_TEST_EULA_ACCEPTED', 'KUBERIC_MSSQL_CONFIGURATION_FAULT_FILT
 'KUBERIC_MSSQL_ONE_REPLICA_CHILD_MODE', 'KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE',
 'SQLSERVER_ONE_REPLICA_FAULT', 'KUBERIC_MSSQL_FAULT_CHECKPOINT',
 'KUBERIC_MSSQL_FAULT_HIT_FILE', 'KUBERIC_MSSQL_SIGNAL_READY_FILE',
-'KUBERIC_MSSQL_LEGACY_PROVISIONED_RESTART']
+'KUBERIC_MSSQL_LEGACY_PROVISIONED_RESTART',
+'KUBERIC_MSSQL_PHASE_TIMING_SCENARIO', 'KUBERIC_MSSQL_PHASE_TIMING_ATTEMPT',
+'KUBERIC_MSSQL_TERMINAL_CONTEXT']
 print(json.dumps({'seams': {name: os.getenv(name) for name in names},
 'arguments': sys.argv[1:], 'one': os.environ['SQLSERVER_ONE_REPLICA_ROOT'],
 'three': os.environ['KUBERIC_MSSQL_THREE_REPLICA_ROOT'],
@@ -609,6 +611,9 @@ print(json.dumps({'seams': {name: os.getenv(name) for name in names},
         "KUBERIC_MSSQL_FAULT_HIT_FILE",
         "KUBERIC_MSSQL_SIGNAL_READY_FILE",
         "KUBERIC_MSSQL_LEGACY_PROVISIONED_RESTART",
+        "KUBERIC_MSSQL_PHASE_TIMING_SCENARIO",
+        "KUBERIC_MSSQL_PHASE_TIMING_ATTEMPT",
+        "KUBERIC_MSSQL_TERMINAL_CONTEXT",
     ] {
         command.env(name, "must-be-cleared");
     }
@@ -647,6 +652,261 @@ print(json.dumps({'seams': {name: os.getenv(name) for name in names},
             0,
             "new fixture family roots must remain private",
         );
+    }
+}
+
+#[test]
+fn live_timing_collector_failure_preserves_primary_status_and_hides_content() {
+    let (directory, script) = nextest_cleanup_test_environment();
+    let probe = r#"import os, pathlib, sys
+root = pathlib.Path(os.environ['KUBERIC_MSSQL_PHASE_TIMING_DIR'])
+(root / '.required-123-0').touch(mode=0o600)
+report = root / '123-0.json'
+report.touch(mode=0o600)
+report.write_text('{"private": "PRIVATE_SENTINEL"}')
+sys.exit(int(sys.argv[1]))"#;
+    for status in [0, 77] {
+        let output = std::process::Command::new("bash")
+            .arg(script.parent().unwrap().join("run_live_nextest.sh"))
+            .arg(directory.path().join(format!("runner-{status}")))
+            .args(["python3", "-c", probe, &status.to_string()])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if status == 0 { 1 } else { status })
+        );
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("MSSQL_PHASE_REPORT_ERROR"));
+        assert!(!error.contains("PRIVATE_SENTINEL"));
+    }
+}
+
+fn filled_timing_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let mut pipe = [-1; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+        0
+    );
+    let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let fill = [b'x'; 4096];
+    while unsafe { libc::write(write.as_raw_fd(), fill.as_ptr().cast(), fill.len()) } >= 0 {}
+    assert_eq!(
+        std::io::Error::last_os_error().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFL, 0) },
+        0
+    );
+    (read, write)
+}
+
+#[test]
+fn live_timing_stalled_publication_is_bounded_and_reaches_cleanup() {
+    use std::time::{Duration, Instant};
+
+    let (directory, script) = nextest_cleanup_test_environment();
+    let probe = r#"import json, os, pathlib, sys
+root = pathlib.Path(os.environ['KUBERIC_MSSQL_PHASE_TIMING_DIR'])
+(root / '.required-123-0').touch(mode=0o600)
+path = root / '123-0.json'
+path.touch(mode=0o600)
+path.write_text(json.dumps({'version': 1, 'scenario': 'lease-expiry',
+'attempt': 'main', 'process': 123, 'outcome': 'succeeded',
+'phases': [{'phase': 'cleanup', 'outcome': 'succeeded', 'elapsed_ms': 1}]}))
+sys.exit(int(sys.argv[1]))"#;
+    for (status, cancel) in [(0, false), (77, false), (0, true)] {
+        let (read, write) = filled_timing_pipe();
+        let mut read = Some(read);
+        let marker = directory.path().join(format!("cleaned-{status}-{cancel}"));
+        let mut child = std::process::Command::new("bash")
+            .args([
+                "-c",
+                "trap 'printf cleaned > \"$MARKER\"' EXIT; bash \"$@\"",
+                "stalled-publication",
+            ])
+            .arg(script.parent().unwrap().join("run_live_nextest.sh"))
+            .arg(directory.path().join(format!("runner-{status}-{cancel}")))
+            .args(["python3", "-c", probe, &status.to_string()])
+            .env("MARKER", &marker)
+            .stdout(std::process::Stdio::from(write))
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut publisher = None;
+        if cancel {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline && publisher.is_none() {
+                let children = fs::read_to_string(format!(
+                    "/proc/{}/task/{}/children",
+                    child.id(),
+                    child.id()
+                ))
+                .unwrap();
+                for wrapper in children.split_whitespace() {
+                    let children =
+                        fs::read_to_string(format!("/proc/{wrapper}/task/{wrapper}/children"))
+                            .unwrap();
+                    for pid in children.split_whitespace() {
+                        if fs::read_link(format!("/proc/{pid}/exe"))
+                            .is_ok_and(|path| path.ends_with("timeout"))
+                        {
+                            publisher = Some(pid.parse::<u32>().unwrap());
+                            assert_eq!(
+                                unsafe { libc::kill(wrapper.parse().unwrap(), libc::SIGTERM) },
+                                0
+                            );
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut exceeded = false;
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                exceeded = true;
+                drop(read.take());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        drop(read);
+        if cancel {
+            let publisher =
+                publisher.expect("observed the publication process before cancellation");
+            assert!(!Path::new(&format!("/proc/{publisher}")).exists());
+        }
+        assert!(
+            !exceeded,
+            "timing publication held cleanup behind stalled stdout"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(if cancel {
+                143
+            } else if status == 0 {
+                124
+            } else {
+                status
+            })
+        );
+        assert_eq!(fs::read_to_string(marker).unwrap(), "cleaned");
+    }
+}
+
+#[test]
+fn live_timing_phase_drop_does_not_block_cleanup_on_stalled_stderr() {
+    use kuberic_mssql_tests::test_support::phase_timing::{Phase, Scenario, Session, phase};
+    use std::time::{Duration, Instant};
+    const CHILD: &str = "KUBERIC_MSSQL_TIMING_STDERR_PROBE";
+    if let Some(marker) = std::env::var_os(CHILD) {
+        let session = Session::start(Scenario::LeaseExpiry).unwrap();
+        phase(Phase::Preflight).succeeded();
+        drop(phase(Phase::FixtureLaunch));
+        drop(session);
+        fs::write(marker, "cleaned").unwrap();
+        return;
+    }
+    let (directory, _) = nextest_cleanup_test_environment();
+    let marker = directory.path().join("cleaned");
+    let reports = directory.path().join("reports");
+    fs::create_dir(&reports).unwrap();
+    fs::set_permissions(&reports, fs::Permissions::from_mode(0o700)).unwrap();
+    let (read, write) = filled_timing_pipe();
+    let mut read = Some(read);
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "live_timing_phase_drop_does_not_block_cleanup_on_stalled_stderr",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, &marker)
+        .env("KUBERIC_MSSQL_PHASE_TIMING_DIR", &reports)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(write))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut exceeded = false;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            exceeded = true;
+            drop(read.take());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child.wait().unwrap();
+    drop(read);
+    assert!(
+        !exceeded,
+        "phase recording held cleanup behind stalled stderr"
+    );
+    assert!(status.success());
+    assert_eq!(fs::read_to_string(marker).unwrap(), "cleaned");
+    let snapshot = fs::read_dir(reports)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(snapshot).unwrap()).unwrap();
+    assert_eq!(report["outcome"], "incomplete");
+    assert_eq!(report["phases"][0]["outcome"], "succeeded");
+    assert_eq!(report["phases"][1]["outcome"], "incomplete");
+}
+
+#[test]
+fn live_timing_runner_forwards_signals_and_joins_before_reporting() {
+    use std::time::{Duration, Instant};
+    let (directory, script) = nextest_cleanup_test_environment();
+    let probe = r#"import pathlib, signal, sys
+ready, receipt = map(pathlib.Path, sys.argv[1:3])
+def stop(number, frame):
+    receipt.write_text(str(number))
+    sys.exit(42)
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+ready.touch()
+while True:
+    signal.pause()"#;
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let ready = directory.path().join(format!("ready-{signal}"));
+        let receipt = directory.path().join(format!("receipt-{signal}"));
+        let mut child = std::process::Command::new("bash")
+            .arg(script.parent().unwrap().join("run_live_nextest.sh"))
+            .arg(directory.path().join(format!("runner-{signal}")))
+            .args(["python3", "-c", probe])
+            .arg(&ready)
+            .arg(&receipt)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !ready.exists() {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!("signal probe was not ready: {:?}", output.status);
+        }
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(42));
+        assert_eq!(fs::read_to_string(receipt).unwrap(), signal.to_string());
     }
 }
 

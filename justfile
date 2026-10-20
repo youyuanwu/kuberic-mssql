@@ -40,7 +40,7 @@ test-doc:
     cargo test --locked --workspace --all-features --doc
 
 test-nextest-partitions:
-    python3 -B -m unittest discover -s crates/kuberic-mssql-tests/scripts -p 'test_nextest_partitions.py' -q
+    python3 -B -m unittest discover -s crates/kuberic-mssql-tests/scripts -p 'test_*.py' -q
 
 # Check and compile once; the four CI workers reuse this exact archive.
 ci-build-nextest-archive archive="target/nextest/mssql-tests.tar.zst": fmt-check clippy test-doc test-nextest-partitions

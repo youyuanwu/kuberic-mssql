@@ -26,7 +26,8 @@ pub use availability_group::{
 pub use cleanup::{
     CLEANUP_BUDGET, CancellationSignals, CleanupBackend, CleanupClock, CleanupCompletion,
     CleanupCoordinator, CleanupError, CleanupJournal, CleanupJournalStore, CleanupReport,
-    HandledCancellationSignal, SystemCleanupClock, cleanup, combine_with_cleanup,
+    ContainerCleanupResult, HandledCancellationSignal, SystemCleanupClock, cleanup,
+    combine_with_cleanup,
 };
 pub use commit_coverage::prefix::NativePrefixReport;
 pub use commit_coverage::prefix::hosted as hosted_native_prefix;

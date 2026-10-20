@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod phase_timing;
+
 pub fn manifest_dir() -> PathBuf {
     std::env::var_os("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)

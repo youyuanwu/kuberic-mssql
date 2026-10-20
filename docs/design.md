@@ -404,7 +404,7 @@ creation and production SQL transport are unchanged. The fixture fence uses
 its own run/configuration identity and a synthetic epoch, not durable Kuberic
 role authority.
 
-The [licensed experiments](../crates/kuberic-mssql-tests/tests/live_lease_fence.rs#L82)
+The [licensed experiments](../crates/kuberic-mssql-tests/tests/live_lease_fence.rs)
 against the pinned SQL Server **17.0.5005.3** fixture established:
 
 | Experiment | Observation |
@@ -414,6 +414,17 @@ against the pinned SQL Server **17.0.5005.3** fixture established:
 | Response cancellation | A delayed renewal response exceeded its client deadline; the session was discarded and fresh observations retained uncertainty rather than assuming rollback. |
 | Active-lease restart | The same container acquired fresh Docker/SQL start identities. Within the previous lease window, SQL reported `RESOLVING`/`OFFLINE`, raw remaining lease was null, and fresh-session marker readback did not confirm the attempted write. This is an unconfirmed outcome, not proof of commit, rollback, or lease persistence. |
 | Exact fixture fence | A verified stop produced matching evidence; after an explicit completed restart, old requests and a genuinely issued old receipt were rejected without stopping the replacement. |
+
+Both scenarios retain a 60-second creation validity and three-second timing
+margin. The expiry experiment renews for 90 seconds; active-restart retains
+120 seconds, including its cancelled-response renewal. The shorter expiry
+experiment still requires a confirmed write beyond the acknowledgement-based
+upper bound on original expiry and before the submission-based lower bound on
+renewed expiry, then the original identity/quorum/telemetry rejection evidence.
+With renewal submission `S` and creation acknowledgement `A`, its conservative
+extension-write interval is `(S - A) + 24 seconds`; a late write still fails.
+These are fixture timing choices, not production lease policy or universal
+runtime guarantees.
 
 Error [988](https://learn.microsoft.com/en-us/sql/relational-databases/errors-events/mssqlserver-988-database-engine-error)
 means insufficient HA quorum, not uniquely lease expiry. The experiment
@@ -812,6 +823,22 @@ is persisted before create dispatch, cleanup revalidates immutable IDs and
 attributes. Both fixture families persist intent before create dispatch, refuse
 foreign or replaced resources, and perform bounded recovery without requiring
 SQL Server availability. `just cleanup` invokes both exact cleanup binaries.
+
+Eligible already-bound members of one three-replica fixture may share a
+cleanup-only multi-ID stop, after durable Cleaning intent and exact ownership
+preparation. This overlaps disposal, not fixtures or SQL cases. The original
+180-second coordinator remains authoritative; one compound allowance, capped
+by its remaining time and 30 seconds per prepared participant (at most 90),
+also covers outcome collection, final absence checks and completion persistence.
+Metadata/per-member commands retain their 30-second local cap. Ten-second stop
+grace and the process supervisor's shutdown reserve are preserved; insufficient
+time fails rather than shortening grace. Aggregate stop errors remain resource
+failures even if later exact inspection permits non-force removal. Panic or
+malformed outcomes block participants, retain observed errors and never trigger
+a hidden scalar stop retry. Network/storage dependents remain protected until
+all containers are proven absent. Noneligible recovery and controlled
+restart/fence keep the existing scalar path.
+
 The three-runtime validation also performs a host-only same-root restart:
 replacement processes receive fresh sessions, stale-session commands are
 rejected, existing-state Open succeeds, native seed records compact without
@@ -819,6 +846,14 @@ redispatch, exact contained reports reconverge, and native marker continuity is
 retained. This is not Public V1 peer-session/lifecycle renewal, does not replay
 an end-to-end Public V1 Build, and does not restore serving access.
 The explicit nextest live stage also runs fault, signal and recovery cases.
+Handled signals and controlled checkpoints require private attempt/PID/run/cause
+evidence after successful applicable teardown plus the dedicated observed
+negative-child exit; arbitrary failure and timeout escalation cannot satisfy
+that expectation. SIGKILL instead requires parent-observed actual SIGKILL
+without escalation. Separate exact recovery precedes classification rejection,
+and successful recovery cannot erase a wrong child outcome or authorize its
+positive retry. These records and phase timings are not disposal authority.
+
 Configuration-completion interruptions now prove exact SQL effect/reply-loss
 boundaries, confirmed host shutdown and exact idempotent cleanup, without
 post-drain terminal-state or fresh-session admission assumptions.

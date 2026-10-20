@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use kuberic_mssql::runtime_host::SeedDispatchPhase;
+use kuberic_mssql_tests::test_support::phase_timing::{
+    self, Attempt, Phase, Scenario, Session, phase,
+};
 use kuberic_mssql_tests::three_replica::{
     CLEANUP_BUDGET, CancellationSignals, CleanupClock, CleanupCoordinator, CombinedFixtureError,
     FixtureConfig, HandledCancellationSignal, JournalStore, LaunchedMembers,
@@ -32,6 +35,8 @@ const FAULT_HIT_ENV: &str = "KUBERIC_MSSQL_FAULT_HIT_FILE";
 
 #[path = "live_three_replica/hosted_witness.rs"]
 mod hosted_witness;
+#[path = "live_three_replica/terminal.rs"]
+mod terminal;
 
 struct PendingSeedCompaction {
     command: PublicBuildCommand,
@@ -46,11 +51,43 @@ fn three_replica_lifecycle_child() {
         Err(std::env::VarError::NotPresent) => return,
         Err(std::env::VarError::NotUnicode(_)) => panic!("invalid live SQL child mode"),
     };
-    match mode.as_str() {
+    if !matches!(
+        mode.as_str(),
+        "happy-path" | "same-root-restart" | "native-commit"
+    ) {
+        panic!("invalid live SQL child mode");
+    }
+    let timing = Session::child().expect("valid child timing context");
+    terminal::install().expect("valid terminal child context");
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| match mode.as_str() {
         "happy-path" => run_three_replica_test(false),
         "same-root-restart" => run_three_replica_test(true),
         "native-commit" => run_native_experiment(NativeExperiment::CommitRecord),
         _ => panic!("invalid live SQL child mode"),
+    }));
+    match outcome {
+        Ok(()) => {
+            if let Some(timing) = timing {
+                timing.complete().expect("complete child timing report");
+            }
+        }
+        Err(panic) => {
+            if terminal::is_ready() {
+                let finalized = timing.map(Session::complete_failure).transpose();
+                match finalized {
+                    Ok(_) => match terminal::publish_ready() {
+                        Ok(()) => std::process::exit(terminal::EXPECTED_EXIT),
+                        Err(error) => {
+                            eprintln!("terminal child evidence failed after teardown: {error}");
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("terminal child timing failed after teardown: {error}");
+                    }
+                }
+            }
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 
@@ -661,6 +698,13 @@ fn three_replica_sigkill_is_recovered_by_a_separate_process() {
 }
 
 fn exercise_signal_recovery(signal: i32, signal_name: &str) {
+    let timing = Session::start(match signal {
+        libc::SIGINT => Scenario::SigintRecovery,
+        libc::SIGTERM => Scenario::SigtermRecovery,
+        libc::SIGKILL => Scenario::SigkillRecovery,
+        _ => panic!("unsupported recovery signal"),
+    })
+    .expect("start signal timing");
     let root = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
     cleanup_three_replica_fixture(&root).expect("clean baseline before signal regression");
 
@@ -672,7 +716,18 @@ fn exercise_signal_recovery(signal: i32, signal_name: &str) {
         fs::remove_file(&ready).expect("remove stale signal-ready evidence");
     }
 
-    let mut interrupted = spawn_live_child(&root, Some(&ready));
+    let terminal = (signal != libc::SIGKILL)
+        .then(|| terminal::Attempt::new(root.parent().expect("fixture parent")))
+        .transpose()
+        .expect("fresh signal terminal attempt");
+    let interruption = phase(Phase::InterruptedLaunch);
+    let mut command = test_child_command(&root, "happy-path", Some(&ready), None);
+    if let Some(terminal) = &terminal {
+        terminal
+            .configure(&mut command)
+            .expect("configure signal terminal attempt");
+    }
+    let mut interrupted = command.spawn().expect("spawn exact interrupted child");
     wait_until(Duration::from_secs(30), || ready.is_file())
         .expect("subprocess did not publish handler-ready evidence");
     wait_until(Duration::from_secs(180), || {
@@ -687,35 +742,59 @@ fn exercise_signal_recovery(signal: i32, signal_name: &str) {
     })
     .expect("subprocess never entered a journaled owned-resource phase");
 
+    let run = load_journal_if_present(&root)
+        .expect("journaled interrupted run")
+        .run
+        .run_id;
     let signal_result = unsafe { libc::kill(interrupted.id() as i32, signal) };
     assert_eq!(signal_result, 0, "send {signal_name} to live subprocess");
     let status = wait_for_child_with_cleanup(&mut interrupted, Duration::from_secs(240), &root);
-    assert!(
-        !status.success(),
-        "{signal_name} must make the interrupted validation fail explicitly"
-    );
-
-    let journal = load_journal_if_present(&root).expect("recoverable ownership journal");
-    assert!(
-        journal.state == RunState::Removed || !journal.resources.is_empty(),
-        "{signal_name} must leave explicit cleanup or recoverable ownership evidence"
-    );
+    let journal = load_journal_if_present(&root);
+    let recoverable = journal
+        .as_ref()
+        .is_some_and(|journal| journal.state == RunState::Removed || !journal.resources.is_empty());
+    let classification = if let Some(terminal) = &terminal {
+        let cause = terminal::Cause::Signal {
+            signal: if signal == libc::SIGINT {
+                terminal::Signal::Interrupt
+            } else {
+                terminal::Signal::Terminate
+            },
+        };
+        terminal.verify(status, interrupted.id(), &run, cause)
+    } else {
+        status.killed()
+    };
+    let separate_cleanup = phase(Phase::SeparateCleanup);
     let mut cleanup = spawn_cleanup_child(&root);
     assert!(
         wait_for_child(&mut cleanup, Duration::from_secs(240)).success(),
-        "separate cleanup process after {signal_name}"
+        "separate cleanup process after {signal_name}; child classification: {classification:?}"
     );
     assert_removed(&root);
+    separate_cleanup.succeeded();
+    assert!(
+        recoverable,
+        "{signal_name} must leave recoverable ownership evidence"
+    );
+    classification.expect("actual expected signal outcome without timeout or teardown failure");
+    interruption.succeeded();
 
+    let recovery = phase(Phase::RecoveryRetry);
     let mut retry = spawn_live_child(&root, None);
     let retry_status = wait_for_child_with_cleanup(&mut retry, Duration::from_secs(1200), &root);
     assert!(
-        retry_status.success(),
+        retry_status
+            .observed()
+            .expect("retry must exit without timeout escalation")
+            .success(),
         "retry after {signal_name} must succeed"
     );
+    recovery.succeeded();
     cleanup_three_replica_fixture(&root).expect("idempotent cleanup after retry");
     assert_removed(&root);
     fs::remove_file(&ready).expect("remove signal-ready evidence");
+    timing.complete().expect("complete signal timing report");
 }
 
 mod three_replica_post_ag_and_report_fault_checkpoints_recover {
@@ -747,34 +826,67 @@ mod three_replica_post_ag_and_report_fault_checkpoints_recover {
 }
 
 fn exercise_fault_checkpoint(checkpoint: &str, index: usize, retry: bool) {
+    let timing = retry
+        .then(|| Session::start(Scenario::RestartCheckpoint).expect("start checkpoint timing"));
     let base = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
     fs::create_dir_all(&base).expect("create fault-checkpoint namespace");
     let root = base.join(checkpoint);
     cleanup_three_replica_fixture(&root).expect("clean fault-checkpoint baseline");
     let receipt = root.join(format!(".fault-hit-{}-{index}", std::process::id()));
     assert!(!receipt.exists(), "checkpoint evidence must be fresh");
-    let mut child = spawn_live_child_with_fault(&root, checkpoint, &receipt);
+    let terminal = terminal::Attempt::new(&base).expect("fresh checkpoint terminal attempt");
+    let fault_journey = phase(Phase::FaultJourney);
+    let mut child = spawn_live_child_with_fault(&root, checkpoint, &receipt, &terminal);
     let status = wait_for_child_with_cleanup(&mut child, Duration::from_secs(1200), &root);
-    assert!(!status.success(), "{checkpoint} must fail explicitly");
-    assert_eq!(
-        fs::read_to_string(&receipt).expect("child must reach the requested checkpoint"),
-        checkpoint,
-    );
-    fs::remove_file(receipt).expect("remove owned checkpoint receipt");
+    let hit = fs::read_to_string(&receipt);
+    let run = load_journal_if_present(&root).map(|journal| journal.run.run_id);
+    let classification = run
+        .as_deref()
+        .ok_or("checkpoint run journal missing")
+        .and_then(|run| {
+            terminal.verify(
+                status,
+                child.id(),
+                run,
+                terminal::Cause::Checkpoint {
+                    checkpoint: terminal::Checkpoint::from_label(checkpoint)
+                        .expect("known checkpoint"),
+                },
+            )
+        });
+    let separate_cleanup = phase(Phase::SeparateCleanup);
     let mut cleanup = spawn_cleanup_child(&root);
     assert!(
         wait_for_child(&mut cleanup, Duration::from_secs(240)).success(),
-        "cleanup process after {checkpoint}"
+        "cleanup process after {checkpoint}; child classification: {classification:?}"
     );
     assert_removed(&root);
+    separate_cleanup.succeeded();
+    assert_eq!(
+        hit.expect("child must reach the requested checkpoint"),
+        checkpoint
+    );
+    fs::remove_file(receipt).expect("remove owned checkpoint receipt");
+    classification.expect("actual controlled checkpoint with error-free terminal teardown");
+    fault_journey.succeeded();
     if retry {
+        let recovery = phase(Phase::RecoveryRetry);
         let mut child = spawn_restart_child(&root);
         assert!(
-            wait_for_child_with_cleanup(&mut child, Duration::from_secs(1200), &root).success(),
+            wait_for_child_with_cleanup(&mut child, Duration::from_secs(1200), &root)
+                .observed()
+                .expect("checkpoint retry must not time out")
+                .success(),
             "retry after fault checkpoint"
         );
+        recovery.succeeded();
         cleanup_three_replica_fixture(&root).expect("cleanup after fault-checkpoint retry");
         assert_removed(&root);
+    }
+    if let Some(timing) = timing {
+        timing
+            .complete()
+            .expect("complete checkpoint timing report");
     }
 }
 
@@ -902,7 +1014,16 @@ async fn execute_live_lifecycle(
     }
     let topology = launched.provision_availability_group().await?;
     if fault_checkpoint("fail-after-ag") {
-        return Err("injected failure after AG provisioning".into());
+        let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+        return finish_runtime_outcome(
+            root,
+            launched,
+            RuntimeOutcome::Completed(Ok(Err(terminal::injected(
+                terminal::Checkpoint::FailAfterAg,
+                "injected failure after AG provisioning",
+            )))),
+            &cleanup,
+        );
     }
     let native_binding = launched
         .journal()
@@ -969,12 +1090,17 @@ async fn execute_live_lifecycle(
     });
     let first_sessions = group.pods.each_ref().map(|pod| pod.session.clone());
     let first_outcome = {
+        let injected_panic = std::sync::atomic::AtomicBool::new(false);
         let runtime = AssertUnwindSafe(async {
             if fault_checkpoint("panic-after-agent-start") {
+                injected_panic.store(true, std::sync::atomic::Ordering::Relaxed);
                 panic!("injected panic after agent startup");
             }
             if fault_checkpoint("fail-during-report") {
-                return Err::<(), TestError>("injected failure during bracketed reporting".into());
+                return Err::<(), TestError>(terminal::injected(
+                    terminal::Checkpoint::FailDuringReport,
+                    "injected failure during bracketed reporting",
+                ));
             }
             wait_for_exact_reports(
                 &group,
@@ -993,6 +1119,12 @@ async fn execute_live_lifecycle(
             Ok(())
         })
         .catch_unwind();
+        let runtime = runtime.map(|result| {
+            terminal::tag_panic(
+                result,
+                injected_panic.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        });
         tokio::pin!(runtime);
         tokio::select! {
             result = &mut runtime => RuntimeOutcome::Completed(result),
@@ -1086,7 +1218,10 @@ async fn execute_live_lifecycle(
                 .assert_superseded_sessions_rejected(&first_sessions)
                 .await?;
             if fault_checkpoint("fail-after-agent-restart") {
-                return Err("injected failure after replacement agent startup".into());
+                return Err(terminal::injected(
+                    terminal::Checkpoint::FailAfterAgentRestart,
+                    "injected failure after replacement agent startup",
+                ));
             }
             wait_for_exact_reports(
                 &restarted,
@@ -1138,7 +1273,16 @@ async fn execute_phase2_bootstrap_lifecycle(
         return Err("prepared fixture unexpectedly claimed a native topology binding".into());
     }
     if fault_checkpoint("fail-after-ag") {
-        return Err("injected failure after endpoint and peer preparation".into());
+        let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+        return finish_runtime_outcome(
+            root,
+            launched,
+            RuntimeOutcome::Completed(Ok(Err(terminal::injected(
+                terminal::Checkpoint::FailAfterAg,
+                "injected failure after endpoint and peer preparation",
+            )))),
+            &cleanup,
+        );
     }
     let startup_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
     let group = match AssertUnwindSafe(start_prepared_public_group_with_retry(
@@ -1185,24 +1329,35 @@ async fn execute_phase2_bootstrap_lifecycle(
         }
     };
     let outcome = {
+        let injected_panic = std::sync::atomic::AtomicBool::new(false);
         let runtime = AssertUnwindSafe(async {
             if fault_checkpoint("panic-after-agent-start") {
+                injected_panic.store(true, std::sync::atomic::Ordering::Relaxed);
                 panic!("injected panic after bootstrap agent startup");
             }
             if fault_checkpoint("fail-during-report") {
-                return Err::<(), TestError>("injected failure during bracketed reporting".into());
+                return Err::<(), TestError>(terminal::injected(
+                    terminal::Checkpoint::FailDuringReport,
+                    "injected failure during bracketed reporting",
+                ));
             }
+            let reports = phase(Phase::Reports);
             let sequence = group.bootstrap_configuration_sequence().await?;
             wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout())
                 .await?;
+            reports.succeeded();
+            let build = phase(Phase::Build);
             let pending = exercise_public_build_retirement_and_supersession(&group).await?;
+            let convergence = phase(Phase::NativeConvergence);
             let topology = launched
                 .finalize_prepared_availability_group(&prepared)
                 .await?;
+            convergence.succeeded();
             exercise_dispatched_build_lifecycle_commands(&group, pending).await?;
             if group.testing_seed_dispatch_count()? != 1 {
                 return Err("final replacement did not dispatch exactly one ADD DATABASE".into());
             }
+            let marker_timing = phase(Phase::Marker);
             let marker = launched
                 .commit_replicated_marker(&topology.evidence)
                 .await?;
@@ -1213,6 +1368,7 @@ async fn execute_phase2_bootstrap_lifecycle(
                     "build-owned seeding marker was not readable from all exact members".into(),
                 );
             }
+            marker_timing.succeeded();
             let peer = group.target_build_command(
                 2,
                 "native-only-seed-build-target-3",
@@ -1224,9 +1380,16 @@ async fn execute_phase2_bootstrap_lifecycle(
                     format!("native-only peer target build failed: {error}").into(),
                 );
             }
+            build.succeeded();
             Ok(())
         })
         .catch_unwind();
+        let runtime = runtime.map(|result| {
+            terminal::tag_panic(
+                result,
+                injected_panic.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        });
         tokio::pin!(runtime);
         tokio::select! {
             result = &mut runtime => RuntimeOutcome::Completed(result),
@@ -1662,8 +1825,11 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
         )
     });
     let first_sessions = first.pods.each_ref().map(|pod| pod.session.clone());
+    let reports = phase(Phase::Reports);
     let first_sequence = first.bootstrap_configuration_sequence().await?;
     wait_for_exact_reports(&first, first_sequence, convergence).await?;
+    reports.succeeded();
+    let build = phase(Phase::Build);
     let interrupted_build = first.target_build_command(
         1,
         "restart-dispatched-build-2",
@@ -1721,6 +1887,7 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
     ) {
         return Err("host abort made dispatched seed authority releasable".into());
     }
+    build.succeeded();
     first.shutdown_with_coordinator(&first_cleanup).await?;
     match interrupted.await {
         Ok(Err(_)) => {}
@@ -1791,12 +1958,14 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
         return finish_runtime_outcome(
             root,
             launched,
-            RuntimeOutcome::Completed(Ok(Err(
-                "injected failure after replacement agent startup".into()
-            ))),
+            RuntimeOutcome::Completed(Ok(Err(terminal::injected(
+                terminal::Checkpoint::FailAfterAgentRestart,
+                "injected failure after replacement agent startup",
+            )))),
             &cleanup,
         );
     }
+    let replacement_build = phase(Phase::Build);
     if replacement.testing_seed_dispatch_record()?.is_some() {
         let builds = [
             replacement.target_build_command(
@@ -1823,6 +1992,8 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
     if replacement.testing_seed_dispatch_record()?.is_some() {
         return Err("replacement host did not compact the dispatched seed record".into());
     }
+    replacement_build.succeeded();
+    let marker_timing = phase(Phase::Marker);
     let verified_marker = launched.verify_replicated_marker(&marker).await?;
     if verified_marker != marker
         || verified_marker.primary_ordinal != topology.evidence.primary_ordinal
@@ -1830,6 +2001,7 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
     {
         return Err("exact pre-restart marker changed after dispatched replacement".into());
     }
+    marker_timing.succeeded();
     replacement
         .shutdown_with_coordinator(&replacement_cleanup)
         .await?;
@@ -1928,10 +2100,15 @@ async fn exercise_seed_submission_fault(
     fault: PublicMutationFault,
     label: &str,
 ) -> Result<(), TestError> {
+    let timing = matches!(fault, PublicMutationFault::SeedAcceptedReplyLost)
+        .then(|| Session::start(Scenario::AcceptedReplyLost))
+        .transpose()?;
     cleanup_three_replica_fixture(root)?;
     let config = FixtureConfig::for_test_fixture(root)?;
     let mut launched = launch_three_members(config).await?;
+    let preparation = phase(Phase::PeerPreparation);
     let prepared = launched.prepare_availability_group().await?;
+    preparation.succeeded();
     let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
     let group = start_prepared_public_group_with_retry(
         root,
@@ -1943,8 +2120,10 @@ async fn exercise_seed_submission_fault(
         &cleanup,
     )
     .await?;
+    let reports = phase(Phase::Reports);
     let sequence = group.bootstrap_configuration_sequence().await?;
     wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout()).await?;
+    reports.succeeded();
     let command =
         group.target_build_command(1, format!("{label}-build"), format!("{label}-build"))?;
     group
@@ -1953,6 +2132,7 @@ async fn exercise_seed_submission_fault(
         .map_err(|error| format!("{label} target authority admission failed: {error}"))?;
 
     group.testing_arm_mutation_fault(fault);
+    let build = phase(Phase::Build);
     let first = group.testing_execute_admitted_seed_callback(&command).await;
     if group.testing_mutation_fault_hits() != 1 {
         return Err(format!(
@@ -1968,10 +2148,13 @@ async fn exercise_seed_submission_fault(
     group
         .testing_assert_source_build_success_not_published(&command)
         .await?;
+    build.succeeded();
+    let retry = phase(Phase::SeedRetry);
     group
         .testing_execute_admitted_seed_callback_with_retry(&command)
         .await
         .map_err(|error| format!("{label} safe callback retry failed: {error}"))?;
+    retry.succeeded();
     if group.testing_seed_dispatch_record()?.is_some() {
         return Err(format!("{label} retained resolved dispatch ambiguity").into());
     }
@@ -1992,9 +2175,11 @@ async fn exercise_seed_submission_fault(
         _ => {}
     }
 
+    let convergence = phase(Phase::NativeConvergence);
     let topology = launched
         .finalize_prepared_availability_group(&prepared)
         .await?;
+    convergence.succeeded();
     let peer = group.target_build_command(2, format!("{label}-peer"), format!("{label}-peer"))?;
     group
         .testing_admit_target_build_authority_only(&peer)
@@ -2004,12 +2189,14 @@ async fn exercise_seed_submission_fault(
         .testing_execute_admitted_seed_callback_with_retry(&peer)
         .await
         .map_err(|error| format!("{label} peer callback failed: {error}"))?;
+    let marker_timing = phase(Phase::Marker);
     let marker = launched
         .commit_replicated_marker(&topology.evidence)
         .await?;
     if marker.readable_ordinals != [1, 2, 3] {
         return Err(format!("{label} did not converge the exact seeded topology").into());
     }
+    marker_timing.succeeded();
     group.shutdown_with_coordinator(&cleanup).await?;
     let evidence = launched.cleanup_with_coordinator(&cleanup)?;
     if evidence.removed_container_ids.len() != 3 || evidence.removed_network_id.is_empty() {
@@ -2018,6 +2205,9 @@ async fn exercise_seed_submission_fault(
     assert_removed(root);
     cleanup_three_replica_fixture(root)?;
     assert_removed(root);
+    if let Some(timing) = timing {
+        timing.complete()?;
+    }
     Ok(())
 }
 
@@ -2573,6 +2763,10 @@ async fn exercise_target_host_evidence_fault(
     window: TargetEvidenceWindow,
     fault: TargetEvidenceFault,
 ) -> Result<(), TestError> {
+    let timing = (matches!(window, TargetEvidenceWindow::PreAssociation)
+        && matches!(fault, TargetEvidenceFault::SqlProcessRestart))
+    .then(|| Session::start(Scenario::TargetSqlRestart))
+    .transpose()?;
     if matches!(fault, TargetEvidenceFault::LineageMismatch)
         && !matches!(window, TargetEvidenceWindow::PostNativePreReply)
     {
@@ -2583,7 +2777,9 @@ async fn exercise_target_host_evidence_fault(
     cleanup_three_replica_fixture(&root)?;
     let config = FixtureConfig::for_test_fixture(&root)?;
     let mut launched = launch_three_members(config).await?;
+    let preparation = phase(Phase::PeerPreparation);
     let prepared = launched.prepare_availability_group().await?;
+    preparation.succeeded();
     let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
     let group = start_prepared_public_group_with_retry(
         &root,
@@ -2607,8 +2803,10 @@ async fn exercise_target_host_evidence_fault(
     };
     let mut callback_owner = None;
     let outcome: Result<(), TestError> = async {
+        let reports = phase(Phase::Reports);
         let sequence = group.bootstrap_configuration_sequence().await?;
         wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout()).await?;
+        reports.succeeded();
         let command = group.target_build_command(
             1,
             format!("target-evidence-{label}"),
@@ -2675,7 +2873,10 @@ async fn exercise_target_host_evidence_fault(
         match fault {
             TargetEvidenceFault::SqlProcessRestart => {
                 let frozen = group.testing_frozen_secondary_start_identity()?;
+                let restart = phase(Phase::SqlRestart);
                 let host_port = launched.restart_sql_process_for_test(1)?;
+                restart.succeeded();
+                let fresh_sql = phase(Phase::FreshSql);
                 let fresh = group
                     .testing_wait_for_fresh_secondary_observation(
                         &frozen,
@@ -2683,6 +2884,7 @@ async fn exercise_target_host_evidence_fault(
                         launched.kuberic_convergence_timeout(),
                     )
                     .await?;
+                fresh_sql.succeeded();
                 if fresh.instance.sqlserver_start_time == frozen {
                     return Err(
                         format!("{label} did not replace the target SQL start identity").into(),
@@ -2694,6 +2896,7 @@ async fn exercise_target_host_evidence_fault(
                 group.testing_inject_target_lineage_mismatch()?;
             }
         }
+        let rejection = phase(Phase::CallbackRejection);
         release_tx
             .send(())
             .map_err(|_| format!("{label} checkpoint was not retained"))?;
@@ -2738,6 +2941,7 @@ async fn exercise_target_host_evidence_fault(
                 .testing_assert_source_build_success_not_published(&command)
                 .await?;
         }
+        rejection.succeeded();
         Ok(())
     }
     .await;
@@ -2772,6 +2976,9 @@ async fn exercise_target_host_evidence_fault(
     assert_removed(&root);
     cleanup_three_replica_fixture(&root)?;
     assert_removed(&root);
+    if let Some(timing) = timing {
+        timing.complete()?;
+    }
     Ok(())
 }
 
@@ -3138,6 +3345,14 @@ fn finish_runtime_cleanup(
             if let Err(cleanup) = cleanup {
                 Err(combined_error(error, cleanup))
             } else {
+                if let Some(cause) = terminal::error_cause(&error) {
+                    assert_removed(root);
+                    if let Err(evidence) = terminal::mark_ready(root, cause) {
+                        return Err(
+                            format!("{error}; terminal evidence also failed: {evidence}").into(),
+                        );
+                    }
+                }
                 Err(error)
             }
         }
@@ -3148,11 +3363,25 @@ fn finish_runtime_cleanup(
                     "three-replica lifecycle panicked: {primary}; cleanup also failed: {cleanup}"
                 );
             }
+            let (panic, cause) = terminal::unpack_panic(panic);
+            if let Some(cause) = cause {
+                assert_removed(root);
+                if let Err(evidence) = terminal::mark_ready(root, cause) {
+                    eprintln!("terminal panic evidence failed after teardown: {evidence}");
+                }
+            }
             std::panic::resume_unwind(panic);
         }
         (RuntimeOutcome::Completed(Ok(Ok(()))), Err(error)) => Err(Box::new(error)),
         (RuntimeOutcome::Interrupted(signal), Ok(_)) => {
-            Err(format!("three-replica lifecycle interrupted by {signal:?}").into())
+            assert_removed(root);
+            let primary = format!("three-replica lifecycle interrupted by {signal:?}");
+            match terminal::mark_ready(root, terminal::Cause::signal(signal)) {
+                Ok(()) => Err(primary.into()),
+                Err(evidence) => {
+                    Err(format!("{primary}; terminal evidence also failed: {evidence}").into())
+                }
+            }
         }
         (RuntimeOutcome::Interrupted(signal), Err(cleanup)) => Err(format!(
             "three-replica lifecycle interrupted by {signal:?}; cleanup also failed: {cleanup}"
@@ -3199,6 +3428,7 @@ where
 }
 
 fn panic_message(panic: &Box<dyn std::any::Any + Send + 'static>) -> String {
+    let panic = terminal::original_panic(panic);
     panic
         .downcast_ref::<String>()
         .cloned()
@@ -3262,6 +3492,8 @@ fn test_child_command(
         .env_remove("KUBERIC_MSSQL_SIGNAL_READY_FILE")
         .env_remove("KUBERIC_MSSQL_FAULT_CHECKPOINT")
         .env_remove(FAULT_HIT_ENV)
+        .env_remove(terminal::CONTEXT_ENV)
+        .env_remove("KUBERIC_MSSQL_LEGACY_PROVISIONED_RESTART")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     if let Some(ready) = ready {
@@ -3270,19 +3502,36 @@ fn test_child_command(
     if let Some(checkpoint) = checkpoint {
         command.env("KUBERIC_MSSQL_FAULT_CHECKPOINT", checkpoint);
     }
+    phase_timing::child_context(
+        &mut command,
+        if checkpoint.is_some() {
+            Attempt::FaultChild
+        } else if ready.is_some() {
+            Attempt::InterruptedChild
+        } else {
+            Attempt::RetryChild
+        },
+    );
     command
 }
 
-fn spawn_live_child_with_fault(root: &Path, checkpoint: &str, receipt: &Path) -> Child {
+fn spawn_live_child_with_fault(
+    root: &Path,
+    checkpoint: &str,
+    receipt: &Path,
+    terminal: &terminal::Attempt,
+) -> Child {
     let mode = if checkpoint == "fail-after-agent-restart" {
         "same-root-restart"
     } else {
         "happy-path"
     };
-    test_child_command(root, mode, None, Some(checkpoint))
-        .env(FAULT_HIT_ENV, receipt)
-        .spawn()
-        .expect("spawn checkpoint fault child")
+    let mut command = test_child_command(root, mode, None, Some(checkpoint));
+    command.env(FAULT_HIT_ENV, receipt);
+    terminal
+        .configure(&mut command)
+        .expect("configure checkpoint terminal attempt");
+    command.spawn().expect("spawn checkpoint fault child")
 }
 
 fn spawn_cleanup_child(root: &Path) -> Child {
@@ -3340,11 +3589,15 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> ExitStatus {
     }
 }
 
-fn wait_for_child_with_cleanup(child: &mut Child, timeout: Duration, root: &Path) -> ExitStatus {
+fn wait_for_child_with_cleanup(
+    child: &mut Child,
+    timeout: Duration,
+    root: &Path,
+) -> terminal::ChildExit {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait().expect("poll live child") {
-            return status;
+            return terminal::ChildExit::Observed(status);
         }
         if Instant::now() >= deadline {
             child.kill().expect("kill timed-out live child");
@@ -3354,10 +3607,30 @@ fn wait_for_child_with_cleanup(child: &mut Child, timeout: Duration, root: &Path
                 wait_for_child(&mut cleanup, Duration::from_secs(240)).success(),
                 "exact cleanup after timed-out live child"
             );
-            return status;
+            return terminal::ChildExit::Escalated(status);
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+fn timeout_escalation_reaps_and_recovers_but_is_not_an_expected_exit() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory =
+        tempfile::tempdir_in(kuberic_mssql_tests::test_support::workspace_root().join("target"))
+            .unwrap();
+    let root = directory.path().join("empty-fixture");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut child = Command::new("sleep")
+        .arg("5")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let outcome = wait_for_child_with_cleanup(&mut child, Duration::from_millis(20), &root);
+    assert!(outcome.observed().is_err());
+    assert!(child.try_wait().unwrap().is_some());
 }
 
 fn load_journal_if_present(root: &Path) -> Option<OwnershipJournal> {

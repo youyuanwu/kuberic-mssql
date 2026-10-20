@@ -13,15 +13,15 @@ use std::time::{Duration, Instant};
 use kuberic_mssql_tests::three_replica::{
     ACKNOWLEDGEMENT_SCHEMA_VERSION, AclController, AclEvidence, AclProbe, BoundedProcessRunner,
     ChildDisposition, CleanupBackend, CleanupClock, CleanupCompletion, CleanupCoordinator,
-    CleanupError, CommandAclController, CommandAclProbe, CommandSpec, ContainerInspection,
-    ContainerLimits, ContainerMount, ContainerPort, ContainerRequest, DockerApi,
-    DockerCapabilities, DockerCli, DockerError, FailureCategory, FailureStage, FixtureConfig,
-    HandledCancellationSignal, HostPlatform, HostProbe, ImageInspection, JournalStore,
-    KubericMember, LockError, NetworkInspection, NetworkRequest, OwnedLabels, OwnershipInspector,
-    OwnershipJournal, PINNED_SQL_SERVER_IMAGE, PreflightError, ProcessError, ProcessErrorKind,
-    ProcessResult, ProcessRunner, ReconcileError, ResourceBinding, ResourceKind,
-    ResourceObservation, ResourcePolicy, ResourceRecord, ResourceState, RunState, SQL_SERVER_UID,
-    SanitizedFailure, SecretValue, SqlMember, SqlServerContainerSpec, TopologyRun,
+    CleanupError, CleanupJournalStore, CommandAclController, CommandAclProbe, CommandSpec,
+    ContainerCleanupResult, ContainerInspection, ContainerLimits, ContainerMount, ContainerPort,
+    ContainerRequest, DockerApi, DockerCapabilities, DockerCli, DockerError, FailureCategory,
+    FailureStage, FixtureConfig, HandledCancellationSignal, HostPlatform, HostProbe,
+    ImageInspection, JournalStore, KubericMember, LockError, NetworkInspection, NetworkRequest,
+    OwnedLabels, OwnershipInspector, OwnershipJournal, PINNED_SQL_SERVER_IMAGE, PreflightError,
+    ProcessError, ProcessErrorKind, ProcessResult, ProcessRunner, ReconcileError, ResourceBinding,
+    ResourceKind, ResourceObservation, ResourcePolicy, ResourceRecord, ResourceState, RunState,
+    SQL_SERVER_UID, SanitizedFailure, SecretValue, SqlMember, SqlServerContainerSpec, TopologyRun,
     acquire_root_lock, cgroup_v2_available_memory, cgroup_v2_effective_cpu_quota,
     cgroup_v2_effective_cpuset, cgroup_v2_path_from, cleanup, combine_with_cleanup,
     effective_cpu_count, inspect_member_directory, parse_acl_evidence, parse_cpu_list,
@@ -882,6 +882,46 @@ fn process_timeout_model_requires_exact_termination_and_reaping() {
 }
 
 #[test]
+fn cleanup_stop_cohort_uses_exact_ids_and_preserves_scalar_grace() {
+    let runner = ScriptedRunner::default();
+    runner
+        .results
+        .lock()
+        .unwrap()
+        .extend([successful("stopped"), successful("stopped")]);
+    let docker = DockerCli::new(runner);
+    let ids: Vec<_> = (1..=3).map(|id| format!("{id:064x}")).collect();
+    docker
+        .stop_container(&ids[0], Duration::from_secs(30))
+        .unwrap();
+    docker
+        .stop_containers_for_cleanup(&ids, Duration::from_secs(90))
+        .unwrap();
+    for invalid in [
+        Vec::new(),
+        vec![ids[0].clone(), ids[0].clone()],
+        vec!["container-name".into()],
+    ] {
+        assert_eq!(
+            docker.stop_containers_for_cleanup(&invalid, Duration::from_secs(90)),
+            Err(DockerError::InvalidRequest)
+        );
+    }
+    let commands = docker.runner().commands.lock().unwrap();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(
+        commands[0].arguments(),
+        ["container", "stop", "--time", "10", &ids[0]].map(std::ffi::OsString::from)
+    );
+    let mut expected: Vec<_> = ["container", "stop", "--time", "10"]
+        .map(std::ffi::OsString::from)
+        .into();
+    expected.extend(ids.iter().map(std::ffi::OsString::from));
+    assert_eq!(commands[1].arguments(), expected);
+    assert_eq!(commands[1].program(), Path::new("docker"));
+}
+
+#[test]
 fn bounded_process_runner_terminates_descendants_that_retain_pipes() {
     let started = Instant::now();
     let result = BoundedProcessRunner
@@ -1635,6 +1675,384 @@ impl CleanupBackend for FakeLifecycle {
 
     fn remove_path(&self, resource: &ResourceRecord, _: Duration) -> Result<(), CleanupError> {
         self.remove(resource, FailureCategory::PathRemoval)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CohortMode {
+    Success,
+    Failure,
+    Panic,
+    Malformed,
+    Duplicate,
+    Extra,
+    Misattributed,
+    Reappeared,
+    Late,
+}
+
+struct CohortLifecycle<'a> {
+    scalar: FakeLifecycle,
+    store: &'a JournalStore,
+    clock: FakeCleanupClock,
+    mode: CohortMode,
+    cohorts: RefCell<Vec<Vec<String>>>,
+    scalar_containers: Cell<usize>,
+    remaining: RefCell<Vec<Duration>>,
+}
+
+impl<'a> CohortLifecycle<'a> {
+    fn new(store: &'a JournalStore, clock: FakeCleanupClock, mode: CohortMode) -> Self {
+        let scalar = FakeLifecycle::default();
+        for resource in store.load::<OwnershipJournal>().unwrap().unwrap().resources {
+            scalar.set(
+                &resource.logical_name,
+                [ResourceObservation::Owned {
+                    binding: resource.binding.unwrap(),
+                    foreign_attachments: Vec::new(),
+                }],
+            );
+        }
+        Self {
+            scalar,
+            store,
+            clock,
+            mode,
+            cohorts: RefCell::new(Vec::new()),
+            scalar_containers: Cell::new(0),
+            remaining: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl OwnershipInspector for CohortLifecycle<'_> {
+    fn inspect(&self, resource: &ResourceRecord) -> Result<ResourceObservation, ReconcileError> {
+        self.scalar.inspect(resource)
+    }
+}
+
+impl CleanupBackend for CohortLifecycle<'_> {
+    fn supports_container_batch(&self) -> bool {
+        true
+    }
+
+    fn inspect_cleanup(
+        &self,
+        resource: &ResourceRecord,
+        _: Duration,
+    ) -> Result<ResourceObservation, ReconcileError> {
+        self.clock
+            .now
+            .set(self.clock.now.get() + Duration::from_secs(1));
+        self.inspect(resource)
+    }
+
+    fn remove_container_batch(
+        &self,
+        resources: &[ResourceRecord],
+        remaining: &dyn Fn() -> Duration,
+    ) -> Vec<ContainerCleanupResult> {
+        let durable = self.store.load::<OwnershipJournal>().unwrap().unwrap();
+        assert_eq!(durable.state, RunState::Cleaning);
+        for resource in resources {
+            assert!(
+                durable.resources.iter().any(|record| {
+                    record.logical_name == resource.logical_name
+                        && record.state == ResourceState::Cleaning
+                        && record.binding == resource.binding
+                }),
+                "every participant must have durable Cleaning before dispatch"
+            );
+        }
+        self.cohorts
+            .borrow_mut()
+            .push(resources.iter().map(|r| r.logical_name.clone()).collect());
+        self.remaining.borrow_mut().push(remaining());
+        self.clock
+            .now
+            .set(self.clock.now.get() + Duration::from_secs(5));
+        self.remaining.borrow_mut().push(remaining());
+        let mut outcomes = Vec::new();
+        for resource in resources {
+            self.scalar
+                .remove(resource, FailureCategory::ContainerRemoval)
+                .unwrap();
+            if matches!(self.mode, CohortMode::Panic) {
+                panic!("dispatch panic");
+            }
+            let errors = if matches!(
+                self.mode,
+                CohortMode::Failure
+                    | CohortMode::Malformed
+                    | CohortMode::Duplicate
+                    | CohortMode::Extra
+                    | CohortMode::Misattributed
+            ) {
+                vec![CleanupError {
+                    resource: resource.logical_name.clone(),
+                    failure: SanitizedFailure::with_detail(
+                        FailureStage::Cleanup,
+                        FailureCategory::ContainerRemoval,
+                        "observed uncertain cohort stop",
+                    ),
+                }]
+            } else {
+                Vec::new()
+            };
+            outcomes.push(ContainerCleanupResult {
+                resource: resource.logical_name.clone(),
+                errors,
+            });
+        }
+        if matches!(self.mode, CohortMode::Malformed) {
+            outcomes.pop();
+        }
+        if matches!(self.mode, CohortMode::Duplicate) {
+            outcomes.push(outcomes[0].clone());
+        }
+        if matches!(self.mode, CohortMode::Extra) {
+            outcomes.push(ContainerCleanupResult {
+                resource: "unexpected".to_owned(),
+                errors: vec![CleanupError {
+                    resource: "unexpected".to_owned(),
+                    failure: SanitizedFailure::new(
+                        FailureStage::Cleanup,
+                        FailureCategory::DeadlineExceeded,
+                    ),
+                }],
+            });
+        }
+        if matches!(self.mode, CohortMode::Misattributed) {
+            outcomes[0].errors[0].resource = "unexpected".to_owned();
+        }
+        if matches!(self.mode, CohortMode::Reappeared) {
+            self.scalar
+                .set(&resources[0].logical_name, [ResourceObservation::Foreign]);
+        }
+        if matches!(self.mode, CohortMode::Late) {
+            self.clock
+                .now
+                .set(self.clock.now.get() + Duration::from_secs(180));
+        }
+        outcomes
+    }
+
+    fn remove_container(&self, resource: &ResourceRecord, _: Duration) -> Result<(), CleanupError> {
+        self.scalar_containers.set(self.scalar_containers.get() + 1);
+        self.scalar
+            .remove(resource, FailureCategory::ContainerRemoval)
+    }
+    fn remove_network(&self, resource: &ResourceRecord, _: Duration) -> Result<(), CleanupError> {
+        self.scalar
+            .remove(resource, FailureCategory::NetworkRemoval)
+    }
+    fn remove_path(&self, resource: &ResourceRecord, _: Duration) -> Result<(), CleanupError> {
+        self.scalar.remove(resource, FailureCategory::PathRemoval)
+    }
+}
+
+fn cohort_journal(root: &Path) -> (JournalStore, OwnershipJournal) {
+    let store = JournalStore::initialize(root).unwrap();
+    let mut journal = store
+        .create::<OwnershipJournal, _>(sample_run(store.root()))
+        .unwrap();
+    journal.resources.push(record(
+        ResourceKind::Network,
+        "network",
+        ResourceState::Bound,
+        Some(binding("network-id")),
+    ));
+    journal.resources.push(record(
+        ResourceKind::DataDirectory,
+        "data",
+        ResourceState::Bound,
+        Some(binding("data-id")),
+    ));
+    for ordinal in 1..=3 {
+        journal.resources.push(record(
+            ResourceKind::Container,
+            &format!("sql-{ordinal}"),
+            ResourceState::Bound,
+            Some(binding(&format!("id-{ordinal}"))),
+        ));
+    }
+    store.save(&journal).unwrap();
+    (store, journal)
+}
+
+#[test]
+fn cohort_cleanup_commits_all_intents_and_uses_original_remaining_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let (store, mut journal) = cohort_journal(&directory.path().join("fixture"));
+    let clock = FakeCleanupClock::new();
+    let coordinator = CleanupCoordinator::new(clock.clone(), Duration::from_secs(180));
+    clock.now.set(Duration::from_secs(100));
+    let backend = CohortLifecycle::new(&store, clock, CohortMode::Success);
+    let report = coordinator.cleanup(&store, &mut journal, &backend);
+    assert!(report.succeeded(), "{report:?}");
+    assert_eq!(
+        backend.cohorts.borrow().as_slice(),
+        [vec!["sql-3", "sql-2", "sql-1"]]
+    );
+    assert_eq!(backend.scalar_containers.get(), 0);
+    let remaining = backend.remaining.borrow();
+    assert_eq!(remaining[0], Duration::from_secs(77));
+    assert_eq!(remaining[0] - remaining[1], Duration::from_secs(5));
+    assert_eq!(journal.state, RunState::Removed);
+}
+
+#[test]
+fn cohort_failure_panic_bad_results_late_completion_and_reappearance_block_dependents() {
+    for mode in [
+        CohortMode::Failure,
+        CohortMode::Panic,
+        CohortMode::Malformed,
+        CohortMode::Duplicate,
+        CohortMode::Extra,
+        CohortMode::Misattributed,
+        CohortMode::Reappeared,
+        CohortMode::Late,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, mut journal) = cohort_journal(&directory.path().join("fixture"));
+        let backend = CohortLifecycle::new(&store, FakeCleanupClock::new(), mode);
+        let coordinator = CleanupCoordinator::new(backend.clock.clone(), Duration::from_secs(180));
+        let report = coordinator.cleanup(&store, &mut journal, &backend);
+        assert!(!report.succeeded(), "mode={mode:?}");
+        assert_eq!(journal.state, RunState::Blocked);
+        assert_eq!(
+            backend.scalar_containers.get(),
+            0,
+            "no scalar retry after cohort dispatch"
+        );
+        let removals = backend.scalar.removals.borrow();
+        assert!(
+            !removals
+                .iter()
+                .any(|name| name == "network" || name == "data")
+        );
+        assert!(!report.errors.is_empty());
+    }
+}
+
+#[test]
+fn malformed_cohort_results_preserve_observed_errors_and_primary_failure() {
+    for mode in [
+        CohortMode::Malformed,
+        CohortMode::Duplicate,
+        CohortMode::Extra,
+        CohortMode::Misattributed,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, mut journal) = cohort_journal(&directory.path().join("fixture"));
+        let backend = CohortLifecycle::new(&store, FakeCleanupClock::new(), mode);
+        let report = cleanup(&store, &mut journal, &backend);
+        let original = CleanupError {
+            resource: "sql-2".to_owned(),
+            failure: SanitizedFailure::with_detail(
+                FailureStage::Cleanup,
+                FailureCategory::ContainerRemoval,
+                "observed uncertain cohort stop",
+            ),
+        };
+        assert!(report.errors.contains(&original), "mode={mode:?}");
+        assert!(report.errors.iter().any(|error| {
+            error
+                .failure
+                .to_string()
+                .contains("outcomes are incomplete or mismatched")
+        }));
+        if matches!(mode, CohortMode::Misattributed | CohortMode::Extra) {
+            assert!(report.errors.iter().any(|error| {
+                error.resource == "container-cohort"
+                    && error
+                        .failure
+                        .to_string()
+                        .contains("malformed container cohort error association")
+            }));
+        }
+        let primary = SanitizedFailure::new(FailureStage::Test, FailureCategory::SqlUnavailable);
+        let combined = combine_with_cleanup::<()>(Err(primary.clone()), &report).unwrap_err();
+        assert_eq!(combined.primary(), primary);
+        assert!(
+            combined
+                .to_string()
+                .contains("observed uncertain cohort stop")
+        );
+        assert_eq!(backend.scalar_containers.get(), 0);
+        assert_eq!(journal.state, RunState::Blocked);
+        assert!(
+            journal.resources[..2]
+                .iter()
+                .all(|r| r.state == ResourceState::Blocked)
+        );
+    }
+}
+
+struct FailingCohortStore<'a> {
+    store: &'a JournalStore,
+    calls: Cell<usize>,
+    fail: usize,
+}
+impl CleanupJournalStore<OwnershipJournal> for FailingCohortStore<'_> {
+    fn save_cleanup_journal(&self, journal: &OwnershipJournal) -> Result<(), ReconcileError> {
+        let call = self.calls.get() + 1;
+        self.calls.set(call);
+        if call == self.fail {
+            Err(ReconcileError::Io)
+        } else {
+            self.store.save(journal).map_err(|_| ReconcileError::Io)
+        }
+    }
+}
+
+#[test]
+fn cohort_never_dispatches_unsaved_foreign_or_duplicate_participants() {
+    for fail in [1, 3] {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, mut journal) = cohort_journal(&directory.path().join("fixture"));
+        let backend = CohortLifecycle::new(&store, FakeCleanupClock::new(), CohortMode::Success);
+        let failing = FailingCohortStore {
+            store: &store,
+            calls: Cell::new(0),
+            fail,
+        };
+        let report = cleanup(&failing, &mut journal, &backend);
+        assert!(!report.succeeded());
+        let dispatched: Vec<_> = backend.cohorts.borrow().iter().flatten().cloned().collect();
+        if fail == 1 {
+            assert!(dispatched.is_empty());
+        } else {
+            assert!(!dispatched.iter().any(|name| name == "sql-2"));
+        }
+        assert!(
+            !backend
+                .scalar
+                .removals
+                .borrow()
+                .iter()
+                .any(|name| name == "network" || name == "data")
+        );
+    }
+    for duplicate in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, mut journal) = cohort_journal(&directory.path().join("fixture"));
+        if duplicate {
+            journal.resources[4].binding = journal.resources[3].binding.clone();
+            store.save(&journal).unwrap();
+        }
+        let backend = CohortLifecycle::new(&store, FakeCleanupClock::new(), CohortMode::Success);
+        if !duplicate {
+            backend.scalar.set("sql-2", [ResourceObservation::Foreign]);
+        }
+        let report = cleanup(&store, &mut journal, &backend);
+        assert!(!report.succeeded());
+        let dispatched: Vec<_> = backend.cohorts.borrow().iter().flatten().cloned().collect();
+        if duplicate {
+            assert!(dispatched.is_empty());
+        } else {
+            assert!(!dispatched.iter().any(|name| name == "sql-2"));
+        }
     }
 }
 

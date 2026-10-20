@@ -438,15 +438,44 @@ just cleanup-nextest-archive "$extract"
 
 Use the same source revision as the archive producer. Retain the extraction
 until cleanup succeeds; archived cleanup invokes its existing fixture binaries
-directly, not Cargo. No credentials, journals, logs or PAW files are uploaded.
+directly, not Cargo. The uploaded archive contains no credentials, journals,
+test logs or PAW files.
 
 Long fault/handshake/conflict/target/checkpoint/lease suites use individually
 named scenario tests, so nextest reports each case's result and duration.
 Fresh fixtures, atomic recovery/replay journeys and serial SQL execution are
 retained; splitting improves progress visibility, not total execution time.
-Five minutes is a normal-runtime target, not a cleanup-interrupting timeout.
+Three minutes is a reduction goal, not a per-case deadline; atomic recovery
+journeys may take longer. Runtime targets never interrupt required cleanup.
 Narrow family recipes select all their named cases by prefix; use the full
 `family::case` name with `--exact` to select an individual three-replica case.
+
+Targeted slow scenarios retain private phase snapshots and publish validated
+`MSSQL_PHASE` summaries through the same local/archive live runner, without
+enabling raw successful SQL output. Scenario, parent/child attempt, phase,
+outcome and elapsed milliseconds distinguish setup, native waits, recovery and
+cleanup. Nested timings are not additive; unfinished work remains incomplete,
+not successful. These diagnostics do not prove containment or authorize cleanup.
+
+Each live-runner invocation retains its snapshots in a fresh
+`.phase-timings.*` directory beneath its runner root. Publication has a separate
+five-second deadline and one-second forced-stop reserve; reporting failure
+cannot hide an existing test failure or indefinitely delay fallback cleanup.
+Direct Cargo live runs retain snapshots in `target/.mssql-phase-timings-*`
+and print their safe summary only after successful cleanup. Their existing
+`--nocapture` output is still raw test output, not a sanitized reporting channel.
+
+Disposal can overlap stops of eligible members within one already-owned
+three-replica fixture; SQL cases and fixtures still run serially per worker.
+Every participant needs durable cleanup intent and exact ownership checks.
+The ten-second stop grace is unchanged, errors remain failures even after
+later recovery, and dependent network/data removal waits for verified absence.
+Controlled restart and fencing retain their scalar stop path.
+
+Handled-signal and checkpoint recovery require the actual expected child cause
+and completed teardown, not just any nonzero exit. Timeout escalation cannot
+count as that expected outcome; SIGKILL requires observed SIGKILL death.
+Separate recovery and the existing full positive retries remain mandatory.
 
 Complete happy-path and same-root-restart journeys run inside recovery retries,
 not again as standalone CI tests. The hosted witness retains the full native

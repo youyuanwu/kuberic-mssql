@@ -14,7 +14,7 @@ const MAX_DRAIN_BYTES_PER_PASS: usize = 64 * 1024;
 const WAIT_INTERVAL: Duration = Duration::from_millis(10);
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(250);
-const SHUTDOWN_RESERVE: Duration = Duration::from_millis(1500);
+pub(crate) const SHUTDOWN_RESERVE: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct CommandSpec {

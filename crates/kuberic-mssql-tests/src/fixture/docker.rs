@@ -551,6 +551,16 @@ impl fmt::Display for DockerError {
 impl Error for DockerError {}
 
 pub trait DockerApi {
+    fn supports_cleanup_stop_batch(&self) -> bool {
+        false
+    }
+    fn stop_containers_for_cleanup(
+        &self,
+        _ids: &[String],
+        _timeout: Duration,
+    ) -> Result<(), DockerError> {
+        Err(DockerError::InvalidRequest)
+    }
     fn capabilities(&self, timeout: Duration) -> Result<DockerCapabilities, DockerError>;
     fn docker_root(&self, timeout: Duration) -> Result<PathBuf, DockerError>;
     fn inspect_image(
@@ -801,6 +811,33 @@ impl<R: ProcessRunner> DockerApi for DockerCli<R> {
             &self.runner,
             self.command("stop owned SQL Server container", timeout)
                 .args(["container", "stop", "--time", "10", id]),
+        )
+    }
+
+    fn supports_cleanup_stop_batch(&self) -> bool {
+        true
+    }
+
+    fn stop_containers_for_cleanup(
+        &self,
+        ids: &[String],
+        timeout: Duration,
+    ) -> Result<(), DockerError> {
+        let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+        if ids.is_empty()
+            || ids.len() > 3
+            || unique.len() != ids.len()
+            || ids
+                .iter()
+                .any(|id| id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(DockerError::InvalidRequest);
+        }
+        run_empty(
+            &self.runner,
+            self.command("stop owned SQL Server container cohort", timeout)
+                .args(["container", "stop", "--time", "10"])
+                .args(ids),
         )
     }
 
