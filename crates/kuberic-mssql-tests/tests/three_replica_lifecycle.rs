@@ -1684,6 +1684,9 @@ enum CohortMode {
     Failure,
     Panic,
     Malformed,
+    Duplicate,
+    Extra,
+    Misattributed,
     Reappeared,
     Late,
 }
@@ -1777,12 +1780,20 @@ impl CleanupBackend for CohortLifecycle<'_> {
             if matches!(self.mode, CohortMode::Panic) {
                 panic!("dispatch panic");
             }
-            let errors = if matches!(self.mode, CohortMode::Failure) {
+            let errors = if matches!(
+                self.mode,
+                CohortMode::Failure
+                    | CohortMode::Malformed
+                    | CohortMode::Duplicate
+                    | CohortMode::Extra
+                    | CohortMode::Misattributed
+            ) {
                 vec![CleanupError {
                     resource: resource.logical_name.clone(),
-                    failure: SanitizedFailure::new(
+                    failure: SanitizedFailure::with_detail(
                         FailureStage::Cleanup,
                         FailureCategory::ContainerRemoval,
+                        "observed uncertain cohort stop",
                     ),
                 }]
             } else {
@@ -1795,6 +1806,24 @@ impl CleanupBackend for CohortLifecycle<'_> {
         }
         if matches!(self.mode, CohortMode::Malformed) {
             outcomes.pop();
+        }
+        if matches!(self.mode, CohortMode::Duplicate) {
+            outcomes.push(outcomes[0].clone());
+        }
+        if matches!(self.mode, CohortMode::Extra) {
+            outcomes.push(ContainerCleanupResult {
+                resource: "unexpected".to_owned(),
+                errors: vec![CleanupError {
+                    resource: "unexpected".to_owned(),
+                    failure: SanitizedFailure::new(
+                        FailureStage::Cleanup,
+                        FailureCategory::DeadlineExceeded,
+                    ),
+                }],
+            });
+        }
+        if matches!(self.mode, CohortMode::Misattributed) {
+            outcomes[0].errors[0].resource = "unexpected".to_owned();
         }
         if matches!(self.mode, CohortMode::Reappeared) {
             self.scalar
@@ -1857,7 +1886,7 @@ fn cohort_cleanup_commits_all_intents_and_uses_original_remaining_budget() {
     let (store, mut journal) = cohort_journal(&directory.path().join("fixture"));
     let clock = FakeCleanupClock::new();
     let coordinator = CleanupCoordinator::new(clock.clone(), Duration::from_secs(180));
-    clock.now.set(Duration::from_secs(40));
+    clock.now.set(Duration::from_secs(100));
     let backend = CohortLifecycle::new(&store, clock, CohortMode::Success);
     let report = coordinator.cleanup(&store, &mut journal, &backend);
     assert!(report.succeeded(), "{report:?}");
@@ -1867,7 +1896,7 @@ fn cohort_cleanup_commits_all_intents_and_uses_original_remaining_budget() {
     );
     assert_eq!(backend.scalar_containers.get(), 0);
     let remaining = backend.remaining.borrow();
-    assert!(remaining[0] < Duration::from_secs(140));
+    assert_eq!(remaining[0], Duration::from_secs(77));
     assert_eq!(remaining[0] - remaining[1], Duration::from_secs(5));
     assert_eq!(journal.state, RunState::Removed);
 }
@@ -1878,6 +1907,9 @@ fn cohort_failure_panic_bad_results_late_completion_and_reappearance_block_depen
         CohortMode::Failure,
         CohortMode::Panic,
         CohortMode::Malformed,
+        CohortMode::Duplicate,
+        CohortMode::Extra,
+        CohortMode::Misattributed,
         CohortMode::Reappeared,
         CohortMode::Late,
     ] {
@@ -1900,6 +1932,60 @@ fn cohort_failure_panic_bad_results_late_completion_and_reappearance_block_depen
                 .any(|name| name == "network" || name == "data")
         );
         assert!(!report.errors.is_empty());
+    }
+}
+
+#[test]
+fn malformed_cohort_results_preserve_observed_errors_and_primary_failure() {
+    for mode in [
+        CohortMode::Malformed,
+        CohortMode::Duplicate,
+        CohortMode::Extra,
+        CohortMode::Misattributed,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, mut journal) = cohort_journal(&directory.path().join("fixture"));
+        let backend = CohortLifecycle::new(&store, FakeCleanupClock::new(), mode);
+        let report = cleanup(&store, &mut journal, &backend);
+        let original = CleanupError {
+            resource: "sql-2".to_owned(),
+            failure: SanitizedFailure::with_detail(
+                FailureStage::Cleanup,
+                FailureCategory::ContainerRemoval,
+                "observed uncertain cohort stop",
+            ),
+        };
+        assert!(report.errors.contains(&original), "mode={mode:?}");
+        assert!(report.errors.iter().any(|error| {
+            error
+                .failure
+                .to_string()
+                .contains("outcomes are incomplete or mismatched")
+        }));
+        if matches!(mode, CohortMode::Misattributed | CohortMode::Extra) {
+            assert!(report.errors.iter().any(|error| {
+                error.resource == "container-cohort"
+                    && error
+                        .failure
+                        .to_string()
+                        .contains("malformed container cohort error association")
+            }));
+        }
+        let primary = SanitizedFailure::new(FailureStage::Test, FailureCategory::SqlUnavailable);
+        let combined = combine_with_cleanup::<()>(Err(primary.clone()), &report).unwrap_err();
+        assert_eq!(combined.primary(), primary);
+        assert!(
+            combined
+                .to_string()
+                .contains("observed uncertain cohort stop")
+        );
+        assert_eq!(backend.scalar_containers.get(), 0);
+        assert_eq!(journal.state, RunState::Blocked);
+        assert!(
+            journal.resources[..2]
+                .iter()
+                .all(|r| r.state == ResourceState::Blocked)
+        );
     }
 }
 

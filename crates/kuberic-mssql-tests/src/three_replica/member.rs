@@ -2238,14 +2238,7 @@ where
             }
             return results;
         }
-        let count = u32::try_from(resources.len()).expect("bounded container cohort");
-        let allowance = Duration::from_secs(30).saturating_mul(count);
-        let budget = OperationBudget::new(&self.clock, remaining().min(allowance));
-        let left = || {
-            budget
-                .remaining()
-                .map_or(Duration::ZERO, |left| left.min(remaining()))
-        };
+        let left = remaining;
         let command_limit = || left().min(Duration::from_secs(30));
         let mut eligible = vec![false; resources.len()];
         let mut running = Vec::new();
@@ -3314,7 +3307,12 @@ mod tests {
             network: None,
             containers: &containers,
         };
-        let results = backend.remove_container_batch(&resources, &|| coordinator.remaining());
+        let budget = OperationBudget::new(&docker.clock, Duration::from_secs(90));
+        let results = backend.remove_container_batch(&resources, &|| {
+            budget
+                .remaining()
+                .map_or(Duration::ZERO, |left| left.min(coordinator.remaining()))
+        });
         assert!(
             results.iter().all(|result| result.errors.is_empty()),
             "{results:?}"
@@ -3334,6 +3332,87 @@ mod tests {
                 .filter(|(kind, _, _)| kind != "stop-cohort")
                 .all(|(_, _, timeout)| *timeout <= Duration::from_secs(30))
         );
+    }
+
+    #[test]
+    fn native_cohort_deadline_includes_coordinator_absence_verification() {
+        for count in [2, 3] {
+            let directory = tempdir().unwrap();
+            let root = directory.path().join("fixture");
+            let store = JournalStore::initialize(&root).unwrap();
+            let mut journal = store.create::<OwnershipJournal, _>(run(&root)).unwrap();
+            let (containers, mut resources, docker) = cohort_fixture(&root);
+            resources.truncate(count);
+            for kind in [ResourceKind::Network, ResourceKind::DataDirectory] {
+                journal.resources.push(ResourceRecord {
+                    kind,
+                    logical_name: format!("dependent-{kind:?}"),
+                    path: None,
+                    intent: None,
+                    binding: None,
+                    state: ResourceState::Bound,
+                });
+            }
+            journal.resources.extend(resources);
+            store.save(&journal).unwrap();
+            let coordinator =
+                CleanupCoordinator::new(docker.clock.clone(), Duration::from_secs(180));
+            docker.clock.now.set(Duration::from_secs(40));
+            let backend = NativeCleanupBackend {
+                root: &root,
+                docker: &docker,
+                runner: &BoundedProcessRunner,
+                clock: docker.clock.clone(),
+                image_id: "image-id",
+                network: None,
+                containers: &containers,
+            };
+            let report = coordinator.cleanup(&store, &mut journal, &backend);
+            assert!(!report.succeeded(), "count={count}");
+            assert!(coordinator.remaining() > Duration::ZERO);
+            assert!(report.errors.iter().any(|error| {
+                error.failure
+                    == SanitizedFailure::new(
+                        FailureStage::Cleanup,
+                        FailureCategory::DeadlineExceeded,
+                    )
+            }));
+            assert_eq!(journal.resources[2].state, ResourceState::Blocked);
+            assert!(
+                journal.resources[..2]
+                    .iter()
+                    .all(|resource| resource.state == ResourceState::Blocked)
+            );
+            let durable = store.load::<OwnershipJournal>().unwrap().unwrap();
+            assert_eq!(durable.state, RunState::Blocked);
+            let calls = docker.calls.borrow();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(kind, _, _)| kind == "stop-cohort")
+                    .count(),
+                1
+            );
+            let final_limits: Vec<_> = calls[calls.len() - count..]
+                .iter()
+                .map(|(kind, _, timeout)| {
+                    assert_eq!(kind, "inspect");
+                    *timeout
+                })
+                .collect();
+            let expected = if count == 2 {
+                vec![11, 4]
+            } else {
+                vec![20, 13, 6]
+            };
+            assert_eq!(
+                final_limits,
+                expected
+                    .into_iter()
+                    .map(Duration::from_secs)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

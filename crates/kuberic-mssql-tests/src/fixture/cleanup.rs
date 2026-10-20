@@ -402,7 +402,7 @@ where
             store,
             journal,
             backend,
-            coordinator,
+            &|| coordinator.remaining(),
             index,
             errors,
             &mut report,
@@ -553,7 +553,7 @@ fn finish_removal<J, S>(
     store: &S,
     journal: &mut J,
     backend: &impl CleanupBackend,
-    coordinator: &CleanupCoordinator<impl CleanupClock>,
+    remaining: &dyn Fn() -> Duration,
     index: usize,
     errors: Vec<CleanupError>,
     report: &mut CleanupReport,
@@ -571,12 +571,12 @@ fn finish_removal<J, S>(
         }
         return;
     }
-    if coordinator.remaining().is_zero() {
+    if remaining().is_zero() {
         exhaust_budget(journal, index, &record, report);
         return;
     }
-    let observation = backend.inspect_cleanup(&journal.resources()[index], coordinator.remaining());
-    if coordinator.remaining().is_zero() {
+    let observation = backend.inspect_cleanup(&journal.resources()[index], remaining());
+    if remaining().is_zero() {
         exhaust_budget(journal, index, &record, report);
         return;
     }
@@ -586,6 +586,9 @@ fn finish_removal<J, S>(
             report.removed.push(record.logical_name.clone());
             if store.save_cleanup_journal(journal).is_err() {
                 report.errors.push(CleanupError::journal(&record));
+            }
+            if remaining().is_zero() {
+                exhaust_budget(journal, index, &record, report);
             }
         }
         Ok(ResourceObservation::Owned { .. }) | Ok(ResourceObservation::Foreign) | Err(_) => {
@@ -683,8 +686,16 @@ where
         return indices;
     }
     let records: Vec<_> = prepared.iter().map(|(_, record)| record.clone()).collect();
+    let allowance = Duration::from_secs(30)
+        .saturating_mul(u32::try_from(records.len()).expect("bounded container cohort"));
+    let budget = OperationBudget::new(coordinator.clock(), coordinator.remaining().min(allowance));
+    let remaining = || {
+        budget
+            .remaining()
+            .map_or(Duration::ZERO, |left| left.min(coordinator.remaining()))
+    };
     let outcomes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        backend.remove_container_batch(&records, &|| coordinator.remaining())
+        backend.remove_container_batch(&records, &remaining)
     }));
     let outcomes = match outcomes {
         Ok(outcomes) => outcomes,
@@ -694,7 +705,7 @@ where
                     store,
                     journal,
                     backend,
-                    coordinator,
+                    &remaining,
                     *index,
                     vec![CleanupError {
                         resource: record.logical_name.clone(),
@@ -727,12 +738,27 @@ where
                 .any(|error| error.resource != outcome.resource)
         })
     {
+        for outcome in &outcomes {
+            for error in &outcome.errors {
+                if expected.contains(&outcome.resource) && error.resource == outcome.resource {
+                    report.errors.push(error.clone());
+                } else {
+                    report.errors.push(CleanupError {
+                        resource: "container-cohort".to_owned(),
+                        failure: error
+                            .failure
+                            .clone()
+                            .with_context("malformed container cohort error association"),
+                    });
+                }
+            }
+        }
         for (index, record) in &prepared {
             finish_removal(
                 store,
                 journal,
                 backend,
-                coordinator,
+                &remaining,
                 *index,
                 vec![CleanupError {
                     resource: record.logical_name.clone(),
@@ -755,7 +781,7 @@ where
         let errors = outcomes
             .remove(&record.logical_name)
             .expect("validated cohort outcome");
-        finish_removal(store, journal, backend, coordinator, *index, errors, report);
+        finish_removal(store, journal, backend, &remaining, *index, errors, report);
     }
     indices
 }
