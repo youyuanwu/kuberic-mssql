@@ -404,7 +404,7 @@ creation and production SQL transport are unchanged. The fixture fence uses
 its own run/configuration identity and a synthetic epoch, not durable Kuberic
 role authority.
 
-The [licensed experiments](../crates/kuberic-mssql-tests/tests/live_lease_fence.rs#L82)
+The [licensed experiments](../crates/kuberic-mssql-tests/tests/live_lease_fence.rs)
 against the pinned SQL Server **17.0.5005.3** fixture established:
 
 | Experiment | Observation |
@@ -414,6 +414,17 @@ against the pinned SQL Server **17.0.5005.3** fixture established:
 | Response cancellation | A delayed renewal response exceeded its client deadline; the session was discarded and fresh observations retained uncertainty rather than assuming rollback. |
 | Active-lease restart | The same container acquired fresh Docker/SQL start identities. Within the previous lease window, SQL reported `RESOLVING`/`OFFLINE`, raw remaining lease was null, and fresh-session marker readback did not confirm the attempted write. This is an unconfirmed outcome, not proof of commit, rollback, or lease persistence. |
 | Exact fixture fence | A verified stop produced matching evidence; after an explicit completed restart, old requests and a genuinely issued old receipt were rejected without stopping the replacement. |
+
+Both scenarios retain a 60-second creation validity and three-second timing
+margin. The expiry experiment renews for 90 seconds; active-restart retains
+120 seconds, including its cancelled-response renewal. The shorter expiry
+experiment still requires a confirmed write beyond the acknowledgement-based
+upper bound on original expiry and before the submission-based lower bound on
+renewed expiry, then the original identity/quorum/telemetry rejection evidence.
+With renewal submission `S` and creation acknowledgement `A`, its conservative
+extension-write interval is `(S - A) + 24 seconds`; a late write still fails.
+These are fixture timing choices, not production lease policy or universal
+runtime guarantees.
 
 Error [988](https://learn.microsoft.com/en-us/sql/relational-databases/errors-events/mssqlserver-988-database-engine-error)
 means insufficient HA quorum, not uniquely lease expiry. The experiment
