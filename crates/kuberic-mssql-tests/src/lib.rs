@@ -7,6 +7,7 @@ pub(crate) mod fixture;
 pub mod one_replica;
 pub mod release_intake;
 pub mod tds;
+pub mod test_support;
 pub mod three_replica;
 
 pub struct Fixture {

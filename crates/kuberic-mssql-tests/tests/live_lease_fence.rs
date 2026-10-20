@@ -21,10 +21,20 @@ const MARGIN: Duration = Duration::from_secs(3);
 
 #[test]
 #[ignore = "requires explicitly provisioned licensed Rust-owned SQL Server containers"]
-fn mssql_write_lease_and_exact_fence_experiments() {
+fn mssql_write_lease_and_exact_fence_experiments_expiry() {
+    run_lease_test("expiry", false);
+}
+
+#[test]
+#[ignore = "requires explicitly provisioned licensed Rust-owned SQL Server containers"]
+fn mssql_write_lease_and_exact_fence_experiments_active_restart() {
+    run_lease_test("active-restart", true);
+}
+
+fn run_lease_test(label: &'static str, restart: bool) {
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
-        .spawn(|| {
+        .spawn(move || {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .thread_stack_size(32 * 1024 * 1024)
@@ -37,8 +47,7 @@ fn mssql_write_lease_and_exact_fence_experiments() {
                     std::fs::create_dir_all(&root)?;
                     let mut signals =
                         CancellationSignals::register().expect("SIGINT/SIGTERM handlers");
-                    run_scenario(&Path::new(&root).join("expiry"), &mut signals, false).await?;
-                    run_scenario(&Path::new(&root).join("active-restart"), &mut signals, true).await
+                    run_scenario(&Path::new(&root).join(label), &mut signals, restart).await
                 })
                 .expect("licensed lease/fence experiments");
         })

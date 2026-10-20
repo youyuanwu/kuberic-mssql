@@ -354,20 +354,22 @@ protocol.
 
 Ordinary tests need neither SQL Server nor Kubernetes. The shared bootstrap
 installs or reuses the pinned Rust toolchain, compiler tools, Docker and
-checksum-pinned `just`.
+checksum-pinned `just` and `cargo-nextest`.
 
 ```bash
 bash crates/kuberic-mssql-tests/scripts/setup_environment.sh
 just check
 ```
 
-`just check` runs formatting, strict Clippy and locked all-feature Rust tests.
+`just check` runs formatting, strict Clippy, locked all-feature nextest tests,
+a separate Cargo doctest step and the archive-partition validator's unit tests.
 Builds default to one job; an explicitly supplied `CARGO_BUILD_JOBS` is
 preserved. Licensed live tests remain ignored during ordinary Cargo execution.
-The required GitHub Actions job `Shared CI validation` runs `just ci` at the
-exact pull-request head and always follows it with `just cleanup`. Its GitHub
-Actions job log is the CI evidence; test logs and evidence artifacts are not
-committed to this repository.
+The required GitHub Actions job `Shared CI validation` gates a checked test
+archive, exact partition coverage and four isolated test workers at the same
+pull-request revision. Each worker always attempts exact archived-binary
+cleanup. GitHub Actions job logs are the CI evidence; logs, archives and fixture
+state are not committed to this repository.
 
 Future Kuberic candidates have a separate server-free readiness group and a
 versioned intake-record validator:
@@ -400,19 +402,59 @@ It exercises exact accepted configuration/session/storage/history binding and
 stale authority rejection, retained partial-startup ownership, and synthetic
 quiet-report assembly, not live SQL durability or public catch-up.
 
-The complete local and CI pipeline is:
+The complete local pipeline remains serial:
 
 ```bash
 just ci
 ```
 
-It runs server-free checks, the Rust one-replica observer/CLI validation, then
-the Rust three-replica topology/Kuberic validation, same-root restart, and
-isolated native lease/fence experiments. Licensed tests therefore run in the
-required CI job as well as
-locally when the same prerequisites are available. Both fixture families
-create only resources owned by that invocation and clean them before
-returning. Aggregate cleanup is always safe to run:
+It runs server-free checks, then all 59 currently ignored SQL fixture tests
+through nextest's `live` profile and shared `live-sql` group. One-replica
+observation/recovery, three-replica happy path/restart/fault/signal/conflict/
+target-evidence, native commit/prefix, hosted witness and lease/fence suites
+run one at a time locally and within each CI worker. The unrelated privileged ACL test is not selected.
+Rust ignores keep ordinary Cargo server-free; the explicit live recipe uses
+`--run-ignored only`. Live failures stop further scheduling and remain failures.
+
+CI follows Kuberic's build-once nextest archive pattern: one producer checks,
+compiles and uploads only the compressed binaries/metadata archive for one day.
+Shard 1 first proves exhaustive, disjoint four-way ordinary/live coverage;
+shards 2–4 start without waiting for it. All four workers run ordinary
+`slice:i/4` and SQL `hash:i/4` partitions. Workers
+reuse the archive without rebuilding, remap paths to their matching checkout,
+and keep SQL serial on their own isolated Docker host. The final required gate
+fails if the producer or any worker fails, skips or is cancelled, including
+a coverage-validation failure in shard 1.
+
+To reproduce archive stages locally, run one worker at a time:
+
+```bash
+just ci-build-nextest-archive
+just validate-nextest-archive
+extract="$(mktemp -d "$PWD/target/nextest-extracted.XXXXXXXXXX")"
+just test-nextest-archive target/nextest/mssql-tests.tar.zst 1 "$extract"
+just cleanup-nextest-archive "$extract"
+```
+
+Use the same source revision as the archive producer. Retain the extraction
+until cleanup succeeds; archived cleanup invokes its existing fixture binaries
+directly, not Cargo. No credentials, journals, logs or PAW files are uploaded.
+
+Long fault/handshake/conflict/target/checkpoint/lease suites use individually
+named scenario tests, so nextest reports each case's result and duration.
+Fresh fixtures, atomic recovery/replay journeys and serial SQL execution are
+retained; splitting improves progress visibility, not total execution time.
+Five minutes is a normal-runtime target, not a cleanup-interrupting timeout.
+Narrow family recipes select all their named cases by prefix; use the full
+`family::case` name with `--exact` to select an individual three-replica case.
+
+Complete happy-path and same-root-restart journeys run inside recovery retries,
+not again as standalone CI tests. The hosted witness retains the full native
+commit collection. Their existing manual recipes remain available through an
+explicitly gated child helper, which runs no SQL in ordinary tests without a
+requested mode; canonical checks clear that internal mode.
+
+The same commands run locally when fixture prerequisites are available:
 
 ```bash
 just test-live-one-replica
@@ -420,8 +462,23 @@ just cleanup-live-one-replica
 just test-live-one-replica-recovery
 just test-live-three-replica
 just cleanup-live-three-replica
+just test-live-nextest
+just cleanup-live-nextest
 just cleanup
 ```
+
+The full nextest run uses absolute fixture-family roots beneath
+`target/mssql-nextest-live`; both new recipes accept an optional runner-root
+argument. Recovery visits retained nested ownership journals only in its
+`one-replica`, `three-replica` and `lease-fence` families, does not traverse
+symlinks beneath the runner root, and delegates removal to exact-ownership cleanup.
+Failures in discovery or cleanup are reported without suppressing other
+families; live/unknown owners remain blocked. Successful cleanup retains
+terminal `Removed` journals. CI uses finite 120-minute producer and 90-minute
+worker envelopes, with a 30-minute coverage step in shard 1. These are not
+worst-case recovery guarantees.
+Serialization applies within each worker/invocation; fixture locks still
+govern separate invocations.
 
 The one-replica preflight requires at least 5 GiB effective available memory,
 6 GiB on its fixture filesystem and two effective CPUs. Its single container
@@ -469,8 +526,9 @@ marker are independently observed typed steps; a retry executes only the next
 missing safe step.
 
 The live path is ignored by default and is not part of `just`, `just check`, or
-direct Cargo test runs. The happy path runs after one-replica validation in
-`just ci`; fault, signal, and recovery recipes remain explicit. It requires
+direct Cargo test runs. The full live profile explicitly selects happy-path,
+fault, signal, recovery and experiment cases in `just ci`; narrow recipes remain
+available. It requires
 local Linux x86-64 with cgroup v2, a local Docker engine
 that enforces memory/no-additional-swap/CPU limits, `setfacl`/`getfacl`, at
 least 10 GiB effective available memory, two effective CPUs, 15 GiB free on the
@@ -514,7 +572,7 @@ just cleanup-live-lease-fence [root]
 ```
 
 The native commit-record recipe uses `target/mssql-native-commit-coverage` by
-default. It runs an ignored fixture-only transaction probe and emits raw
+default. It explicitly runs the fixture-only native diagnostic and emits raw
 before/after/quiet evidence. A passing collection run can report **blocked**
 coverage; it does not enable catch-up or switchover. See the
 [implemented probe and remaining proof gates](docs/kuberic-progress.md#first-native-proof-toward-switchover).
@@ -535,8 +593,8 @@ has demonstrated one licensed sampled native association using the no-control
 commit probe and actual observe-only public hosts. Startup validates exact
 accepted lifecycle evidence without requiring serving report roles; public
 coverage remains blocked. Its ignored case adds
-no SUSPEND/RESUME controls and is not included in `just ci`; the guide gives
-the exact selection command for a separately authorized licensed run.
+no SUSPEND/RESUME controls and is included in the explicit nextest live CI
+profile; the guide also gives its exact individual selection command.
 
 The lease/fence recipe uses separate `expiry` and `active-restart` scenario
 roots and verifies native lease behavior, cancelled-response uncertainty,
@@ -588,10 +646,24 @@ executes real SIGINT and SIGKILL subprocess cases.
 The fault recipe uses a test-only observation seam to lose the callback reply
 after each separately classified database, backup, AG-create/bind, local-join,
 and seeding-permission SQL step. The statements themselves execute through the
-normal TDS mutation path, and replacement hosts then reobserve their native
-results. Seed intent, submission, acceptance, association, native completion,
-and callback publication use explicit test-only gates/probes around real
-callbacks; they are not SQL Server process-crash tests.
+normal TDS mutation path. Each configuration fault case requires exactly one
+injected reply loss at its named effect, observed mutation dispatch, confirmed
+host shutdown and exact idempotent cleanup. Source-recovery also reads back
+the completed FULL recovery change. The test makes no post-shutdown restart
+attempt: these cases do not establish terminal-versus-pending public state,
+fresh-session admission, completed AG/seeding or marker convergence after each
+lost reply. Those old per-boundary recovery expectations are removed, not
+treated as successful renewal.
+
+Separate seed submission cases retain positive same-session safe retry and
+zero duplicate accepted dispatch checks. Seed intent, submission, acceptance,
+association, native completion and callback publication use explicit test-only
+gates/probes around real callbacks; they are not SQL Server process-crash tests.
+The post-native-success case requires effect-free callback rejection after
+Abort instead of polling unavailable terminal progress. Its completed-state
+replacement executes a real native callback replay with zero duplicate
+`ADD DATABASE` dispatch and preserved marker visibility; this is not Public V1
+Build completion or interrupted-session renewal.
 
 The conflict recipe separates three real SQL-native cases from callback-seam
 coverage. Through normal TDS observation it converges a source that inherits
@@ -604,20 +676,23 @@ process restart plus a test gate.
 The terminal-seed recipe performs real SQL association removal and AG
 recreation, then proves terminal conflict/unsafe classification, zero
 redispatch, no recreated temporary intent, and exact cleanup. The
-target-evidence recipe uses real target SQL process restarts and test-injected
-target-local lineage mismatches at the pre-association, in-flight-seeding, and
-post-native/pre-reply windows. Every scenario performs exact, idempotent
-cleanup.
+target-evidence recipe retains three real target SQL restart windows. One
+synthetic-lineage journey holds the callback at pre-association, in-flight
+seeding and final target evidence, then injects the mismatch only at its final
+report-consumption seam. Every scenario performs exact, idempotent
+cleanup. Physical restart requires an independently observed new SQL start,
+a returned unsafe/unavailable or bounded callback-budget error, and no duplicate
+seed submission. An admitted `ADD DATABASE` may remain: callback failure does
+not prove rollback, zero side effects or a specific incarnation-check branch.
+Lineage mismatch still requires the lineage-conflict error.
 
 Direct test commands remain available:
 
 ```bash
 cargo test --locked -p kuberic-mssql-tests --test live_one_replica \
   one_replica_mssql_observation_and_cli -- --ignored --exact --test-threads=1
-cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
-  three_replica_mssql_happy_path -- --ignored --exact --test-threads=1
-cargo test --locked -p kuberic-mssql-tests --test live_three_replica \
-  three_replica_mssql_same_root_restart -- --ignored --exact --test-threads=1
+just test-live-three-replica
+just test-live-three-replica-restart
 ```
 
 An explicitly requested live test fails if any of its prerequisites are

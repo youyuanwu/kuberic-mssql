@@ -769,17 +769,28 @@ Server-free tests
 cover profile rejection, exact progress, malformed observations, canonical
 operation vectors, duplicate/reused operation IDs, epoch regression,
 destructive approval, lease timing/native uncertainty, fresh-model replay,
-fence binding, and gated lifecycle exclusion/re-entry. They run in the ordinary CI job as
-`cargo test --workspace --all-features`.
+fence binding, and gated lifecycle exclusion/re-entry. The ordinary CI stage
+uses locked all-feature nextest plus a separate Cargo doctest step; raw Cargo
+workspace tests remain server-free through the retained Rust ignores.
 Runtime tests also cover typed DMV decoding, inconsistent snapshots,
 permissions, transport and sample deadlines, freshness, cancellation, CLI
 output, and credential redaction. A dedicated server-free observer workflow
 runs these without provisioning PostgreSQL or Kubernetes.
 
-Live tests run sequentially in the required GitHub Actions job
-`Shared CI validation`, which runs `just ci` at the exact pull-request head and
-always runs `just cleanup`, after server-free checks. GitHub Actions job logs
-are the run evidence; no test logs or evidence artifacts are committed. The
+The required GitHub Actions check `Shared CI validation` gates one checked
+nextest archive and four isolated workers at the same pull-request revision.
+Shard 1 validates exact partition coverage; shards 2–4 do not wait for it.
+Each worker runs an ordinary slice followed by a
+serial SQL hash partition without rebuilding, and always attempts exact
+cleanup using the archived fixture binaries. Local `just ci` retains complete
+serial coverage. GitHub Actions logs are the run evidence; no archives, test
+logs or fixture-private state are committed. The
+nextest live profile selects every ignored SQL test in the three live binaries,
+including fault/recovery and native evidence experiments, and excludes the
+unrelated privileged ACL case. A shared `live-sql` group and the canonical
+single-threaded invocation prevent overlap within a worker. Namespace recovery
+visits nested exact journals, attempts all families after failures, and retains
+Removed journal evidence; it does not bypass blocked owner checks. The
 Rust one-replica lifecycle owns one digest-pinned SQL Server 2025
 Enterprise Developer container and validates absent AG, partial permission
 denial, invalid TLS and fresh production CLI provenance. It creates no
@@ -807,11 +818,17 @@ rejected, existing-state Open succeeds, native seed records compact without
 redispatch, exact contained reports reconverge, and native marker continuity is
 retained. This is not Public V1 peer-session/lifecycle renewal, does not replay
 an end-to-end Public V1 Build, and does not restore serving access.
-Fault, signal and recovery cases remain explicitly invoked, including failure
-after replacement-host startup followed by exact cleanup and retry. This does
-not advance the production delivery sequence: licensed validation restarts a
-target SQL process only to prove build-evidence invalidation; it does not own or
-contain that process lifecycle. Write-lease expiry, old-primary fencing,
+The explicit nextest live stage also runs fault, signal and recovery cases.
+Configuration-completion interruptions now prove exact SQL effect/reply-loss
+boundaries, confirmed host shutdown and exact idempotent cleanup, without
+post-drain terminal-state or fresh-session admission assumptions.
+They no longer assert completed AG/seeding/marker convergence after each such
+lost reply; same-session seed retries and completed-state host restart remain
+separate positive coverage. Physical target restart proves bounded native
+callback failure with observed SQL-start drift and no duplicate seed
+submission, not rollback or zero side effects. This does not advance the
+production delivery sequence: fixture-only restart is not production ownership
+or containment of that process lifecycle. Write-lease expiry, old-primary fencing,
 switchover, failover, replica replacement, Kubernetes lifecycle, and client
 routing remain unimplemented.
 

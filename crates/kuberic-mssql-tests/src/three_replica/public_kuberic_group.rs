@@ -999,6 +999,7 @@ impl PublicMutationFault {
 struct PublicFaultState {
     armed: Mutex<Option<PublicMutationFault>>,
     hits: AtomicUsize,
+    mutation_dispatches: AtomicUsize,
     seed_after_request_gate: Mutex<Option<SeedGate>>,
 }
 
@@ -1024,6 +1025,10 @@ impl PublicFaultInjection {
 
     pub fn hit_count(&self) -> usize {
         self.state.hits.load(Ordering::SeqCst)
+    }
+
+    pub fn mutation_dispatch_count(&self) -> usize {
+        self.state.mutation_dispatches.load(Ordering::SeqCst)
     }
 
     pub fn gate_seed_after_request(
@@ -1156,6 +1161,10 @@ impl SqlMutationExecutor for PublicMutationExecutor {
         &self,
         request: &SeedDispatchRequest,
     ) -> Result<SeedDispatchEvidence, RuntimeError> {
+        self.faults
+            .state
+            .mutation_dispatches
+            .fetch_add(1, Ordering::SeqCst);
         self.seed_dispatches.fetch_add(1, Ordering::SeqCst);
         self.mutation.submit_seed_dispatch(request).await
     }
@@ -1164,6 +1173,10 @@ impl SqlMutationExecutor for PublicMutationExecutor {
         if self.faults.take_if(self.ordinal, effect, true) {
             return Err(injected_fault());
         }
+        self.faults
+            .state
+            .mutation_dispatches
+            .fetch_add(1, Ordering::SeqCst);
         let is_seed_dispatch = effect.label() == "add database to availability group";
         if is_seed_dispatch {
             self.seed_dispatches.fetch_add(1, Ordering::SeqCst);

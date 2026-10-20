@@ -247,13 +247,8 @@ SELECT
                 .client
                 .query(sql, parameters)
                 .await
-                .map_err(|_| AdminError::Query)?;
-            while stream
-                .try_next()
-                .await
-                .map_err(|_| AdminError::Query)?
-                .is_some()
-            {}
+                .map_err(diagnostic_error)?;
+            while stream.try_next().await.map_err(diagnostic_error)?.is_some() {}
             Ok(())
         })
         .await

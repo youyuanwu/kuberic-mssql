@@ -26,8 +26,9 @@ use kuberic_runtime::protocol::public_operations::{
 use kuberic_runtime::protocol::types::{AccessStatus, ReplicaRole, ReplicaStorageIdentity};
 
 type TestError = Box<dyn Error + Send + Sync>;
-const HAPPY_PATH_TEST: &str = "three_replica_mssql_happy_path";
-const SAME_ROOT_RESTART_TEST: &str = "three_replica_mssql_same_root_restart";
+const LIFECYCLE_CHILD_TEST: &str = "three_replica_lifecycle_child";
+const CHILD_MODE_ENV: &str = "KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE";
+const FAULT_HIT_ENV: &str = "KUBERIC_MSSQL_FAULT_HIT_FILE";
 
 #[path = "live_three_replica/hosted_witness.rs"]
 mod hosted_witness;
@@ -39,51 +40,379 @@ struct PendingSeedCompaction {
 }
 
 #[test]
-#[ignore = "auto-accepts the SQL Server EULA for this test fixture and requires a qualified local Docker host"]
-fn three_replica_mssql_happy_path() {
-    run_three_replica_test(false);
+fn three_replica_lifecycle_child() {
+    let mode = match std::env::var(CHILD_MODE_ENV) {
+        Ok(mode) => mode,
+        Err(std::env::VarError::NotPresent) => return,
+        Err(std::env::VarError::NotUnicode(_)) => panic!("invalid live SQL child mode"),
+    };
+    match mode.as_str() {
+        "happy-path" => run_three_replica_test(false),
+        "same-root-restart" => run_three_replica_test(true),
+        "native-commit" => run_native_experiment(NativeExperiment::CommitRecord),
+        _ => panic!("invalid live SQL child mode"),
+    }
 }
 
 #[test]
-#[ignore = "validates same-root Kuberic host restart with a licensed SQL Server fixture"]
-fn three_replica_mssql_same_root_restart() {
-    run_three_replica_test(true);
+fn lifecycle_child_rejects_invalid_mode_before_fixture_admission() {
+    let output = test_child_command(
+        Path::new("/unused-live-sql-child-root"),
+        "invalid",
+        None,
+        None,
+    )
+    .env_remove("KUBERIC_MSSQL_THREE_REPLICA_ROOT")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid live SQL child mode"));
 }
 
-#[test]
-#[ignore = "exercises licensed bootstrap interruption boundaries sequentially on a qualified local Docker host"]
-fn three_replica_mssql_bootstrap_fault_boundaries() {
-    run_phase4_test(Phase4LiveTest::FaultBoundaries);
+macro_rules! phase4_case {
+    ($name:ident, $case:ident, $suffix:literal $(, $argument:expr)* $(,)?) => {
+        #[test]
+        #[ignore = "exercises a licensed SQL scenario on a qualified local Docker host"]
+        fn $name() {
+            run_phase4_test(|root| async move {
+                let root = root.join($suffix);
+                $case(&root $(, $argument)*).await
+            });
+        }
+    };
 }
 
-#[test]
-#[ignore = "exercises licensed seed dispatch handshake faults sequentially on a qualified local Docker host"]
-fn three_replica_mssql_seed_dispatch_handshake_faults() {
-    run_phase4_test(Phase4LiveTest::SeedDispatchHandshake);
+mod three_replica_mssql_bootstrap_fault_boundaries {
+    use super::*;
+
+    phase4_case!(
+        source_recovery,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::SourceRecoveryCompletion,
+        "source-recovery"
+    );
+    phase4_case!(
+        source_database_creation_intent,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::SourceDatabaseCreationIntentCompletion,
+        "source-database-creation-intent"
+    );
+    phase4_case!(
+        source_database_completion,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::SourceDatabaseCompletion,
+        "source-database-completion"
+    );
+    phase4_case!(
+        source_database_creation_intent_removal,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::SourceDatabaseCreationIntentRemovalCompletion,
+        "source-database-creation-intent-removal"
+    );
+    phase4_case!(
+        source_ownership,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::SourceOwnershipCompletion,
+        "source-ownership"
+    );
+    phase4_case!(
+        source_marker_table,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::SourceMarkerTableCompletion,
+        "source-marker-table"
+    );
+    phase4_case!(
+        source_full_backup,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::SourceFullBackupCompletion,
+        "source-full-backup"
+    );
+    phase4_case!(
+        source_log_backup,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::SourceLogBackupCompletion,
+        "source-log-backup"
+    );
+    phase4_case!(
+        source_backup_verification,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::SourceBackupVerificationCompletion,
+        "source-backup-verification"
+    );
+    phase4_case!(
+        availability_group_ownership_intent,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::AvailabilityGroupIntentCompletion,
+        "availability-group-ownership-intent"
+    );
+    phase4_case!(
+        availability_group_creation_intent,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::AvailabilityGroupCreationIntentCompletion,
+        "availability-group-creation-intent"
+    );
+    phase4_case!(
+        availability_group_creation,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::AvailabilityGroupCompletion,
+        "availability-group-creation"
+    );
+    phase4_case!(
+        availability_group_binding,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::AvailabilityGroupBindingCompletion,
+        "availability-group-binding"
+    );
+    phase4_case!(
+        availability_group_creation_intent_removal,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::AvailabilityGroupCreationIntentRemovalCompletion,
+        "availability-group-creation-intent-removal"
+    );
+    phase4_case!(
+        primary_seeding_grant,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::PrimarySeedingGrantCompletion,
+        "primary-seeding-grant"
+    );
+    phase4_case!(
+        primary_seeding_grant_evidence,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::PrimarySeedingGrantEvidenceCompletion,
+        "primary-seeding-grant-evidence"
+    );
+    phase4_case!(
+        first_secondary_join,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::FirstSecondaryJoinCompletion,
+        "first-secondary-join"
+    );
+    phase4_case!(
+        first_secondary_seeding_grant,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::FirstSecondarySeedingGrantCompletion,
+        "first-secondary-seeding-grant"
+    );
+    phase4_case!(
+        first_secondary_seeding_grant_evidence,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::FirstSecondarySeedingGrantEvidenceCompletion,
+        "first-secondary-seeding-grant-evidence"
+    );
+    phase4_case!(
+        second_secondary_join,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::SecondSecondaryJoinCompletion,
+        "second-secondary-join"
+    );
+    phase4_case!(
+        second_secondary_seeding_grant,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::SecondSecondarySeedingGrantCompletion,
+        "second-secondary-seeding-grant"
+    );
+    phase4_case!(
+        second_secondary_seeding_grant_evidence,
+        exercise_configuration_fault,
+        "",
+        PublicMutationFault::SecondSecondarySeedingGrantEvidenceCompletion,
+        "second-secondary-seeding-grant-evidence"
+    );
+    phase4_case!(seed_boundaries, exercise_seed_faults, "seed-boundaries");
+    phase4_case!(
+        post_native_success,
+        exercise_post_native_success_replay,
+        "post-native-success"
+    );
 }
 
-#[test]
-#[ignore = "exercises isolated SQL-native cases and callback observation-seam conflicts sequentially on a qualified local Docker host"]
-fn three_replica_mssql_conflict_evidence() {
-    run_phase4_test(Phase4LiveTest::ConflictEvidence);
+mod three_replica_mssql_seed_dispatch_handshake_faults {
+    use super::*;
+
+    phase4_case!(
+        before_request_submission,
+        exercise_seed_submission_fault,
+        "seed-before-request-submission",
+        PublicMutationFault::SeedBeforeRequestSubmission,
+        "seed-before-request-submission"
+    );
+    phase4_case!(
+        after_request_submission,
+        exercise_seed_submission_fault,
+        "seed-after-request-submission",
+        PublicMutationFault::SeedAfterRequestSubmission,
+        "seed-after-request-submission"
+    );
+    phase4_case!(
+        accepted_reply_lost,
+        exercise_seed_submission_fault,
+        "seed-accepted-reply-lost",
+        PublicMutationFault::SeedAcceptedReplyLost,
+        "seed-accepted-reply-lost"
+    );
+    phase4_case!(
+        definite_sql_rejection,
+        exercise_seed_submission_fault,
+        "seed-definite-sql-rejection",
+        PublicMutationFault::SeedDefiniteSqlRejection,
+        "seed-definite-sql-rejection"
+    );
 }
 
-#[test]
-#[ignore = "exercises licensed post-compaction terminal seed conflicts on a qualified local Docker host"]
-fn three_replica_mssql_terminal_seed_conflicts() {
-    run_phase4_test(Phase4LiveTest::TerminalSeedConflicts);
+mod three_replica_mssql_conflict_evidence {
+    use super::*;
+
+    phase4_case!(
+        native_source_recovery_partial,
+        exercise_native_source_recovery_partial,
+        "native-source-recovery-partial",
+        "native-source-recovery-partial"
+    );
+    phase4_case!(
+        native_unowned_source_database,
+        exercise_native_sql_conflict,
+        "native-unowned-source-database",
+        "native-unowned-source-database",
+        false
+    );
+    phase4_case!(
+        native_unowned_availability_group,
+        exercise_native_sql_conflict,
+        "native-unowned-availability-group",
+        "native-unowned-availability-group",
+        true
+    );
+    phase4_case!(
+        availability_group_identity_profile,
+        exercise_conflict_scenario,
+        "00-seam-availability-group-identity-profile",
+        LicensedConflictScenario::AvailabilityGroupIdentityOrProfile,
+        "seam-availability-group-identity-profile",
+        "conflicts with the requested bootstrap topology"
+    );
+    phase4_case!(
+        logical_replica_native_identity,
+        exercise_conflict_scenario,
+        "01-seam-logical-replica-native-identity",
+        LicensedConflictScenario::LogicalReplicaNativeMismatch,
+        "seam-logical-replica-native-identity",
+        "conflicts with the requested bootstrap topology"
+    );
+    phase4_case!(
+        endpoint_member_profile,
+        exercise_conflict_scenario,
+        "02-seam-endpoint-member-profile",
+        LicensedConflictScenario::EndpointOrMemberProfile,
+        "seam-endpoint-member-profile",
+        "conflicts with the requested bootstrap topology"
+    );
+    phase4_case!(
+        standalone_database_identity_recovery,
+        exercise_conflict_scenario,
+        "03-seam-standalone-database-identity-recovery",
+        LicensedConflictScenario::StandaloneDatabaseIdentityOrRecovery,
+        "seam-standalone-database-identity-recovery",
+        "conflicts with the requested bootstrap topology"
+    );
+    phase4_case!(
+        associated_database_identity_recovery,
+        exercise_conflict_scenario,
+        "04-seam-associated-database-identity-recovery",
+        LicensedConflictScenario::AssociatedDatabaseIdentityOrRecovery,
+        "seam-associated-database-identity-recovery",
+        "conflicts with the requested bootstrap topology"
+    );
+    phase4_case!(
+        target_lineage,
+        exercise_conflict_scenario,
+        "05-seam-target-lineage",
+        LicensedConflictScenario::IncompatibleLineage,
+        "seam-target-lineage",
+        "conflicts with the requested bootstrap topology"
+    );
+    phase4_case!(
+        sql_process_incarnation,
+        exercise_conflict_scenario,
+        "06-seam-sql-process-incarnation",
+        LicensedConflictScenario::SqlProcessIncarnationReplacement,
+        "seam-sql-process-incarnation",
+        "is unsafe to continue"
+    );
 }
 
-#[test]
-#[ignore = "exercises licensed target-local build evidence windows on a qualified local Docker host"]
-fn three_replica_mssql_target_host_evidence_faults() {
-    run_phase4_test(Phase4LiveTest::TargetHostEvidence);
+mod three_replica_mssql_terminal_seed_conflicts {
+    use super::*;
+
+    phase4_case!(
+        association_removal,
+        exercise_terminal_seed_conflict,
+        "terminal-association-removal",
+        false,
+        "terminal-association-removal"
+    );
+    phase4_case!(
+        ag_recreation,
+        exercise_terminal_seed_conflict,
+        "terminal-ag-recreation",
+        true,
+        "terminal-ag-recreation"
+    );
 }
 
-#[test]
-#[ignore = "probes native commit-record evidence with a licensed owned three-replica fixture"]
-fn three_replica_mssql_native_commit_coverage() {
-    run_native_experiment(NativeExperiment::CommitRecord);
+mod three_replica_mssql_target_host_evidence_faults {
+    use super::*;
+
+    phase4_case!(
+        pre_association_sql_process_restart,
+        exercise_target_host_evidence_fault,
+        "",
+        TargetEvidenceWindow::PreAssociation,
+        TargetEvidenceFault::SqlProcessRestart
+    );
+    phase4_case!(
+        in_flight_seeding_sql_process_restart,
+        exercise_target_host_evidence_fault,
+        "",
+        TargetEvidenceWindow::InFlightSeeding,
+        TargetEvidenceFault::SqlProcessRestart
+    );
+    phase4_case!(
+        post_native_pre_reply_sql_process_restart,
+        exercise_target_host_evidence_fault,
+        "",
+        TargetEvidenceWindow::PostNativePreReply,
+        TargetEvidenceFault::SqlProcessRestart
+    );
+    phase4_case!(
+        lineage_mismatch_across_checkpoints,
+        exercise_target_host_evidence_fault,
+        "",
+        TargetEvidenceWindow::PostNativePreReply,
+        TargetEvidenceFault::LineageMismatch
+    );
 }
 
 #[test]
@@ -256,16 +585,11 @@ fn run_three_replica_test(validate_restart: bool) {
         .expect("three-replica test thread panicked");
 }
 
-#[derive(Clone, Copy)]
-enum Phase4LiveTest {
-    FaultBoundaries,
-    SeedDispatchHandshake,
-    ConflictEvidence,
-    TerminalSeedConflicts,
-    TargetHostEvidence,
-}
-
-fn run_phase4_test(test: Phase4LiveTest) {
+fn run_phase4_test<F, Fut>(test: F)
+where
+    F: FnOnce(PathBuf) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), TestError>>,
+{
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
         .spawn(move || {
@@ -277,22 +601,8 @@ fn run_phase4_test(test: Phase4LiveTest) {
                 .expect("three-replica Phase 4 Tokio runtime")
                 .block_on(async move {
                     let root = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
-                    match test {
-                        Phase4LiveTest::FaultBoundaries => {
-                            execute_phase4_fault_boundaries(&root).await
-                        }
-                        Phase4LiveTest::SeedDispatchHandshake => {
-                            execute_seed_dispatch_handshake_faults(&root).await
-                        }
-                        Phase4LiveTest::ConflictEvidence => execute_conflict_evidence(&root).await,
-                        Phase4LiveTest::TerminalSeedConflicts => {
-                            execute_terminal_seed_conflicts(&root).await
-                        }
-                        Phase4LiveTest::TargetHostEvidence => {
-                            execute_target_host_evidence_faults(&root).await
-                        }
-                    }
-                    .expect("licensed Phase 4 lifecycle");
+                    fs::create_dir_all(&root).expect("create SQL scenario namespace");
+                    test(root).await.expect("licensed Phase 4 lifecycle");
                 });
         })
         .expect("three-replica Phase 4 test thread")
@@ -408,35 +718,64 @@ fn exercise_signal_recovery(signal: i32, signal_name: &str) {
     fs::remove_file(&ready).expect("remove signal-ready evidence");
 }
 
-#[test]
-#[ignore = "auto-accepts the SQL Server EULA for this test fixture and requires a qualified local Docker host"]
-fn three_replica_post_ag_and_report_fault_checkpoints_recover() {
-    for checkpoint in [
-        "fail-after-ag",
-        "panic-after-agent-start",
-        "fail-during-report",
-        "fail-after-agent-restart",
-    ] {
-        let root = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
-        cleanup_three_replica_fixture(&root).expect("clean fault-checkpoint baseline");
-        let mut child = spawn_live_child_with_fault(&root, checkpoint);
-        let status = wait_for_child_with_cleanup(&mut child, Duration::from_secs(1200), &root);
-        assert!(!status.success(), "{checkpoint} must fail explicitly");
-        let mut cleanup = spawn_cleanup_child(&root);
+mod three_replica_post_ag_and_report_fault_checkpoints_recover {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a qualified local Docker host and licensed SQL Server fixture"]
+    fn fail_after_ag() {
+        exercise_fault_checkpoint("fail-after-ag", 0, false);
+    }
+
+    #[test]
+    #[ignore = "requires a qualified local Docker host and licensed SQL Server fixture"]
+    fn panic_after_agent_start() {
+        exercise_fault_checkpoint("panic-after-agent-start", 1, false);
+    }
+
+    #[test]
+    #[ignore = "requires a qualified local Docker host and licensed SQL Server fixture"]
+    fn fail_during_report() {
+        exercise_fault_checkpoint("fail-during-report", 2, false);
+    }
+
+    #[test]
+    #[ignore = "requires a qualified local Docker host and licensed SQL Server fixture"]
+    fn fail_after_agent_restart_and_retry() {
+        exercise_fault_checkpoint("fail-after-agent-restart", 3, true);
+    }
+}
+
+fn exercise_fault_checkpoint(checkpoint: &str, index: usize, retry: bool) {
+    let base = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
+    fs::create_dir_all(&base).expect("create fault-checkpoint namespace");
+    let root = base.join(checkpoint);
+    cleanup_three_replica_fixture(&root).expect("clean fault-checkpoint baseline");
+    let receipt = root.join(format!(".fault-hit-{}-{index}", std::process::id()));
+    assert!(!receipt.exists(), "checkpoint evidence must be fresh");
+    let mut child = spawn_live_child_with_fault(&root, checkpoint, &receipt);
+    let status = wait_for_child_with_cleanup(&mut child, Duration::from_secs(1200), &root);
+    assert!(!status.success(), "{checkpoint} must fail explicitly");
+    assert_eq!(
+        fs::read_to_string(&receipt).expect("child must reach the requested checkpoint"),
+        checkpoint,
+    );
+    fs::remove_file(receipt).expect("remove owned checkpoint receipt");
+    let mut cleanup = spawn_cleanup_child(&root);
+    assert!(
+        wait_for_child(&mut cleanup, Duration::from_secs(240)).success(),
+        "cleanup process after {checkpoint}"
+    );
+    assert_removed(&root);
+    if retry {
+        let mut child = spawn_restart_child(&root);
         assert!(
-            wait_for_child(&mut cleanup, Duration::from_secs(240)).success(),
-            "cleanup process after {checkpoint}"
+            wait_for_child_with_cleanup(&mut child, Duration::from_secs(1200), &root).success(),
+            "retry after fault checkpoint"
         );
+        cleanup_three_replica_fixture(&root).expect("cleanup after fault-checkpoint retry");
         assert_removed(&root);
     }
-    let root = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
-    let mut retry = spawn_restart_child(&root);
-    assert!(
-        wait_for_child_with_cleanup(&mut retry, Duration::from_secs(1200), &root).success(),
-        "retry after fault checkpoints"
-    );
-    cleanup_three_replica_fixture(&root).expect("cleanup after fault-checkpoint retry");
-    assert_removed(&root);
 }
 
 async fn run_three_replica_mssql_happy_path(validate_restart: bool) {
@@ -1294,6 +1633,12 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
     .await
     {
         Ok(group) => group,
+        Err(error) if error.agent_termination_unconfirmed() => {
+            return hosted_witness::block_disposal(
+                &mut launched,
+                &format!("pre-association startup termination unconfirmed: {error}"),
+            );
+        }
         Err(error) => {
             let cleanup = launched.cleanup_with_coordinator(&first_cleanup);
             return match cleanup {
@@ -1395,12 +1740,18 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
         &prepared,
         &launched.members,
         convergence,
-        Instant::now() + convergence,
+        launched.complete_deadline(),
         &replacement_cleanup,
     )
     .await
     {
         Ok(group) => group,
+        Err(error) if error.agent_termination_unconfirmed() => {
+            return hosted_witness::block_disposal(
+                &mut launched,
+                &format!("dispatched replacement termination unconfirmed: {error}"),
+            );
+        }
         Err(error) => {
             let cleanup = launched.cleanup_with_coordinator(&replacement_cleanup);
             return match cleanup {
@@ -1428,6 +1779,23 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
         )
     {
         return Err("dispatched replacement changed stable authority".into());
+    }
+    if fault_checkpoint("fail-after-agent-restart") {
+        let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+        if let Err(error) = replacement.shutdown_with_coordinator(&cleanup).await {
+            return hosted_witness::block_disposal(
+                &mut launched,
+                &format!("injected replacement shutdown failed: {error}"),
+            );
+        }
+        return finish_runtime_outcome(
+            root,
+            launched,
+            RuntimeOutcome::Completed(Ok(Err(
+                "injected failure after replacement agent startup".into()
+            ))),
+            &cleanup,
+        );
     }
     if replacement.testing_seed_dispatch_record()?.is_some() {
         let builds = [
@@ -1471,31 +1839,6 @@ async fn execute_phase3_bootstrap_restart_lifecycle(
         RuntimeOutcome::Completed(Ok(Ok(()))),
         &replacement_cleanup,
     )
-}
-
-async fn execute_phase4_fault_boundaries(base_root: &Path) -> Result<(), TestError> {
-    fs::create_dir_all(base_root)?;
-    execute_configuration_faults(base_root).await?;
-    execute_seed_dispatch_handshake_faults(&base_root.join("seed-dispatch-handshake")).await?;
-    exercise_seed_faults(&base_root.join("seed-boundaries")).await?;
-    exercise_post_native_success_replay(&base_root.join("post-native-success")).await
-}
-
-async fn execute_terminal_seed_conflicts(base_root: &Path) -> Result<(), TestError> {
-    fs::create_dir_all(base_root)?;
-    exercise_terminal_seed_conflict(
-        &base_root.join("terminal-association-removal"),
-        false,
-        "terminal-association-removal",
-    )
-    .await?;
-    exercise_terminal_seed_conflict(
-        &base_root.join("terminal-ag-recreation"),
-        true,
-        "terminal-ag-recreation",
-    )
-    .await?;
-    Ok(())
 }
 
 async fn exercise_terminal_seed_conflict(
@@ -1577,135 +1920,6 @@ async fn exercise_terminal_seed_conflict(
     assert_removed(root);
     cleanup_three_replica_fixture(root)?;
     assert_removed(root);
-    Ok(())
-}
-
-async fn execute_configuration_faults(base_root: &Path) -> Result<(), TestError> {
-    let filter = std::env::var("KUBERIC_MSSQL_CONFIGURATION_FAULT_FILTER").ok();
-    for (fault, label) in [
-        (
-            PublicMutationFault::SourceRecoveryCompletion,
-            "source-recovery",
-        ),
-        (
-            PublicMutationFault::SourceDatabaseCreationIntentCompletion,
-            "source-database-creation-intent",
-        ),
-        (
-            PublicMutationFault::SourceDatabaseCompletion,
-            "source-database-completion",
-        ),
-        (
-            PublicMutationFault::SourceDatabaseCreationIntentRemovalCompletion,
-            "source-database-creation-intent-removal",
-        ),
-        (
-            PublicMutationFault::SourceOwnershipCompletion,
-            "source-ownership",
-        ),
-        (
-            PublicMutationFault::SourceMarkerTableCompletion,
-            "source-marker-table",
-        ),
-        (
-            PublicMutationFault::SourceFullBackupCompletion,
-            "source-full-backup",
-        ),
-        (
-            PublicMutationFault::SourceLogBackupCompletion,
-            "source-log-backup",
-        ),
-        (
-            PublicMutationFault::SourceBackupVerificationCompletion,
-            "source-backup-verification",
-        ),
-        (
-            PublicMutationFault::AvailabilityGroupIntentCompletion,
-            "availability-group-ownership-intent",
-        ),
-        (
-            PublicMutationFault::AvailabilityGroupCreationIntentCompletion,
-            "availability-group-creation-intent",
-        ),
-        (
-            PublicMutationFault::AvailabilityGroupCompletion,
-            "availability-group-creation",
-        ),
-        (
-            PublicMutationFault::AvailabilityGroupBindingCompletion,
-            "availability-group-binding",
-        ),
-        (
-            PublicMutationFault::AvailabilityGroupCreationIntentRemovalCompletion,
-            "availability-group-creation-intent-removal",
-        ),
-        (
-            PublicMutationFault::PrimarySeedingGrantCompletion,
-            "primary-seeding-grant",
-        ),
-        (
-            PublicMutationFault::PrimarySeedingGrantEvidenceCompletion,
-            "primary-seeding-grant-evidence",
-        ),
-        (
-            PublicMutationFault::FirstSecondaryJoinCompletion,
-            "first-secondary-join",
-        ),
-        (
-            PublicMutationFault::FirstSecondarySeedingGrantCompletion,
-            "first-secondary-seeding-grant",
-        ),
-        (
-            PublicMutationFault::FirstSecondarySeedingGrantEvidenceCompletion,
-            "first-secondary-seeding-grant-evidence",
-        ),
-        (
-            PublicMutationFault::SecondSecondaryJoinCompletion,
-            "second-secondary-join",
-        ),
-        (
-            PublicMutationFault::SecondSecondarySeedingGrantCompletion,
-            "second-secondary-seeding-grant",
-        ),
-        (
-            PublicMutationFault::SecondSecondarySeedingGrantEvidenceCompletion,
-            "second-secondary-seeding-grant-evidence",
-        ),
-    ] {
-        if filter.as_deref().is_some_and(|filter| filter != label) {
-            continue;
-        }
-        exercise_configuration_fault(base_root, fault, label).await?;
-    }
-    Ok(())
-}
-
-async fn execute_seed_dispatch_handshake_faults(base_root: &Path) -> Result<(), TestError> {
-    fs::create_dir_all(base_root)?;
-    let filter = std::env::var("KUBERIC_MSSQL_SEED_FAULT_FILTER").ok();
-    for (fault, label) in [
-        (
-            PublicMutationFault::SeedBeforeRequestSubmission,
-            "seed-before-request-submission",
-        ),
-        (
-            PublicMutationFault::SeedAfterRequestSubmission,
-            "seed-after-request-submission",
-        ),
-        (
-            PublicMutationFault::SeedAcceptedReplyLost,
-            "seed-accepted-reply-lost",
-        ),
-        (
-            PublicMutationFault::SeedDefiniteSqlRejection,
-            "seed-definite-sql-rejection",
-        ),
-    ] {
-        if filter.as_deref().is_some_and(|filter| filter != label) {
-            continue;
-        }
-        exercise_seed_submission_fault(&base_root.join(label), fault, label).await?;
-    }
     Ok(())
 }
 
@@ -1843,9 +2057,24 @@ async fn exercise_configuration_fault(
         &format!("phase4-{label}-interrupted"),
     )
     .await;
-    let error = first
-        .err()
-        .ok_or_else(|| format!("{label} unexpectedly published configuration success"))?;
+    let error = match first {
+        Err(error) => error,
+        Ok(group) => {
+            if let Err(error) = group.shutdown_with_coordinator(&first_cleanup).await {
+                return hosted_witness::block_disposal(
+                    &mut launched,
+                    &format!("{label} unexpected success could not be drained: {error}"),
+                );
+            }
+            return Err(format!("{label} unexpectedly published configuration success").into());
+        }
+    };
+    if error.agent_termination_unconfirmed() {
+        return hosted_witness::block_disposal(
+            &mut launched,
+            &format!("{label} interrupted startup termination unconfirmed: {error}"),
+        );
+    }
     let expected_effect = fault.effect_label();
     let diagnostic = error.to_string();
     if injected.hit_count() != 1
@@ -1854,23 +2083,17 @@ async fn exercise_configuration_fault(
     {
         return Err(format!("{label} did not fail at its exact injected boundary: {error}").into());
     }
-
-    let retry_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
-    let group = PublicMssqlGroup::from_prepared_with_fault(
-        &root,
-        &launched.run,
-        &prepared,
-        &launched.members,
-        launched.kuberic_convergence_timeout(),
-        Instant::now() + launched.kuberic_convergence_timeout(),
-        &retry_cleanup,
-        PublicFaultInjection::default(),
-        &format!("phase4-{label}-interrupted"),
-    )
-    .await?;
-    converge_minimal_seeded_topology(&group, &mut launched, &prepared, label).await?;
-    group.shutdown_with_coordinator(&retry_cleanup).await?;
-    let cleanup = launched.cleanup_with_coordinator(&retry_cleanup)?;
+    let dispatches = injected.mutation_dispatch_count();
+    if dispatches == 0 {
+        return Err(format!("{label} did not dispatch its injected SQL mutation").into());
+    }
+    if fault == PublicMutationFault::SourceRecoveryCompletion
+        && launched.testing_source_recovery_model().await? != "FULL"
+    {
+        return Err(format!("{label} did not retain the completed native recovery change").into());
+    }
+    let fixture_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    let cleanup = launched.cleanup_with_coordinator(&fixture_cleanup)?;
     if cleanup.removed_container_ids.len() != 3 || cleanup.removed_network_id.is_empty() {
         return Err(format!("{label} cleanup did not remove the exact owned topology").into());
     }
@@ -2086,9 +2309,17 @@ async fn exercise_post_native_success_replay(root: &Path) -> Result<(), TestErro
         launched.complete_deadline(),
         &first_cleanup,
     )
-    .await?;
-    let sequence = first.bootstrap_configuration_sequence().await?;
-    wait_for_exact_reports(&first, sequence, convergence).await?;
+    .await;
+    let first = match first {
+        Ok(group) => group,
+        Err(error) if error.agent_termination_unconfirmed() => {
+            return hosted_witness::block_disposal(
+                &mut launched,
+                &format!("post-native-success startup termination unconfirmed: {error}"),
+            );
+        }
+        Err(error) => return Err(error.into()),
+    };
     let stable_resource = first.resource_uid.clone();
     let stable_policy = first.effective_policy.clone();
     let stable_configuration = first.configuration.clone();
@@ -2100,21 +2331,26 @@ async fn exercise_post_native_success_replay(root: &Path) -> Result<(), TestErro
             pod.pvc_uid.clone(),
         )
     });
-    let command =
-        first.target_build_command(1, "post-native-success-build", "post-native-success-build")?;
-    first
-        .testing_admit_target_build_authority_only(&command)
-        .await
-        .map_err(|error| format!("post-native-success target admission failed: {error}"))?;
-    let marker = {
+    let first_result = async {
+        let sequence = first.bootstrap_configuration_sequence().await?;
+        wait_for_exact_reports(&first, sequence, convergence).await?;
+        let command = first.target_build_command(
+            1,
+            "post-native-success-build",
+            "post-native-success-build",
+        )?;
+        first
+            .testing_admit_target_build_authority_only(&command)
+            .await
+            .map_err(|error| format!("post-native-success target admission failed: {error}"))?;
         first
             .testing_execute_admitted_seed_callback_with_retry(&command)
             .await
             .map_err(|error| format!("post-native-success callback failed: {error}"))?;
         if first.testing_seed_dispatch_count()? != 1 {
-            return Err(
-                "post-native-success checkpoint did not execute exactly one ADD DATABASE".into(),
-            );
+            return Err(TestError::from(
+                "post-native-success checkpoint did not execute exactly one ADD DATABASE",
+            ));
         }
         first
             .testing_assert_source_build_success_not_published(&command)
@@ -2127,14 +2363,32 @@ async fn exercise_post_native_success_replay(root: &Path) -> Result<(), TestErro
             .await?;
 
         first.testing_abort_seed_source();
-        marker
-    };
-    first
-        .testing_assert_source_build_success_not_published(&command)
-        .await?;
-    first.shutdown_with_coordinator(&first_cleanup).await?;
+        let rejected = first.testing_execute_admitted_seed_callback(&command).await;
+        match rejected {
+            Err(error)
+                if error.code() == tonic::Code::FailedPrecondition
+                    && error.message() == "bootstrap source replicator is unavailable" => {}
+            other => return Err(format!(
+                "post-native-success aborted source did not reject its callback exactly: {other:?}"
+            )
+            .into()),
+        }
+        if first.testing_seed_dispatch_count()? != 1 {
+            return Err("post-native-success aborted source dispatched additional SQL".into());
+        }
+        Ok((command, marker))
+    }
+    .await;
+    let source_cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    if let Err(error) = first.shutdown_with_coordinator(&source_cleanup).await {
+        return hosted_witness::block_disposal(
+            &mut launched,
+            &format!("post-native-success source shutdown failed: {error}"),
+        );
+    }
+    let (command, marker) = first_result?;
 
-    let replacement_cleanup =
+    let replacement_startup_cleanup =
         CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
     let replacement = start_prepared_public_group_with_retry(
         root,
@@ -2142,41 +2396,75 @@ async fn exercise_post_native_success_replay(root: &Path) -> Result<(), TestErro
         &prepared,
         &launched.members,
         convergence,
-        Instant::now() + convergence,
-        &replacement_cleanup,
+        launched.complete_deadline(),
+        &replacement_startup_cleanup,
     )
-    .await?;
-    if replacement.resource_uid != stable_resource
-        || replacement.effective_policy != stable_policy
-        || replacement.configuration != stable_configuration
-        || replacement.pods.iter().zip(&stable_pods).any(
-            |(pod, (identity, role, pod_uid, pvc_uid))| {
-                &pod.identity != identity
-                    || pod.stable_role != *role
-                    || &pod.pod_uid != pod_uid
-                    || &pod.pvc_uid != pvc_uid
-            },
-        )
-    {
-        return Err("post-native-success replacement changed exact durable authority".into());
+    .await;
+    let replacement = match replacement {
+        Ok(group) => group,
+        Err(error) if error.agent_termination_unconfirmed() => {
+            return hosted_witness::block_disposal(
+                &mut launched,
+                &format!("post-native-success replacement termination unconfirmed: {error}"),
+            );
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let replay: Result<(), TestError> = async {
+        if replacement.resource_uid != stable_resource
+            || replacement.effective_policy != stable_policy
+            || replacement.configuration != stable_configuration
+            || replacement.pods.iter().zip(&stable_pods).any(
+                |(pod, (identity, role, pod_uid, pvc_uid))| {
+                    &pod.identity != identity
+                        || pod.stable_role != *role
+                        || &pod.pod_uid != pod_uid
+                        || &pod.pvc_uid != pvc_uid
+                },
+            )
+        {
+            return Err("post-native-success replacement changed exact durable authority".into());
+        }
+        replacement
+            .testing_admit_target_build_authority_only(&command)
+            .await
+            .map_err(|error| {
+                format!("post-replacement native callback admission failed: {error}")
+            })?;
+        replacement
+            .testing_execute_admitted_seed_callback_with_retry(&command)
+            .await
+            .map_err(|error| {
+                format!("native callback replay after host replacement failed: {error}")
+            })?;
+        if replacement.testing_seed_dispatch_count()? != 0 {
+            return Err("post-native-success replay issued a second ADD DATABASE".into());
+        }
+        if replacement.testing_seed_dispatch_record()?.is_some() {
+            return Err("post-native-success replay retained resolved seed authority".into());
+        }
+        let verified_marker = launched.verify_replicated_marker(&marker).await?;
+        if verified_marker != marker || verified_marker.readable_ordinals != [1, 2, 3] {
+            return Err("post-native-success replay changed the exact native result".into());
+        }
+        replacement
+            .testing_assert_source_build_success_not_published(&command)
+            .await?;
+        Ok(())
     }
-    replacement
-        .testing_execute_kuberic_build_command(&command)
-        .await
-        .map_err(|error| format!("exact build replay after host replacement failed: {error}"))?;
-    if replacement.testing_seed_dispatch_count()? != 0 {
-        return Err("post-native-success replay issued a second ADD DATABASE".into());
-    }
-    if replacement.testing_seed_dispatch_record()?.is_some() {
-        return Err("post-native-success replay retained resolved seed authority".into());
-    }
-    let verified_marker = launched.verify_replicated_marker(&marker).await?;
-    if verified_marker != marker || verified_marker.readable_ordinals != [1, 2, 3] {
-        return Err("post-native-success replay changed the exact native result".into());
-    }
-    replacement
+    .await;
+    let replacement_cleanup =
+        CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    if let Err(error) = replacement
         .shutdown_with_coordinator(&replacement_cleanup)
-        .await?;
+        .await
+    {
+        return hosted_witness::block_disposal(
+            &mut launched,
+            &format!("post-native-success replacement shutdown failed: {error}"),
+        );
+    }
+    replay?;
     let evidence = launched.cleanup_with_coordinator(&replacement_cleanup)?;
     if evidence.removed_container_ids.len() != 3 || evidence.removed_network_id.is_empty() {
         return Err("post-native-success cleanup did not remove exact owned resources".into());
@@ -2234,21 +2522,50 @@ impl TargetEvidenceFault {
     }
 }
 
-async fn execute_target_host_evidence_faults(base_root: &Path) -> Result<(), TestError> {
-    fs::create_dir_all(base_root)?;
-    for window in [
-        TargetEvidenceWindow::PreAssociation,
-        TargetEvidenceWindow::InFlightSeeding,
-        TargetEvidenceWindow::PostNativePreReply,
-    ] {
-        for fault in [
-            TargetEvidenceFault::SqlProcessRestart,
-            TargetEvidenceFault::LineageMismatch,
-        ] {
-            exercise_target_host_evidence_fault(base_root, window, fault).await?;
+async fn await_owned_checkpoint(
+    entered: tokio::sync::oneshot::Receiver<()>,
+    callback_owner: &mut Option<tokio::task::JoinHandle<Result<(), tonic::Status>>>,
+    label: &str,
+) -> Result<(), TestError> {
+    let completed = tokio::select! {
+        entered = entered => {
+            entered.map_err(|_| format!("{label} checkpoint sender disappeared"))?;
+            None
         }
+        result = callback_owner.as_mut().expect("callback owner armed") => Some(result),
+        _ = tokio::time::sleep(Duration::from_secs(120)) => {
+            return Err(format!("{label} checkpoint exceeded its bounded wait").into());
+        }
+    };
+    if let Some(result) = completed {
+        callback_owner.take();
+        return Err(format!("{label} callback completed before its checkpoint: {result:?}").into());
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn owned_checkpoint_wait_preserves_callback_ownership() {
+    let (_entered, receiver) = tokio::sync::oneshot::channel();
+    let mut owner = Some(tokio::spawn(async { Ok(()) }));
+    let error = await_owned_checkpoint(receiver, &mut owner, "early completion")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("callback completed before"));
+    assert!(owner.is_none());
+
+    let (entered, receiver) = tokio::sync::oneshot::channel();
+    drop(entered);
+    let mut owner = Some(tokio::spawn(std::future::pending::<
+        Result<(), tonic::Status>,
+    >()));
+    let error = await_owned_checkpoint(receiver, &mut owner, "lost checkpoint")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("checkpoint sender disappeared"));
+    let callback = owner.take().expect("pending callback owner retained");
+    callback.abort();
+    assert!(callback.await.unwrap_err().is_cancelled());
 }
 
 async fn exercise_target_host_evidence_fault(
@@ -2256,6 +2573,11 @@ async fn exercise_target_host_evidence_fault(
     window: TargetEvidenceWindow,
     fault: TargetEvidenceFault,
 ) -> Result<(), TestError> {
+    if matches!(fault, TargetEvidenceFault::LineageMismatch)
+        && !matches!(window, TargetEvidenceWindow::PostNativePreReply)
+    {
+        return Err("synthetic lineage must retain all checkpoints before the final report".into());
+    }
     let label = format!("{}-{}", window.label(), fault.label());
     let root = base_root.join(&label);
     cleanup_three_replica_fixture(&root)?;
@@ -2272,84 +2594,177 @@ async fn exercise_target_host_evidence_fault(
         launched.complete_deadline(),
         &cleanup,
     )
-    .await?;
-    let sequence = group.bootstrap_configuration_sequence().await?;
-    wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout()).await?;
-    let command = group.target_build_command(
-        1,
-        format!("target-evidence-{label}"),
-        format!("target-evidence-{label}"),
-    )?;
-    group
-        .testing_admit_target_build_authority_only(&command)
-        .await
-        .map_err(|error| format!("{label} target authority admission failed: {error}"))?;
+    .await;
+    let group = match group {
+        Ok(group) => group,
+        Err(error) if error.agent_termination_unconfirmed() => {
+            return hosted_witness::block_disposal(
+                &mut launched,
+                &format!("{label} startup termination unconfirmed: {error}"),
+            );
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut callback_owner = None;
+    let outcome: Result<(), TestError> = async {
+        let sequence = group.bootstrap_configuration_sequence().await?;
+        wait_for_exact_reports(&group, sequence, launched.kuberic_convergence_timeout()).await?;
+        let command = group.target_build_command(
+            1,
+            format!("target-evidence-{label}"),
+            format!("target-evidence-{label}"),
+        )?;
+        group
+            .testing_admit_target_build_authority_only(&command)
+            .await
+            .map_err(|error| format!("{label} target authority admission failed: {error}"))?;
 
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    match window {
-        TargetEvidenceWindow::PreAssociation => {
-            group.testing_gate_next_seed_intent(entered_tx, release_rx)?;
-        }
-        TargetEvidenceWindow::InFlightSeeding => {
-            group.testing_gate_seed_after_request(entered_tx, release_rx)?;
-        }
-        TargetEvidenceWindow::PostNativePreReply => {
-            group.testing_gate_next_target_evidence(entered_tx, release_rx)?;
-        }
-    }
-    let mut callback = group.testing_spawn_admitted_seed_callback(&command)?;
-    await_checkpoint(entered_rx, &mut callback, &label).await?;
-
-    match fault {
-        TargetEvidenceFault::SqlProcessRestart => {
-            let frozen = group.testing_frozen_secondary_start_identity()?;
-            let host_port = launched.restart_sql_process_for_test(1)?;
-            let fresh = group
-                .testing_wait_for_fresh_secondary_observation(
-                    &frozen,
-                    host_port,
-                    launched.kuberic_convergence_timeout(),
-                )
-                .await?;
-            if fresh.instance.sqlserver_start_time == frozen {
-                return Err(
-                    format!("{label} did not replace the target SQL start identity").into(),
-                );
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        match window {
+            TargetEvidenceWindow::PreAssociation => {
+                group.testing_gate_next_seed_intent(entered_tx, release_rx)?;
+            }
+            TargetEvidenceWindow::InFlightSeeding => {
+                group.testing_gate_seed_after_request(entered_tx, release_rx)?;
+            }
+            TargetEvidenceWindow::PostNativePreReply => {
+                group.testing_gate_next_target_evidence(entered_tx, release_rx)?;
             }
         }
-        TargetEvidenceFault::LineageMismatch => {
-            group.testing_inject_target_lineage_mismatch()?;
+        let preceding_checkpoints = if matches!(fault, TargetEvidenceFault::LineageMismatch) {
+            let (intent_entered, intent_receiver) = tokio::sync::oneshot::channel();
+            let (intent_release, intent_wait) = tokio::sync::oneshot::channel();
+            group.testing_gate_next_seed_intent(intent_entered, intent_wait)?;
+            let (request_entered, request_receiver) = tokio::sync::oneshot::channel();
+            let (request_release, request_wait) = tokio::sync::oneshot::channel();
+            group.testing_gate_seed_after_request(request_entered, request_wait)?;
+            Some([
+                ("seed-intent", intent_receiver, intent_release),
+                ("after-request", request_receiver, request_release),
+            ])
+        } else {
+            None
+        };
+        callback_owner = Some(group.testing_spawn_admitted_seed_callback(&command)?);
+        if let Some(checkpoints) = preceding_checkpoints {
+            for (checkpoint, entered, release) in checkpoints {
+                let checkpoint_label = format!("{label} {checkpoint}");
+                await_owned_checkpoint(entered, &mut callback_owner, &checkpoint_label).await?;
+                group
+                    .testing_assert_source_build_success_not_published(&command)
+                    .await?;
+                if callback_owner.as_ref().expect("callback owner armed").is_finished() {
+                    return Err(format!("{checkpoint_label} callback was not retained").into());
+                }
+                release
+                    .send(())
+                    .map_err(|_| format!("{checkpoint_label} checkpoint was not retained"))?;
+            }
         }
-    }
-    release_tx
-        .send(())
-        .map_err(|_| format!("{label} checkpoint was not retained"))?;
-    let result = tokio::time::timeout(launched.kuberic_convergence_timeout(), callback)
+        await_owned_checkpoint(entered_rx, &mut callback_owner, &label).await?;
+        group
+            .testing_assert_source_build_success_not_published(&command)
+            .await?;
+        let dispatches = group.testing_seed_dispatch_count()?;
+        if callback_owner.as_ref().expect("callback owner armed").is_finished() {
+            return Err(format!("{label} callback ended before fault initiation").into());
+        }
+        let mut verified_new_start = false;
+
+        match fault {
+            TargetEvidenceFault::SqlProcessRestart => {
+                let frozen = group.testing_frozen_secondary_start_identity()?;
+                let host_port = launched.restart_sql_process_for_test(1)?;
+                let fresh = group
+                    .testing_wait_for_fresh_secondary_observation(
+                        &frozen,
+                        host_port,
+                        launched.kuberic_convergence_timeout(),
+                    )
+                    .await?;
+                if fresh.instance.sqlserver_start_time == frozen {
+                    return Err(
+                        format!("{label} did not replace the target SQL start identity").into(),
+                    );
+                }
+                verified_new_start = true;
+            }
+            TargetEvidenceFault::LineageMismatch => {
+                group.testing_inject_target_lineage_mismatch()?;
+            }
+        }
+        release_tx
+            .send(())
+            .map_err(|_| format!("{label} checkpoint was not retained"))?;
+        let joined = tokio::time::timeout(
+            launched.kuberic_convergence_timeout(),
+            callback_owner.as_mut().expect("callback owner armed"),
+        )
         .await
-        .map_err(|_| format!("{label} callback did not terminate within its deadline"))?
-        .map_err(|error| format!("{label} callback task failed: {error}"))?;
-    let error = result
-        .err()
-        .ok_or_else(|| format!("{label} completed without current target-local evidence"))?;
-    let diagnostic = error.to_string();
-    match fault {
-        TargetEvidenceFault::SqlProcessRestart
-            if !diagnostic.contains("unsafe")
-                && !diagnostic.contains("unavailable")
-                && !diagnostic.contains("failed") =>
-        {
-            return Err(format!("{label} returned an unexpected restart error: {error}").into());
+        .map_err(|_| format!("{label} callback did not terminate within its deadline"))?;
+        callback_owner.take();
+        let result = joined.map_err(|error| format!("{label} callback task failed: {error}"))?;
+        let error = result
+            .err()
+            .ok_or_else(|| format!("{label} completed without current target-local evidence"))?;
+        let diagnostic = error.to_string();
+        match fault {
+            TargetEvidenceFault::SqlProcessRestart
+                if !target_restart_failure_is_fail_closed(
+                    fault,
+                    &error,
+                    verified_new_start,
+                    dispatches,
+                    group.testing_seed_dispatch_count()?,
+                ) =>
+            {
+                return Err(format!(
+                    "{label} did not fail closed: verified_new_start={verified_new_start}, \
+                     seed_dispatches_before={dispatches}, seed_dispatches_after={}; callback={error}",
+                    group.testing_seed_dispatch_count()?,
+                )
+                .into());
+            }
+            TargetEvidenceFault::LineageMismatch if !diagnostic.contains("conflicts") => {
+                return Err(
+                    format!("{label} returned an unexpected lineage error: {error}").into(),
+                );
+            }
+            _ => {}
         }
-        TargetEvidenceFault::LineageMismatch if !diagnostic.contains("conflicts") => {
-            return Err(format!("{label} returned an unexpected lineage error: {error}").into());
+        if matches!(fault, TargetEvidenceFault::LineageMismatch) {
+            group
+                .testing_assert_source_build_success_not_published(&command)
+                .await?;
         }
-        _ => {}
+        Ok(())
     }
-    group
-        .testing_assert_source_build_success_not_published(&command)
-        .await?;
-    group.shutdown_with_coordinator(&cleanup).await?;
+    .await;
+    let callback_shutdown = if let Some(callback) = callback_owner.take() {
+        callback.abort();
+        match callback.await {
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(tonic::Status::internal(format!(
+                "target callback cleanup failed: {error}"
+            ))),
+            Ok(Err(error)) => Err(error),
+            Ok(Ok(())) => Err(tonic::Status::failed_precondition(
+                "target callback completed after a failed evidence test",
+            )),
+        }
+    } else {
+        Ok(())
+    };
+    let outcome = combine_primary_and_shutdown(outcome, callback_shutdown);
+    let cleanup = CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
+    if let Err(error) = group.shutdown_with_coordinator(&cleanup).await {
+        return hosted_witness::block_disposal(
+            &mut launched,
+            &format!("{label} host shutdown failed: {error}"),
+        );
+    }
+    outcome?;
     let evidence = launched.cleanup_with_coordinator(&cleanup)?;
     if evidence.removed_container_ids.len() != 3 || evidence.removed_network_id.is_empty() {
         return Err(format!("{label} cleanup did not remove exact owned resources").into());
@@ -2360,83 +2775,119 @@ async fn exercise_target_host_evidence_fault(
     Ok(())
 }
 
-async fn execute_conflict_evidence(root: &Path) -> Result<(), TestError> {
-    fs::create_dir_all(root)?;
-    let filter = std::env::var("KUBERIC_MSSQL_CONFLICT_FILTER").ok();
-    for label in [
-        "native-source-recovery-partial",
-        "native-unowned-source-database",
-        "native-unowned-availability-group",
-    ] {
-        if filter.as_deref().is_some_and(|filter| filter != label) {
-            continue;
-        }
-        match label {
-            "native-source-recovery-partial" => {
-                exercise_native_source_recovery_partial(&root.join(label), label).await?
-            }
-            "native-unowned-source-database" => {
-                exercise_native_sql_conflict(&root.join(label), label, false).await?
-            }
-            "native-unowned-availability-group" => {
-                exercise_native_sql_conflict(&root.join(label), label, true).await?
-            }
-            _ => unreachable!("native SQL case list is exhaustive"),
-        }
-    }
-
-    for (index, (scenario, label, expected)) in [
-        (
-            LicensedConflictScenario::AvailabilityGroupIdentityOrProfile,
-            "seam-availability-group-identity-profile",
-            "conflicts with the requested bootstrap topology",
-        ),
-        (
-            LicensedConflictScenario::LogicalReplicaNativeMismatch,
-            "seam-logical-replica-native-identity",
-            "conflicts with the requested bootstrap topology",
-        ),
-        (
-            LicensedConflictScenario::EndpointOrMemberProfile,
-            "seam-endpoint-member-profile",
-            "conflicts with the requested bootstrap topology",
-        ),
-        (
-            LicensedConflictScenario::StandaloneDatabaseIdentityOrRecovery,
-            "seam-standalone-database-identity-recovery",
-            "conflicts with the requested bootstrap topology",
-        ),
-        (
-            LicensedConflictScenario::AssociatedDatabaseIdentityOrRecovery,
-            "seam-associated-database-identity-recovery",
-            "conflicts with the requested bootstrap topology",
-        ),
-        (
-            LicensedConflictScenario::IncompatibleLineage,
-            "seam-target-lineage",
-            "conflicts with the requested bootstrap topology",
-        ),
-        (
-            LicensedConflictScenario::SqlProcessIncarnationReplacement,
-            "seam-sql-process-incarnation",
-            "is unsafe to continue",
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        if filter.as_deref().is_some_and(|filter| filter != label) {
-            continue;
-        }
-        exercise_conflict_scenario(
-            &root.join(format!("{index:02}-{label}")),
-            scenario,
-            label,
-            expected,
+fn target_restart_failure_is_fail_closed(
+    fault: TargetEvidenceFault,
+    error: &tonic::Status,
+    verified_new_start: bool,
+    dispatches_before: usize,
+    dispatches_after: usize,
+) -> bool {
+    matches!(fault, TargetEvidenceFault::SqlProcessRestart)
+        && verified_new_start
+        && dispatches_before <= dispatches_after
+        && dispatches_after <= 1
+        && error.code() == tonic::Code::Internal
+        && matches!(
+            error.message(),
+            "application error: target SQL Server start identity is unsafe to continue"
+                | "application error: SQL Server observation is unavailable: Unreachable"
+                | "application error: SQL Server observation is unavailable: TimedOut"
+                | "application error: bootstrap convergence exceeded its bounded callback budget"
         )
-        .await?;
+}
+
+#[test]
+fn target_restart_failure_requires_real_drift_and_no_duplicate_seed() {
+    let budget = tonic::Status::internal(
+        "application error: bootstrap convergence exceeded its bounded callback budget",
+    );
+    for message in [
+        budget.message(),
+        "application error: target SQL Server start identity is unsafe to continue",
+        "application error: SQL Server observation is unavailable: Unreachable",
+        "application error: SQL Server observation is unavailable: TimedOut",
+    ] {
+        for (before, after) in [(0, 0), (0, 1), (1, 1)] {
+            assert!(target_restart_failure_is_fail_closed(
+                TargetEvidenceFault::SqlProcessRestart,
+                &tonic::Status::internal(message),
+                true,
+                before,
+                after,
+            ));
+        }
     }
-    Ok(())
+    for (fault, error, verified, before, after) in [
+        (
+            TargetEvidenceFault::LineageMismatch,
+            budget.clone(),
+            true,
+            1,
+            1,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            budget.clone(),
+            false,
+            1,
+            1,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            budget.clone(),
+            true,
+            1,
+            2,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            budget.clone(),
+            true,
+            1,
+            0,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            budget.clone(),
+            true,
+            2,
+            2,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            tonic::Status::deadline_exceeded(budget.message()),
+            true,
+            1,
+            1,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            tonic::Status::internal("unrelated operation is unsafe or unavailable"),
+            true,
+            1,
+            1,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            tonic::Status::internal(
+                "application error: SQL Server observation is unavailable: PermissionDenied",
+            ),
+            true,
+            1,
+            1,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            tonic::Status::internal("administrator query failed"),
+            true,
+            1,
+            1,
+        ),
+    ] {
+        assert!(!target_restart_failure_is_fail_closed(
+            fault, &error, verified, before, after,
+        ));
+    }
 }
 
 async fn exercise_native_source_recovery_partial(
@@ -2775,28 +3226,42 @@ fn required_path(variable: &str) -> PathBuf {
 }
 
 fn spawn_live_child(root: &Path, ready: Option<&Path>) -> Child {
-    spawn_test_child(root, HAPPY_PATH_TEST, ready, None)
+    spawn_test_child(root, "happy-path", ready, None)
 }
 
 fn spawn_restart_child(root: &Path) -> Child {
-    spawn_test_child(root, SAME_ROOT_RESTART_TEST, None, None)
+    spawn_test_child(root, "same-root-restart", None, None)
 }
 
 fn spawn_test_child(
     root: &Path,
-    test_name: &str,
+    mode: &str,
     ready: Option<&Path>,
     checkpoint: Option<&str>,
 ) -> Child {
+    test_child_command(root, mode, ready, checkpoint)
+        .spawn()
+        .expect("spawn exact live child")
+}
+
+fn test_child_command(
+    root: &Path,
+    mode: &str,
+    ready: Option<&Path>,
+    checkpoint: Option<&str>,
+) -> Command {
     let mut command = Command::new(std::env::current_exe().expect("current live test executable"));
     command
-        .arg(test_name)
-        .arg("--ignored")
+        .arg(LIFECYCLE_CHILD_TEST)
         .arg("--exact")
         .arg("--nocapture")
         .arg("--test-threads=1")
         .env("KUBERIC_MSSQL_THREE_REPLICA_ROOT", root)
+        .env_remove(CHILD_MODE_ENV)
+        .env(CHILD_MODE_ENV, mode)
         .env_remove("KUBERIC_MSSQL_SIGNAL_READY_FILE")
+        .env_remove("KUBERIC_MSSQL_FAULT_CHECKPOINT")
+        .env_remove(FAULT_HIT_ENV)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     if let Some(ready) = ready {
@@ -2805,16 +3270,19 @@ fn spawn_test_child(
     if let Some(checkpoint) = checkpoint {
         command.env("KUBERIC_MSSQL_FAULT_CHECKPOINT", checkpoint);
     }
-    command.spawn().expect("spawn exact live child")
+    command
 }
 
-fn spawn_live_child_with_fault(root: &Path, checkpoint: &str) -> Child {
-    let test_name = if checkpoint == "fail-after-agent-restart" {
-        SAME_ROOT_RESTART_TEST
+fn spawn_live_child_with_fault(root: &Path, checkpoint: &str, receipt: &Path) -> Child {
+    let mode = if checkpoint == "fail-after-agent-restart" {
+        "same-root-restart"
     } else {
-        HAPPY_PATH_TEST
+        "happy-path"
     };
-    spawn_test_child(root, test_name, None, Some(checkpoint))
+    test_child_command(root, mode, None, Some(checkpoint))
+        .env(FAULT_HIT_ENV, receipt)
+        .spawn()
+        .expect("spawn checkpoint fault child")
 }
 
 fn spawn_cleanup_child(root: &Path) -> Child {
@@ -2836,7 +3304,13 @@ fn spawn_cleanup_child(root: &Path) -> Child {
 }
 
 fn fault_checkpoint(expected: &str) -> bool {
-    std::env::var("KUBERIC_MSSQL_FAULT_CHECKPOINT").as_deref() == Ok(expected)
+    if std::env::var("KUBERIC_MSSQL_FAULT_CHECKPOINT").as_deref() != Ok(expected) {
+        return false;
+    }
+    if let Some(path) = std::env::var_os(FAULT_HIT_ENV) {
+        fs::write(path, expected).expect("record reached fault checkpoint");
+    }
+    true
 }
 
 fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> Result<(), ()> {

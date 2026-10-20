@@ -4698,7 +4698,7 @@ async fn accepted_epoch_cancels_target_evidence_before_release() {
         exchange.clone(),
     );
     admit_seed_replicator(&replicator).await;
-    let callback = tokio::spawn({
+    let mut callback = tokio::spawn({
         let replicator = replicator.clone();
         async move {
             replicator
@@ -4706,8 +4706,18 @@ async fn accepted_epoch_cancels_target_evidence_before_release() {
                 .await
         }
     });
-    entered_rx.await.unwrap();
-    replicator.update_epoch(Epoch::new(7, 43)).await.unwrap();
+    tokio::select! {
+        entered = entered_rx => entered.expect("target evidence checkpoint sender disappeared"),
+        result = &mut callback => panic!("callback completed before target evidence checkpoint: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(3)) => panic!("target evidence checkpoint was not reached"),
+    }
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        replicator.update_epoch(Epoch::new(7, 43)),
+    )
+    .await
+    .expect("epoch admission must not wait for target evidence release")
+    .unwrap();
     let result = tokio::time::timeout(Duration::from_secs(3), callback)
         .await
         .expect("retired target evidence must not require external release")

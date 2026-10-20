@@ -55,11 +55,10 @@ impl StatefulServiceReplica for CleanupApplication {
 }
 
 fn runtime_binary() -> PathBuf {
-    std::env::var_os("NEXTEST_BIN_EXE_kuberic_mssql_runtime_test")
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_kuberic-mssql-runtime-test"))
-        .map(PathBuf::from)
-        .or_else(|| option_env!("CARGO_BIN_EXE_kuberic-mssql-runtime-test").map(PathBuf::from))
-        .expect("kuberic-mssql-runtime-test binary path")
+    kuberic_mssql_tests::test_support::companion_binary(
+        "kuberic-mssql-runtime-test",
+        option_env!("CARGO_BIN_EXE_kuberic-mssql-runtime-test"),
+    )
 }
 
 fn write_private(path: &Path, value: impl AsRef<[u8]>) {

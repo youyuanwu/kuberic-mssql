@@ -8,8 +8,9 @@ if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
   exit 1
 fi
 
-scratch="$(mktemp -d)"
-trap 'rm -f -- "$scratch/just.tar.gz" "$scratch/just" "$scratch/rustup-init.sh"; rmdir -- "$scratch"' EXIT
+install -d "$repo/target"
+scratch="$(mktemp -d "$repo/target/setup-environment.XXXXXX")"
+trap 'rm -f -- "$scratch/just.tar.gz" "$scratch/just" "$scratch/cargo-nextest.tar.gz" "$scratch/cargo-nextest" "$scratch/rustup-init.sh"; rmdir -- "$scratch"' EXIT
 
 if ! command -v rustup >/dev/null; then
   curl --fail --silent --show-error --location https://sh.rustup.rs -o "$scratch/rustup-init.sh"
@@ -58,7 +59,20 @@ if ! command -v just >/dev/null || [[ "$(just --version)" != "just 1.21.0" ]]; t
   mv -f "$HOME/.local/bin/.just-new" "$HOME/.local/bin/just"
 fi
 
+if ! command -v cargo-nextest >/dev/null || [[ "$(cargo nextest --version)" != "cargo-nextest 0.9.146 "* ]]; then
+  curl --fail --silent --show-error --location --retry 3 \
+    https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.146/cargo-nextest-0.9.146-x86_64-unknown-linux-musl.tar.gz \
+    -o "$scratch/cargo-nextest.tar.gz"
+  printf '%s  %s\n' \
+    b64617e8640624e8f9ba99819e37d7971154e97836d7ae4774fed4715501a6aa \
+    "$scratch/cargo-nextest.tar.gz" | sha256sum --check --status
+  tar -xzf "$scratch/cargo-nextest.tar.gz" -C "$scratch" cargo-nextest
+  install -d "$HOME/.local/bin"
+  install -m 755 "$scratch/cargo-nextest" "$HOME/.local/bin/.cargo-nextest-new"
+  mv -f "$HOME/.local/bin/.cargo-nextest-new" "$HOME/.local/bin/cargo-nextest"
+fi
+
 if [[ -n "${GITHUB_PATH:-}" ]]; then
   printf '%s\n' "$HOME/.local/bin" "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 fi
-echo "Shared Rust/just validation tools are ready."
+echo "Shared Rust/just/nextest validation tools are ready."

@@ -456,7 +456,8 @@ CARGO_BUILD_JOBS=1 cargo test --locked -p kuberic-mssql-tests \
 The existing test-only fixture authorization accepts the SQL Server EULA for
 owned disposable containers; this is not authorization to run this new
 experiment or use borrowed deployments. The case remains ignored by default
-and outside `just ci`. It provisions via existing fixture APIs and observes
+for raw Cargo and is explicitly selected by nextest's live profile in `just ci`.
+It provisions via existing fixture APIs and observes
 through ordinary non-bootstrap hosts, not production SQL deployment behavior.
 A blocked disposal result retains ownership evidence and is not successful
 cleanup; resolve exact host ownership before using the existing fixture recovery
@@ -856,8 +857,9 @@ until verified target fencing exists.
 
 ### One-replica observer and CLI fixture
 
-`just ci` first runs one Rust-owned digest-pinned SQL Server 2025 Enterprise
-Developer container. It creates no AG, endpoint or database. Separate allowed,
+The one-replica member of `just ci`'s serial live profile runs one Rust-owned
+digest-pinned SQL Server 2025 Enterprise Developer container. It creates no AG,
+endpoint or database. Separate allowed,
 partially privileged and invalid-CA configurations prove absent-group behavior,
 permission-denied classification, TLS rejection and fresh production CLI
 provenance. This fixture does not publish Kuberic progress.
@@ -943,10 +945,24 @@ does not restore serving access.
 The ignored live tests additionally prove handled-signal and SIGKILL recovery.
 The fault recipe uses test-only callback seams after each independently
 classified database/backup/AG/join/grant statement has executed through normal
-TDS, then replaces the hosts and reobserves native state. Seed submission and
-callback-publication windows use explicit test-only probes/gates around real
+TDS. Its configuration-interruption cases require exactly one injected reply
+loss at the named effect, observed mutation dispatch, confirmed host
+termination and exact idempotent cleanup; source-recovery also reads FULL
+recovery. They deliberately make no post-drain startup attempt or public
+terminal-state inference: neither fresh-session rejection/admission nor
+AG/seeding/marker convergence is proved after each lost reply. Those former
+recovery assertions are removed, not supplied by an unrelated happy path.
+Genuine interrupted-bootstrap renewal remains a separate unsupported gate.
+Separate seed submission cases retain positive
+same-session safe retry. Callback-publication windows use explicit probes/gates around real
 callbacks, including before request submission, after submission, after SQL
 acceptance with a lost reply, and after definite SQL rejection.
+The post-native-success case stops requesting progress after Abort: it requires
+the exact closed-source callback rejection, then confirms host drainage.
+Completed-state replacement performs the actual native callback replay and
+checks no duplicate `ADD DATABASE`, resolved temporary seed state and unchanged
+three-member marker visibility. That is native callback evidence, not Public V1
+Build success or renewal of an interrupted operation.
 
 The conflict recipe has three isolated SQL-native cases observed through the
 normal TDS path: convergence from a source database that inherits `SIMPLE`
@@ -956,13 +972,38 @@ cases are decoded-observation injections consumed by production validators; its
 SQL-incarnation validator uses a real process restart plus a test gate.
 Separate terminal-seed cases perform real post-compaction association removal
 and AG recreation with zero redispatch. Target-local evidence cases use real
-target SQL process restarts and test-injected lineage mismatches at
-pre-association, in-flight-seeding and post-native/pre-reply windows. Every
-scenario performs exact cleanup.
+target SQL process restarts at three distinct windows. One synthetic-lineage
+callback retains all three held-checkpoint/no-success observations before the
+single final report-seam injection; it does not model three physical fork
+changes. Every scenario performs exact cleanup. Physical restart requires an
+independently observed new SQL start, a returned narrowly classified unsafe/unavailable or
+bounded callback-budget error, and at most one seed submission. This proves
+bounded callback failure without duplicate submission, not rollback, zero
+effects or a specific incarnation-check branch; an admitted `ADD DATABASE` may
+remain. Lineage mismatch still requires its strict conflict error.
 
-The required GitHub Actions check `Shared CI validation` runs `just ci`,
-including licensed one-replica, three-replica, same-root restart, and isolated
-lease/fence validation, and always runs `just cleanup`. Its GitHub Actions job log is the
+The required GitHub Actions check `Shared CI validation` gates a checked
+nextest archive and four isolated test workers. Shard 1 validates exact-once
+partition coverage before its tests; shards 2–4 start without waiting.
+Each runs its ordinary slice then ignored-SQL hash partition without rebuilding,
+keeping the serial live profile and always attempting direct archived-binary
+cleanup. This includes one-replica
+recovery, three-replica fault/signal/conflict/target evidence, native commit/
+prefix, the hosted witness and isolated lease/fence cases, not just happy
+path/restart. The unrelated privileged ACL test is not selected.
+Long aggregate loops are exposed as individually named scenario tests while
+preserving fresh-fixture isolation and the single-slot SQL group. Each case
+gets its own nextest result/timing; duplicate bootstrap handshake execution is
+removed without dropping the separately selected handshake cases. The last
+restart-checkpoint case retains its same-root positive retry as one atomic
+journey, rather than relying on another test's order. Splitting does not
+promise lower total runtime or impose a five-minute kill deadline.
+Complete happy/restart executions are retained inside recovery retries rather
+than scheduled a second time. Hosted witness retains the complete native
+commit report; the native-only manual diagnostic keeps its separate blocked-
+coverage acceptance semantics. Manual recipes and subprocesses use one gated
+ordinary child helper, which starts no SQL without an explicit mode.
+Its GitHub Actions job log is the
 run evidence; no test logs or evidence artifacts are committed. The dependency
 source and version remain defined only by the root `Cargo.toml`.
 
@@ -1002,10 +1043,14 @@ Run the complete server-free and Rust-owned live gates:
 just ci
 ```
 
-The required exact PR-head GitHub Actions job `Shared CI validation` runs this
-same command and always runs `just cleanup`. Licensed gates therefore execute
-in CI; their GitHub Actions job log is the evidence, not a checked-in log or
-artifact.
+The required exact PR-head GitHub Actions job `Shared CI validation` requires
+the corresponding archive producer and all four workers to pass, including
+coverage validation inside shard 1. Workers use the same source revision,
+preserve serial SQL on each
+Docker host and always attempt exact archived-binary cleanup. Local `just ci`
+remains serial; `ci-build-nextest-archive`, `validate-nextest-archive` and
+`test-nextest-archive` reproduce the separate cloud stages. Job logs are the
+evidence, not checked-in logs or artifacts.
 
 Run or clean up the one-member observer/CLI path:
 
@@ -1015,6 +1060,22 @@ just cleanup-live-one-replica [root]
 ```
 
 Live tests remain ignored for ordinary Cargo invocation.
+
+Run all existing SQL fixture suites serially, or recover their nested journals
+within a selected runner namespace:
+
+```bash
+just test-live-nextest [runner-root]
+just cleanup-live-nextest [runner-root]
+```
+
+The default runner namespace is `target/mssql-nextest-live`, with separate
+one-replica, three-replica and lease-fence families. `just check` preserves
+ordinary tests in those binaries and runs Cargo doctests separately.
+The live recipe clears case-narrowing environments and uses ignored-only
+selection; a live failure stops scheduling. Cleanup retains Removed journals
+and refuses live/unknown owners or unverifiable resources. Per-invocation
+nextest serialization is not a substitute for fixture ownership locks.
 
 Run the real three-member path with an optional fixture root:
 
@@ -1038,9 +1099,9 @@ Exercise handled SIGTERM, recovery, retry, and idempotent cleanup:
 just test-live-three-replica-signal [root]
 ```
 
-The three-replica happy path, same-root restart, and isolated lease/fence
-experiments run after the one-replica observer/CLI validation in `just ci`.
-Signal, recovery, fault and conflict recipes remain explicit. The shipped
+All these suites are selected by the explicit serial nextest live stage after
+server-free checks in `just ci`; no inter-suite ordering is promised.
+Narrow signal, recovery, fault and conflict recipes remain available. The shipped
 acknowledgement example still contains
 `accepted: false` as documentation for the production/file-backed contract, but
 tests do not require it.

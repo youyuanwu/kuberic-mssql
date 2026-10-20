@@ -70,11 +70,7 @@ fn live_owner_process_blocks_cleanup_until_death_then_allows_recovery_and_retry(
     let resource = PathBuf::from(String::from_utf8(fs::read(&ready).unwrap()).unwrap());
     assert!(resource.is_dir());
 
-    let refused_cleanup = Command::new(env!("CARGO_BIN_EXE_mssql-three-replica-fixture"))
-        .args(["cleanup", "--root"])
-        .arg(&root)
-        .output()
-        .unwrap();
+    let refused_cleanup = cleanup_process(&root);
     assert!(!refused_cleanup.status.success());
     assert!(
         resource.is_dir(),
@@ -89,11 +85,7 @@ fn live_owner_process_blocks_cleanup_until_death_then_allows_recovery_and_retry(
 
     child.kill().unwrap();
     child.wait().unwrap();
-    let recovered = Command::new(env!("CARGO_BIN_EXE_mssql-three-replica-fixture"))
-        .args(["cleanup", "--root"])
-        .arg(&root)
-        .output()
-        .unwrap();
+    let recovered = cleanup_process(&root);
     assert!(
         recovered.status.success(),
         "{}",
@@ -205,11 +197,14 @@ fn spawn_child(root: &Path, ready: &Path, refused: &Path, retry: bool) -> Child 
 }
 
 fn cleanup_process(root: &Path) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_mssql-three-replica-fixture"))
-        .args(["cleanup", "--root"])
-        .arg(root)
-        .output()
-        .unwrap()
+    Command::new(kuberic_mssql_tests::test_support::companion_binary(
+        "mssql-three-replica-fixture",
+        option_env!("CARGO_BIN_EXE_mssql-three-replica-fixture"),
+    ))
+    .args(["cleanup", "--root"])
+    .arg(root)
+    .output()
+    .unwrap()
 }
 
 fn project_tempdir(prefix: &str) -> tempfile::TempDir {
