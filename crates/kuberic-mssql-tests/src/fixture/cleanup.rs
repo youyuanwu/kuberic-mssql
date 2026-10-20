@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -10,6 +11,31 @@ use super::model::{
 use super::ownership::{OwnershipInspector, ReconcileError, ResourceObservation};
 
 pub trait CleanupBackend: OwnershipInspector {
+    fn supports_container_batch(&self) -> bool {
+        false
+    }
+
+    fn remove_container_batch(
+        &self,
+        resources: &[ResourceRecord],
+        _remaining: &dyn Fn() -> Duration,
+    ) -> Vec<ContainerCleanupResult> {
+        resources
+            .iter()
+            .map(|resource| ContainerCleanupResult {
+                resource: resource.logical_name.clone(),
+                errors: vec![CleanupError {
+                    resource: resource.logical_name.clone(),
+                    failure: SanitizedFailure::with_detail(
+                        FailureStage::Cleanup,
+                        FailureCategory::ContainerRemoval,
+                        "container cohort cleanup is unsupported",
+                    ),
+                }],
+            })
+            .collect()
+    }
+
     fn inspect_cleanup(
         &self,
         resource: &ResourceRecord,
@@ -33,6 +59,12 @@ pub trait CleanupBackend: OwnershipInspector {
         resource: &ResourceRecord,
         remaining: Duration,
     ) -> Result<(), CleanupError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerCleanupResult {
+    pub resource: String,
+    pub errors: Vec<CleanupError>,
 }
 
 pub trait CleanupJournal {
@@ -288,6 +320,7 @@ where
         return report;
     }
 
+    let batched = cleanup_container_batch(store, journal, backend, coordinator, &mut report);
     let mut cleanup_order = (0..journal.resources().len())
         .rev()
         .filter(|index| journal.resources()[*index].kind == ResourceKind::Container)
@@ -298,6 +331,9 @@ where
             .filter(|index| journal.resources()[*index].kind != ResourceKind::Container),
     );
     for index in cleanup_order {
+        if batched.contains(&index) {
+            continue;
+        }
         let record = journal.resources()[index].clone();
         if record.state == ResourceState::Removed {
             continue;
@@ -347,142 +383,30 @@ where
             let _ = store.save_cleanup_journal(journal);
             continue;
         }
-        let observation = match backend.inspect_cleanup(&record, coordinator.remaining()) {
-            Ok(observation) => observation,
-            Err(_) => {
-                block_with_detail(
-                    journal,
-                    index,
-                    &record,
-                    &mut report,
-                    Some("resource inspection could not prove exact ownership"),
-                );
-                continue;
-            }
-        };
-        if coordinator.remaining().is_zero() {
-            exhaust_budget(journal, index, &record, &mut report);
-            continue;
-        }
-        let binding = match observation {
-            ResourceObservation::Absent => {
-                if matches!(
-                    record.state,
-                    ResourceState::Dispatched | ResourceState::Blocked
-                ) && record.binding.is_none()
-                    && !matches!(
-                        record.kind,
-                        ResourceKind::DataDirectory
-                            | ResourceKind::Directory
-                            | ResourceKind::SecretFile
-                    )
-                {
-                    block_with_detail(
-                        journal,
-                        index,
-                        &record,
-                        &mut report,
-                        Some("create dispatch outcome is ambiguous"),
-                    );
-                } else {
-                    journal.resources_mut()[index].state = ResourceState::Removed;
-                    report.removed.push(record.logical_name.clone());
-                    if store.save_cleanup_journal(journal).is_err() {
-                        report.errors.push(CleanupError::journal(&record));
-                    }
-                }
-                continue;
-            }
-            ResourceObservation::Foreign => {
-                block(journal, index, &record, &mut report);
-                continue;
-            }
-            ResourceObservation::Owned {
-                binding,
-                foreign_attachments,
-            } => {
-                if !foreign_attachments.is_empty() {
-                    block_with_detail(
-                        journal,
-                        index,
-                        &record,
-                        &mut report,
-                        Some("resource has foreign attachments"),
-                    );
-                    continue;
-                }
-                binding
-            }
-        };
-        if let Some(expected) = &record.binding {
-            if expected != &binding {
-                let detail = match record.kind {
-                    ResourceKind::Container => "container immutable binding changed",
-                    ResourceKind::Network => "network immutable binding changed",
-                    ResourceKind::DataDirectory
-                    | ResourceKind::Directory
-                    | ResourceKind::SecretFile => "path immutable binding changed",
-                    ResourceKind::AvailabilityGroup | ResourceKind::Database => {
-                        "native SQL immutable binding changed"
-                    }
-                };
-                block_with_detail(journal, index, &record, &mut report, Some(detail));
-                continue;
-            }
-        } else if matches!(
-            record.state,
-            ResourceState::Dispatched | ResourceState::Blocked
-        ) {
-            journal.resources_mut()[index].binding = Some(binding);
-        } else {
-            block_with_detail(
-                journal,
-                index,
-                &record,
-                &mut report,
-                Some("resource state lacks a dispatched binding"),
-            );
-            continue;
-        }
-        journal.resources_mut()[index].state = ResourceState::Cleaning;
-        if store.save_cleanup_journal(journal).is_err() {
-            report.errors.push(CleanupError::journal(&record));
-            block(journal, index, &record, &mut report);
-            continue;
-        }
-        if let Err(error) = remove(
+        let Some(prepared) = prepare_resource(
+            store,
+            journal,
             backend,
-            &journal.resources()[index],
-            coordinator.remaining(),
-        ) {
-            journal.resources_mut()[index].state = ResourceState::Blocked;
-            report.unresolved.push(record.logical_name.clone());
-            report.errors.push(error);
-            let _ = store.save_cleanup_journal(journal);
+            coordinator,
+            index,
+            &record,
+            &mut report,
+        ) else {
             continue;
-        }
-        if coordinator.remaining().is_zero() {
-            exhaust_budget(journal, index, &record, &mut report);
-            continue;
-        }
-        match backend.inspect_cleanup(&journal.resources()[index], coordinator.remaining()) {
-            Ok(ResourceObservation::Absent) => {
-                journal.resources_mut()[index].state = ResourceState::Removed;
-                report.removed.push(record.logical_name.clone());
-                if store.save_cleanup_journal(journal).is_err() {
-                    report.errors.push(CleanupError::journal(&record));
-                }
-            }
-            Ok(ResourceObservation::Owned { .. }) | Ok(ResourceObservation::Foreign) | Err(_) => {
-                block_with_detail(
-                    journal,
-                    index,
-                    &record,
-                    &mut report,
-                    Some("resource remained present after removal"),
-                )
-            }
-        }
+        };
+        let errors = match remove(backend, &prepared, coordinator.remaining()) {
+            Ok(()) => Vec::new(),
+            Err(error) => vec![error],
+        };
+        finish_removal(
+            store,
+            journal,
+            backend,
+            coordinator,
+            index,
+            errors,
+            &mut report,
+        );
     }
 
     let final_state = if journal
@@ -504,6 +428,336 @@ where
         });
     }
     report
+}
+
+fn prepare_resource<J, S>(
+    store: &S,
+    journal: &mut J,
+    backend: &impl CleanupBackend,
+    coordinator: &CleanupCoordinator<impl CleanupClock>,
+    index: usize,
+    record: &ResourceRecord,
+    report: &mut CleanupReport,
+) -> Option<ResourceRecord>
+where
+    J: CleanupJournal,
+    S: CleanupJournalStore<J>,
+{
+    let observation = match backend.inspect_cleanup(record, coordinator.remaining()) {
+        Ok(observation) => observation,
+        Err(_) => {
+            block_with_detail(
+                journal,
+                index,
+                record,
+                report,
+                Some("resource inspection could not prove exact ownership"),
+            );
+            return None;
+        }
+    };
+    if coordinator.remaining().is_zero() {
+        exhaust_budget(journal, index, record, report);
+        return None;
+    }
+    let binding = match observation {
+        ResourceObservation::Absent => {
+            if matches!(
+                record.state,
+                ResourceState::Dispatched | ResourceState::Blocked
+            ) && record.binding.is_none()
+                && !matches!(
+                    record.kind,
+                    ResourceKind::DataDirectory
+                        | ResourceKind::Directory
+                        | ResourceKind::SecretFile
+                )
+            {
+                block_with_detail(
+                    journal,
+                    index,
+                    record,
+                    report,
+                    Some("create dispatch outcome is ambiguous"),
+                );
+            } else {
+                journal.resources_mut()[index].state = ResourceState::Removed;
+                report.removed.push(record.logical_name.clone());
+                if store.save_cleanup_journal(journal).is_err() {
+                    report.errors.push(CleanupError::journal(record));
+                }
+            }
+            return None;
+        }
+        ResourceObservation::Foreign => {
+            block(journal, index, record, report);
+            return None;
+        }
+        ResourceObservation::Owned {
+            binding,
+            foreign_attachments,
+        } => {
+            if !foreign_attachments.is_empty() {
+                block_with_detail(
+                    journal,
+                    index,
+                    record,
+                    report,
+                    Some("resource has foreign attachments"),
+                );
+                return None;
+            }
+            binding
+        }
+    };
+    if let Some(expected) = &record.binding {
+        if expected != &binding {
+            let detail = match record.kind {
+                ResourceKind::Container => "container immutable binding changed",
+                ResourceKind::Network => "network immutable binding changed",
+                ResourceKind::DataDirectory
+                | ResourceKind::Directory
+                | ResourceKind::SecretFile => "path immutable binding changed",
+                ResourceKind::AvailabilityGroup | ResourceKind::Database => {
+                    "native SQL immutable binding changed"
+                }
+            };
+            block_with_detail(journal, index, record, report, Some(detail));
+            return None;
+        }
+    } else if matches!(
+        record.state,
+        ResourceState::Dispatched | ResourceState::Blocked
+    ) {
+        journal.resources_mut()[index].binding = Some(binding);
+    } else {
+        block_with_detail(
+            journal,
+            index,
+            record,
+            report,
+            Some("resource state lacks a dispatched binding"),
+        );
+        return None;
+    }
+    journal.resources_mut()[index].state = ResourceState::Cleaning;
+    if store.save_cleanup_journal(journal).is_err() {
+        report.errors.push(CleanupError::journal(record));
+        block(journal, index, record, report);
+        return None;
+    }
+    Some(journal.resources()[index].clone())
+}
+
+fn finish_removal<J, S>(
+    store: &S,
+    journal: &mut J,
+    backend: &impl CleanupBackend,
+    coordinator: &CleanupCoordinator<impl CleanupClock>,
+    index: usize,
+    errors: Vec<CleanupError>,
+    report: &mut CleanupReport,
+) where
+    J: CleanupJournal,
+    S: CleanupJournalStore<J>,
+{
+    let record = journal.resources()[index].clone();
+    if !errors.is_empty() {
+        journal.resources_mut()[index].state = ResourceState::Blocked;
+        report.unresolved.push(record.logical_name.clone());
+        report.errors.extend(errors);
+        if store.save_cleanup_journal(journal).is_err() {
+            report.errors.push(CleanupError::journal(&record));
+        }
+        return;
+    }
+    if coordinator.remaining().is_zero() {
+        exhaust_budget(journal, index, &record, report);
+        return;
+    }
+    let observation = backend.inspect_cleanup(&journal.resources()[index], coordinator.remaining());
+    if coordinator.remaining().is_zero() {
+        exhaust_budget(journal, index, &record, report);
+        return;
+    }
+    match observation {
+        Ok(ResourceObservation::Absent) => {
+            journal.resources_mut()[index].state = ResourceState::Removed;
+            report.removed.push(record.logical_name.clone());
+            if store.save_cleanup_journal(journal).is_err() {
+                report.errors.push(CleanupError::journal(&record));
+            }
+        }
+        Ok(ResourceObservation::Owned { .. }) | Ok(ResourceObservation::Foreign) | Err(_) => {
+            block_with_detail(
+                journal,
+                index,
+                &record,
+                report,
+                Some("resource remained present after removal"),
+            )
+        }
+    }
+}
+
+fn cleanup_container_batch<J, S>(
+    store: &S,
+    journal: &mut J,
+    backend: &impl CleanupBackend,
+    coordinator: &CleanupCoordinator<impl CleanupClock>,
+    report: &mut CleanupReport,
+) -> Vec<usize>
+where
+    J: CleanupJournal,
+    S: CleanupJournalStore<J>,
+{
+    if !backend.supports_container_batch() {
+        return Vec::new();
+    }
+    let indices: Vec<_> = (0..journal.resources().len())
+        .rev()
+        .filter(|index| {
+            let record = &journal.resources()[*index];
+            record.kind == ResourceKind::Container && record.state != ResourceState::Removed
+        })
+        .collect();
+    if !(2..=3).contains(&indices.len())
+        || indices.iter().any(|index| {
+            let record = &journal.resources()[*index];
+            record.binding.is_none()
+                || !matches!(record.state, ResourceState::Bound | ResourceState::Cleaning)
+        })
+    {
+        return Vec::new();
+    }
+    let names: BTreeSet<_> = indices
+        .iter()
+        .map(|index| journal.resources()[*index].logical_name.clone())
+        .collect();
+    let identities: BTreeSet<_> = indices
+        .iter()
+        .filter_map(|index| {
+            journal.resources()[*index]
+                .binding
+                .as_ref()
+                .map(|binding| binding.immutable_id.clone())
+        })
+        .collect();
+    if names.len() != indices.len() || identities.len() != indices.len() {
+        for index in &indices {
+            let record = journal.resources()[*index].clone();
+            block_with_detail(
+                journal,
+                *index,
+                &record,
+                report,
+                Some("duplicate container cohort identity"),
+            );
+        }
+        return indices;
+    }
+    let mut prepared = Vec::new();
+    for index in &indices {
+        let record = journal.resources()[*index].clone();
+        if coordinator.remaining().is_zero() {
+            exhaust_budget(journal, *index, &record, report);
+        } else if let Some(record) = prepare_resource(
+            store,
+            journal,
+            backend,
+            coordinator,
+            *index,
+            &record,
+            report,
+        ) {
+            prepared.push((*index, record));
+        }
+    }
+    if prepared.is_empty() {
+        return indices;
+    }
+    if coordinator.remaining().is_zero() {
+        for (index, record) in &prepared {
+            exhaust_budget(journal, *index, record, report);
+        }
+        return indices;
+    }
+    let records: Vec<_> = prepared.iter().map(|(_, record)| record.clone()).collect();
+    let outcomes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        backend.remove_container_batch(&records, &|| coordinator.remaining())
+    }));
+    let outcomes = match outcomes {
+        Ok(outcomes) => outcomes,
+        Err(_) => {
+            for (index, record) in &prepared {
+                finish_removal(
+                    store,
+                    journal,
+                    backend,
+                    coordinator,
+                    *index,
+                    vec![CleanupError {
+                        resource: record.logical_name.clone(),
+                        failure: SanitizedFailure::with_detail(
+                            FailureStage::Cleanup,
+                            FailureCategory::ContainerRemoval,
+                            "container cohort cleanup panicked",
+                        ),
+                    }],
+                    report,
+                );
+            }
+            return indices;
+        }
+    };
+    let expected: BTreeSet<_> = records
+        .iter()
+        .map(|record| record.logical_name.clone())
+        .collect();
+    let actual: BTreeSet<_> = outcomes
+        .iter()
+        .map(|outcome| outcome.resource.clone())
+        .collect();
+    if outcomes.len() != expected.len()
+        || actual != expected
+        || outcomes.iter().any(|outcome| {
+            outcome
+                .errors
+                .iter()
+                .any(|error| error.resource != outcome.resource)
+        })
+    {
+        for (index, record) in &prepared {
+            finish_removal(
+                store,
+                journal,
+                backend,
+                coordinator,
+                *index,
+                vec![CleanupError {
+                    resource: record.logical_name.clone(),
+                    failure: SanitizedFailure::with_detail(
+                        FailureStage::Cleanup,
+                        FailureCategory::ContainerRemoval,
+                        "container cohort outcomes are incomplete or mismatched",
+                    ),
+                }],
+                report,
+            );
+        }
+        return indices;
+    }
+    let mut outcomes: BTreeMap<_, _> = outcomes
+        .into_iter()
+        .map(|outcome| (outcome.resource, outcome.errors))
+        .collect();
+    for (index, record) in &prepared {
+        let errors = outcomes
+            .remove(&record.logical_name)
+            .expect("validated cohort outcome");
+        finish_removal(store, journal, backend, coordinator, *index, errors, report);
+    }
+    indices
 }
 
 pub fn combine_with_cleanup<T>(

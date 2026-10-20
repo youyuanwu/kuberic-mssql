@@ -30,7 +30,7 @@ use crate::fixture::admin::{
 };
 use crate::fixture::cleanup::{
     CLEANUP_BUDGET, CleanupBackend, CleanupClock, CleanupCoordinator, CleanupError, CleanupReport,
-    OperationBudget, SystemCleanupClock, combine_with_cleanup,
+    ContainerCleanupResult, OperationBudget, SystemCleanupClock, combine_with_cleanup,
 };
 use crate::fixture::config::{FixtureConfig, PINNED_SQL_SERVER_IMAGE};
 use crate::fixture::docker::{
@@ -2101,6 +2101,21 @@ where
         OperationBudget::new(&self.clock, remaining.min(Duration::from_secs(30)))
     }
 
+    fn cleanup_container(
+        &self,
+        resource: &ResourceRecord,
+    ) -> Result<&OwnedContainer, CleanupError> {
+        self.containers
+            .iter()
+            .find(|container| {
+                resource
+                    .intent
+                    .as_ref()
+                    .is_some_and(|intent| intent.immutable_id == container.request.name)
+            })
+            .ok_or_else(|| cleanup_ownership_error(resource))
+    }
+
     fn timeout(
         &self,
         resource: &ResourceRecord,
@@ -2201,6 +2216,219 @@ where
     R: ProcessRunner + Copy,
     C: CleanupClock,
 {
+    fn supports_container_batch(&self) -> bool {
+        self.docker.supports_cleanup_stop_batch()
+    }
+
+    fn remove_container_batch(
+        &self,
+        resources: &[ResourceRecord],
+        remaining: &dyn Fn() -> Duration,
+    ) -> Vec<ContainerCleanupResult> {
+        let mut results: Vec<_> = resources
+            .iter()
+            .map(|resource| ContainerCleanupResult {
+                resource: resource.logical_name.clone(),
+                errors: Vec::new(),
+            })
+            .collect();
+        if resources.is_empty() || resources.len() > 3 {
+            for (result, resource) in results.iter_mut().zip(resources) {
+                result.errors.push(cleanup_ownership_error(resource));
+            }
+            return results;
+        }
+        let count = u32::try_from(resources.len()).expect("bounded container cohort");
+        let allowance = Duration::from_secs(30).saturating_mul(count);
+        let budget = OperationBudget::new(&self.clock, remaining().min(allowance));
+        let left = || {
+            budget
+                .remaining()
+                .map_or(Duration::ZERO, |left| left.min(remaining()))
+        };
+        let command_limit = || left().min(Duration::from_secs(30));
+        let mut eligible = vec![false; resources.len()];
+        let mut running = Vec::new();
+
+        for (index, resource) in resources.iter().enumerate() {
+            let container = match self.cleanup_container(resource) {
+                Ok(container) => container,
+                Err(error) => {
+                    results[index].errors.push(error);
+                    continue;
+                }
+            };
+            let Some(binding) = resource.binding.as_ref() else {
+                results[index]
+                    .errors
+                    .push(cleanup_ownership_error(resource));
+                continue;
+            };
+            if command_limit().is_zero() {
+                results[index].errors.push(cleanup_operation_error(
+                    resource,
+                    FailureCategory::DeadlineExceeded,
+                ));
+                continue;
+            }
+            let inspection = self
+                .docker
+                .inspect_container(&binding.immutable_id, command_limit());
+            if left().is_zero() {
+                results[index].errors.push(cleanup_operation_error(
+                    resource,
+                    FailureCategory::DeadlineExceeded,
+                ));
+                continue;
+            }
+            let inspection = match inspection {
+                Ok(Some(inspection)) => inspection,
+                Ok(None) => continue,
+                Err(_) => {
+                    results[index].errors.push(cleanup_operation_error(
+                        resource,
+                        FailureCategory::ContainerRemoval,
+                    ));
+                    continue;
+                }
+            };
+            if inspection.id != binding.immutable_id
+                || container
+                    .request
+                    .verify_inspection(&inspection, self.image_id, inspection.running)
+                    .is_err()
+            {
+                results[index]
+                    .errors
+                    .push(cleanup_ownership_error(resource));
+                continue;
+            }
+            eligible[index] = true;
+            if inspection.running {
+                running.push((index, binding.immutable_id.clone()));
+            }
+        }
+
+        if !running.is_empty() {
+            let available = left();
+            if available <= Duration::from_secs(10) + crate::fixture::process::SHUTDOWN_RESERVE {
+                for (index, _) in &running {
+                    results[*index].errors.push(cleanup_operation_error(
+                        &resources[*index],
+                        FailureCategory::DeadlineExceeded,
+                    ));
+                }
+            } else {
+                let ids: Vec<_> = running.iter().map(|(_, id)| id.clone()).collect();
+                if self
+                    .docker
+                    .stop_containers_for_cleanup(&ids, available)
+                    .is_err()
+                {
+                    for (index, _) in &running {
+                        results[*index].errors.push(CleanupError {
+                            resource: resources[*index].logical_name.clone(),
+                            failure: SanitizedFailure::with_detail(
+                                FailureStage::Cleanup,
+                                FailureCategory::ContainerRemoval,
+                                "container cohort stop outcome is uncertain",
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        for (index, resource) in resources.iter().enumerate() {
+            if !eligible[index] {
+                continue;
+            }
+            if command_limit().is_zero() {
+                results[index].errors.push(cleanup_operation_error(
+                    resource,
+                    FailureCategory::DeadlineExceeded,
+                ));
+                continue;
+            }
+            let binding = resource.binding.as_ref().expect("validated cohort binding");
+            let inspection = self
+                .docker
+                .inspect_container(&binding.immutable_id, command_limit());
+            if left().is_zero() {
+                results[index].errors.push(cleanup_operation_error(
+                    resource,
+                    FailureCategory::DeadlineExceeded,
+                ));
+                continue;
+            }
+            let inspection = match inspection {
+                Ok(Some(inspection)) => inspection,
+                Ok(None) => continue,
+                Err(_) => {
+                    results[index].errors.push(cleanup_operation_error(
+                        resource,
+                        FailureCategory::ContainerRemoval,
+                    ));
+                    continue;
+                }
+            };
+            let container = match self.cleanup_container(resource) {
+                Ok(container) => container,
+                Err(error) => {
+                    results[index].errors.push(error);
+                    continue;
+                }
+            };
+            if inspection.id != binding.immutable_id
+                || container
+                    .request
+                    .verify_inspection(&inspection, self.image_id, inspection.running)
+                    .is_err()
+            {
+                results[index]
+                    .errors
+                    .push(cleanup_ownership_error(resource));
+                continue;
+            }
+            if inspection.running {
+                results[index].errors.push(CleanupError {
+                    resource: resource.logical_name.clone(),
+                    failure: SanitizedFailure::with_detail(
+                        FailureStage::Cleanup,
+                        FailureCategory::ContainerRemoval,
+                        "container remained running after cohort stop; stop is not retried",
+                    ),
+                });
+                continue;
+            }
+            let timeout = command_limit();
+            if timeout.is_zero() {
+                results[index].errors.push(cleanup_operation_error(
+                    resource,
+                    FailureCategory::DeadlineExceeded,
+                ));
+            } else {
+                if self
+                    .docker
+                    .remove_container(&binding.immutable_id, timeout)
+                    .is_err()
+                {
+                    results[index].errors.push(cleanup_operation_error(
+                        resource,
+                        FailureCategory::ContainerRemoval,
+                    ));
+                }
+                if left().is_zero() {
+                    results[index].errors.push(cleanup_operation_error(
+                        resource,
+                        FailureCategory::DeadlineExceeded,
+                    ));
+                }
+            }
+        }
+        results
+    }
+
     fn inspect_cleanup(
         &self,
         resource: &ResourceRecord,
@@ -2323,16 +2551,7 @@ where
         resource: &ResourceRecord,
         remaining: Duration,
     ) -> Result<(), CleanupError> {
-        let container = self
-            .containers
-            .iter()
-            .find(|container| {
-                resource
-                    .intent
-                    .as_ref()
-                    .is_some_and(|intent| intent.immutable_id == container.request.name)
-            })
-            .ok_or_else(|| cleanup_ownership_error(resource))?;
+        let container = self.cleanup_container(resource)?;
         let expected = resource
             .binding
             .as_ref()
@@ -2932,6 +3151,280 @@ mod tests {
             self.record("remove-container", id, timeout);
             self.container.borrow_mut().take();
             Ok(())
+        }
+    }
+
+    struct CohortDocker {
+        clock: FakeClock,
+        elapsed: Duration,
+        containers: RefCell<std::collections::BTreeMap<String, ContainerInspection>>,
+        calls: RefCell<Vec<(String, String, Duration)>>,
+        stop_error: bool,
+        keep_running: bool,
+        replace_after_stop: bool,
+    }
+
+    impl CohortDocker {
+        fn record(&self, operation: &str, id: &str, timeout: Duration) {
+            self.calls
+                .borrow_mut()
+                .push((operation.into(), id.into(), timeout));
+            self.clock.now.set(self.clock.now.get() + self.elapsed);
+        }
+    }
+
+    impl DockerApi for CohortDocker {
+        fn capabilities(&self, _: Duration) -> Result<DockerCapabilities, DockerError> {
+            Err(DockerError::Command)
+        }
+        fn docker_root(&self, _: Duration) -> Result<PathBuf, DockerError> {
+            Err(DockerError::Command)
+        }
+        fn inspect_image(
+            &self,
+            _: &str,
+            _: Duration,
+        ) -> Result<Option<ImageInspection>, DockerError> {
+            Err(DockerError::Command)
+        }
+        fn pull_image(&self, _: &str, _: Duration) -> Result<(), DockerError> {
+            Err(DockerError::Command)
+        }
+        fn inspect_network(
+            &self,
+            _: &str,
+            _: Duration,
+        ) -> Result<Option<NetworkInspection>, DockerError> {
+            Err(DockerError::Command)
+        }
+        fn create_network(&self, _: &NetworkRequest, _: Duration) -> Result<String, DockerError> {
+            Err(DockerError::Command)
+        }
+        fn remove_network(&self, _: &str, _: Duration) -> Result<(), DockerError> {
+            Err(DockerError::Command)
+        }
+        fn create_container(
+            &self,
+            _: &ContainerRequest,
+            _: Duration,
+        ) -> Result<String, DockerError> {
+            Err(DockerError::Command)
+        }
+        fn start_container(&self, _: &str, _: Duration) -> Result<(), DockerError> {
+            Err(DockerError::Command)
+        }
+        fn stop_container(&self, _: &str, _: Duration) -> Result<(), DockerError> {
+            panic!("cohort stop must not be retried as scalar")
+        }
+        fn inspect_container(
+            &self,
+            id: &str,
+            timeout: Duration,
+        ) -> Result<Option<ContainerInspection>, DockerError> {
+            self.record("inspect", id, timeout);
+            Ok(self.containers.borrow().get(id).cloned())
+        }
+        fn supports_cleanup_stop_batch(&self) -> bool {
+            true
+        }
+        fn stop_containers_for_cleanup(
+            &self,
+            ids: &[String],
+            timeout: Duration,
+        ) -> Result<(), DockerError> {
+            self.record("stop-cohort", &ids.join(","), timeout);
+            for (index, id) in ids.iter().enumerate() {
+                let mut containers = self.containers.borrow_mut();
+                let container = containers.get_mut(id).unwrap();
+                if !(self.keep_running && index == 0) {
+                    container.running = false;
+                }
+                if self.replace_after_stop && index == 0 {
+                    container
+                        .labels
+                        .insert("io.kuberic.mssql.run".into(), "foreign".into());
+                }
+            }
+            if self.stop_error {
+                Err(DockerError::Command)
+            } else {
+                Ok(())
+            }
+        }
+        fn remove_container(&self, id: &str, timeout: Duration) -> Result<(), DockerError> {
+            self.record("remove", id, timeout);
+            self.containers.borrow_mut().remove(id);
+            Ok(())
+        }
+    }
+
+    fn cohort_fixture(root: &Path) -> (Vec<OwnedContainer>, Vec<ResourceRecord>, CohortDocker) {
+        let mut containers = Vec::new();
+        let mut resources = Vec::new();
+        let mut inspections = std::collections::BTreeMap::new();
+        for ordinal in 1u8..=3 {
+            let member = root.join(format!("cohort-{ordinal}"));
+            fs::create_dir(&member).unwrap();
+            let (mut request, mut inspection, mut owned) = cleanup_container(&member, true);
+            request.name = format!("container-{ordinal}");
+            request.hostname = format!("km0123456789n{ordinal}");
+            request.labels = OwnedLabels::container("0123456789ab", ordinal);
+            inspection.id = format!("{ordinal:064x}");
+            inspection.name = request.name.clone();
+            inspection.hostname = request.hostname.clone();
+            inspection.labels = request.labels.as_map();
+            let binding = container_resource_binding(&request, "image-id", &inspection).unwrap();
+            resources.push(ResourceRecord {
+                kind: ResourceKind::Container,
+                logical_name: format!("sql-{ordinal}"),
+                path: None,
+                intent: Some(request.intent_binding("image-id")),
+                binding: Some(binding),
+                state: ResourceState::Cleaning,
+            });
+            owned.request = request;
+            owned.id = Some(inspection.id.clone());
+            inspections.insert(inspection.id.clone(), inspection);
+            containers.push(owned);
+        }
+        let docker = CohortDocker {
+            clock: FakeClock::new(),
+            elapsed: Duration::from_secs(7),
+            containers: RefCell::new(inspections),
+            calls: RefCell::new(Vec::new()),
+            stop_error: false,
+            keep_running: false,
+            replace_after_stop: false,
+        };
+        (containers, resources, docker)
+    }
+
+    #[test]
+    fn native_cohort_shares_one_shrinking_allowance_without_send_clock() {
+        let directory = tempdir().unwrap();
+        let (containers, resources, docker) = cohort_fixture(directory.path());
+        let coordinator = CleanupCoordinator::new(docker.clock.clone(), Duration::from_secs(180));
+        docker.clock.now.set(Duration::from_secs(40));
+        let backend = NativeCleanupBackend {
+            root: directory.path(),
+            docker: &docker,
+            runner: &BoundedProcessRunner,
+            clock: docker.clock.clone(),
+            image_id: "image-id",
+            network: None,
+            containers: &containers,
+        };
+        let results = backend.remove_container_batch(&resources, &|| coordinator.remaining());
+        assert!(
+            results.iter().all(|result| result.errors.is_empty()),
+            "{results:?}"
+        );
+        assert!(docker.containers.borrow().is_empty());
+        let calls = docker.calls.borrow();
+        let stops: Vec<_> = calls
+            .iter()
+            .filter(|(kind, _, _)| kind == "stop-cohort")
+            .collect();
+        assert_eq!(stops.len(), 1);
+        assert_eq!(stops[0].2, Duration::from_secs(69));
+        assert_eq!(calls.last().unwrap().2, Duration::from_secs(27));
+        assert!(
+            calls
+                .iter()
+                .filter(|(kind, _, _)| kind != "stop-cohort")
+                .all(|(_, _, timeout)| *timeout <= Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn native_cohort_retains_aggregate_errors_and_never_retries_or_removes_running_foreign() {
+        for mode in 0..3 {
+            let directory = tempdir().unwrap();
+            let (containers, resources, mut docker) = cohort_fixture(directory.path());
+            docker.stop_error = true;
+            docker.keep_running = mode == 1;
+            docker.replace_after_stop = mode == 2;
+            let coordinator =
+                CleanupCoordinator::new(docker.clock.clone(), Duration::from_secs(180));
+            let backend = NativeCleanupBackend {
+                root: directory.path(),
+                docker: &docker,
+                runner: &BoundedProcessRunner,
+                clock: docker.clock.clone(),
+                image_id: "image-id",
+                network: None,
+                containers: &containers,
+            };
+            let results = backend.remove_container_batch(&resources, &|| coordinator.remaining());
+            assert!(results.iter().all(|result| !result.errors.is_empty()));
+            assert_eq!(
+                docker
+                    .calls
+                    .borrow()
+                    .iter()
+                    .filter(|(kind, _, _)| kind == "stop-cohort")
+                    .count(),
+                1
+            );
+            if mode == 0 {
+                assert!(docker.containers.borrow().is_empty());
+            } else {
+                assert!(
+                    docker
+                        .containers
+                        .borrow()
+                        .contains_key(&resources[0].binding.as_ref().unwrap().immutable_id)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_cohort_revalidates_before_dispatch_and_refuses_insufficient_grace_budget() {
+        for short in [false, true] {
+            let directory = tempdir().unwrap();
+            let (containers, resources, docker) = cohort_fixture(directory.path());
+            let foreign = resources[1].binding.as_ref().unwrap().immutable_id.clone();
+            if !short {
+                docker
+                    .containers
+                    .borrow_mut()
+                    .get_mut(&foreign)
+                    .unwrap()
+                    .labels
+                    .insert("io.kuberic.mssql.run".into(), "foreign".into());
+            }
+            let coordinator = CleanupCoordinator::new(
+                docker.clock.clone(),
+                Duration::from_secs(if short { 30 } else { 180 }),
+            );
+            let backend = NativeCleanupBackend {
+                root: directory.path(),
+                docker: &docker,
+                runner: &BoundedProcessRunner,
+                clock: docker.clock.clone(),
+                image_id: "image-id",
+                network: None,
+                containers: &containers,
+            };
+            let results = backend.remove_container_batch(&resources, &|| coordinator.remaining());
+            let calls = docker.calls.borrow();
+            if short {
+                assert!(
+                    calls
+                        .iter()
+                        .all(|(kind, _, _)| kind != "stop-cohort" && kind != "remove")
+                );
+                assert!(results.iter().all(|result| !result.errors.is_empty()));
+            } else {
+                assert!(!results[1].errors.is_empty());
+                let stop = calls
+                    .iter()
+                    .find(|(kind, _, _)| kind == "stop-cohort")
+                    .unwrap();
+                assert!(!stop.1.contains(&foreign));
+                assert!(docker.containers.borrow().contains_key(&foreign));
+            }
         }
     }
 
