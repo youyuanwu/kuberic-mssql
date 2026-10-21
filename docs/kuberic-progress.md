@@ -669,8 +669,9 @@ CARGO_BUILD_JOBS=1 cargo test --locked -p kuberic-mssql-tests \
 ```
 
 The scenario observes three exact successful controller-issued Open receipts,
-then reconciles their unavailable native evidence. Real host queries report
-scripted native-current unavailability and explicit unsupported catch-up
+then reconciles their unavailable native evidence without increasing the
+harness's reconciliation-error count. Real host queries report scripted
+native-current unavailability and explicit unsupported catch-up
 capability, without substituting zero. Role remains None, no configuration is
 admitted, and read/write access is not granted. These are query failures in
 valid reports, not failed configuration/catch-up operation receipts or a
@@ -682,8 +683,10 @@ future. Consuming harness `finish` stops/joins hosts; the factory terminally
 aborts its exact services and awaits their inherent local containment. The
 held source is cancelled/dropped, its caller joins with Closed, every service
 acknowledges drainage, repeat containment succeeds, and new child work rejects.
-Scenario errors still go through consuming finalization and the caller join;
-a timeout or unrelated harness error cannot satisfy the expected outcome.
+Startup retains the harness's existing retry policy, but a new error in the
+post-Open reconciliation fails the scenario. Returned scenario/helper errors
+still go through consuming finalization and the caller join; a timeout or
+report-acquisition error cannot satisfy the expected outcome.
 
 Generic finalization is Abort plus explicit factory drainage, not proof that
 public Close ran. This raw-service pilot does not exercise the concrete

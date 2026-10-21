@@ -204,8 +204,13 @@ async fn open_observers(
         {
             continue;
         }
+        let reconcile_errors_before = observation.reconcile_errors();
         cluster.step().await?;
         let observation = cluster.observe().await?;
+        require(
+            observation.reconcile_errors() == reconcile_errors_before,
+            "post-Open reconciliation failed instead of evaluating unavailable native evidence",
+        )?;
         require(
             observation.reports().count() == 3
                 && observation
