@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kuberic_mssql::kuberic::{HealthyTopologyBinding, ObservationClock};
+use kuberic_mssql::kuberic::{HealthyTopologyBinding, ObservationClock, SqlServerReplicator};
 use kuberic_mssql::observation::InstanceSnapshot;
 use kuberic_mssql::runtime_config::ObserverConfig;
 use kuberic_mssql::{Guid, Observation, SqlIdentifier};
@@ -17,6 +17,7 @@ use kuberic_runtime::protocol::public_operations::{
 use kuberic_runtime::protocol::types::{
     ConfigurationDescriptor, ConfigurationMember, Epoch, ReplicaIdentity, ReplicaRole,
 };
+use kuberic_runtime::replicator::{PrimaryReplicator, ReplicaSetConfiguration};
 use serde::Serialize;
 
 use super::ReadyMember;
@@ -36,6 +37,7 @@ pub struct HostedAssociation {
     pub scope: &'static str,
     pub native_input: &'static str,
     pub authority_boundary: &'static str,
+    pub secondary_native_binding: &'static str,
     pub accepted_configuration: Vec<AcceptedCommand>,
     pub accepted_advances: Vec<AcceptedCommand>,
     pub admitted_reports: Vec<PublicV1AgentReport>,
@@ -189,8 +191,14 @@ pub fn complete_remote_configuration(
                 process_session_id: report.process_session_id.clone(),
                 storage_incarnation: Some(report.storage_incarnation.clone()),
                 role: member.role,
-                current_progress: report.progress.last,
-                catch_up_capability: report.progress.first,
+                current_progress: report
+                    .progress
+                    .current()
+                    .ok_or("configuration peer current progress is unavailable")?,
+                catch_up_capability: report
+                    .progress
+                    .capability()
+                    .ok_or("configuration peer catch-up capability is unavailable")?,
                 must_catchup: false,
             })
         })
@@ -202,6 +210,40 @@ pub fn complete_remote_configuration(
     };
     input.validate().map_err(str::to_owned)?;
     Ok(input)
+}
+
+pub async fn validate_secondary_native_configuration(
+    target_index: usize,
+    input: &PublicOperationIntent,
+    report: &PublicV1AgentReport,
+    replicator: &SqlServerReplicator,
+) -> DiagnosticResult<Arc<HealthyTopologyBinding>> {
+    accepted_command(target_index, input, report)?;
+    let Some(PublicOperationProgram::Configuration(configuration)) = &input.program else {
+        return Err("secondary native validation requires an accepted configuration".into());
+    };
+    configuration.validate().map_err(str::to_owned)?;
+    if !configuration.current.members.iter().any(|member| {
+        member.identity == report.replica && member.role == ReplicaRole::ActiveSecondary
+    }) {
+        return Err("secondary native validation requires the exact secondary member".into());
+    }
+    // Public secondary configuration persists host authority, not a primary callback.
+    replicator
+        .update_current_replica_set_configuration(ReplicaSetConfiguration {
+            configuration: configuration.current.clone(),
+            replicas: configuration
+                .replicas
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect(),
+        })
+        .await
+        .map_err(|error| format!("explicit secondary native validation: {error}"))?;
+    replicator
+        .admitted_topology()
+        .ok_or_else(|| "explicit secondary native validation did not admit a topology".into())
 }
 
 fn operation_kind(input: &PublicOperationIntent) -> DiagnosticResult<PublicV1CallKind> {
@@ -434,9 +476,7 @@ pub fn validate_startup_configuration(
         let peers = configuration
             .members
             .iter()
-            .filter(|peer| {
-                peer.role == ReplicaRole::ActiveSecondary && peer.identity != member.identity
-            })
+            .filter(|peer| peer.identity != member.identity)
             .collect::<Vec<_>>();
         validate_peer_descriptors(&peers, &lifecycle.replicas, reports)?;
         accepted_command(index, input, report)?;
@@ -647,6 +687,7 @@ impl HostedAuthority {
             scope,
             native_input,
             authority_boundary: "exclusively_owned_command_stream_at_publication",
+            secondary_native_binding: "explicit_mssql_validation_after_public_configuration_receipt",
             accepted_configuration: self.accepted.clone(),
             accepted_advances: state.advances.clone(),
             admitted_reports,

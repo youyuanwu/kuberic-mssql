@@ -112,15 +112,23 @@ adapter has no launcher, never accepts an EULA, and never deploys SQL Server.
 The licensed Stage 3 configuration and seed callbacks remain a SQL-native test
 seam, not end-to-end Public V1 Build operations. Public V1 Build evidence is
 ordinary/server-free negative coverage for valid idle-build DTOs and
-effect-free rejection. The licensed happy path's contained reports use role
-`None`, progress role `Recovery`, `first = 0`, `last =` the current native AG
-sequence, and read/write access `NotPrimary`; direct SQL observation separately
-proves one native primary and two native secondaries.
+effect-free rejection. Configured reports expose the accepted primary/secondary
+roles and typed current-progress/catch-up-capability observations of the native
+AG sequence. Host read/write access is `Granted` on the configured primary and
+`NotPrimary` on secondaries; it is not SQL authorization, a client SQL endpoint,
+or an external write lease. Direct SQL observation separately proves the native
+roles, and the scalar projection does not prove database history or retention.
+
+Public secondary configuration records host authority without calling the
+primary-only configuration callback. Hosted-native witnesses perform explicit
+MSSQL secondary validation after checking the exact public receipt and label
+that separate evidence in `secondary_native_binding`. A successful public
+receipt alone must not stand in for the callback or native verification.
 
 The same-root run proves contained existing-state Open, fresh sessions,
 stale-session rejection, native seed-record compaction, zero redispatch, and
 marker continuity. It does not prove Public V1 peer-session/lifecycle renewal,
-replay a Public V1 Build operation, or restore serving access.
+replay a Public V1 Build operation, or establish a client SQL write path.
 
 `cancel_before_remove` uses two-part evidence. Kuberic release conformance
 catalog gate KSF-06 proves host-owned cancellation/drain ordering. The MSSQL

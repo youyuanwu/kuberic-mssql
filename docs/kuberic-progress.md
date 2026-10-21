@@ -388,19 +388,20 @@ the selected secondary's exclusive hardened boundary `44000000056000001`.
 This is one sampled live association, not semantic public/native history
 equivalence or general catch-up proof.
 
-The initial run exposed a test-support startup gate that waited for serving
-`ActiveSecondary` reports. Ordinary provider-free hosts instead remain contained
-as `None`/Recovery with `[0, native sequence]` compatibility progress and
-`NotPrimary` access. Fresh existing-native startup now validates its frozen
+Fresh existing-native startup validates its frozen
 `InitialPrimary`/`SecondaryEpochAdvance` inputs against exact successful
 receipts and an independent post-Open/Role, pre-lifecycle report baseline.
 It rejects changed identities, sessions, storage/history, replayed reports and
-different command/peer provenance rather than treating containment as missing
-authority. Bootstrap retains its serving-role prerequisite; established-store
-reopen is unchanged. Startup acceptance is not serving eligibility or the later
-complete-secondary-configuration proof
-([startup gate](../crates/kuberic-mssql-tests/src/three_replica/public_kuberic_group.rs#L3906-L3948),
-[startup evidence](../crates/kuberic-mssql-tests/src/three_replica/hosted_authority.rs#L394-L445)).
+different command/peer provenance. Bootstrap retains its serving-role
+prerequisite; established-store reopen is unchanged. Public secondary
+configuration persists host authority without invoking the primary-only
+configuration callback. The witness explicitly calls the existing MSSQL native
+validation seam after checking that receipt, and independently reobserves the
+resulting secondary binding. Output labels this distinction in
+`secondary_native_binding`; a receipt alone is not callback or native-effect
+proof. Startup acceptance is not SQL serving eligibility
+([startup gate](../crates/kuberic-mssql-tests/src/three_replica/public_kuberic_group.rs#L3931-L3968),
+[startup evidence](../crates/kuberic-mssql-tests/src/three_replica/hosted_authority.rs#L436-L484)).
 The corrected live run completed host shutdown and exact fixture teardown
 before publishing output.
 
@@ -411,7 +412,7 @@ and independent native database anchors from each owned SQL observation source.
 The raw `CommitCoverageReport` is collected inside the shared authority
 coordinator's fresh same-source public-report bracket, then adapted without
 changing its ACK, exact record, bindings or observation timestamps
-([hosted_witness.rs:31-222](../crates/kuberic-mssql-tests/src/three_replica/public_kuberic_group/hosted_witness.rs#L31-L222)).
+([hosted_witness.rs](../crates/kuberic-mssql-tests/src/three_replica/public_kuberic_group/hosted_witness.rs)).
 
 The result retains that original raw report under `native_collection` and its
 association under `association`, with `scope = live_hosted_native_association`
@@ -918,17 +919,19 @@ authority. Reports are bracketed by fresh direct observations and must show:
 - one shared resource and current configuration with no previous
   configuration;
 - three exact identities and process sessions;
-- contained observe-only report role `None`;
-- progress role `Recovery`, with `first = 0` and `last` equal to the
-  corresponding fresh native AG sequence;
-- read and write access both `NotPrimary`;
+- accepted `Primary`/`ActiveSecondary` report roles;
+- corresponding `Primary`/`Secondary` progress roles, with typed
+  `current_progress` and `catch_up_capability` values equal to the fresh native
+  AG sequence;
+- host read/write access both `Granted` on the configured primary and both
+  `NotPrimary` on secondaries;
 - healthy initialized durable state; and
 - no client service address.
 
-These contained Public V1 report roles are distinct from SQL-native topology:
-direct SQL observation still proves exactly one native primary and two native
-secondaries. Recovery `[0, native sequence]` is preserved host compatibility
-projection, not proof of a public data-history range or retained floor. Native
+These Public V1 roles are host projections, not independent SQL-native topology
+evidence: direct SQL observation still proves exactly one native primary and
+two native secondaries. The AG-sequence compatibility projection is not proof
+of a public data-history range or retained floor. Native
 marker/lineage/synchronization observations remain separate evidence.
 No SQL external write lease is acquired. The replicated marker is
 written only by the fixture administrator against the directly observed native
@@ -937,7 +940,7 @@ primary.
 The licensed same-root restart test stops all three public hosts while retaining
 SQL Server and durable roots. It proves contained existing-state Open, fresh
 replacement sessions, stale-session rejection, native seed-record compaction,
-zero redispatch, exact contained report convergence, and marker continuity.
+zero redispatch, exact report convergence, and marker continuity.
 SQL Server processes are not restarted. It is not Public V1 peer-session or
 lifecycle renewal, does not replay an end-to-end Public V1 Build operation, and
 does not restore serving access.

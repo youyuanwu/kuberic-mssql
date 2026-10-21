@@ -5,13 +5,15 @@ use kuberic_mssql_tests::three_replica::hosted_native_prefix::{
     TransactionAcknowledgement, TransactionRecordRow, TransactionSample,
 };
 use kuberic_mssql_tests::three_replica::{NativeMemberBinding, NativeTopologyBinding, ReadyMember};
-use kuberic_runtime::protocol::public_operations::{PublicV1CallKind, PublicV1OperationResult};
+use kuberic_runtime::protocol::public_operations::{
+    ProgressQueryResult, PublicV1CallKind, PublicV1OperationResult,
+};
 use kuberic_runtime::replicator::{PrimaryReplicator, ReplicaSetConfiguration};
 
 use kuberic_mssql_tests::three_replica::hosted_authority::{
     AcceptedCommand, DiagnosticResult, HostedAssociation, HostedAuthority, NativeDatabaseAnchor,
     NativeInput, accepted_command, complete_remote_configuration, operation_input,
-    validate_reports,
+    validate_reports, validate_secondary_native_configuration,
 };
 
 struct OwnedDiagnostic {
@@ -148,17 +150,27 @@ impl OwnedDiagnostic {
                 }
             );
         }
-        let bindings: Vec<_> = attempts
-            .iter()
-            .map(|attempt| {
-                attempt
-                    .application
-                    .testing_replicator()
-                    .unwrap()
-                    .admitted_topology()
-                    .unwrap()
-            })
-            .collect();
+        let mut bindings = Vec::with_capacity(3);
+        for (index, attempt) in attempts.iter().enumerate() {
+            let replicator = attempt.application.testing_replicator().unwrap();
+            let binding = if index == 0 {
+                replicator.admitted_topology().unwrap()
+            } else {
+                assert!(
+                    replicator.admitted_topology().is_none(),
+                    "public secondary configuration must not invoke a primary-only callback"
+                );
+                validate_secondary_native_configuration(
+                    index,
+                    &accepted[index].input,
+                    &baseline[index],
+                    &replicator,
+                )
+                .await
+                .unwrap()
+            };
+            bindings.push(binding);
+        }
         let mut native_database_anchors = Vec::with_capacity(3);
         for (index, attempt) in attempts.iter().enumerate() {
             let Observation::Present {
@@ -278,6 +290,10 @@ impl OwnedDiagnostic {
         .map_err(|error| format!("authority dispatch deadline: {error}"))?
         .map_err(|error| format!("authority dispatch: {error}"))?;
         let reports = self.fresh_reports().await?;
+        if terminal {
+            accepted_command(command.target_index, &input, &reports[command.target_index])?;
+            return Ok(());
+        }
         self.authority
             .complete_command(admission, command.target_index, &input, &reports)
     }
@@ -538,6 +554,10 @@ async fn association_case() {
         assert_eq!(serialized["public_coverage"]["status"], "blocked");
         assert_eq!(serialized["native_input"], "scripted_no_live_sql");
         assert_eq!(
+            serialized["secondary_native_binding"],
+            "explicit_mssql_validation_after_public_configuration_receipt"
+        );
+        assert_eq!(
             association
                 .native
                 .record_binding
@@ -786,11 +806,12 @@ async fn terminal_case() {
         result = &mut collection => panic!("early collection: {result:?}"),
         result = waiting => result.unwrap(),
     }
-    let error = group
+    let replicator = group.attempts[0].application.testing_replicator().unwrap();
+    group
         .dispatch(group.command(5, PublicOperationProgram::Close))
         .await
-        .unwrap_err();
-    assert!(error.contains("closed"), "{error}");
+        .unwrap();
+    assert!(replicator.current_progress().await.is_err());
     release.send(()).unwrap();
     assert!(collection.await.unwrap_err().contains("retired"));
     group.attempts[0]
@@ -1094,9 +1115,45 @@ async fn quiet_assembly_case() {
     let temporary = tempfile::tempdir().unwrap();
     let clock = Arc::new(PublicationClock(AtomicU64::new(1200)));
     let mut group = OwnedDiagnostic::start_with_clock(temporary.path(), clock.clone()).await;
+    let secondary = group.attempts[1].application.testing_replicator().unwrap();
+    let binding = secondary.admitted_topology().unwrap();
+    let mut unacknowledged = group.baseline[1].clone();
+    unacknowledged
+        .completed_operations
+        .retain(|completion| completion.operation_id != group.accepted[1].input.operation_id);
+    assert!(
+        validate_secondary_native_configuration(
+            1,
+            &group.accepted[1].input,
+            &unacknowledged,
+            &secondary,
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(secondary.admitted_topology().unwrap(), binding);
     let original = &group.accepted[0].input;
+    for unavailable in [
+        ProgressQueryResult::NotReady,
+        ProgressQueryResult::NotQueried("copy pending".into()),
+        ProgressQueryResult::Failed("query failed".into()),
+    ] {
+        let mut reports = group.baseline.clone();
+        reports[1].progress.current_progress = unavailable.clone();
+        assert_eq!(
+            complete_remote_configuration(&configuration(), &reports, 0).unwrap_err(),
+            "configuration peer current progress is unavailable"
+        );
+        reports[1].progress = group.baseline[1].progress.clone();
+        reports[1].progress.catch_up_capability = unavailable;
+        assert_eq!(
+            complete_remote_configuration(&configuration(), &reports, 0).unwrap_err(),
+            "configuration peer catch-up capability is unavailable"
+        );
+    }
     let mut later = group.baseline.clone();
-    later[1].progress.last += 1;
+    later[1].progress.current_progress =
+        ProgressQueryResult::Value(later[1].progress.current().unwrap() + 1);
     let mut rebuilt = original.clone();
     let lifecycle = rebuilt.lifecycle.as_mut().unwrap();
     lifecycle.replicas = complete_remote_configuration(&configuration(), &later, 0)
@@ -1245,13 +1302,26 @@ async fn contained_startup_case() {
         &evidence.reports,
     )
     .unwrap();
-    for (report, control) in evidence.reports.iter().zip(controls) {
-        assert_eq!(report.role, ReplicaRole::None);
-        assert_eq!(report.progress.role, PublicProgressRole::Recovery);
-        assert_eq!(report.progress.first, 0);
-        assert_eq!(report.progress.last, 42);
-        assert_eq!(report.read_status, AccessStatus::NotPrimary);
-        assert_eq!(report.write_status, AccessStatus::NotPrimary);
+    for (index, (report, control)) in evidence.reports.iter().zip(controls).enumerate() {
+        let (role, progress_role, access) = if index == 0 {
+            (
+                ReplicaRole::Primary,
+                PublicProgressRole::Primary,
+                AccessStatus::Granted,
+            )
+        } else {
+            (
+                ReplicaRole::ActiveSecondary,
+                PublicProgressRole::Secondary,
+                AccessStatus::NotPrimary,
+            )
+        };
+        assert_eq!(report.role, role);
+        assert_eq!(report.progress.role, progress_role);
+        assert_eq!(report.progress.capability(), Some(42));
+        assert_eq!(report.progress.current(), Some(42));
+        assert_eq!(report.read_status, access);
+        assert_eq!(report.write_status, access);
         assert!(tokio::net::TcpStream::connect(control).await.is_err());
     }
 

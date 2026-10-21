@@ -3678,6 +3678,11 @@ fn assert_exact_reports(
             ReplicaRole::ActiveSecondary => PublicV1CallKind::SecondaryEpochAdvance,
             _ => return Err("public Kuberic pod has an unstable role".into()),
         };
+        let (expected_progress_role, expected_access) = if pod.stable_role == ReplicaRole::Primary {
+            (PublicProgressRole::Primary, AccessStatus::Granted)
+        } else {
+            (PublicProgressRole::Secondary, AccessStatus::NotPrimary)
+        };
         let public = normalize_public_v1_agent_status_report(report.clone())?;
         let storage_matches = matches!(
             &public.storage_incarnation.storage,
@@ -3696,18 +3701,18 @@ fn assert_exact_reports(
             || !storage_matches
             || public.report_sequence == 0
             || !configuration_completed
-            || public.progress.role != PublicProgressRole::Recovery
-            || public.progress.first != 0
-            || public.progress.last != configuration_sequence
-            || public.read_status != AccessStatus::NotPrimary
-            || public.write_status != AccessStatus::NotPrimary
-            || public.role != ReplicaRole::None
+            || public.progress.role != expected_progress_role
+            || public.progress.capability() != Some(configuration_sequence)
+            || public.progress.current() != Some(configuration_sequence)
+            || public.read_status != expected_access
+            || public.write_status != expected_access
+            || public.role != pod.stable_role
         {
             return Err(format!(
-                "Kuberic report differs from the exact fenced topology: ordinal={}, \
+                "Kuberic report differs from the exact hosted topology: ordinal={}, \
                  resource_uid={}, identity={:?}, session={}, storage={:?}, \
                  report_sequence={}, configuration_completed={}, \
-                 progress_role={:?}, first_progress={}, last_progress={}, expected_progress={}, \
+                 progress_role={:?}, catch_up_capability={:?}, current_progress={:?}, expected_progress={}, \
                  expected_session={}, storage_matches={}, \
                  read_status={:?}, write_status={:?}, role={:?}",
                 pod.ordinal,
@@ -3718,8 +3723,8 @@ fn assert_exact_reports(
                 public.report_sequence,
                 configuration_completed,
                 public.progress.role,
-                public.progress.first,
-                public.progress.last,
+                public.progress.catch_up_capability,
+                public.progress.current_progress,
                 configuration_sequence,
                 pod.session,
                 storage_matches,
