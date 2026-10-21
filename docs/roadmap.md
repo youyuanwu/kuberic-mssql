@@ -68,6 +68,13 @@ hosted configuration/session/storage evidence and independent native identity.
 Its corrected startup gate preserves contained roles/access. This does not
 establish semantic native/public history mapping or complete Stage 6A.
 
+The [server-free shared controller pilot](kuberic-progress.md#shared-controller-harness-pilot)
+exercises real controller-issued Open, honest failed native queries, nonadmission,
+and owned host/application drainage. It does not establish a ready cluster or
+replace the native witnesses. The selected runtime already supports typed
+current/capability query outcomes and successful terminal reports with failed
+closed-runtime queries; these are no longer pending schema/reporting fixes.
+
 Planned work:
 
 - extend the sampled live [native acknowledged-record witness](kuberic-progress.md#native-prefix-coverage)
@@ -78,21 +85,23 @@ Planned work:
   sequence into authority.
   Any new licensed experiment/workload requires authorization; one witness is
   not full conformance;
-- establish the public progress/history model for primary committed progress,
-  secondary contiguous durable progress, access-closed recovery, and retained
-  catch-up capability, including restart, history changes and unavailable
-  evidence;
-- resolve the [host reporting/history constraints](kuberic-progress.md#upstream-reporting-and-history-blockers):
-  mandatory successful current progress, provider-free synthetic `first = 0`,
-  custom capability not projected into reports, and no unknown completed
-  progress range; preserve compatibility only as an explicit interim boundary;
+- establish the SQL-native mapping to the selected role-specific
+  queue/quorum/ACK/recovery progress and catch-up capability contracts, including
+  restart, history changes and unavailable evidence. Separately prove the
+  committed/durable data and retention needed for SQL role transitions;
+- close the remaining [native/public history gap](kuberic-progress.md#upstream-reporting-and-history-blockers):
+  typed current/capability fields and explicit unavailable outcomes do not
+  establish SQL-native progress, retention, or history correspondence. Prove
+  each consumer's required meaning rather than treating named fields or
+  native AG configuration sequence as a durable-data range;
 - use separate native AG election evidence without treating configuration
   freshness as transaction durability or narrowing native `numeric(25,0)`
   positions to the public signed-64-bit slot;
-- resolve terminal reporting without fabricated progress: the current public
-  Close drains the adapter but its subsequent report returns
-  `Unavailable`/Closed; assess the host/reporting implementation rather than
-  requiring terminal progress or another application callback;
+- preserve truthful terminal reporting and actual drainage: a successful
+  public Close receipt can carry failed closed-runtime progress queries.
+  Neither that receipt nor generic Abort-based host shutdown alone proves
+  MSSQL-owned descendants have joined; retain the separate local containment
+  acknowledgement without adding an application callback;
 - separate idle nonvoting build targets from active membership, prove exact
   build completion before admission, and replace partial bootstrap success
   with the documented public configuration postconditions;
@@ -102,10 +111,10 @@ Planned work:
   public `ReplicaHost` operations, not only direct test-only callbacks; and
 - verify upstream host/planner conformance, recording any unresolved blockers
   from Kuberic's Service Fabric audit rather than copying example behavior.
-  Follow its [native SF V1 alignment plan](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/sf-v1-semantic-alignment-plan.md#L240-L266)
-  for coherent report/consumer changes through the fixed application APIs;
-  keep current local requirements distinct from the future native target.
-  Built-in snapshot-prefix proof fixes do not supply native SQL progress,
+  Assess the selected [native SF V1 query contract](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/replicator/traits.rs#L45-L65)
+  through the fixed application APIs; native queue/ACK semantics, application
+  durability, and SQL prefix evidence remain distinct.
+  Built-in replication/transfer proofs do not supply native SQL progress,
   retained capability or the adapter's currently rejected catch-up callbacks.
 
 Exit criteria:

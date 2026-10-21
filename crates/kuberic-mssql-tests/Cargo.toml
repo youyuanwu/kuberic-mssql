@@ -49,3 +49,6 @@ tokio = { workspace = true, features = ["test-util"] }
 tokio-util.workspace = true
 tonic.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+kuberic-controller.workspace = true

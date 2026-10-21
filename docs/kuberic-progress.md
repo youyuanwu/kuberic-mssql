@@ -480,43 +480,45 @@ redo-lag proof or lossless switchover.
 
 ### Upstream reporting and history blockers
 
-The dependency selected by root `Cargo.toml` has these concrete integration
-constraints. The upstream links identify source locations, not another
-dependency pin:
+The dependency selected by root `Cargo.toml` already supports truthful query
+failures in valid host reports. The remaining blocker is SQL-native semantic
+evidence, not the former first/last report representation. The upstream links
+identify source locations, not another dependency pin:
 
-| Boundary | Current constraint |
+| Boundary | Selected behavior and remaining constraint |
 |---|---|
-| [Registered host reporting](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/hosting.rs#L62-L83) | Status/report construction requires successful custom `current_progress`. Returning an unsupported-progress error would also disable existing registered-host report-dependent bootstrap/restart journeys. |
-| [Provider-free report projection](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/hosting.rs#L665-L712) | The host synthesizes `first = 0` without a provider, or uses provider committed progress otherwise. It does not query custom `catch_up_capability` for that field. Returning `INVALID_LSN` from capability alone would not fix the report. |
-| [Completed progress validation](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/protocol/public_operations.rs#L2168-L2195) | A completed report needs nonnegative ordered endpoints; it cannot express unknown progress with `INVALID_LSN`. Peer descriptors allowing unknown values do not relax this requirement. |
-| [Public history consumers](https://github.com/youyuanwu/kuberic/blob/main/kuberic-controller/src/evaluator/public_v1_topology.rs) | Candidate selection compares report tails within accepted public history; retained rejoin uses history, storage/session/completion evidence, and report endpoints. Peer descriptors receive report `last` as current progress and `first` as capability. These are not Microsoft's native AG-sequence/quorum/failover protocol. |
+| [Registered host reporting](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/hosting.rs#L67-L101) | The host queries custom `current_progress` and `catch_up_capability` separately. Query errors become explicit `NotReady`/`Failed` outcomes, not necessarily a failed status RPC. The provider-free path no longer synthesizes a first endpoint. |
+| [Typed progress validation](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/protocol/public_operations.rs#L2184-L2263) | `PublicProgress` contains role, current progress, and capability; each query is `Value`, `NotQueried`, `NotReady`, or `Failed`. These are not ordered first/last endpoints. `INVALID_LSN` is a schema-valid unknown/inapplicable query value, not election-eligible progress or an empty-history proof. |
+| [Public history consumers](https://github.com/youyuanwu/kuberic/blob/main/kuberic-controller/src/evaluator/public_v1_topology.rs) | Election still needs nonnegative current progress and compatible accepted history. All-unavailable current progress causes Wait. Ordinary peer descriptors require available current and capability; retained rejoin additionally checks exact storage/session/history/configuration/build evidence. The native-specific descriptor path has separate unknown-capability handling. None supplies SQL history equivalence. |
+| [Native query semantics](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/replicator/traits.rs#L45-L65) | Primary queue/quorum progress, secondary receiver ACK progress, protected opened-recovery progress, and native catch-up capability are distinct from application durability. MSSQL's AG-sequence projection does not acquire those meanings from the field names. |
 
 The remaining adapter obligation is to establish how SQL-native evidence
-corresponds to public history, role-specific durable progress, recovery-only
-election evidence, and retained catch-up coverage across restart/history changes.
+corresponds to public history and the selected role-specific current/capability
+contracts, while separately proving the durable data, recovery and retained
+catch-up coverage needed for SQL transitions across restart/history changes.
 No conforming mapping is established by an AG sequence or by fitting a database
 position into `i64`. A wider integer alone would not resolve these semantics.
 
-The built-in engine's [completed-copy prefix proof](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/replicator/stateless/mod.rs#L1625-L1764)
-handles quiet snapshot catch-up using exact live build/storage/session evidence.
+The selected built-in [classic V1 engine](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/replicator/mod.rs#L1137-L1155)
+owns its native queues and transfer evidence.
 MSSQL registers a custom replicator without a StateProvider or StateReplicator
 ([kuberic.rs:925-932](../crates/kuberic-mssql/src/kuberic.rs#L925-L932),
 [kuberic.rs:1007-1039](../crates/kuberic-mssql/src/kuberic.rs#L1007-L1039));
-it does not inherit that proof or gain native prefix/catch-up support from it.
+it does not inherit that engine's proof or gain native prefix/catch-up support
+from it.
 
-The upstream [SF V1 semantic-alignment plan](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/sf-v1-semantic-alignment-plan.md#L35-L84)
-also distinguishes native SF queue semantics from the current local durability
-and catch-up definitions. Its [reporting work](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/sf-v1-semantic-alignment-plan.md#L240-L266)
-calls for a coherent report/consumer correction rather than reinterpreting the
-two existing integers in place. This is a future port plan, not an implemented
-custom-adapter fix. Assess the selected contract and eventual native target
-separately; neither certifies MSSQL's missing native evidence or permits an
-application trait expansion.
+The selected producer/schema/consumers already distinguish current progress
+from capability and unavailable queries. That correction does not implement
+MSSQL's native mapping or its currently rejected catch-up/data-loss operations.
+The upstream [SF V1 semantic-alignment plan](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/sf-v1-semantic-alignment-plan.md)
+provides architectural context, not a substitute for the selected source or
+SQL-native evidence. No application trait expansion is required or authorized.
 
-For now, hosted scalar values and report journeys remain deliberately unchanged
-compatibility behavior. This is a known semantic gap, not a successful
-conformance gate. No dummy provider, fabricated counter, epoch fallback, or
-alternate replication log is introduced to hide the upstream constraints.
+MSSQL's existing native AG-sequence/zero/unknown scalar paths remain explicit
+compatibility behavior, distinct from the corrected report representation.
+They are a known semantic gap, not a successful conformance gate. No dummy
+provider, fabricated counter, epoch fallback, or alternate replication log is
+introduced to hide missing native evidence.
 
 The [design](design.md#kuberic-and-service-fabric-semantics) records implemented
 local lifecycle containment and the remaining gaps in progress,
@@ -569,12 +571,12 @@ Server-free coverage sends actual public Epoch, same-role Role and equal-epoch
 commands, checking completed operation receipts and the actual adapter's
 predecessor behavior. Actual public Close remains pending behind a held adapter
 callback and then reaches local drainage and application Close after release.
-The host subsequently constructs a progress report, which fails with
-`Unavailable`/Closed because the adapter is terminal. This RPC/report limitation
-is preserved and asserted separately from successful local callback drainage;
-tests do not fabricate terminal progress or assume a successful post-Abort
-status report. Existing report/restart compatibility and the broader semantic
-conformance blockers remain unchanged.
+The successful Close response includes its completion receipt, role None,
+closed access, and typed `Failed` progress/capability queries from the closed
+child. Tests assert that truthful terminal report separately from actual local
+callback drainage; no terminal progress is fabricated. Unrelated report or
+authority failures remain errors. The broader SQL-native semantic conformance
+gaps remain.
 
 ### Concrete Process Shutdown
 
@@ -634,22 +636,62 @@ reporting after cancellation or a bounded response.
   not evidence that Kuberic must expose another hook. The concrete process owner
   now retains and awaits that drainage independently of its caller; a generic
   terminal receipt alone still cannot certify it.
-- **Terminal reporting is a separate host implementation issue.** After a
-  successful terminal program, the execute response still constructs a report.
-  Both projection refresh and report projection query the registered custom
-  replicator's current progress even though it is closed. MSSQL's Closed result
-  is correct; fixing the reporting path must preserve truthful progress/history
-  semantics without another trait method, invented progress, or relabeling a
-  stale snapshot as a current observation. That fix is not implemented here.
+- **Terminal reporting already preserves failed queries.** A successful terminal
+  program skips the nonterminal projection-refresh/reopen path. Its response
+  can report the closed custom child's current/capability failures as typed
+  `Failed` values alongside the successful terminal receipt and closed access.
+  MSSQL's Closed result is correct; this needs neither another trait method nor
+  invented progress. Report success is still separate from actual local joins.
 
 The upstream evidence is the existing
-[Close/Abort program](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/public_lifecycle_program.rs#L438-L479),
+[Close/Abort program](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/public_lifecycle_program.rs#L531-L573),
 [terminal cleanup owner](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/public_lifecycle_terminal.rs#L41-L76),
-[runtime callback binding](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/hosting.rs#L318-L347),
-and [execute response reporting](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/service.rs#L914-L929).
+[runtime drainage](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/hosting.rs#L1030-L1067),
+and [execute response reporting](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/service.rs#L721-L787).
 The concrete MSSQL process wrapper bounds acknowledgement separately from actual
 completion and retains the existing local wait after Abort or interrupted Close.
 It does not expose that method to the generic host through a new interface.
+
+## Shared Controller Harness Pilot
+
+The ordinary server-free
+[`controller_harness` test](../crates/kuberic-mssql-tests/tests/controller_harness.rs)
+uses `kuberic_controller::test_util` with a private factory returning the real
+inert observe-only `SqlServerService`. It runs the production controller and
+three real hosts over fake in-process Pod/PVC resources; no Kubernetes cluster,
+container image, SQL process, or credential file is used. The empty owned
+application root is adapter storage classification, not SQL data-history proof.
+The context's port-zero replication address is metadata, not a SQL listener.
+
+```bash
+CARGO_BUILD_JOBS=1 cargo test --locked -p kuberic-mssql-tests \
+  --test controller_harness -- --test-threads=1
+```
+
+The scenario observes three exact successful controller-issued Open receipts,
+then reconciles their unavailable native evidence. Real host queries report
+scripted native-current unavailability and explicit unsupported catch-up
+capability, without substituting zero. Role remains None, no configuration is
+admitted, and read/write access is not granted. These are query failures in
+valid reports, not failed configuration/catch-up operation receipts or a
+ready cluster.
+
+For a nonidle drainage witness, the test separately invokes a retained real
+child's current query and acknowledges entry into a deliberately held source
+future. Consuming harness `finish` stops/joins hosts; the factory terminally
+aborts its exact services and awaits their inherent local containment. The
+held source is cancelled/dropped, its caller joins with Closed, every service
+acknowledges drainage, repeat containment succeeds, and new child work rejects.
+Scenario errors still go through consuming finalization and the caller join;
+a timeout or unrelated harness error cannot satisfy the expected outcome.
+
+Generic finalization is Abort plus explicit factory drainage, not proof that
+public Close ran. This raw-service pilot does not exercise the concrete
+`RuntimeHostApplication` binding-file/process-owner runner, bootstrap worker
+joins, SQL rollback, native history/catch-up, or lossless switchover. Built-in
+routed TCP faults cannot fault this custom replicator's SQL/HADR/TDS traffic.
+Existing direct contracts, public-host lifecycle tests, and licensed/native
+witnesses remain independent; none is removed or replaced.
 
 ## Adapter Boundary
 
