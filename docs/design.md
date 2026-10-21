@@ -868,10 +868,12 @@ switchover, failover, replica replacement, Kubernetes lifecycle, and client
 routing remain unimplemented.
 
 The `cancel_before_remove` intake gate combines upstream and local evidence:
-Kuberic release conformance catalog gate KSF-06 proves host-owned
-cancellation/drain ordering, while the MSSQL readiness test proves that remove
-rejection is effect-free after a callback task has settled. The local test is
-not represented as host-owned ordering.
+upstream Kuberic runtime/lifecycle tests cover host-owned cancellation/drain
+ordering, while the MSSQL readiness test proves that remove rejection is
+effect-free after a callback task has settled. KSF-06 catalog membership alone
+does not execute those host scenarios and is checked upstream, not repeated as
+a standalone MSSQL test. Local application, native-effect and ownership
+assertions remain; they are not replaced by upstream in-memory replication.
 
 ## References
 

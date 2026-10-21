@@ -465,6 +465,14 @@ Direct Cargo live runs retain snapshots in `target/.mssql-phase-timings-*`
 and print their safe summary only after successful cleanup. Their existing
 `--nocapture` output is still raw test output, not a sanitized reporting channel.
 
+Three-member fixtures use a 250ms observation retry cadence and 180-second
+observation budget by default, separate from the five-minute SQL member-startup
+allowance. The pre-association SQL restart case and its accepted-reply-loss
+healthy control instead share a 90-second observation budget and the original
+two-second cadence. These are test-only functional budgets, not whole-test
+runtime targets. Transport limits, outer operation waits, full recovery
+assertions and cleanup grace remain unchanged.
+
 Disposal can overlap stops of eligible members within one already-owned
 three-replica fixture; SQL cases and fixtures still run serially per worker.
 Every participant needs durable cleanup intent and exact ownership checks.

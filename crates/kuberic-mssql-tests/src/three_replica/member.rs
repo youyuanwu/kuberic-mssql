@@ -1336,7 +1336,8 @@ impl LaunchContext {
                 .ok_or(NativeLaunchError::Ownership)?;
             let evidence = self
                 .initialize_member(index, port, &run, &credentials, &tls)
-                .await?;
+                .await
+                .map_err(|error| error.with_member_deadline(run.members[index].ordinal, None))?;
             timing.succeeded();
             evidence
                 .verify(&run.members[index].server_name)
@@ -1559,16 +1560,22 @@ impl LaunchContext {
         };
         let readiness_deadline =
             Instant::now() + self.limit(self.config.deadlines().member_readiness)?;
+        let mut last_error = None;
         let mut sa = loop {
-            let deadlines = self.admin_deadlines(readiness_deadline)?;
+            let deadlines = self.admin_deadlines(readiness_deadline).map_err(|error| {
+                error.with_member_deadline(run.members[index].ordinal, last_error)
+            })?;
             match AdminSession::connect(&endpoint, &sa_login, deadlines).await {
                 Ok(mut session) => {
                     session
                         .set_query_timeout(
-                            self.limit_until(
-                                self.config.deadlines().sql_batch,
-                                readiness_deadline,
-                            )?,
+                            self.limit_until(self.config.deadlines().sql_batch, readiness_deadline)
+                                .map_err(|error| {
+                                    error.with_member_deadline(
+                                        run.members[index].ordinal,
+                                        last_error,
+                                    )
+                                })?,
                         )
                         .map_err(NativeLaunchError::Admin)?;
                     match session.readiness().await {
@@ -1578,17 +1585,14 @@ impl LaunchContext {
                                 .map_err(NativeLaunchError::Admin)?;
                             break session;
                         }
-                        Err(error) if Instant::now() < readiness_deadline => {
-                            let _ = error;
-                        }
-                        Err(error) => return Err(NativeLaunchError::Admin(error)),
+                        Err(error) => last_error = Some(error),
                     }
                 }
-                Err(_) if Instant::now() < readiness_deadline => {}
-                Err(error) => return Err(NativeLaunchError::Admin(error)),
+                Err(error) => last_error = Some(error),
             }
             if Instant::now() >= readiness_deadline {
-                return Err(NativeLaunchError::Readiness);
+                return Err(NativeLaunchError::Deadline
+                    .with_member_deadline(run.members[index].ordinal, last_error));
             }
             sleep(
                 READINESS_RETRY.min(readiness_deadline.saturating_duration_since(Instant::now())),
@@ -1718,8 +1722,8 @@ impl LaunchContext {
             ca_certificate_file: tls.ca_certificate.path(),
             connect_timeout_ms: self.config.deadlines().sql_connect.as_millis() as u64,
             query_timeout_ms: self.config.deadlines().sql_batch.as_millis() as u64,
-            sample_timeout_ms: self.config.deadlines().member_readiness.as_millis() as u64,
-            poll_interval_ms: 2_000,
+            sample_timeout_ms: self.config.observation_budget().as_millis() as u64,
+            poll_interval_ms: self.config.observation_poll_interval().as_millis() as u64,
             max_age_ms: 30_000,
         };
         let bytes =
@@ -2827,6 +2831,10 @@ pub enum NativeLaunchError {
     Tls(TlsError),
     Docker(DockerError),
     Admin(AdminError),
+    MemberInitializationDeadline {
+        ordinal: u8,
+        last_error: Option<AdminError>,
+    },
     Ownership,
     Readiness,
     Deadline,
@@ -2865,6 +2873,19 @@ impl fmt::Display for NativeLaunchError {
                     "three-replica SQL administration failed: {error}"
                 );
             }
+            Self::MemberInitializationDeadline {
+                ordinal,
+                last_error,
+            } => {
+                write!(
+                    formatter,
+                    "three-replica SQL member {ordinal} initialization deadline exceeded"
+                )?;
+                if let Some(error) = last_error {
+                    write!(formatter, "; last readiness error: {error}")?;
+                }
+                return Ok(());
+            }
             Self::Ownership => "three-replica resource ownership verification failed",
             Self::Readiness => "three-replica SQL readiness failed",
             Self::Deadline => "three-replica setup deadline exceeded",
@@ -2882,18 +2903,34 @@ impl std::error::Error for NativeLaunchError {
             Self::Tls(error) => Some(error),
             Self::Docker(error) => Some(error),
             Self::Admin(error) => Some(error),
+            Self::MemberInitializationDeadline {
+                last_error: Some(error),
+                ..
+            } => Some(error),
             _ => None,
         }
     }
 }
 
 impl NativeLaunchError {
+    fn with_member_deadline(self, ordinal: u8, last_error: Option<AdminError>) -> Self {
+        match self {
+            Self::Deadline => Self::MemberInitializationDeadline {
+                ordinal,
+                last_error,
+            },
+            other => other,
+        }
+    }
+
     fn sanitized(&self) -> SanitizedFailure {
         let category = match self {
             Self::Preflight(_) => FailureCategory::Preflight,
             Self::Docker(_) => FailureCategory::ContainerCreation,
             Self::Admin(_) | Self::Readiness => FailureCategory::SqlUnavailable,
-            Self::Deadline => FailureCategory::DeadlineExceeded,
+            Self::Deadline | Self::MemberInitializationDeadline { .. } => {
+                FailureCategory::DeadlineExceeded
+            }
             Self::Journal => FailureCategory::Journal,
             Self::Ownership | Self::PriorRunUnresolved | Self::RootLock => {
                 FailureCategory::OwnershipMismatch
@@ -3047,6 +3084,45 @@ mod tests {
     use super::*;
     use crate::three_replica::docker::{DockerCapabilities, ImageInspection, NetworkInspection};
     use crate::three_replica::ownership::reconcile;
+
+    #[test]
+    fn member_deadline_preserves_last_readiness_cause_without_reclassifying_other_errors() {
+        let error = NativeLaunchError::Deadline
+            .with_member_deadline(2, Some(AdminError::ConnectDeadline))
+            .with_member_deadline(3, None);
+        assert!(matches!(
+            &error,
+            NativeLaunchError::MemberInitializationDeadline {
+                ordinal: 2,
+                last_error: Some(AdminError::ConnectDeadline),
+            }
+        ));
+        assert_eq!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<AdminError>(),
+            Some(&AdminError::ConnectDeadline)
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("SQL member 2 initialization deadline exceeded"));
+        assert!(
+            rendered.contains("last readiness error: administrator connection deadline exceeded")
+        );
+        assert_eq!(
+            error.sanitized(),
+            SanitizedFailure::with_detail(
+                FailureStage::Setup,
+                FailureCategory::DeadlineExceeded,
+                rendered,
+            )
+        );
+        let terminal = NativeLaunchError::Admin(AdminError::WrongIdentity)
+            .with_member_deadline(2, Some(AdminError::Connect));
+        assert!(matches!(
+            terminal,
+            NativeLaunchError::Admin(AdminError::WrongIdentity)
+        ));
+    }
 
     #[derive(Clone)]
     struct FakeClock {

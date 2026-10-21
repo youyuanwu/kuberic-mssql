@@ -3232,6 +3232,10 @@ fn retryable_public_build_error(error: &tonic::Status) -> bool {
         || (error.code() == tonic::Code::Internal
             && error
                 .message()
+                .contains("SQL Server observation is unavailable: Inconsistent"))
+        || (error.code() == tonic::Code::Internal
+            && error
+                .message()
                 .contains("current configuration replay differs from the admitted value"))
         || (error.code() == tonic::Code::Internal
             && error.message().contains(
@@ -4603,6 +4607,24 @@ mod tests {
 
     static PUBLIC_HOST_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     const PUBLIC_HOST_STALL_ENTRY_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn positive_build_retry_distinguishes_inconsistent_samples_from_terminal_failures() {
+        let message = "application error: SQL Server observation is unavailable: Inconsistent";
+        assert!(retryable_public_build_error(&tonic::Status::internal(
+            message
+        )));
+        for error in [
+            tonic::Status::permission_denied(message),
+            tonic::Status::deadline_exceeded(message),
+            tonic::Status::internal(
+                "application error: SQL Server observation is unavailable: PermissionDenied",
+            ),
+            tonic::Status::internal("application error: native bootstrap topology conflicts"),
+        ] {
+            assert!(!retryable_public_build_error(&error));
+        }
+    }
 
     fn public_host_attempt_roots(root: &Path) -> Vec<PathBuf> {
         let mut attempts = fs::read_dir(root)
