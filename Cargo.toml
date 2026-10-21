@@ -17,6 +17,7 @@ publish = false
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
+kuberic-controller = { version = "=0.0.1", default-features = false, features = ["test-util"] }
 kuberic-mssql = { path = "crates/kuberic-mssql", default-features = false, features = ["kuberic-testing"] }
 kuberic-runtime = { version = "=0.0.1", default-features = false }
 libc = "0.2"
@@ -32,5 +33,6 @@ tonic = "0.14"
 zeroize = "1"
 
 [patch.crates-io]
+kuberic-controller = { git = "https://github.com/youyuanwu/kuberic.git", rev = "e2a47b6c631c974aa0135e81c3a7e3a439980ded" }
 # Custom authority validation must complete before durable authority publication.
 kuberic-runtime = { git = "https://github.com/youyuanwu/kuberic.git", rev = "e2a47b6c631c974aa0135e81c3a7e3a439980ded" }
