@@ -32,6 +32,8 @@ type TestError = Box<dyn Error + Send + Sync>;
 const LIFECYCLE_CHILD_TEST: &str = "three_replica_lifecycle_child";
 const CHILD_MODE_ENV: &str = "KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE";
 const FAULT_HIT_ENV: &str = "KUBERIC_MSSQL_FAULT_HIT_FILE";
+const SHORT_BUILD_OBSERVATION_BUDGET: Duration = Duration::from_secs(90);
+const RESTART_OBSERVATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[path = "live_three_replica/hosted_witness.rs"]
 mod hosted_witness;
@@ -2105,6 +2107,14 @@ async fn exercise_seed_submission_fault(
         .transpose()?;
     cleanup_three_replica_fixture(root)?;
     let config = FixtureConfig::for_test_fixture(root)?;
+    let config = if matches!(fault, PublicMutationFault::SeedAcceptedReplyLost) {
+        config.with_observation_profile(
+            SHORT_BUILD_OBSERVATION_BUDGET,
+            RESTART_OBSERVATION_POLL_INTERVAL,
+        )?
+    } else {
+        config
+    };
     let mut launched = launch_three_members(config).await?;
     let preparation = phase(Phase::PeerPreparation);
     let prepared = launched.prepare_availability_group().await?;
@@ -2776,6 +2786,16 @@ async fn exercise_target_host_evidence_fault(
     let root = base_root.join(&label);
     cleanup_three_replica_fixture(&root)?;
     let config = FixtureConfig::for_test_fixture(&root)?;
+    let config = if matches!(window, TargetEvidenceWindow::PreAssociation)
+        && matches!(fault, TargetEvidenceFault::SqlProcessRestart)
+    {
+        config.with_observation_profile(
+            SHORT_BUILD_OBSERVATION_BUDGET,
+            RESTART_OBSERVATION_POLL_INTERVAL,
+        )?
+    } else {
+        config
+    };
     let mut launched = launch_three_members(config).await?;
     let preparation = phase(Phase::PeerPreparation);
     let prepared = launched.prepare_availability_group().await?;
@@ -3081,6 +3101,15 @@ fn target_restart_failure_requires_real_drift_and_no_duplicate_seed() {
             ),
             true,
             1,
+            1,
+        ),
+        (
+            TargetEvidenceFault::SqlProcessRestart,
+            tonic::Status::internal(
+                "application error: SQL Server observation is unavailable: Malformed",
+            ),
+            true,
+            0,
             1,
         ),
         (

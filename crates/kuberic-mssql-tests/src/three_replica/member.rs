@@ -1718,8 +1718,8 @@ impl LaunchContext {
             ca_certificate_file: tls.ca_certificate.path(),
             connect_timeout_ms: self.config.deadlines().sql_connect.as_millis() as u64,
             query_timeout_ms: self.config.deadlines().sql_batch.as_millis() as u64,
-            sample_timeout_ms: self.config.deadlines().member_readiness.as_millis() as u64,
-            poll_interval_ms: 2_000,
+            sample_timeout_ms: self.config.observation_budget().as_millis() as u64,
+            poll_interval_ms: self.config.observation_poll_interval().as_millis() as u64,
             max_age_ms: 30_000,
         };
         let bytes =

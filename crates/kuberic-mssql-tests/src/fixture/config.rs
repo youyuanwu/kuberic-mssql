@@ -28,6 +28,7 @@ pub enum FixtureConfigError {
     AcknowledgementDenied,
     AcknowledgementChanged,
     InvalidFixtureRoot,
+    InvalidObservationProfile,
 }
 
 impl fmt::Display for FixtureConfigError {
@@ -59,6 +60,11 @@ impl fmt::Display for FixtureConfigError {
             }
             Self::InvalidFixtureRoot => {
                 formatter.write_str("SQL Server fixture root must be an absolute path")
+            }
+            Self::InvalidObservationProfile => {
+                formatter.write_str(
+                    "fixture observation profile must cover SQL timeouts, fit member readiness and use bounded polling",
+                )
             }
         }
     }
@@ -209,6 +215,12 @@ impl Default for StageDeadlines {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ObservationProfile {
+    budget: Duration,
+    poll_interval: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct FixtureConfig {
     root: PathBuf,
@@ -216,6 +228,7 @@ pub struct FixtureConfig {
     image: &'static str,
     resources: ResourcePolicy,
     deadlines: StageDeadlines,
+    observation_profile: Option<ObservationProfile>,
 }
 
 impl FixtureConfig {
@@ -262,6 +275,35 @@ impl FixtureConfig {
         self.deadlines
     }
 
+    pub fn with_observation_profile(
+        mut self,
+        budget: Duration,
+        poll_interval: Duration,
+    ) -> Result<Self, FixtureConfigError> {
+        if budget < self.deadlines.sql_connect.max(self.deadlines.sql_batch)
+            || budget > self.deadlines.member_readiness
+            || poll_interval < Duration::from_millis(100)
+            || poll_interval > budget
+        {
+            return Err(FixtureConfigError::InvalidObservationProfile);
+        }
+        self.observation_profile = Some(ObservationProfile {
+            budget,
+            poll_interval,
+        });
+        Ok(self)
+    }
+
+    pub fn observation_budget(&self) -> Duration {
+        self.observation_profile
+            .map_or(self.deadlines.member_readiness, |profile| profile.budget)
+    }
+
+    pub fn observation_poll_interval(&self) -> Duration {
+        self.observation_profile
+            .map_or(Duration::from_millis(250), |profile| profile.poll_interval)
+    }
+
     fn with_authorization(
         root: PathBuf,
         authorization: LaunchAuthorization,
@@ -272,6 +314,7 @@ impl FixtureConfig {
             image: PINNED_SQL_SERVER_IMAGE,
             resources: ResourcePolicy::default(),
             deadlines: StageDeadlines::default(),
+            observation_profile: None,
         })
     }
 }

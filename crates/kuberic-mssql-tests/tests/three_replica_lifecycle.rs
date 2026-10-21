@@ -16,17 +16,17 @@ use kuberic_mssql_tests::three_replica::{
     CleanupError, CleanupJournalStore, CommandAclController, CommandAclProbe, CommandSpec,
     ContainerCleanupResult, ContainerInspection, ContainerLimits, ContainerMount, ContainerPort,
     ContainerRequest, DockerApi, DockerCapabilities, DockerCli, DockerError, FailureCategory,
-    FailureStage, FixtureConfig, HandledCancellationSignal, HostPlatform, HostProbe,
-    ImageInspection, JournalStore, KubericMember, LockError, NetworkInspection, NetworkRequest,
-    OwnedLabels, OwnershipInspector, OwnershipJournal, PINNED_SQL_SERVER_IMAGE, PreflightError,
-    ProcessError, ProcessErrorKind, ProcessResult, ProcessRunner, ReconcileError, ResourceBinding,
-    ResourceKind, ResourceObservation, ResourcePolicy, ResourceRecord, ResourceState, RunState,
-    SQL_SERVER_UID, SanitizedFailure, SecretValue, SqlMember, SqlServerContainerSpec, TopologyRun,
-    acquire_root_lock, cgroup_v2_available_memory, cgroup_v2_effective_cpu_quota,
-    cgroup_v2_effective_cpuset, cgroup_v2_path_from, cleanup, combine_with_cleanup,
-    effective_cpu_count, inspect_member_directory, parse_acl_evidence, parse_cpu_list,
-    prepare_member_directory, prepare_member_directory_with_clock, reconcile, run_preflight,
-    run_preflight_with_deadline, verify_member_directory,
+    FailureStage, FixtureConfig, FixtureConfigError, HandledCancellationSignal, HostPlatform,
+    HostProbe, ImageInspection, JournalStore, KubericMember, LockError, NetworkInspection,
+    NetworkRequest, OwnedLabels, OwnershipInspector, OwnershipJournal, PINNED_SQL_SERVER_IMAGE,
+    PreflightError, ProcessError, ProcessErrorKind, ProcessResult, ProcessRunner, ReconcileError,
+    ResourceBinding, ResourceKind, ResourceObservation, ResourcePolicy, ResourceRecord,
+    ResourceState, RunState, SQL_SERVER_UID, SanitizedFailure, SecretValue, SqlMember,
+    SqlServerContainerSpec, TopologyRun, acquire_root_lock, cgroup_v2_available_memory,
+    cgroup_v2_effective_cpu_quota, cgroup_v2_effective_cpuset, cgroup_v2_path_from, cleanup,
+    combine_with_cleanup, effective_cpu_count, inspect_member_directory, parse_acl_evidence,
+    parse_cpu_list, prepare_member_directory, prepare_member_directory_with_clock, reconcile,
+    run_preflight, run_preflight_with_deadline, verify_member_directory,
 };
 
 fn effective_uid() -> u32 {
@@ -379,6 +379,49 @@ fn cgroup_v1_and_unknown_hierarchies_fail_closed() {
     assert_eq!(
         cgroup_v2_path_from("0::/team/job", &mount).unwrap(),
         mount.join("team/job")
+    );
+}
+
+#[test]
+fn observation_profile_rejects_invalid_windows_without_changing_lifecycle_limits() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = fixture_config(directory.path());
+    let deadlines = config.deadlines();
+    let budget = Duration::from_secs(90);
+    let poll_interval = Duration::from_secs(2);
+    for (budget, poll_interval) in [
+        (Duration::ZERO, poll_interval),
+        (
+            deadlines.sql_batch - Duration::from_millis(1),
+            poll_interval,
+        ),
+        (
+            deadlines.member_readiness + Duration::from_millis(1),
+            poll_interval,
+        ),
+        (budget, Duration::ZERO),
+        (budget, Duration::from_millis(99)),
+        (budget, budget + Duration::from_millis(1)),
+    ] {
+        assert_eq!(
+            config
+                .clone()
+                .with_observation_profile(budget, poll_interval)
+                .unwrap_err(),
+            FixtureConfigError::InvalidObservationProfile
+        );
+    }
+    let bounded = config
+        .clone()
+        .with_observation_profile(budget, poll_interval)
+        .unwrap();
+    assert_eq!(bounded.observation_budget(), budget);
+    assert_eq!(bounded.observation_poll_interval(), poll_interval);
+    assert_eq!(bounded.deadlines(), deadlines);
+    assert_eq!(config.observation_budget(), deadlines.member_readiness);
+    assert_eq!(
+        config.observation_poll_interval(),
+        Duration::from_millis(250)
     );
 }
 
