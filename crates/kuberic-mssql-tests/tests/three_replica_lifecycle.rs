@@ -418,7 +418,16 @@ fn observation_profile_rejects_invalid_windows_without_changing_lifecycle_limits
     assert_eq!(bounded.observation_budget(), budget);
     assert_eq!(bounded.observation_poll_interval(), poll_interval);
     assert_eq!(bounded.deadlines(), deadlines);
-    assert_eq!(config.observation_budget(), deadlines.member_readiness);
+    assert_eq!(config.observation_budget(), Duration::from_secs(180));
+    let longer_than_performance_target = config
+        .clone()
+        .with_observation_profile(Duration::from_secs(240), poll_interval)
+        .unwrap();
+    assert_eq!(
+        longer_than_performance_target.observation_budget(),
+        Duration::from_secs(240)
+    );
+    assert_eq!(longer_than_performance_target.deadlines(), deadlines);
     assert_eq!(
         config.observation_poll_interval(),
         Duration::from_millis(250)

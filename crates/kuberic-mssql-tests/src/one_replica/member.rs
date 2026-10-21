@@ -841,12 +841,7 @@ impl LaunchContext {
                 connect_timeout_ms: self.config.fixture().deadlines().sql_connect.as_millis()
                     as u64,
                 query_timeout_ms: self.config.fixture().deadlines().sql_batch.as_millis() as u64,
-                sample_timeout_ms: self
-                    .config
-                    .fixture()
-                    .deadlines()
-                    .member_readiness
-                    .as_millis() as u64,
+                sample_timeout_ms: self.config.fixture().observation_budget().as_millis() as u64,
                 poll_interval_ms: 2_000,
                 max_age_ms: 60_000,
             },
@@ -868,12 +863,7 @@ impl LaunchContext {
                 connect_timeout_ms: self.config.fixture().deadlines().sql_connect.as_millis()
                     as u64,
                 query_timeout_ms: self.config.fixture().deadlines().sql_batch.as_millis() as u64,
-                sample_timeout_ms: self
-                    .config
-                    .fixture()
-                    .deadlines()
-                    .member_readiness
-                    .as_millis() as u64,
+                sample_timeout_ms: self.config.fixture().observation_budget().as_millis() as u64,
                 poll_interval_ms: 2_000,
                 max_age_ms: 60_000,
             },
@@ -895,12 +885,7 @@ impl LaunchContext {
                 connect_timeout_ms: self.config.fixture().deadlines().sql_connect.as_millis()
                     as u64,
                 query_timeout_ms: self.config.fixture().deadlines().sql_batch.as_millis() as u64,
-                sample_timeout_ms: self
-                    .config
-                    .fixture()
-                    .deadlines()
-                    .member_readiness
-                    .as_millis() as u64,
+                sample_timeout_ms: self.config.fixture().observation_budget().as_millis() as u64,
                 poll_interval_ms: 2_000,
                 max_age_ms: 60_000,
             },

@@ -17,6 +17,7 @@ pub const PINNED_SQL_SERVER_IMAGE: &str = concat!(
 );
 const MAX_ACKNOWLEDGEMENT_BYTES: u64 = 4096;
 const GIB: u64 = 1024 * 1024 * 1024;
+const DEFAULT_OBSERVATION_BUDGET: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FixtureConfigError {
@@ -205,7 +206,7 @@ impl Default for StageDeadlines {
             tls_helper: Duration::from_secs(30),
             sql_connect: Duration::from_secs(15),
             sql_batch: Duration::from_secs(30),
-            member_readiness: Duration::from_secs(180),
+            member_readiness: Duration::from_secs(300),
             availability_group: Duration::from_secs(300),
             kuberic_convergence: Duration::from_secs(180),
             marker_convergence: Duration::from_secs(60),
@@ -295,8 +296,12 @@ impl FixtureConfig {
     }
 
     pub fn observation_budget(&self) -> Duration {
-        self.observation_profile
-            .map_or(self.deadlines.member_readiness, |profile| profile.budget)
+        self.observation_profile.map_or(
+            self.deadlines
+                .member_readiness
+                .min(DEFAULT_OBSERVATION_BUDGET),
+            |profile| profile.budget,
+        )
     }
 
     pub fn observation_poll_interval(&self) -> Duration {
