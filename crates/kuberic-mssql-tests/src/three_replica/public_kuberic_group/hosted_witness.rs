@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::three_replica::hosted_authority::{
     HostedAssociation, HostedAuthority, NativeDatabaseAnchor, NativeInput, accepted_command,
-    complete_remote_configuration,
+    complete_remote_configuration, validate_secondary_native_configuration,
 };
 use crate::three_replica::hosted_native_prefix::NativePrefixEvidence;
 use crate::three_replica::{CommitCoverageReport, LaunchedMembers};
@@ -147,13 +147,28 @@ impl PublicMssqlGroup {
         let mut anchors = Vec::with_capacity(3);
         let mut observers = Vec::with_capacity(3);
         for (index, pod) in self.pods.iter().enumerate() {
-            let binding = pod
+            let replicator = pod
                 .application
                 .testing_replicator()
-                .and_then(|replicator| replicator.admitted_topology())
-                .ok_or_else(|| {
+                .ok_or_else(|| MssqlGroupError::new("live witness actual Replicator missing"))?;
+            let binding = if pod.stable_role == ReplicaRole::Primary {
+                replicator.admitted_topology().ok_or_else(|| {
                     MssqlGroupError::new("live witness actual admitted topology missing")
-                })?;
+                })?
+            } else {
+                timeout(
+                    self.witness_rpc_budget()?,
+                    "live witness explicit secondary native validation",
+                    validate_secondary_native_configuration(
+                        index,
+                        &inputs[index],
+                        &baseline[index],
+                        &replicator,
+                    ),
+                )
+                .await?
+                .map_err(MssqlGroupError::new)?
+            };
             let Observation::Present {
                 value: snapshot, ..
             } = timeout(

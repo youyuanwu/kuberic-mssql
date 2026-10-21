@@ -725,15 +725,24 @@ another `ADD DATABASE`. Previous/current
 transitions, catch-up quorum, removal, data loss, destructive recovery, failover
 and lease behavior remain explicit unsupported errors.
 
-Role is not write authority. The contained observe-only Public V1 reports use
-role `None`, progress role `Recovery`, `first = 0`, `last =` the current native
-AG sequence, and read/write access `NotPrimary`. Those report roles are
-distinct from direct SQL observation, which proves one native primary and two
-native secondaries. No client SQL service address is published and there is no
-external write lease. The fixture's marker write uses its private administrator
-connection to the directly observed native primary and is not a Kuberic
-client-access decision. The reported AG scalar is not proof of durable recovery
-progress merely because the report labels its progress role `Recovery`.
+Role is not SQL write authority. Configured Public V1 reports expose the
+accepted `Primary`/`ActiveSecondary` roles and `Primary`/`Secondary` progress
+roles. The host grants read/write access on its configured primary and reports
+`NotPrimary` for both on secondaries; this is not a SQL external write lease.
+The typed `current_progress` and `catch_up_capability` observations project the
+current native AG sequence, not proven data progress or a retained-history
+floor. Unavailable query outcomes remain explicit rather than becoming zero.
+Direct SQL observation separately proves the native roles. No client SQL
+service address is published. The fixture's marker write uses its private
+administrator connection to the directly observed native primary and is not a
+Kuberic client-access decision.
+
+Public secondary configuration persists host authority without invoking the
+primary-only configuration callback. The hosted-native witness separately
+invokes the existing MSSQL validation seam after checking the exact successful
+configuration receipt, then independently reobserves each binding. Its
+`secondary_native_binding` field labels this explicit validation; the receipt
+alone is not proof of a secondary callback or SQL effect.
 
 Stage 3 first identifies what Kuberic's private agent store retains and what
 exact SQL Server postcondition can be reobserved after restart. The PostgreSQL
@@ -818,8 +827,8 @@ synchronous external AG and one automatically seeded database. Fresh direct
 observations must prove one primary, two synchronized healthy
 secondaries, common identities and lineage, completed seeding, and a marker
 readable from all members. Three in-process Kuberic agents then admit only the
-frozen current topology and publish bracketed, fenced reports. Exact ownership
-is persisted before create dispatch, cleanup revalidates immutable IDs and
+frozen current topology and publish reports bracketed by native observations.
+Exact ownership is persisted before create dispatch, cleanup revalidates immutable IDs and
 attributes. Both fixture families persist intent before create dispatch, refuse
 foreign or replaced resources, and perform bounded recovery without requiring
 SQL Server availability. `just cleanup` invokes both exact cleanup binaries.

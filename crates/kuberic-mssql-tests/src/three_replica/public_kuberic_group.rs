@@ -4057,7 +4057,7 @@ async fn configuration_request(
         possible_data_loss: PossibleDataLossIntent::NotPossible,
         current: configuration.clone(),
         previous: None,
-        replicas: ready_remote_secondaries(
+        replicas: ready_remote_replicas(
             pods,
             reports,
             local_index,
@@ -4159,7 +4159,7 @@ async fn operation_revision(
         .map_err(display_error)
 }
 
-fn ready_remote_secondaries(
+fn ready_remote_replicas(
     pods: &[PublicMssqlPod; 3],
     reports: &[PublicV1AgentReport; 3],
     local_index: usize,
@@ -4169,18 +4169,13 @@ fn ready_remote_secondaries(
     configuration
         .members
         .iter()
-        .filter(|member| {
-            member.role == ReplicaRole::ActiveSecondary
-                && member.identity.replica_id != pods[local_index].identity.replica_id
-        })
+        .filter(|member| member.identity != pods[local_index].identity)
         .map(|member| {
             let index = pods
                 .iter()
                 .position(|pod| pod.identity == member.identity)
                 .ok_or_else(|| {
-                    MssqlGroupError::new(
-                        "public configuration secondary has no exact local fixture pod",
-                    )
+                    MssqlGroupError::new("public configuration peer has no exact local fixture pod")
                 })?;
             let pod = &pods[index];
             let report = &reports[index];
@@ -4192,13 +4187,13 @@ fn ready_remote_secondaries(
                         configuration.epoch,
                     )
                 });
-            if !role_visible {
+            if member.role == ReplicaRole::ActiveSecondary && !role_visible {
                 return Err(MssqlGroupError::new(format!(
                     "member {} has no visible active-secondary authority",
                     pod.ordinal
                 )));
             }
-            public_replica_descriptor(pod, report, ReplicaRole::ActiveSecondary)
+            public_replica_descriptor(pod, report, member.role)
         })
         .collect()
 }
@@ -4215,8 +4210,12 @@ fn public_replica_descriptor(
         process_session_id: report.process_session_id.clone(),
         storage_incarnation: Some(exact_storage_incarnation(pod, report)?),
         role,
-        current_progress: report.progress.last,
-        catch_up_capability: report.progress.first,
+        current_progress: report.progress.current().ok_or_else(|| {
+            MssqlGroupError::new("configuration peer current progress is unavailable")
+        })?,
+        catch_up_capability: report.progress.capability().ok_or_else(|| {
+            MssqlGroupError::new("configuration peer catch-up capability is unavailable")
+        })?,
         must_catchup: false,
     })
 }

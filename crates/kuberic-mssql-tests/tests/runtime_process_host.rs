@@ -31,13 +31,13 @@ use kuberic_runtime::control::{
 use kuberic_runtime::host::{ReplicaHost, RunningReplica};
 use kuberic_runtime::protocol::command::PublicV1OperationCommand;
 use kuberic_runtime::protocol::public_operations::{
-    PossibleDataLossIntent, PublicLifecycleInput, PublicLifecycleRecipe, PublicOperationClass,
-    PublicOperationIntent, PublicOperationProgram, PublicOperationReplayDisposition,
-    PublicReplicaDescriptor, PublicV1AgentReport,
+    PossibleDataLossIntent, ProgressQueryResult, PublicLifecycleInput, PublicLifecycleRecipe,
+    PublicOperationClass, PublicOperationIntent, PublicOperationProgram,
+    PublicOperationReplayDisposition, PublicReplicaDescriptor, PublicV1AgentReport,
 };
 use kuberic_runtime::protocol::types::{
-    ConfigurationDescriptor, ConfigurationMember, Epoch, OperationId, PodUid, PvcUid, ReplicaId,
-    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ReplicaStorageIdentity,
+    AccessStatus, ConfigurationDescriptor, ConfigurationMember, Epoch, OperationId, PodUid, PvcUid,
+    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ReplicaStorageIdentity,
     ReplicaStorageIncarnationContext, ResourceUid, StorageGeneration, derive_agent_generation,
     derive_initialization_id,
 };
@@ -675,7 +675,7 @@ fn lifecycle_intent(
     }
 }
 
-fn remote_active_descriptions(
+fn remote_descriptions(
     attempts: &[HostAttempt],
     reports: &[PublicV1AgentReport],
     local_index: usize,
@@ -683,10 +683,7 @@ fn remote_active_descriptions(
     configuration()
         .members
         .iter()
-        .filter(|member| {
-            member.role == ReplicaRole::ActiveSecondary
-                && member.identity.replica_id != identities()[local_index].replica_id
-        })
+        .filter(|member| member.identity != identities()[local_index])
         .map(|member| {
             let remote_index = usize::try_from(member.identity.replica_id.value() - 1).unwrap();
             let report = &reports[remote_index];
@@ -696,9 +693,12 @@ fn remote_active_descriptions(
                 replication_address: format!("http://{}", attempts[remote_index].replication),
                 process_session_id: report.process_session_id.clone(),
                 storage_incarnation: Some(report.storage_incarnation.clone()),
-                role: ReplicaRole::ActiveSecondary,
-                current_progress: report.progress.last,
-                catch_up_capability: report.progress.first,
+                role: member.role,
+                current_progress: report.progress.current().expect("peer current progress"),
+                catch_up_capability: report
+                    .progress
+                    .capability()
+                    .expect("peer catch-up capability"),
                 must_catchup: false,
             }
         })
@@ -815,7 +815,7 @@ async fn configure_attempts(attempts: &[HostAttempt]) -> (Vec<String>, Vec<Publi
         possible_data_loss: PossibleDataLossIntent::NotPossible,
         current: configuration(),
         previous: None,
-        replicas: remote_active_descriptions(attempts, &after_open, 0),
+        replicas: remote_descriptions(attempts, &after_open, 0),
         data_loss_recovery: None,
     };
     let primary = PublicCommand {
@@ -869,7 +869,7 @@ async fn configure_attempts(attempts: &[HostAttempt]) -> (Vec<String>, Vec<Publi
                 possible_data_loss: PossibleDataLossIntent::NotPossible,
                 current: configuration(),
                 previous: None,
-                replicas: remote_active_descriptions(attempts, &after_roles, index),
+                replicas: remote_descriptions(attempts, &after_roles, index),
                 data_loss_recovery: None,
             };
             PublicCommand {
@@ -968,16 +968,33 @@ async fn reports(
             reports.push(status(attempt.control, index as i64 + 1).await.1);
         }
         if reports.iter().enumerate().all(|(index, report)| {
+            let expected_role = if !require_current_session_lifecycle {
+                wire::ReplicaRole::None
+            } else if index == 0 {
+                wire::ReplicaRole::Primary
+            } else {
+                wire::ReplicaRole::ActiveSecondary
+            };
+            let expected_access = if expected_role == wire::ReplicaRole::Primary {
+                wire::AccessStatus::Granted
+            } else {
+                wire::AccessStatus::NotPrimary
+            };
             report.public_v1.as_ref().is_some_and(|public| {
                 public
                     .identity
                     .as_ref()
                     .is_some_and(|identity| identity.replica_id == index as i64 + 1)
-                    && public.role == wire::ReplicaRole::None as i32
-                    && public.read_status == wire::AccessStatus::NotPrimary as i32
-                    && public.write_status == wire::AccessStatus::NotPrimary as i32
+                    && public.role == expected_role as i32
+                    && public.read_status == expected_access as i32
+                    && public.write_status == expected_access as i32
                     && (!require_current_session_lifecycle
-                        || (public.first_progress == 0 && public.last_progress == 42))
+                        || normalize_public_v1_agent_status_report(report.clone()).is_ok_and(
+                            |report| {
+                                report.progress.capability() == Some(42)
+                                    && report.progress.current() == Some(42)
+                            },
+                        ))
                     && (!require_current_session_lifecycle || lifecycle_completed(public, index))
             })
         }) {
@@ -994,8 +1011,8 @@ async fn reports(
                         public.role,
                         public.read_status,
                         public.write_status,
-                        public.first_progress,
-                        public.last_progress,
+                        public.catch_up_capability.clone(),
+                        public.current_progress.clone(),
                         public.process_session_id.clone(),
                         public
                             .completed_operations
@@ -1306,13 +1323,32 @@ async fn public_close_waits_for_actual_adapter_callback_drain_case() {
         callback.join().unwrap(),
         Err(KubericRuntimeError::Closed)
     ));
-    let error = tokio::time::timeout(Duration::from_secs(5), close)
+    let response = tokio::time::timeout(Duration::from_secs(5), close)
         .await
         .unwrap()
         .unwrap()
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::Unavailable);
-    assert!(error.message().contains("closed"));
+        .unwrap()
+        .into_inner();
+    let report = response.observation.expect("closed host observation");
+    assert!(completed_success(
+        report.public_v1.as_ref().unwrap(),
+        "hosted-local-close",
+        4,
+        wire::PublicV1CallKind::Close,
+    ));
+    let report = public_report(&report);
+    assert_eq!(report.role, ReplicaRole::None);
+    assert_eq!(report.read_status, AccessStatus::NotPrimary);
+    assert_eq!(report.write_status, AccessStatus::NotPrimary);
+    for query in [
+        &report.progress.current_progress,
+        &report.progress.catch_up_capability,
+    ] {
+        assert!(matches!(
+            query,
+            ProgressQueryResult::Failed(reason) if reason.contains("closed")
+        ));
+    }
     assert!(application.testing_replicator().is_none());
     application.wait_for_containment().await.unwrap();
     stop_all(&mut replicas).await;
