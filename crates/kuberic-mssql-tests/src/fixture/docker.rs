@@ -601,6 +601,20 @@ pub struct DockerCli<R> {
     executable: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StartupState {
+    #[serde(rename = "Running")]
+    pub running: bool,
+    #[serde(rename = "Restarting")]
+    pub restarting: bool,
+    #[serde(rename = "Dead")]
+    pub dead: bool,
+    #[serde(rename = "ExitCode")]
+    pub exit_code: i64,
+    #[serde(rename = "OOMKilled")]
+    pub oom_killed: bool,
+}
+
 impl<R> DockerCli<R> {
     pub fn new(runner: R) -> Self {
         Self {
@@ -615,6 +629,33 @@ impl<R> DockerCli<R> {
 
     pub fn runner(&self) -> &R {
         &self.runner
+    }
+}
+
+impl<R: ProcessRunner> DockerCli<R> {
+    pub(crate) fn startup_state(
+        &self,
+        request: &ContainerRequest,
+        id: &str,
+        image_id: &str,
+        timeout: Duration,
+    ) -> Result<StartupState, DockerError> {
+        let result = self
+            .runner
+            .run(&self.command("inspect SQL startup state", timeout).args([
+                "container",
+                "inspect",
+                id,
+            ]))
+            .map_err(|_| DockerError::Command)?;
+        let inspection = parse_container_inspection(&result.stdout)?;
+        if inspection.id != id {
+            return Err(DockerError::OwnershipMismatch);
+        }
+        request.verify_inspection(&inspection, image_id, inspection.running)?;
+        let value = first_inspection(&result.stdout)?;
+        serde_json::from_value(at(&value, &["State"])?.clone())
+            .map_err(|_| DockerError::MalformedInspection)
     }
 }
 

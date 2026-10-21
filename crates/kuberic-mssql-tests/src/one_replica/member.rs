@@ -37,6 +37,7 @@ use crate::fixture::ownership::{
 use crate::fixture::preflight::{CommandAclProbe, LocalHostProbe, run_preflight_with_deadline};
 use crate::fixture::process::{BoundedProcessRunner, CommandSpec, ProcessRunner};
 use crate::fixture::secrets::{PrivateFile, SecretValue};
+use crate::fixture::startup_diagnostics::with_startup_diagnostics;
 use crate::fixture::tls::{SharedTlsAssets, TlsAssetRecorder, TlsError, TlsGenerationRequest};
 
 use super::cleanup::{
@@ -178,7 +179,24 @@ pub async fn launch_one_replica(
             member,
         }),
         Err(error) => {
-            let failure = error.sanitized();
+            let container_id = context
+                .journal
+                .resources
+                .iter()
+                .find(|resource| resource.kind == ResourceKind::Container)
+                .and_then(|resource| resource.binding.as_ref())
+                .map(|binding| binding.immutable_id.as_str());
+            let failure = with_startup_diagnostics(
+                error.sanitized(),
+                &context.docker,
+                &context.journal.run.image_id,
+                context.store.root(),
+                &context.private_files,
+                context
+                    .container_request
+                    .as_ref()
+                    .map(|request| (request, context.member_directory.as_ref(), container_id)),
+            );
             let report = context.cleanup_report();
             Err(combine_with_cleanup::<()>(Err(failure), &report).unwrap_err())
         }
@@ -688,6 +706,7 @@ impl LaunchContext {
         self.store
             .bind(&mut self.journal, index, binding)
             .map_err(|_| OneReplicaLaunchError::Journal)?;
+        self.container_request = Some(request.clone());
         check_fault("after-container-create")?;
         self.docker
             .start_container(&inspection.id, timeout)

@@ -473,6 +473,21 @@ two-second cadence. These are test-only functional budgets, not whole-test
 runtime targets. Transport limits, outer operation waits, full recovery
 assertions and cleanup grace remain unchanged.
 
+Failed one- and three-member fixture launches attach a `SQL_STARTUP` JSON
+diagnostic to the original setup failure before cleanup. Collection has a
+separate 15-second total budget (at most five seconds per Docker inspection);
+startup and cleanup deadlines are unchanged. Each verified owned container
+reports running/restarting/dead, exit code and OOM-killed state plus up to
+64 lines/8 KiB of JSON-encoded SQL `log/errorlog` tail from its bound data
+directory, including after container exit. Generated credentials are redacted,
+control characters escaped or removed, and raw Docker inspection/environment
+and command-error text are never published. Missing, replaced, unsafe or
+unreadable sources (including unsupported non-UTF-8/NUL-containing text) are
+explicit unavailable evidence, not a new primary
+failure or permission to skip cleanup. No extra SQL workload runs and successful
+launches collect nothing. These snapshots do not establish the cause of every
+readiness attempt, healthy forward progress, or containment.
+
 Disposal can overlap stops of eligible members within one already-owned
 three-replica fixture; SQL cases and fixtures still run serially per worker.
 Every participant needs durable cleanup intent and exact ownership checks.
