@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove exact-once ordinary/live coverage of the four archived CI workers."""
+"""Prove exact-once active coverage and explicit blocked licensed accounting."""
 
 import argparse
 import json
@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+
+import live_coverage
 
 
 PARTITIONS = 4
@@ -74,10 +76,19 @@ def listed_tests(document):
     return rows
 
 
-def classify(rows):
-    ordinary, live, excluded = set(), set(), set()
+def classify(rows, blocked=None):
+    if blocked is None:
+        blocked = {
+            TestId("kuberic-mssql-tests", live_coverage.BINARY, name)
+            for name in live_coverage.BLOCKED
+        }
+    ordinary, live, excluded, blocked_seen = set(), set(), set(), set()
     for row in rows:
-        if not row.ignored:
+        if row.identity in blocked:
+            if not row.ignored or row.identity.binary not in LIVE_BINARIES:
+                raise ValidationError(f"blocked case is not an ignored licensed test: {row.identity}")
+            blocked_seen.add(row.identity)
+        elif not row.ignored:
             ordinary.add(row.identity)
         elif row.identity.binary in LIVE_BINARIES:
             live.add(row.identity)
@@ -87,6 +98,7 @@ def classify(rows):
             raise ValidationError(f"unclassified ignored test: {row.identity}")
     if excluded != EXCLUDED:
         raise ValidationError("the privileged ACL exclusion inventory changed")
+    require_equal(blocked_seen, blocked, "blocked licensed inventory is stale")
     if not ordinary or not live:
         raise ValidationError("ordinary and live inventories must both be nonempty")
     return ordinary, live
@@ -103,12 +115,12 @@ def require_equal(actual, expected, label):
         )
 
 
-def validate_partition_sets(expected, partitions, label):
+def validate_partition_sets(expected, partitions, label, allow_empty=False):
     if len(partitions) != PARTITIONS:
         raise ValidationError(f"{label}: expected exactly {PARTITIONS} partitions")
     union = set()
     for index, partition in enumerate(partitions, 1):
-        if not partition:
+        if not partition and not allow_empty:
             raise ValidationError(f"{label}: partition {index} is empty")
         if union & partition:
             raise ValidationError(f"{label}: partition {index} overlaps an earlier partition")
@@ -148,6 +160,8 @@ class ArchiveListing:
 
     def tests(self, profile, ignored="default", partition=None, complete=False):
         command = self.command + ["--profile", profile, "--run-ignored", ignored]
+        if profile == "live":
+            command += ["-E", live_coverage.live_filter()]
         if partition is not None:
             command += ["--partition", partition]
         if complete:
@@ -166,9 +180,10 @@ def validate(source):
             matching(source.tests(profile, ignored=ignored, partition=f"{mode}:{i}/{PARTITIONS}"))
             for i in range(1, PARTITIONS + 1)
         ]
-        validate_partition_sets(expected, partitions, profile)
+        validate_partition_sets(expected, partitions, profile, allow_empty=profile == "live")
         print(f"{profile}: {len(expected)} tests, {mode} partitions {[len(p) for p in partitions]}")
-    print("Exact-once archive coverage verified; privileged ACL test excluded.")
+    live_coverage.report()
+    print("Exact-once active archive coverage verified; blocked cases accounted; privileged ACL test excluded.")
 
 
 def main():

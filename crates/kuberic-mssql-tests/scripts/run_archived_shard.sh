@@ -48,4 +48,4 @@ env -u KUBERIC_MSSQL_ONE_REPLICA_CHILD_MODE -u KUBERIC_MSSQL_THREE_REPLICA_CHILD
   cargo nextest run "${metadata[@]}" --profile default --run-ignored default \
   --partition "slice:$partition/4" --test-threads=1
 bash "$scripts/run_live_nextest.sh" "$fixtures" cargo nextest run \
-  "${metadata[@]}" --partition "hash:$partition/4"
+  "${metadata[@]}" --partition "hash:$partition/4" --no-tests warn

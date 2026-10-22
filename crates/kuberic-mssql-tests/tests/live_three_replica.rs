@@ -55,7 +55,7 @@ fn three_replica_lifecycle_child() {
     };
     if !matches!(
         mode.as_str(),
-        "happy-path" | "same-root-restart" | "native-commit"
+        "happy-path" | "same-root-restart" | "native-commit" | "native-members"
     ) {
         panic!("invalid live SQL child mode");
     }
@@ -65,6 +65,7 @@ fn three_replica_lifecycle_child() {
         "happy-path" => run_three_replica_test(false),
         "same-root-restart" => run_three_replica_test(true),
         "native-commit" => run_native_experiment(NativeExperiment::CommitRecord),
+        "native-members" => run_native_experiment(NativeExperiment::MembersReady),
         _ => panic!("invalid live SQL child mode"),
     }));
     match outcome {
@@ -462,6 +463,7 @@ fn three_replica_mssql_native_prefix_coverage() {
 
 #[derive(Clone, Copy)]
 enum NativeExperiment {
+    MembersReady,
     CommitRecord,
     PrefixCoverage,
 }
@@ -479,6 +481,7 @@ fn run_native_experiment(kind: NativeExperiment) {
                 .block_on(async {
                     let mut cancellation =
                         CancellationSignals::register().expect("cancellation signals");
+                    write_signal_handler_ready_evidence();
                     let root = required_path("KUBERIC_MSSQL_THREE_REPLICA_ROOT");
                     let config =
                         FixtureConfig::for_test_fixture(&root).expect("test-only fixture config");
@@ -488,8 +491,27 @@ fn run_native_experiment(kind: NativeExperiment) {
                     let mut serialized_report = None;
                     let outcome = {
                         let experiment = AssertUnwindSafe(async {
-                            launched.provision_availability_group().await?;
+                            if !matches!(kind, NativeExperiment::MembersReady) {
+                                launched.provision_availability_group().await?;
+                            }
                             serialized_report = Some(match kind {
+                                NativeExperiment::MembersReady => {
+                                    if launched.members.each_ref().map(|member| member.ordinal)
+                                        != [1, 2, 3]
+                                        || launched
+                                            .members
+                                            .iter()
+                                            .any(|member| member.sql_start_time.is_empty())
+                                    {
+                                        return Err(
+                                            "native members lack exact readiness evidence".into()
+                                        );
+                                    }
+                                    serde_json::to_vec(&serde_json::json!({
+                                        "native_members_ready": [1, 2, 3],
+                                        "public_history": "unsupported",
+                                    }))?
+                                }
                                 NativeExperiment::CommitRecord => serde_json::to_vec(
                                     &launched.probe_native_commit_coverage(2).await?,
                                 )?,
@@ -500,11 +522,7 @@ fn run_native_experiment(kind: NativeExperiment) {
                             Ok::<(), TestError>(())
                         })
                         .catch_unwind();
-                        tokio::pin!(experiment);
-                        tokio::select! {
-                            result = &mut experiment => RuntimeOutcome::Completed(result),
-                            signal = cancellation.recv() => RuntimeOutcome::Interrupted(signal),
-                        }
+                        await_native_outcome(experiment, cancellation.recv()).await
                     };
                     let cleanup =
                         CleanupCoordinator::new(SystemCleanupClock::default(), CLEANUP_BUDGET);
@@ -525,6 +543,34 @@ fn run_native_experiment(kind: NativeExperiment) {
         .expect("native commit probe thread")
         .join()
         .expect("native commit probe thread panicked");
+}
+
+async fn await_native_outcome(
+    experiment: impl std::future::Future<Output = std::thread::Result<Result<(), TestError>>>,
+    signal: impl std::future::Future<Output = HandledCancellationSignal>,
+) -> RuntimeOutcome {
+    tokio::select! {
+        biased;
+        signal = signal => RuntimeOutcome::Interrupted(signal),
+        result = experiment => RuntimeOutcome::Completed(result),
+    }
+}
+
+#[tokio::test]
+async fn pending_native_launch_signal_precedes_immediate_completion() {
+    for signal in [
+        HandledCancellationSignal::Interrupt,
+        HandledCancellationSignal::Terminate,
+    ] {
+        for _ in 0..64 {
+            let outcome = await_native_outcome(
+                std::future::ready(Ok(Ok(()))),
+                std::future::ready(signal.clone()),
+            )
+            .await;
+            assert!(matches!(outcome, RuntimeOutcome::Interrupted(_)));
+        }
+    }
 }
 
 fn finish_native_commit_report(
@@ -723,7 +769,7 @@ fn exercise_signal_recovery(signal: i32, signal_name: &str) {
         .transpose()
         .expect("fresh signal terminal attempt");
     let interruption = phase(Phase::InterruptedLaunch);
-    let mut command = test_child_command(&root, "happy-path", Some(&ready), None);
+    let mut command = test_child_command(&root, "native-members", Some(&ready), None);
     if let Some(terminal) = &terminal {
         terminal
             .configure(&mut command)
@@ -783,14 +829,14 @@ fn exercise_signal_recovery(signal: i32, signal_name: &str) {
     interruption.succeeded();
 
     let recovery = phase(Phase::RecoveryRetry);
-    let mut retry = spawn_live_child(&root, None);
+    let mut retry = spawn_test_child(&root, "native-members", None, None);
     let retry_status = wait_for_child_with_cleanup(&mut retry, Duration::from_secs(1200), &root);
     assert!(
         retry_status
             .observed()
             .expect("retry must exit without timeout escalation")
             .success(),
-        "retry after {signal_name} must succeed"
+        "native member retry after {signal_name} must succeed"
     );
     recovery.succeeded();
     cleanup_three_replica_fixture(&root).expect("idempotent cleanup after retry");
@@ -3482,10 +3528,6 @@ fn required_path(variable: &str) -> PathBuf {
         std::env::var_os(variable)
             .unwrap_or_else(|| panic!("{variable} must be explicitly configured")),
     )
-}
-
-fn spawn_live_child(root: &Path, ready: Option<&Path>) -> Child {
-    spawn_test_child(root, "happy-path", ready, None)
 }
 
 fn spawn_restart_child(root: &Path) -> Child {

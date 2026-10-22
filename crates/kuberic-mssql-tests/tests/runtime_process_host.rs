@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::future::join_all;
-use kuberic_mssql::kuberic::{ObservationClock, SqlServerObservationSource};
+use kuberic_mssql::kuberic::{KubericAdapterError, ObservationClock, SqlServerObservationSource};
 use kuberic_mssql::observation::{
     AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, DatabaseSnapshot, InstanceMetadata,
     InstanceSnapshot, LocalDatabaseSnapshot, LocalRecoveryMetadata, LocalReplicaSnapshot,
@@ -31,9 +31,8 @@ use kuberic_runtime::control::{
 use kuberic_runtime::host::{ReplicaHost, RunningReplica};
 use kuberic_runtime::protocol::command::PublicV1OperationCommand;
 use kuberic_runtime::protocol::public_operations::{
-    PossibleDataLossIntent, ProgressQueryResult, PublicLifecycleInput, PublicLifecycleRecipe,
-    PublicOperationClass, PublicOperationIntent, PublicOperationProgram,
-    PublicOperationReplayDisposition, PublicReplicaDescriptor, PublicV1AgentReport,
+    ProgressQueryResult, PublicOperationClass, PublicOperationIntent, PublicOperationProgram,
+    PublicV1AgentReport,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, ConfigurationDescriptor, ConfigurationMember, Epoch, OperationId, PodUid, PvcUid,
@@ -656,55 +655,6 @@ fn program_intent(
     }
 }
 
-fn lifecycle_intent(
-    report: &PublicV1AgentReport,
-    operation_id: impl Into<String>,
-    revision: u64,
-    lifecycle: PublicLifecycleInput,
-) -> PublicOperationIntent {
-    PublicOperationIntent {
-        identity: report.identity.clone(),
-        operation_id: OperationId::new(operation_id.into()),
-        revision,
-        process_session_id: report.process_session_id.clone(),
-        class: PublicOperationClass::Authority,
-        input_digest: lifecycle.digest(),
-        replay_disposition: PublicOperationReplayDisposition::Convergent,
-        lifecycle: Some(lifecycle),
-        program: None,
-    }
-}
-
-fn remote_descriptions(
-    attempts: &[HostAttempt],
-    reports: &[PublicV1AgentReport],
-    local_index: usize,
-) -> Vec<PublicReplicaDescriptor> {
-    configuration()
-        .members
-        .iter()
-        .filter(|member| member.identity != identities()[local_index])
-        .map(|member| {
-            let remote_index = usize::try_from(member.identity.replica_id.value() - 1).unwrap();
-            let report = &reports[remote_index];
-            PublicReplicaDescriptor {
-                build_id: OperationId::default(),
-                identity: report.replica.clone(),
-                replication_address: format!("http://{}", attempts[remote_index].replication),
-                process_session_id: report.process_session_id.clone(),
-                storage_incarnation: Some(report.storage_incarnation.clone()),
-                role: member.role,
-                current_progress: report.progress.current().expect("peer current progress"),
-                catch_up_capability: report
-                    .progress
-                    .capability()
-                    .expect("peer catch-up capability"),
-                must_catchup: false,
-            }
-        })
-        .collect()
-}
-
 async fn current_public_reports(
     attempts: &[HostAttempt],
 ) -> (Vec<wire::AgentStatusReport>, Vec<PublicV1AgentReport>) {
@@ -738,11 +688,11 @@ async fn execute_public_command(attempts: &[HostAttempt], command: &PublicComman
     }
 }
 
-async fn initialize_attempts(
+async fn initialize_open_attempts(
     attempts: &mut [HostAttempt],
 ) -> (Vec<RunningReplica>, Vec<String>, Vec<PublicCommand>) {
     let replicas = initialize_stores(attempts).await;
-    let (sessions, commands) = configure_attempts(attempts).await;
+    let (sessions, commands) = open_attempts(attempts, false).await;
     (replicas, sessions, commands)
 }
 
@@ -776,7 +726,10 @@ async fn initialize_stores(attempts: &mut [HostAttempt]) -> Vec<RunningReplica> 
     replicas
 }
 
-async fn configure_attempts(attempts: &[HostAttempt]) -> (Vec<String>, Vec<PublicCommand>) {
+async fn open_attempts(
+    attempts: &[HostAttempt],
+    existing: bool,
+) -> (Vec<String>, Vec<PublicCommand>) {
     let (_, initial) = current_public_reports(attempts).await;
     let sessions = initial
         .iter()
@@ -786,7 +739,7 @@ async fn configure_attempts(attempts: &[HostAttempt]) -> (Vec<String>, Vec<Publi
         .map(|index| {
             let program = PublicOperationProgram::Open {
                 replica: initial[index].replica.clone(),
-                existing: false,
+                existing,
             };
             PublicCommand {
                 target_index: index,
@@ -795,8 +748,12 @@ async fn configure_attempts(attempts: &[HostAttempt]) -> (Vec<String>, Vec<Publi
                     &initial[index],
                     program_intent(
                         &initial[index],
-                        format!("bootstrap-open-{}", index + 1),
-                        1,
+                        format!(
+                            "bootstrap-open-{}-session-{}",
+                            index + 1,
+                            initial[index].process_session_id
+                        ),
+                        if existing { 2 } else { 1 },
                         program,
                     ),
                 ),
@@ -807,98 +764,10 @@ async fn configure_attempts(attempts: &[HostAttempt]) -> (Vec<String>, Vec<Publi
         execute_public_command(attempts, open).await;
     }
 
-    let (_, after_open) = current_public_reports(attempts).await;
-    let primary_lifecycle = PublicLifecycleInput {
-        recipe: PublicLifecycleRecipe::InitialPrimary,
-        replica: after_open[0].replica.clone(),
-        epoch: configuration().epoch,
-        possible_data_loss: PossibleDataLossIntent::NotPossible,
-        current: configuration(),
-        previous: None,
-        replicas: remote_descriptions(attempts, &after_open, 0),
-        data_loss_recovery: None,
-    };
-    let primary = PublicCommand {
-        target_index: 0,
-        request: public_operation_request(
-            0,
-            &after_open[0],
-            lifecycle_intent(
-                &after_open[0],
-                "bootstrap-initial-primary",
-                2,
-                primary_lifecycle,
-            ),
-        ),
-    };
-    execute_public_command(attempts, &primary).await;
-
-    let (_, after_primary) = current_public_reports(attempts).await;
-    let roles = (1..3)
-        .map(|index| {
-            let program = PublicOperationProgram::Role {
-                epoch: configuration().epoch,
-                role: ReplicaRole::ActiveSecondary,
-            };
-            PublicCommand {
-                target_index: index,
-                request: public_operation_request(
-                    index,
-                    &after_primary[index],
-                    program_intent(
-                        &after_primary[index],
-                        format!("bootstrap-secondary-role-{}", index + 1),
-                        2,
-                        program,
-                    ),
-                ),
-            }
-        })
-        .collect::<Vec<_>>();
-    for role in &roles {
-        execute_public_command(attempts, role).await;
-    }
-
-    let (_, after_roles) = current_public_reports(attempts).await;
-    let configurations = (1..3)
-        .map(|index| {
-            let lifecycle = PublicLifecycleInput {
-                recipe: PublicLifecycleRecipe::SecondaryEpochAdvance,
-                replica: after_roles[index].replica.clone(),
-                epoch: configuration().epoch,
-                possible_data_loss: PossibleDataLossIntent::NotPossible,
-                current: configuration(),
-                previous: None,
-                replicas: remote_descriptions(attempts, &after_roles, index),
-                data_loss_recovery: None,
-            };
-            PublicCommand {
-                target_index: index,
-                request: public_operation_request(
-                    index,
-                    &after_roles[index],
-                    lifecycle_intent(
-                        &after_roles[index],
-                        format!("bootstrap-secondary-lifecycle-{}", index + 1),
-                        3,
-                        lifecycle,
-                    ),
-                ),
-            }
-        })
-        .collect::<Vec<_>>();
-    for configuration in &configurations {
-        execute_public_command(attempts, configuration).await;
-    }
-
-    let mut commands = opens;
-    commands.push(primary);
-    commands.extend(roles);
-    commands.extend(configurations);
-    (sessions, commands)
+    (sessions, opens)
 }
 
-async fn replay_configuration(attempts: &[HostAttempt], commands: &[PublicCommand]) -> Vec<String> {
+async fn replay_open(attempts: &[HostAttempt], commands: &[PublicCommand]) -> Vec<String> {
     for command in commands {
         execute_public_command(attempts, command).await;
     }
@@ -929,37 +798,38 @@ fn completed_success(
     })
 }
 
-fn lifecycle_completed(public: &wire::PublicV1AgentStatus, index: usize) -> bool {
+fn open_completed(public: &wire::PublicV1AgentStatus, index: usize, revision: u64) -> bool {
     completed_success(
         public,
-        &format!("bootstrap-open-{}", index + 1),
-        1,
+        &format!(
+            "bootstrap-open-{}-session-{}",
+            index + 1,
+            public.process_session_id
+        ),
+        revision,
         wire::PublicV1CallKind::Open,
-    ) && if index == 0 {
-        completed_success(
-            public,
-            "bootstrap-initial-primary",
-            2,
-            wire::PublicV1CallKind::InitialPrimary,
-        )
-    } else {
-        completed_success(
-            public,
-            &format!("bootstrap-secondary-role-{}", index + 1),
-            2,
-            wire::PublicV1CallKind::Role,
-        ) && completed_success(
-            public,
-            &format!("bootstrap-secondary-lifecycle-{}", index + 1),
-            3,
-            wire::PublicV1CallKind::SecondaryEpochAdvance,
-        )
+    )
+}
+
+fn assert_unsupported_queries(report: &PublicV1AgentReport) {
+    report.validate().unwrap();
+    for (query, operation) in [
+        (&report.progress.current_progress, "current_progress"),
+        (&report.progress.catch_up_capability, "catch_up_capability"),
+    ] {
+        assert!(
+            matches!(query, ProgressQueryResult::Failed(message)
+                if message.contains(&format!("{operation} is disabled by the observe-only SQL Server adapter"))),
+            "{query:?}"
+        );
     }
+    assert!(report.progress.current().is_none());
+    assert!(report.progress.capability().is_none());
 }
 
 async fn reports(
     attempts: &[HostAttempt],
-    require_current_session_lifecycle: bool,
+    open_revision: Option<u64>,
 ) -> Vec<wire::AgentStatusReport> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -968,36 +838,25 @@ async fn reports(
             reports.push(status(attempt.control, index as i64 + 1).await.1);
         }
         if reports.iter().enumerate().all(|(index, report)| {
-            let expected_role = if !require_current_session_lifecycle {
-                wire::ReplicaRole::None
-            } else if index == 0 {
-                wire::ReplicaRole::Primary
-            } else {
-                wire::ReplicaRole::ActiveSecondary
-            };
-            let expected_access = if expected_role == wire::ReplicaRole::Primary {
-                wire::AccessStatus::Granted
-            } else {
-                wire::AccessStatus::NotPrimary
-            };
             report.public_v1.as_ref().is_some_and(|public| {
                 public
                     .identity
                     .as_ref()
                     .is_some_and(|identity| identity.replica_id == index as i64 + 1)
-                    && public.role == expected_role as i32
-                    && public.read_status == expected_access as i32
-                    && public.write_status == expected_access as i32
-                    && (!require_current_session_lifecycle
-                        || normalize_public_v1_agent_status_report(report.clone()).is_ok_and(
-                            |report| {
-                                report.progress.capability() == Some(42)
-                                    && report.progress.current() == Some(42)
-                            },
-                        ))
-                    && (!require_current_session_lifecycle || lifecycle_completed(public, index))
+                    && public.role == wire::ReplicaRole::None as i32
+                    && public.read_status == wire::AccessStatus::NotPrimary as i32
+                    && public.write_status == wire::AccessStatus::NotPrimary as i32
+                    && open_revision.is_none_or(|revision| open_completed(public, index, revision))
             })
         }) {
+            if open_revision.is_some() {
+                for report in &reports {
+                    let report = public_report(report);
+                    assert!(report.has_current_open_endpoint());
+                    assert!(report.configuration.is_none());
+                    assert_unsupported_queries(&report);
+                }
+            }
             return reports;
         }
         assert!(
@@ -1047,16 +906,24 @@ async fn stop_all(replicas: &mut [RunningReplica]) {
 }
 
 async fn public_hosts_initialize_report_and_restart_with_fresh_sessions_case() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = tempfile::tempdir_in(".").unwrap();
     let mut first_attempts = start_attempts(temporary.path()).await;
     assert_initialization_listeners(&mut first_attempts).await;
-    let (mut first_replicas, first_sessions, configuration_commands) =
-        initialize_attempts(&mut first_attempts).await;
-    let first_reports = reports(&first_attempts, true).await;
+    let (mut first_replicas, first_sessions, open_commands) =
+        initialize_open_attempts(&mut first_attempts).await;
+    let first_reports = reports(&first_attempts, Some(1)).await;
     let expected_identities = identities();
     for (index, report) in first_reports.iter().enumerate() {
         let wire_public = report.public_v1.as_ref().unwrap();
-        assert!(lifecycle_completed(wire_public, index));
+        assert!(open_completed(wire_public, index, 1));
+        assert!(
+            first_attempts[index]
+                .application
+                .testing_replicator()
+                .unwrap()
+                .admitted_topology()
+                .is_none()
+        );
 
         let public = public_report(report);
         assert_eq!(public.resource_uid.as_str(), "runtime-host-test");
@@ -1083,7 +950,7 @@ async fn public_hosts_initialize_report_and_restart_with_fresh_sessions_case() {
             format!("storage-{initialization}")
         );
     }
-    let replay_sessions = replay_configuration(&first_attempts, &configuration_commands).await;
+    let replay_sessions = replay_open(&first_attempts, &open_commands).await;
     assert_eq!(
         replay_sessions, first_sessions,
         "Public V1 replay must retain exact process-session authority"
@@ -1102,7 +969,7 @@ async fn public_hosts_initialize_report_and_restart_with_fresh_sessions_case() {
                 .unwrap(),
         );
     }
-    let restarted_reports = reports(&restarted_attempts, false).await;
+    let restarted_reports = reports(&restarted_attempts, None).await;
     let restarted_sessions = restarted_reports
         .iter()
         .map(|report| public_report(report).process_session_id.to_string())
@@ -1116,20 +983,38 @@ async fn public_hosts_initialize_report_and_restart_with_fresh_sessions_case() {
 
     let (mut client, _) = status(restarted_attempts[0].control, 1).await;
     let error = client
-        .execute(authorized(configuration_commands[0].request.clone()))
+        .execute(authorized(open_commands[0].request.clone()))
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert!(error.message().contains("stale agent process session"));
+    let (reopened_sessions, _) = open_attempts(&restarted_attempts, true).await;
+    assert_eq!(reopened_sessions, restarted_sessions);
+    let reopened = reports(&restarted_attempts, Some(2)).await;
+    for (old, new) in first_reports.iter().zip(&reopened) {
+        assert_eq!(
+            public_report(old).storage_incarnation,
+            public_report(new).storage_incarnation,
+            "restart keeps exact storage, not the predecessor's process authority"
+        );
+    }
     stop_all(&mut restarted).await;
 }
 
 async fn service_close_cancellation_retains_actual_hosted_replicator_case() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = tempfile::tempdir_in(".").unwrap();
     let mut attempts = start_attempts(temporary.path()).await;
-    let (mut replicas, _, _) = initialize_attempts(&mut attempts).await;
-    let application = attempts[0].application.clone();
+    let (mut replicas, _, _) = initialize_open_attempts(&mut attempts).await;
+    let application = attempts[1].application.clone();
     let replicator = application.testing_replicator().unwrap();
+    replicator
+        .change_role(configuration().epoch, ReplicaRole::ActiveSecondary)
+        .await
+        .unwrap();
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("42").unwrap())
+    );
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     replicator
@@ -1142,7 +1027,7 @@ async fn service_close_cancellation_retains_actual_hosted_replicator_case() {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(replicator.current_progress())
+                .block_on(replicator.native_configuration_sequence())
         }
     });
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1172,7 +1057,7 @@ async fn service_close_cancellation_retains_actual_hosted_replicator_case() {
     release_tx.send(()).unwrap();
     assert!(matches!(
         callback.join().unwrap(),
-        Err(KubericRuntimeError::Closed)
+        Err(KubericAdapterError::Closed)
     ));
     tokio::time::timeout(Duration::from_secs(5), retry)
         .await
@@ -1183,10 +1068,31 @@ async fn service_close_cancellation_retains_actual_hosted_replicator_case() {
 }
 
 async fn public_epoch_and_same_role_commands_fence_actual_adapter_work_case() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = tempfile::tempdir_in(".").unwrap();
     let mut attempts = start_attempts(temporary.path()).await;
-    let (mut replicas, _, _) = initialize_attempts(&mut attempts).await;
-    let replicator = attempts[0].application.testing_replicator().unwrap();
+    let (mut replicas, _, _) = initialize_open_attempts(&mut attempts).await;
+    let (_, opened) = current_public_reports(&attempts).await;
+    let role = PublicOperationProgram::Role {
+        epoch: configuration().epoch,
+        role: ReplicaRole::ActiveSecondary,
+    };
+    execute_public_command(
+        &attempts,
+        &PublicCommand {
+            target_index: 1,
+            request: public_operation_request(
+                1,
+                &opened[1],
+                program_intent(&opened[1], "native-observer-secondary-role", 2, role),
+            ),
+        },
+    )
+    .await;
+    let replicator = attempts[1].application.testing_replicator().unwrap();
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("42").unwrap())
+    );
     for (revision, program, retired, kind) in [
         (
             4,
@@ -1200,7 +1106,7 @@ async fn public_epoch_and_same_role_commands_fence_actual_adapter_work_case() {
             5,
             PublicOperationProgram::Role {
                 epoch: Epoch::new(0, 44),
-                role: ReplicaRole::Primary,
+                role: ReplicaRole::ActiveSecondary,
             },
             true,
             wire::PublicV1CallKind::Role,
@@ -1214,18 +1120,18 @@ async fn public_epoch_and_same_role_commands_fence_actual_adapter_work_case() {
             wire::PublicV1CallKind::Epoch,
         ),
     ] {
-        let (mut client, before) = status(attempts[0].control, 1).await;
+        let (mut client, before) = status(attempts[1].control, 2).await;
         let before = public_report(&before);
         let operation_id = format!("hosted-authority-{revision}");
         let request = public_operation_request(
-            0,
+            1,
             &before,
             program_intent(&before, &operation_id, revision, program),
         );
-        let (entered, release) = attempts[0].source.gate_next_observation();
+        let (entered, release) = attempts[1].source.gate_next_observation();
         let callback = tokio::spawn({
             let replicator = replicator.clone();
-            async move { replicator.current_progress().await }
+            async move { replicator.native_configuration_sequence().await }
         });
         tokio::time::timeout(Duration::from_secs(5), entered)
             .await
@@ -1240,35 +1146,55 @@ async fn public_epoch_and_same_role_commands_fence_actual_adapter_work_case() {
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(matches!(result, Err(KubericRuntimeError::Closed)));
+            assert!(matches!(result, Err(KubericAdapterError::Closed)));
             assert!(release.send(()).is_err());
         } else {
             assert!(!callback.is_finished());
             release.send(()).unwrap();
-            assert_eq!(callback.await.unwrap().unwrap(), 42);
+            assert_eq!(
+                callback.await.unwrap().unwrap(),
+                Some(ConfigurationSequence::parse("42").unwrap())
+            );
         }
-        let (_, after) = status(attempts[0].control, 1).await;
+        let (_, after) = status(attempts[1].control, 2).await;
         assert!(completed_success(
             after.public_v1.as_ref().unwrap(),
             &operation_id,
             revision,
             kind
         ));
-        assert_eq!(replicator.current_progress().await.unwrap(), 42);
+        let report = public_report(&after);
+        assert_unsupported_queries(&report);
+        assert!(report.configuration.is_none());
+        assert_ne!(report.read_status, AccessStatus::Granted);
+        assert_ne!(report.write_status, AccessStatus::Granted);
+        assert!(replicator.admitted_topology().is_none());
+        assert_eq!(
+            replicator.native_configuration_sequence().await.unwrap(),
+            Some(ConfigurationSequence::parse("42").unwrap())
+        );
     }
     stop_all(&mut replicas).await;
 }
 
 async fn public_close_waits_for_actual_adapter_callback_drain_case() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = tempfile::tempdir_in(".").unwrap();
     let mut attempts = start_attempts(temporary.path()).await;
-    let (mut replicas, _, _) = initialize_attempts(&mut attempts).await;
-    let application = attempts[0].application.clone();
+    let (mut replicas, _, _) = initialize_open_attempts(&mut attempts).await;
+    let application = attempts[1].application.clone();
     let replicator = application.testing_replicator().unwrap();
-    let (mut client, before) = status(attempts[0].control, 1).await;
+    replicator
+        .change_role(configuration().epoch, ReplicaRole::ActiveSecondary)
+        .await
+        .unwrap();
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("42").unwrap())
+    );
+    let (mut client, before) = status(attempts[1].control, 2).await;
     let before = public_report(&before);
     let request = public_operation_request(
-        0,
+        1,
         &before,
         program_intent(
             &before,
@@ -1289,7 +1215,7 @@ async fn public_close_waits_for_actual_adapter_callback_drain_case() {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(replicator.current_progress())
+                .block_on(replicator.native_configuration_sequence())
         }
     });
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1321,7 +1247,7 @@ async fn public_close_waits_for_actual_adapter_callback_drain_case() {
     release_tx.send(()).unwrap();
     assert!(matches!(
         callback.join().unwrap(),
-        Err(KubericRuntimeError::Closed)
+        Err(KubericAdapterError::Closed)
     ));
     let response = tokio::time::timeout(Duration::from_secs(5), close)
         .await
@@ -1355,10 +1281,11 @@ async fn public_close_waits_for_actual_adapter_callback_drain_case() {
 }
 
 async fn retained_dispatch_survives_runtime_restart_as_historical_session_evidence_case() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = tempfile::tempdir_in(".").unwrap();
     let mut first_attempts = start_attempts(temporary.path()).await;
     assert_initialization_listeners(&mut first_attempts).await;
-    let (mut first_replicas, first_sessions, _) = initialize_attempts(&mut first_attempts).await;
+    let (mut first_replicas, first_sessions, _) =
+        initialize_open_attempts(&mut first_attempts).await;
     let primary_application_root = first_attempts[0].application_root.clone();
     stop_all(&mut first_replicas).await;
     drop(first_replicas);
@@ -1385,7 +1312,7 @@ async fn retained_dispatch_survives_runtime_restart_as_historical_session_eviden
                 .unwrap(),
         );
     }
-    let restarted_reports = reports(&restarted_attempts, false).await;
+    let restarted_reports = reports(&restarted_attempts, None).await;
     let restarted_sessions = restarted_reports
         .iter()
         .map(|report| public_report(report).process_session_id.to_string())
@@ -1421,7 +1348,7 @@ async fn retained_dispatch_survives_runtime_restart_as_historical_session_eviden
 }
 
 async fn application_binding_without_agent_metadata_is_reported_unsafe_case() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = tempfile::tempdir_in(".").unwrap();
     let (controls, replications) = free_host_addresses();
     let root = temporary.path().join("member-1");
     std::fs::create_dir(&root).unwrap();
@@ -1477,10 +1404,10 @@ async fn application_binding_without_agent_metadata_is_reported_unsafe_case() {
 }
 
 async fn established_public_host_rejects_changed_application_path_and_topology_case() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = tempfile::tempdir_in(".").unwrap();
     let mut first_attempts = start_attempts(temporary.path()).await;
     assert_initialization_listeners(&mut first_attempts).await;
-    let (mut first_replicas, _, _) = initialize_attempts(&mut first_attempts).await;
+    let (mut first_replicas, _, _) = initialize_open_attempts(&mut first_attempts).await;
     stop_all(&mut first_replicas).await;
 
     let (controls, replications) = free_host_addresses();

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -60,6 +60,7 @@ impl Drop for CallbackDrop {
 struct UnavailableSource {
     config: ObserverConfig,
     gate: Mutex<Option<CallbackGate>>,
+    observations: AtomicUsize,
 }
 
 #[async_trait]
@@ -69,6 +70,7 @@ impl SqlServerObservationSource for UnavailableSource {
     }
 
     async fn observe(&self) -> Result<Observation<InstanceSnapshot>, RuntimeError> {
+        self.observations.fetch_add(1, Ordering::SeqCst);
         let gate = self.gate.lock().unwrap().take();
         if let Some(gate) = gate {
             let _dropped = CallbackDrop(Some(gate.dropped));
@@ -146,6 +148,7 @@ impl ApplicationFactory for MssqlFactory {
         let source = Arc::new(UnavailableSource {
             config: ObserverConfig::from_json(&observer).map_err(application_error)?,
             gate: Mutex::new(None),
+            observations: AtomicUsize::new(0),
         });
         let service = Arc::new(SqlServerService::with_observation_source(
             config,
@@ -234,8 +237,8 @@ async fn open_observers(
             )?;
             require(
                 matches!(&report.progress.current_progress, ProgressQueryResult::Failed(message)
-                    if message.contains("SQL Server observation is unavailable: Unreachable")),
-                "current progress must retain the actual native observation rejection",
+                    if message.contains("current_progress is disabled by the observe-only SQL Server adapter")),
+                "current progress must retain the explicit unsupported MSSQL result",
             )?;
             require(
                 matches!(&report.progress.catch_up_capability, ProgressQueryResult::Failed(message)
@@ -275,7 +278,7 @@ async fn open_observers(
 }
 
 #[test]
-fn controller_opens_unavailable_mssql_and_drains_owned_work() {
+fn controller_opens_unsupported_mssql_observers_and_drains_native_work() {
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -303,13 +306,33 @@ async fn exercise_controller() {
     let mut retained_child = None;
     let scenario = async {
         let (replica, child) = open_observers(&mut cluster, &factory).await?;
+        for (result, operation) in [
+            (child.current_progress().await, "current_progress"),
+            (child.catch_up_capability().await, "catch_up_capability"),
+        ] {
+            require(
+                matches!(result, Err(kuberic_runtime::RuntimeError::Application(message))
+                    if message == format!("{operation} is disabled by the observe-only SQL Server adapter")),
+                "open public queries must fail with their exact unsupported operation",
+            )?;
+        }
+        require(
+            factory
+                .replicas
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|replica| replica.source.observations.load(Ordering::SeqCst) == 0),
+            "public reporting and queries must not observe SQL",
+        )?;
         let (entered, entry) = oneshot::channel();
         let (dropped, cancellation) = oneshot::channel();
         *replica.source.gate.lock().unwrap() = Some(CallbackGate { entered, dropped });
         let querying = child.clone();
-        callback = Some(tokio::spawn(
-            async move { querying.current_progress().await },
-        ));
+        // Independently native work, not a successful public query or admission.
+        callback = Some(tokio::spawn(async move {
+            querying.native_configuration_sequence().await
+        }));
         retained_child = Some(child);
         cancelled = Some(cancellation);
         cluster
@@ -339,11 +362,19 @@ async fn exercise_controller() {
     assert_eq!(cancelled_at_finish, Some(Ok(())));
     assert!(matches!(
         callback_result,
-        Some(Ok(Err(kuberic_runtime::RuntimeError::Closed)))
+        Some(Ok(Err(kuberic_mssql::kuberic::KubericAdapterError::Closed)))
     ));
 
     let replicas = factory.replicas.lock().unwrap().clone();
     assert_eq!(replicas.len(), 3);
+    assert_eq!(
+        replicas
+            .iter()
+            .map(|replica| replica.source.observations.load(Ordering::SeqCst))
+            .sum::<usize>(),
+        1,
+        "only the separately owned native callback may observe SQL"
+    );
     for replica in replicas {
         assert!(replica.drained.load(Ordering::Acquire));
         tokio::time::timeout(DRAIN_BUDGET, replica.service.wait_for_containment())

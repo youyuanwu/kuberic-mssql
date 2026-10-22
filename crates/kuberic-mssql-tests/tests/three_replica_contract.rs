@@ -619,6 +619,16 @@ print(json.dumps({'seams': {name: os.getenv(name) for name in names},
     }
     let output = command.output().unwrap();
     assert!(output.status.success());
+    let coverage = std::process::Command::new("python3")
+        .arg(script.parent().unwrap().join("live_coverage.py"))
+        .arg("--filter")
+        .output()
+        .unwrap();
+    assert!(coverage.status.success());
+    let filter = String::from_utf8(coverage.stdout).unwrap();
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostics.contains("BLOCKED licensed coverage: 49 journeys"));
+    assert!(diagnostics.contains("not executed or qualified"));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(
         report["seams"]
@@ -634,7 +644,9 @@ print(json.dumps({'seams': {name: os.getenv(name) for name in names},
             "live",
             "--run-ignored",
             "only",
-            "--test-threads=1"
+            "--test-threads=1",
+            "-E",
+            filter.trim()
         ])
     );
     for (key, family) in [

@@ -1,9 +1,11 @@
 import copy
 import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
 import validate_nextest_partitions as validator
+import live_coverage
 
 
 def identity(name, binary="ordinary"):
@@ -21,13 +23,50 @@ class PartitionCoverageTests(unittest.TestCase):
                 validator.ListedTest(ordinary, False, True),
                 validator.ListedTest(live, True, True),
                 validator.ListedTest(excluded, True, True),
-            ]),
+            ], blocked=set()),
             ({ordinary}, {live}),
         )
 
     def test_unknown_ignored_test_is_not_silently_omitted(self):
         with self.assertRaisesRegex(validator.ValidationError, "unclassified ignored"):
-            validator.classify([validator.ListedTest(identity("unknown"), True, True)])
+            validator.classify([validator.ListedTest(identity("unknown"), True, True)], blocked=set())
+
+    def test_blocked_coverage_is_accounted_not_active(self):
+        ordinary = identity("ordinary")
+        live = identity("active", live_coverage.BINARY)
+        blocked = identity("blocked", live_coverage.BINARY)
+        rows = [
+            validator.ListedTest(ordinary, False, True),
+            validator.ListedTest(live, True, True),
+            validator.ListedTest(blocked, True, True),
+            validator.ListedTest(next(iter(validator.EXCLUDED)), True, True),
+        ]
+        self.assertEqual(validator.classify(rows, blocked={blocked}), ({ordinary}, {live}))
+        with self.assertRaisesRegex(validator.ValidationError, "blocked licensed inventory is stale"):
+            validator.classify(rows[:-2] + rows[-1:], blocked={blocked})
+        rows[2] = validator.ListedTest(blocked, False, True)
+        with self.assertRaisesRegex(validator.ValidationError, "not an ignored licensed test"):
+            validator.classify(rows, blocked={blocked})
+
+    def test_empty_live_shard_requires_explicit_permission_and_complete_union(self):
+        case = identity("active", live_coverage.BINARY)
+        partitions = [{case}, set(), set(), set()]
+        validator.validate_partition_sets({case}, partitions, "live", allow_empty=True)
+        with self.assertRaisesRegex(validator.ValidationError, "empty"):
+            validator.validate_partition_sets({case}, partitions, "ordinary")
+        with self.assertRaisesRegex(validator.ValidationError, "missing="):
+            validator.validate_partition_sets({case}, [set()] * 4, "live", allow_empty=True)
+
+    def test_blocked_manual_recipe_fails_with_explicit_coverage_limit(self):
+        result = subprocess.run(
+            [sys.executable, live_coverage.__file__, "--require-public"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not executed or qualified", result.stdout)
+        self.assertIn("no fixture was launched", result.stderr)
 
     def test_exact_disjoint_partitions(self):
         cases = [identity(str(i)) for i in range(4)]

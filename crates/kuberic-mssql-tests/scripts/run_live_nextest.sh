@@ -8,6 +8,8 @@ fi
 root="$(realpath -m "$1")"
 shift
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+python3 "$script_dir/live_coverage.py" >&2
+live_filter="$(python3 "$script_dir/live_coverage.py" --filter)"
 mkdir -m 700 -p "$root"
 for family in one-replica three-replica lease-fence; do
   if [[ -L "$root/$family" || ( -e "$root/$family" && ! -d "$root/$family" ) ]]; then
@@ -36,7 +38,7 @@ env -u SQLSERVER_TEST_EULA_ACCEPTED \
   KUBERIC_MSSQL_LEASE_FENCE_ROOT="$root/lease-fence" \
   KUBERIC_MSSQL_PHASE_TIMING_DIR="$timing_root" \
   CARGO_BUILD_JOBS=1 \
-  "$@" --profile live --run-ignored only --test-threads=1 &
+  "$@" --profile live --run-ignored only --test-threads=1 -E "$live_filter" &
 child=$!
 cancelled=0
 forward_signal() {
