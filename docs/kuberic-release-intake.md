@@ -85,7 +85,7 @@ Profile version 2 is the Public V1 intake profile. It retains the same
 
 | Version 1 gate | Version 2 gate | Public V1 meaning |
 |---|---|---|
-| `external_progress_contract` | `ag_sequence_history_contract` | Historical gate identity, not permission to publish AG sequence as public progress. The current adapter refuses both unsupported semantic queries; missing native/public correspondence must remain blocked, not pass because native election metadata is available. |
+| `external_progress_contract` | `ag_sequence_history_contract` | Historical gate identity, not permission to publish AG sequence as public progress. Current progress is unsupported and capability is honestly unknown/inapplicable; missing native/public correspondence stays blocked, not passed by native election metadata or the unknown sentinel. |
 | `signed_authorization_contract` | `ordinary_mutation_boundary` | Ordinary construction cannot reach any SQL executor path. The released Public V1 transport is not described as authenticated; licensed bootstrap remains a separate bounded test-only construction. |
 
 All other gate identities are unchanged. A version-2 record containing a
@@ -104,7 +104,7 @@ then exact archived-binary cleanup including nested journal recovery.
 The GitHub Actions job log is the run evidence.
 Test logs and evidence artifacts are not committed to this repository.
 The current 49 blocked licensed journeys are listed separately in CI output
-and its summary. Passing the 10 active licensed cases does not qualify those
+and its summary. Passing the 26 active licensed cases does not qualify those
 journeys, prove history/catch-up support or clear a blocked release-intake gate.
 The profile identifiers/schema are unchanged; unsupported semantic evidence
 must not be reported as a passing gate.
@@ -117,8 +117,8 @@ adapter has no launcher, never accepts an EULA, and never deploys SQL Server.
 The licensed Stage 3 configuration and seed callbacks remain a SQL-native test
 seam, not end-to-end Public V1 Build operations. Public V1 Build evidence is
 ordinary/server-free negative coverage for valid idle-build DTOs and
-effect-free rejection. Observer reports expose actual unsupported
-current-progress/catch-up-capability query failures, with no progress-based
+effect-free rejection. Observer reports expose actual unsupported current
+and unknown/inapplicable capability, with no progress-based
 configuration or serving admission. The former configured role/access reports
 and AG-sequence projections were not database history or retention proof;
 those public-ready paths are currently blocked. Direct native observation,
@@ -171,7 +171,7 @@ callback task has settled; it is not host-ordering evidence.
    just ci
    ```
 
-   The command performs setup, ordinary checks and the 10 active licensed
+   The command performs setup, ordinary checks and the 26 active licensed
    cases sequentially while visibly reporting the 49 blocked public journeys.
    Public-ready same-root restart, fault and hosted-witness gates are not
    executed or satisfied by that active success. CI workers always attempt exact cleanup with archived
@@ -181,6 +181,12 @@ callback task has settled; it is not host-ordering evidence.
    uploaded as evidence artifacts. Unavailable or unrun candidate-required
    licensed gates remain `pending`; they are never inferred from server-free
    success.
+   Sixteen active native-source-foundation subcases recover independent
+   recovery/ownership/effect checks through the actual adapter, and 28
+   synthetic-record mutations recover ordinary validator checks. Neither
+   substitutes for the unavailable public association/history gate. Further
+   native join/seed/target/restart harness decoupling is orchestration work,
+   separate from the missing semantic correspondence proof.
 6. Fill one JSON record for the applicable profile version with every
    canonical gate and nonempty evidence. Validate it:
 

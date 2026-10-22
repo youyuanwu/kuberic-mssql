@@ -61,7 +61,9 @@ sessions, storage/history and independent native identity anchors. Real hosted
 supersession, restart, terminal and uncertain-command journeys rejected predecessor
 evidence. Those positive-baseline journeys are now blocked; current server-free
 coverage retains native replay, actual Open ownership/lifecycle/drainage and
-explicit failed startup, not that association battery. The historical result
+explicit failed startup. Five pure validator groups now recover 28 selected
+receipt/history/peer/startup/independent-anchor mutations, not the actual
+accepted hosted association. The historical result
 is bounded diagnostic evidence, not a live hosted witness,
 semantic public/native history mapping or production authority.
 
@@ -70,25 +72,50 @@ has demonstrated one licensed sampled native association with exact accepted
 hosted configuration/session/storage evidence and independent native identity.
 Its corrected startup gate preserves contained roles/access. This does not
 establish semantic native/public history mapping or complete Stage 6A.
-That measurement is historical: current unsupported semantic queries block
+That measurement is historical: current-progress refusal blocks
 hosted witness startup and the former positive offline association journeys.
 Their downstream checks are not current qualification.
 
 The [server-free shared controller pilot](kuberic-progress.md#shared-controller-harness-pilot)
-exercises real controller-issued Open, honest unsupported semantic queries, nonadmission,
+exercises real controller-issued Open, failed current and honest unknown capability, nonadmission,
 and owned host/application drainage. It does not establish a ready cluster or
 replace the native witnesses. The selected runtime already supports typed
 current/capability query outcomes and successful terminal reports with failed
 closed-runtime queries; these are no longer pending schema/reporting fixes.
 
-Unsupported public AG-sequence/zero/unknown projections have been removed.
+Unsupported public AG-sequence/current-zero projections have been removed.
+Contract-permitted `INVALID_LSN` capability is implemented as unknown or
+inapplicable, never a retained floor or an admission grant.
 Deferred and initial foundation-only configuration refuse before SQL effects.
 These corrections make failures truthful; they do not supply the missing
-positive mapping. Canonical CI separately accounts for 49 blocked licensed
-journeys and runs the remaining active native/observer cases. A green active
+positive mapping. Sixteen separately named native source-foundation cases
+recover actual recovery/foreign-resource predicates and 13 precise source/AG
+effect reply-loss checkpoints under the existing capability. They return
+native evidence, not public configuration success or a ready/seeded group.
+Canonical CI runs 26 active licensed cases and separately accounts for 49
+blocked compound public journeys. A green active
 test gate is not completion of those blocked obligations or Stage 6A.
 
-Planned work:
+#### Deferred work and ordering
+
+The blocked inventory is not one homogeneous proof gap. Keep these follow-ups
+separate, without restoring fake progress or successful partial callbacks:
+
+| Follow-up | Required result before it is called restored |
+|---|---|
+| Remaining independent native coverage | Decouple secondary join/grant, seed submission/compaction, target evidence and native restart fault drivers from public-ready setup. Exercise the same actual callbacks/effects, exact intended fault and cleanup. These are harness/orchestration gaps, not all intrinsically dependent on a public history mapping. |
+| Minimum positive public path | Establish a supported SQL-native/public history and role-specific queue/quorum/ACK/recovery mapping through fixed APIs, then exercise genuine `ReplicaHost` bootstrap/configuration and hosted association/provenance. Unknown capability may remain where permitted; invented current zero or AG sequence cannot unblock the path. |
+| Advanced transfer/history/admission | Prove retained transfer to an exact peer, recovered-prefix continuity across restart/replacement/forks, justified history changes, nonvoting build admission and current/previous/required-successor catch-up. Restore the corresponding full journeys only when their own evidence/postconditions exist. |
+| Role movement | Complete the separate native lease, exact-incarnation fencing, access and ordering gates before planned switchover or failover. Native source preparation and passing validator tests do not supply this authority. |
+
+A narrow proven fresh-state public path need not wait for every advanced
+failover/rejoin feature. Conversely, reactivating a compound case requires all
+its original assertions to run; a new native-only subcase or synthetic record
+test does not requalify that whole journey. If a sound mapping cannot be
+established under the fixed contracts, record the architectural blocker rather
+than invent a provider, alternate replication log, counter or narrowed position.
+
+Detailed remaining obligations:
 
 - extend the sampled live [native acknowledged-record witness](kuberic-progress.md#native-prefix-coverage)
   to hardening ahead of redo under separately reviewed controls, while retaining

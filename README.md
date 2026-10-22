@@ -14,8 +14,10 @@ native seam is not exposed by production configuration; the public-ready
 recipe is now blocked by unsupported progress/history semantics.
 
 The optional Kuberic runtime implements the fresh-state Public V1 replacement
-contract partially. Both public progress queries refuse unsupported semantics
-after lifecycle checks, without SQL observation. Validated AG configuration
+contract partially. Current progress refuses unsupported semantics; capability
+returns the contract's `INVALID_LSN` unknown/inapplicable result after lifecycle
+checks, without SQL observation. That unknown is not a retained floor or an
+admission grant. Validated AG configuration
 sequence is available only as independent native election metadata, not public
 progress or retained capability. Kuberic epochs and exact decimal database
 positions remain separate domains. The root `Cargo.toml` is authoritative for
@@ -107,9 +109,9 @@ Runtime identity and topology files reject unknown, duplicate, ambiguous,
 symlinked or oversized inputs. The application root contains only a private
 schema-versioned binding of non-secret identity and topology digests. Kuberic
 role and epoch authority can initially arrive before configuration admission.
-Public `current_progress` and `catch_up_capability` refuse unsupported
-SQL/native-history semantics; they do not publish zero, AG sequence or an
-unknown sentinel to keep bootstrap moving. Public V1
+Public `current_progress` refuses unsupported SQL/native-history semantics;
+`catch_up_capability` honestly reports unknown. Neither substitutes AG sequence
+or invented current progress to keep bootstrap moving. Public V1
 current configurations describe exact ready remote active secondaries; the
 local member is recovered from runtime identity and the configuration
 descriptor, while idle build targets remain separate and require
@@ -122,7 +124,7 @@ No client SQL listener or service address is published.
 For validated native election metadata, use the typed
 `SqlServerReplicator::native_configuration_sequence` API. Public scalar
 queries are not a source of native election metadata. Valid hosted reports
-retain their failed query outcomes; progress-dependent admission remains
+retain failed current and unknown capability; progress-dependent admission remains
 blocked. The [integration guide](docs/kuberic-progress.md#upstream-reporting-and-history-blockers)
 records the remaining semantic proof obligations; production remains observe-only.
 
@@ -408,9 +410,12 @@ CARGO_BUILD_JOBS=1 cargo test --locked -p kuberic-mssql-tests \
 ```
 
 They retain native replay and partial-startup ownership, and prove that actual
-failed public queries block hosted configuration with owned drainage. Former
+failed current with unknown capability blocks hosted configuration with owned drainage. Former
 positive hosted associations and their downstream provenance checks are
-currently blocked, not requalified by these tests.
+currently blocked, not requalified by these tests. Five separate ordinary
+validator groups recover 28 synthetic-record rejection cases through the
+actual receipt/history/peer/startup and independent-anchor predicates; these
+are record-consistency checks, not successful hosted execution.
 
 The complete local pipeline remains serial:
 
@@ -418,17 +423,27 @@ The complete local pipeline remains serial:
 just ci
 ```
 
-It runs server-free checks, then all 10 active ignored SQL fixture tests
+It runs server-free checks, then all 26 active ignored SQL fixture tests
 through nextest's `live` profile and shared `live-sql` group. The
 [exact blocked-coverage ledger](crates/kuberic-mssql-tests/scripts/live_coverage.py)
 separately accounts for 49 compiled, ignored journeys whose public semantic
 prerequisites are unsupported. CI prints that inventory and publishes it in
 the job summary; active success does not qualify blocked journeys or complete
 Stage 6A. One-replica observation/recovery, native-only owned-launch recovery,
-native prefix and lease/fence suites remain serial within each worker.
+native source foundation, native prefix and lease/fence suites remain serial within each worker.
 The unrelated privileged ACL test is not selected.
 Rust ignores keep ordinary Cargo server-free; the explicit live recipe uses
 `--run-ignored only`. Live failures stop further scheduling and remain failures.
+
+The 16 [native source-foundation cases](docs/kuberic-progress.md#independent-native-source-foundation)
+recover three actual recovery/foreign-resource checks and 13 precise
+reply-loss checkpoints through the existing capability-gated adapter code.
+They prepare only the owned source/local-primary foundation, never public
+configuration success or a ready three-member group. The original 49 compound
+journeys remain blocked; their native subchecks must not all be classified as
+intrinsically dependent on public history proof. Remaining native harness
+orchestration and genuine public semantics are separate
+[deferred work](docs/roadmap.md#stage-6a-follow-up-replicator-semantic-conformance).
 
 CI follows Kuberic's build-once nextest archive pattern: one producer checks,
 compiles and uploads only the compressed binaries/metadata archive for one day.

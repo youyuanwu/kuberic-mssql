@@ -79,8 +79,8 @@ validation:
 - exact SQL Server `numeric(25,0)` database progress values without narrowing
   them to Kuberic progress;
 - a dedicated signed `ConfigurationSequence` native accessor and optional
-  Public V1 adapter whose public progress/capability queries explicitly refuse
-  unsupported semantics, keeping native election metadata, lifecycle epochs
+  Public V1 adapter whose current progress is unsupported and capability is
+  honestly unknown, keeping native election metadata, lifecycle epochs
   and native decimal database positions separate;
 - observations that distinguish present, absent, stale, and failed evidence;
 - versioned operation envelopes with canonical SHA-256 input signatures;
@@ -105,8 +105,8 @@ an explicit bootstrap capability and closed mutation executor are injected by
 the licensed test harness. That construction lets the configured primary own
 source database and AG convergence, each secondary own only its local join, and
 Kuberic build authority own one group-level `ADD DATABASE` dispatch in the
-native test seam. Public current-progress and capability queries now refuse:
-AG configuration sequence and absent evidence cannot establish the selected
+native test seam. Public current-progress refuses and capability returns
+`INVALID_LSN` as unknown/inapplicable: AG sequence and absent evidence cannot establish the selected
 queue/quorum, receiver/ACK, recovery or retained-history semantics. Deferred
 and initial source-foundation-only configurations refuse before effects.
 Full native topology/replay remains separately supported, not a ready public
@@ -181,7 +181,7 @@ which dependency those contracts must be checked against.
 
 | Area | Required semantics | Current boundary |
 |---|---|---|
-| Progress and history | Primary native queue/quorum, secondary receiver/ACK and protected recovery progress have distinct meanings. Native catch-up capability is separate from application durability and SQL sampled prefixes. | A typed native configuration-sequence read distinguishes unavailable evidence from observed zero. Both public queries explicitly refuse unsupported semantics; no compatibility scalar or retained floor is published. |
+| Progress and history | Primary native queue/quorum, secondary receiver/ACK and protected recovery progress have distinct meanings. Native catch-up capability is separate from application durability and SQL sampled prefixes. | A typed native configuration-sequence read distinguishes unavailable evidence from observed zero. Current explicitly refuses; capability is contract-valid unknown/inapplicable, not a retained floor or admission grant. |
 | Epoch authority | Epoch barriers fence predecessor operations on primaries and secondaries, including same-role changes. | Higher validated epochs retire predecessor dispatch/publication authority, including same-role changes; equal replays preserve it. Submitted effects retain their existing durable uncertainty and exclusion. |
 | Configuration and build | Successful callbacks certify the exact supported configuration. An idle build target is outside voting membership; build completion and later admission are separate. | Exact native topology/replay retains its limited scope. Deferred/initial source-foundation requests refuse before effects, not successful partial completion. The seed-build translator still requires a target in the frozen active-secondary layout, despite accepting idle build DTOs. |
 | Access and catch-up | Serving follows partition read/write status, not role alone. Catch-up satisfies the requested predicate for applicable current/previous configurations and any required successor. | Ordinary hosts publish no client address and do not manage SQL serving access. Catch-up callbacks explicitly reject; native synchronization alone is not a public catch-up receipt. |
@@ -195,8 +195,9 @@ transactions advance. It cannot stand in for data durability. Native
 across fields or recovery lineages to fill the public signed-64-bit slot.
 A valid public progress/history model must be established before using these
 callbacks for data-bearing admission. Although the fixed contract permits
-unknown/inapplicable capability, this adapter refuses both unimplemented
-queries rather than publishing a successful sentinel or native sequence.
+unknown/inapplicable capability, this adapter returns that explicit sentinel
+while refusing unimplemented current progress. Neither publishes native
+sequence as data progress or a retained floor.
 Unsupported operations reject instead of certifying unproved postconditions.
 
 The [native evidence assessment](kuberic-progress.md#native-evidence-feasibility)
@@ -223,7 +224,7 @@ semantic prerequisites; their historical results are not current qualification.
 
 `SqlServerReplicator::native_configuration_sequence` now exposes the existing
 validated native read as an optional `ConfigurationSequence`, independently of
-the refused public queries. It does not establish public membership,
+the public progress/capability callbacks. It does not establish public membership,
 readiness, election quorum, or promotion authority.
 The selected host already represents current and capability independently,
 including query failures in valid registered reports. The controller waits
@@ -507,7 +508,7 @@ different databases, or compared across incompatible recovery histories. They
 also cannot be safely narrowed, hashed, saturated, or substituted into
 Kuberic's signed 64-bit LSN slot. Every progress-bearing transition therefore
 includes both the database GUID and recovery-fork GUID. Public V1
-callbacks now refuse unsupported semantic progress and capability. The native
+current callback refuses unsupported semantic progress; capability is unknown. The native
 AG configuration sequence remains independent election metadata, not the
 required public history contract. Any future
 operation that depends on database-native progress must compare the appropriate
@@ -737,7 +738,8 @@ accepted `Primary`/`ActiveSecondary` roles and `Primary`/`Secondary` progress
 roles. The host granted read/write access on its configured primary and reported
 `NotPrimary` for both on secondaries; this is not a SQL external write lease.
 The current typed `current_progress` and `catch_up_capability` observations
-are explicit failed queries, not AG-sequence or unknown/zero projections.
+are failed current and contract-valid unknown capability, not AG-sequence or
+invented current-zero projections.
 The observer-only controller path opens hosts but does not admit configuration
 or grant access from that missing evidence. Public-ready fixture recipes and
 hosted-native associations are consequently blocked, not requalified.
@@ -815,7 +817,7 @@ serial SQL hash partition without rebuilding, and always attempts exact
 cleanup using the archived fixture binaries. Local `just ci` retains complete
 serial active coverage with separately visible blocked obligations. GitHub Actions logs are the run evidence; no archives, test
 logs or fixture-private state are committed. The
-canonical runner selects all 10 active ignored SQL cases and separately
+canonical runner selects all 26 active ignored SQL cases and separately
 reports 49 blocked public-progress-dependent journeys. An exact-name ledger
 and archived inventory validation reject stale, missing or reclassified cases;
 passing active tests is not full native/release qualification. The unrelated
@@ -827,6 +829,16 @@ Rust one-replica lifecycle owns one digest-pinned SQL Server 2025
 Enterprise Developer container and validates absent AG, partial permission
 denial, invalid TLS and fresh production CLI provenance. It creates no
 availability group and never adopts or borrows an existing container.
+
+Independent recovery now includes 16 native source-foundation cases using the
+same capability-gated source converger: three actual recovery/foreign-resource
+checks and 13 precise reply-loss effects. Their result certifies only owned
+source/local-primary facts, not joins, grants, seeding, data prefixes or public
+configuration completion. Five ordinary validator groups exercise 28
+synthetic-record mutations through actual receipt/history/peer/startup and
+independent-anchor checks. These do not requalify the blocked hosted
+association journeys. Remaining native harness orchestration and genuinely
+missing public semantics are separate [deferred work](roadmap.md#stage-6a-follow-up-replicator-semantic-conformance).
 
 The Rust three-replica lifecycle pins
 `mcr.microsoft.com/mssql/server@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726`

@@ -3,9 +3,10 @@
 ## Purpose
 
 The optional Kuberic integration implements a partial fresh-state Public V1
-`Replicator` adapter. Both public progress/capability callbacks explicitly
-refuse unsupported semantic queries rather than publish SQL availability-group
-sequence, zero or an unknown placeholder. Kuberic lifecycle epochs and SQL-native database positions are
+`Replicator` adapter. Public current progress refuses unsupported semantics;
+capability reports the contract-permitted `INVALID_LSN` unknown/inapplicable
+result, not a retained floor. Neither uses SQL availability-group sequence or
+invented current progress. Kuberic lifecycle epochs and SQL-native database positions are
 independent authority domains; full Kuberic/Service Fabric semantic conformance
 is not yet established.
 
@@ -15,7 +16,8 @@ hosted/bootstrap recipes are blocked rather than kept successful through
 unproved projections. Safe refusal is not positive semantic conformance.
 
 Ordinary construction is deliberately observe-only. It can open as a Kuberic
-application, validate a requested native role and report failed semantic queries. An
+application, validate a requested native role and report failed current with
+unknown capability. An
 explicit bootstrap-capable construction used by licensed validation can also
 create the managed source database and AG, join local secondaries, and execute
 one build-authorized automatic-seeding dispatch. Neither construction can
@@ -40,9 +42,10 @@ native evidence through that API before public admission. An observed zero
 sequence is valid native metadata but is not promotable; missing evidence
 remains `None`, not zero. Configuration epoch is never a fallback progress value.
 
-Public `current_progress` and `catch_up_capability` now explicitly refuse
-unsupported semantic queries, even after native topology admission. The
-former zero/unknown/sequence compatibility projections have been removed.
+Public `current_progress` explicitly refuses unsupported semantics, even after
+native topology admission. `catch_up_capability` returns unknown/inapplicable
+without claiming a transfer range. The former zero/AG-sequence current
+projections and AG-sequence retained floor have been removed.
 AG sequence can remain unchanged while
 customer transactions advance; it does not prove that a transaction has been
 committed, hardened, or redone.
@@ -84,14 +87,14 @@ association, but does not admit public membership or establish readiness.
 Without a topology expectation or association, the read validates the native
 profile but does not freeze a binding or acquire bound-history guarantees.
 
-Both public queries preserve unopened/terminal lifecycle errors and otherwise
-return operation-specific unsupported errors without observing SQL. The host
-represents these as independent `Failed` queries in valid reports, not
-`NotReady`, `NotQueried`, successful zero or unknown capability. Native callers
+Both public queries preserve unopened/terminal lifecycle errors. Otherwise
+current is an unsupported failure and capability is `Value(INVALID_LSN)`,
+without observing SQL. The host preserves those distinct outcomes in valid
+reports, not `NotReady`, `NotQueried`, invented current zero or a retained floor. Native callers
 use the typed API and retain its applicable role/binding/observation checks.
 Native metadata does not certify an election quorum, promotion eligibility,
 database durability or retained catch-up coverage
-([public callbacks](../crates/kuberic-mssql/src/kuberic.rs#L4712-L4723)).
+([public callbacks](../crates/kuberic-mssql/src/kuberic.rs#L4793-L4805)).
 
 ### Database-native positions
 
@@ -147,18 +150,18 @@ unique storage ownership or retained transfer capability.
 | Secondary receiver/ACK progress | Target-local positions and an executable exclusive flush-prefix predicate, with exact native history/incarnation and evidenced fixture configuration phases. | **Native sample demonstrated; public current refuses.** One record's sampled hardening coverage is not the selected contiguous receiver/ACK boundary or accepted public authority/history mapping. |
 | Opened recovery progress | SQL start, database/recovery identity and available local positions; recovery metadata can be unavailable. | **Public current refuses.** Establish exact recovered committed-prefix correspondence to accepted storage/history; missing or terminal evidence is not an empty history or access grant. |
 | History continuity | Database/family/recovery-fork identities, fork point, public storage/session authority and existing immutable runtime binding. | **No comparable public progress is published.** Prove recovered continuity or justified new history across restart, replacement and forks. Matching GUIDs/public IDs do not prove operation-history equivalence or unique ownership. |
-| Retained catch-up capability | Current positions and seed evidence; no native retained-transfer range is collected. | **Public capability refuses.** Prove complete retained/transferable history for the exact admitted peer across truncation/restart. Current tail, unknown capability or completed seed is not that proof. |
+| Retained catch-up capability | Current positions and seed evidence; no native retained-transfer range is collected. | **Public capability is unknown/inapplicable.** A supported retained floor still needs complete retained/transferable history for the exact admitted peer across truncation/restart. Current tail, the unknown sentinel or completed seed is not that proof. |
 | Configuration and required-successor catch-up | Exact three-replica topology and target-local seed/synchronization observations. | **Catch-up callbacks and incomplete public configuration refuse.** Count-one commitment does not prove exact successor/current/previous quorum coverage. Full exact native topology/replay remains separately scoped, not arbitrary transition or catch-up conformance. |
 
 The raw query and identity bindings are in
 [query.rs:296-334](../crates/kuberic-mssql/src/query.rs#L296-L334) and
 [kuberic.rs:506-542](../crates/kuberic-mssql/src/kuberic.rs#L506-L542).
-The [current callback implementations](../crates/kuberic-mssql/src/kuberic.rs#L4712-L4741)
-refuse unsupported current/capability and catch-up queries. Safe refusal removes
+The [current callback implementations](../crates/kuberic-mssql/src/kuberic.rs#L4793-L4823)
+refuse unsupported current/catch-up operations and report honest unknown capability. Safe refusal removes
 false success; it does not discharge the matrix's positive proof obligations.
 Current-configuration admission supports a constrained topology/bootstrap path,
 not arbitrary changing current/previous configurations
-([kuberic.rs:4813-5013](../crates/kuberic-mssql/src/kuberic.rs#L4813-L5013)).
+([kuberic.rs:4825-5024](../crates/kuberic-mssql/src/kuberic.rs#L4825-L5024)).
 
 Microsoft's [database-replica DMV documentation](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-objects/sys-dm-hadr-database-replica-states-transact-sql?view=sql-server-ver17)
 qualifies these observations: primary remote rows may be out of date;
@@ -181,6 +184,59 @@ documented secondary result is limited. These vendor descriptions are not
 build-specific live proof. An exact bounded scalar representation would still
 need supported ordering, history and recovery semantics; numeric width alone
 does not decide feasibility.
+
+### Independent native source foundation
+
+The hidden test-feature
+[`testing_prepare_native_source_foundation`](../crates/kuberic-mssql/src/kuberic.rs#L1454-L1530)
+reuses the actual source converger under its existing injected bootstrap
+capability. It accepts only a validated primary SourceFoundation input and
+returns already validated source/local-primary snapshots, with the original
+deadline, generation and freshness checks. It does not admit topology,
+publish role/progress or return a public configuration receipt. Ordinary
+construction cannot obtain mutation capability through this entry point;
+public deferred/foundation-only configuration still refuses before effects.
+
+Sixteen ignored native-only cases recover independent checks from the blocked
+compound journeys:
+
+- actual SIMPLE-inherited source recovery to FULL and exact foreign source
+  database/AG rejection;
+- nine source effect reply-loss boundaries: creation intent, creation,
+  intent removal, recovery, ownership, marker schema, full backup, log backup
+  and verification; and
+- four AG effect boundaries: ownership intent, creation intent, creation
+  and native binding.
+
+Each fault requires its exact real dispatch, one hit and the specific expected
+error; earlier generic failure cannot satisfy it. Recovery is checked through
+the actual SQL oracle. The fixture uses prepared owned members and the real
+adapter/executor, not unrelated fixture provisioning or a ready public group.
+Its synthetic fixture identities/sessions are not accepted-host authority or
+listener proof. Adapter containment precedes exact journaled disposal, and
+uncertain containment blocks disposal.
+
+These cases certify neither AG-intent removal, grants, secondary joins,
+seeding, data prefixes nor public readiness. Remaining native join/seed/target/
+restart coverage needs additional decoupled harness orchestration; it is not
+all intrinsically blocked on a public history mapping. The 49 original
+compound public journeys retain their complete assertions and remain blocked.
+
+After explicit licensed-fixture authorization and the existing
+[three-member prerequisites](../README.md#three-replica-licensed-happy-path):
+
+```bash
+env -u KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE \
+KUBERIC_MSSQL_THREE_REPLICA_ROOT="$PWD/target/mssql-native-source-foundation" \
+CARGO_BUILD_JOBS=1 cargo test --locked -p kuberic-mssql-tests \
+  --test live_three_replica native_foundation:: \
+  -- --ignored --nocapture --test-threads=1
+just cleanup-live-three-replica target/mssql-native-source-foundation
+```
+
+The cases are compiled/selected for licensed CI, not locally executed by the
+server-free qualification. Native preparation is not a conforming positive
+public progress/history path.
 
 ### First native proof toward switchover
 
@@ -325,9 +381,11 @@ separate gates, alongside SQL access, lease/fence and role-transition authority.
 **Historical association, currently blocked:** real public queries no longer
 provide the successful scalar prerequisites used by this diagnostic.
 Four positive association tests were consolidated away and the former
-contained-startup success case now tests actual failed prerequisites and
-owned drainage. Their downstream association/provenance/supersession checks
-are not current executable coverage. Independent native predicates, native
+contained-startup success case now tests actual failed current, unknown
+capability and owned drainage. Their actual hosted association/supersession
+journeys remain blocked. Five separate ordinary validator groups recover 28
+record-level mutations through the existing receipt, baseline, peer, startup
+and independent-anchor checks. Independent native predicates, native
 replay, real lifecycle fencing and concrete worker drainage remain active.
 
 The former server-free diagnostic associated **scripted native evidence with
@@ -483,11 +541,16 @@ source-specific output assembly and publication-clock staleness. Those cases
 used **synthetic native inputs**, including when inspecting the live output
 schema; they were not live evidence. Those quiet-assembly/provenance cases
 were removed with their unavailable positive public baseline, not retained as
-passing aliases. Current partial-startup cases retain actual Open observers,
+passing aliases. The new pure record tests restore selected consistency
+mechanisms, not that real hosted assembly. Their explicitly synthetic records
+validate before mutation rejection; coherent rewritten native samples first
+pass the existing native evaluator before the real bridge's shared independent
+anchor predicate rejects them. They never make a real host query or operation
+succeed. Current partial-startup cases retain actual Open observers,
 transferred/late handles, caller cancellation, cleanup deadlines and failed
 readiness/report joins.
 The current startup regression invokes the actual fixture configuration
-startup path, requires both real unsupported query failures in the blocked
+startup path, requires actual failed current and unknown capability in the blocked
 peer prerequisite, and joins every owned host. It does not produce accepted
 configuration/association receipts or exercise the removed altered-success
 provenance battery.
@@ -531,9 +594,10 @@ The upstream [SF V1 semantic-alignment plan](https://github.com/youyuanwu/kuberi
 provides architectural context, not a substitute for the selected source or
 SQL-native evidence. No application trait expansion is required or authorized.
 
-MSSQL no longer publishes AG-sequence/zero/unknown compatibility scalars.
-Both public queries refuse unsupported semantics and retain actual query
-failure reporting. Missing positive mapping remains a conformance blocker,
+MSSQL no longer publishes AG-sequence/zero current or an AG-sequence retained
+floor. Current remains a failed query and capability is honestly unknown;
+that sentinel is contract-valid but does not prove a retained range. Missing
+positive mapping remains a conformance blocker,
 not a completed gate. No dummy
 provider, fabricated counter, epoch fallback, or alternate replication log is
 introduced to hide missing native evidence.
@@ -687,10 +751,10 @@ CARGO_BUILD_JOBS=1 cargo test --locked -p kuberic-mssql-tests \
 ```
 
 The scenario observes three exact successful controller-issued Open receipts,
-then reconciles unsupported public semantic queries without increasing the
-harness's reconciliation-error count. Both queries report operation-specific
-failures without observing SQL or substituting zero. Role remains None, no configuration is
-admitted, and read/write access is not granted. These are query failures in
+then reconciles failed current and `Value(INVALID_LSN)` capability without
+increasing the harness's reconciliation-error count. Neither query observes
+SQL or substitutes current zero. Role remains None, no configuration is
+admitted, and read/write access is not granted. These are truthful query outcomes in
 valid reports, not failed configuration/catch-up operation receipts or a
 ready cluster.
 
@@ -720,8 +784,8 @@ The `kuberic` feature enables the service, custom replicator, and factory. The
 default observer build remains independent of Kuberic.
 
 Publishing an observed sequence through the inherent native API requires a new
-observation evaluated at request time. Both public semantic queries refuse
-without observing SQL; there is no pre-admission zero/unknown compatibility
+observation evaluated at request time. Public current refuses and capability
+is unknown without observing SQL; there is no pre-admission current-zero compatibility
 path. Native sequence publication requires:
 
 - the observation is successful, within the configured maximum age, and not
@@ -769,10 +833,10 @@ incarnation is local evidence: each runtime freezes and revalidates its own
 start identity, while the three-member validation proves all members
 collectively.
 
-Neither public query reports a successful scalar in any open role. Unopened
-and terminal queries retain their lifecycle errors; open queries return
-explicit unsupported failures. A successful status RPC can carry both failed
-queries. Native identity, session/address, epoch, role, health, synchronization,
+No successful current scalar is published. Unopened and terminal queries
+retain lifecycle errors; open current is unsupported and capability returns
+the valid unknown/inapplicable sentinel. A successful status RPC preserves
+these independent outcomes. Native identity, session/address, epoch, role, health, synchronization,
 lineage, incarnation and freshness checks remain on applicable native work,
 not as pointless SQL reads for an unimplemented public query.
 
@@ -833,7 +897,7 @@ failover callbacks remain explicit unsupported errors. Deferred and initial
 source-foundation configuration refuse before effects; complete native
 topology/replay retains only its established scope, not full semantic
 configuration/build conformance
-([configuration boundary](../crates/kuberic-mssql/src/kuberic.rs#L4743-L4823)).
+([configuration boundary](../crates/kuberic-mssql/src/kuberic.rs#L4825-L4906)).
 
 ## Ownership Model
 
@@ -976,8 +1040,8 @@ restart, container replacement, AG/database recreation, role drift, stale
 sample, sequence mismatch, suspended database, or unhealthy synchronization
 invalidates the binding.
 
-**Historical public journey, currently blocked:** unsupported current/capability
-queries prevent the startup/configuration prerequisites below. These ignored
+**Historical public journey, currently blocked:** failed current and unknown
+capability do not supply the startup/configuration prerequisites below. These ignored
 cases remain compiled and explicitly accounted, not counted as active licensed
 qualification. The native-only observation/prefix and owned-launch recovery
 paths remain independent.
@@ -1069,7 +1133,7 @@ nextest archive and four isolated test workers. Shard 1 validates exact-once
 partition coverage before its tests; shards 2–4 start without waiting.
 Each runs its ordinary slice then ignored-SQL hash partition without rebuilding,
 keeping the serial live profile and always attempting direct archived-binary
-cleanup. The canonical runner executes 10 active licensed cases and visibly
+cleanup. The canonical runner executes 26 active licensed cases and visibly
 accounts for 49 blocked public-progress-dependent cases. Archive validation
 requires every ignored case to be active exactly once, explicitly blocked,
 or the one known privileged ACL exclusion. Stale/nonignored ledger entries
@@ -1151,7 +1215,7 @@ The default runner namespace is `target/mssql-nextest-live`, with separate
 one-replica, three-replica and lease-fence families. `just check` preserves
 ordinary tests in those binaries and runs Cargo doctests separately.
 The live recipe clears case-narrowing environments and uses ignored-only
-selection with the exact-name 49-case blocked ledger; a live failure stops scheduling. Cleanup retains Removed journals
+selection with the exact-name 49-case compound-journey ledger; a live failure stops scheduling. Cleanup retains Removed journals
 and refuses live/unknown owners or unverifiable resources. Per-invocation
 nextest serialization is not a substitute for fixture ownership locks.
 
@@ -1178,7 +1242,7 @@ Exercise handled SIGTERM, recovery, retry, and idempotent cleanup:
 just test-live-three-replica-signal [root]
 ```
 
-Canonical `just ci` runs 10 active licensed cases after server-free checks and
+Canonical `just ci` runs 26 active licensed cases after server-free checks and
 reports 49 blocked journeys separately; no inter-suite ordering is promised.
 Signal/recovery and independent native recipes remain active. Public
 happy/restart/fault/conflict/target recipes are blocked, not counted as
