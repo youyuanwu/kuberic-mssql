@@ -56,10 +56,13 @@ Public coverage remains blocked, and the live hardening-with-redo-lag case
 remains unexercised. A sampled native witness does not complete Stage 6A.
 
 An [offline hosted association](kuberic-progress.md#offline-hosted-authority-association)
-now binds scripted native witnesses to actual public configuration receipts,
+historically bound scripted native witnesses to actual public configuration receipts,
 sessions, storage/history and independent native identity anchors. Real hosted
-supersession, restart, terminal and uncertain-command journeys reject predecessor
-evidence. This is bounded diagnostic evidence, not a live hosted witness,
+supersession, restart, terminal and uncertain-command journeys rejected predecessor
+evidence. Those positive-baseline journeys are now blocked; current server-free
+coverage retains native replay, actual Open ownership/lifecycle/drainage and
+explicit failed startup, not that association battery. The historical result
+is bounded diagnostic evidence, not a live hosted witness,
 semantic public/native history mapping or production authority.
 
 The [ignored live hosted witness](kuberic-progress.md#live-hosted-witness)
@@ -67,13 +70,23 @@ has demonstrated one licensed sampled native association with exact accepted
 hosted configuration/session/storage evidence and independent native identity.
 Its corrected startup gate preserves contained roles/access. This does not
 establish semantic native/public history mapping or complete Stage 6A.
+That measurement is historical: current unsupported semantic queries block
+hosted witness startup and the former positive offline association journeys.
+Their downstream checks are not current qualification.
 
 The [server-free shared controller pilot](kuberic-progress.md#shared-controller-harness-pilot)
-exercises real controller-issued Open, honest failed native queries, nonadmission,
+exercises real controller-issued Open, honest unsupported semantic queries, nonadmission,
 and owned host/application drainage. It does not establish a ready cluster or
 replace the native witnesses. The selected runtime already supports typed
 current/capability query outcomes and successful terminal reports with failed
 closed-runtime queries; these are no longer pending schema/reporting fixes.
+
+Unsupported public AG-sequence/zero/unknown projections have been removed.
+Deferred and initial foundation-only configuration refuse before SQL effects.
+These corrections make failures truthful; they do not supply the missing
+positive mapping. Canonical CI separately accounts for 49 blocked licensed
+journeys and runs the remaining active native/observer cases. A green active
+test gate is not completion of those blocked obligations or Stage 6A.
 
 Planned work:
 
@@ -102,9 +115,10 @@ Planned work:
   Neither that receipt nor generic Abort-based host shutdown alone proves
   MSSQL-owned descendants have joined; retain the separate local containment
   acknowledgement without adding an application callback;
-- separate idle nonvoting build targets from active membership, prove exact
-  build completion before admission, and replace partial bootstrap success
-  with the documented public configuration postconditions;
+- separate idle nonvoting build targets from active membership and prove exact
+  build completion before admission. Incomplete bootstrap completion now
+  refuses; establish the remaining positive public configuration postconditions
+  rather than restore partial success;
 - define native replication endpoint ownership and partition read/write
   admission independently of role and routing;
 - exercise the supported configuration/build/lifecycle path through real

@@ -8,19 +8,22 @@ role, renew a write lease, or execute any mutation command.
 An explicit bootstrap-capable construction exists for licensed validation. The
 Rust fixture supplies three running SQL Server instances, HADR endpoints,
 authentication and administrative credentials; the three standalone
-`ReplicaHost` applications then create the managed database and AG, join local
-secondaries and perform one build-authorized automatic-seeding dispatch. This
-path is not exposed by the production CLI or runtime configuration.
+`ReplicaHost` applications historically created the managed database and AG,
+joined local secondaries and performed one build-authorized automatic-seeding dispatch. This
+native seam is not exposed by production configuration; the public-ready
+recipe is now blocked by unsupported progress/history semantics.
 
 The optional Kuberic runtime implements the fresh-state Public V1 replacement
-contract. It publishes exact SQL Server AG `sequence_number` only after an
-exact native binding; capability publication also requires the admitted stable
-local role. Kuberic epochs and exact decimal database positions remain separate
-domains. The root `Cargo.toml` is authoritative for the Kuberic dependency;
+contract partially. Both public progress queries refuse unsupported semantics
+after lifecycle checks, without SQL observation. Validated AG configuration
+sequence is available only as independent native election metadata, not public
+progress or retained capability. Kuberic epochs and exact decimal database
+positions remain separate domains. The root `Cargo.toml` is authoritative for
+the Kuberic dependency;
 release-intake records evaluate proposed changes but do not define a separate
 documented pin.
-The adapter is not wired into the level-triggered controller and remains
-ineligible for lease, reseed, switchover, failover, and data-loss operations.
+Controller-driven data admission remains blocked. The adapter is ineligible
+for lease, reseed, switchover, failover and data-loss operations.
 See the [progress integration guide](docs/kuberic-progress.md); the [support
 and safety design](docs/design.md) remains authoritative.
 Role validation never publishes a client service address; the configured
@@ -103,21 +106,25 @@ cargo run --locked -p kuberic-mssql \
 Runtime identity and topology files reject unknown, duplicate, ambiguous,
 symlinked or oversized inputs. The application root contains only a private
 schema-versioned binding of non-secret identity and topology digests. Kuberic
-role and epoch authority can initially arrive before configuration admission;
-without native association, the usual compatibility path reports progress `0`
-and capability `INVALID_LSN`. Public V1
+role and epoch authority can initially arrive before configuration admission.
+Public `current_progress` and `catch_up_capability` refuse unsupported
+SQL/native-history semantics; they do not publish zero, AG sequence or an
+unknown sentinel to keep bootstrap moving. Public V1
 current configurations describe exact ready remote active secondaries; the
 local member is recovered from runtime identity and the configuration
 descriptor, while idle build targets remain separate and require
 `INVALID_LSN`, exact build/session/storage identity, and an exact address.
-After topology admission, role and progress publication reobserve SQL Server.
+Full native topology admission and applicable role/native-evidence operations
+reobserve SQL Server. Deferred and initial foundation-only configuration
+requests refuse before SQL effects rather than report partial work as complete.
 No client SQL listener or service address is published.
 
 For validated native election metadata, use the typed
 `SqlServerReplicator::native_configuration_sequence` API. Public scalar
-publication remains hosted compatibility behavior, not proven durable-data
-progress or retained history. The [integration guide](docs/kuberic-progress.md#upstream-reporting-and-history-blockers)
-records the upstream reporting/history blockers; production remains observe-only.
+queries are not a source of native election metadata. Valid hosted reports
+retain their failed query outcomes; progress-dependent admission remains
+blocked. The [integration guide](docs/kuberic-progress.md#upstream-reporting-and-history-blockers)
+records the remaining semantic proof obligations; production remains observe-only.
 
 Accepted higher epochs fence predecessor dispatch and completion, including
 same-role changes. Close drains adapter-owned work; Abort fences immediately
@@ -135,9 +142,11 @@ exact binding; new mode with any established, old, partial, copied, or
 mismatched application state rejects without migration. Licensed seed records
 and SQL ownership markers are also activation-bound, so predecessor Stage 3
 authority cannot be adopted.
-The licensed three-replica validation also stops all public hosts, reopens the
-same roots with fresh sessions, rejects commands targeting the superseded
-sessions, and reconverges exact reports without restarting SQL Server.
+The historical licensed three-replica validation also stopped all public hosts, reopened the
+same roots with fresh sessions, rejected commands targeting the superseded
+sessions, and reconverged exact reports without restarting SQL Server.
+That public-ready licensed journey is currently blocked; active server-free
+tests retain session/storage/Open evidence without claiming native continuity.
 
 SIGINT and SIGTERM cancel initialization or request bounded runtime shutdown.
 Operational and cleanup failures are retained together instead of being
@@ -171,8 +180,8 @@ metadata permission denial, invalid CA rejection, and fresh production CLI
 output with exact provenance. It creates no AG, endpoint, database, Kuberic
 runtime, lease, role transition or failover operation.
 
-The three-replica fixture remains the positive topology and Kuberic progress
-proof. Both lifecycles use durable exact-ownership journals, bounded cleanup and
+The three-replica fixture retains independent native topology/observation
+seams, not proven public Kuberic progress. Both lifecycles use durable exact-ownership journals, bounded cleanup and
 recovery. They never borrow, start, stop or preserve a pre-existing container.
 Test-only code accepts the EULA for non-production Enterprise Developer
 containers; production remains observe-only.
@@ -390,17 +399,18 @@ cargo test --locked --workspace --all-features
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 ```
 
-The server-free [hosted authority diagnostic](docs/kuberic-progress.md#offline-hosted-authority-association)
-uses real public hosts with scripted native witnesses:
+The server-free [hosted authority tests](docs/kuberic-progress.md#offline-hosted-authority-association)
+exercise real observer hosts and explicit blocked startup:
 
 ```bash
 CARGO_BUILD_JOBS=1 cargo test --locked -p kuberic-mssql-tests \
   --test runtime_process_host native_authority -- --test-threads=1
 ```
 
-It exercises exact accepted configuration/session/storage/history binding and
-stale authority rejection, retained partial-startup ownership, and synthetic
-quiet-report assembly, not live SQL durability or public catch-up.
+They retain native replay and partial-startup ownership, and prove that actual
+failed public queries block hosted configuration with owned drainage. Former
+positive hosted associations and their downstream provenance checks are
+currently blocked, not requalified by these tests.
 
 The complete local pipeline remains serial:
 
@@ -408,17 +418,22 @@ The complete local pipeline remains serial:
 just ci
 ```
 
-It runs server-free checks, then all 59 currently ignored SQL fixture tests
-through nextest's `live` profile and shared `live-sql` group. One-replica
-observation/recovery, three-replica happy path/restart/fault/signal/conflict/
-target-evidence, native commit/prefix, hosted witness and lease/fence suites
-run one at a time locally and within each CI worker. The unrelated privileged ACL test is not selected.
+It runs server-free checks, then all 10 active ignored SQL fixture tests
+through nextest's `live` profile and shared `live-sql` group. The
+[exact blocked-coverage ledger](crates/kuberic-mssql-tests/scripts/live_coverage.py)
+separately accounts for 49 compiled, ignored journeys whose public semantic
+prerequisites are unsupported. CI prints that inventory and publishes it in
+the job summary; active success does not qualify blocked journeys or complete
+Stage 6A. One-replica observation/recovery, native-only owned-launch recovery,
+native prefix and lease/fence suites remain serial within each worker.
+The unrelated privileged ACL test is not selected.
 Rust ignores keep ordinary Cargo server-free; the explicit live recipe uses
 `--run-ignored only`. Live failures stop further scheduling and remain failures.
 
 CI follows Kuberic's build-once nextest archive pattern: one producer checks,
 compiles and uploads only the compressed binaries/metadata archive for one day.
-Shard 1 first proves exhaustive, disjoint four-way ordinary/live coverage;
+Shard 1 first proves exhaustive, disjoint four-way active coverage and exact
+blocked-journey accounting, rejecting stale or reclassified ledger entries;
 shards 2–4 start without waiting for it. All four workers run ordinary
 `slice:i/4` and SQL `hash:i/4` partitions. Workers
 reuse the archive without rebuilding, remap paths to their matching checkout,
@@ -498,13 +513,14 @@ Controlled restart and fencing retain their scalar stop path.
 Handled-signal and checkpoint recovery require the actual expected child cause
 and completed teardown, not just any nonzero exit. Timeout escalation cannot
 count as that expected outcome; SIGKILL requires observed SIGKILL death.
-Separate recovery and the existing full positive retries remain mandatory.
-
-Complete happy-path and same-root-restart journeys run inside recovery retries,
-not again as standalone CI tests. The hosted witness retains the full native
-commit collection. Their existing manual recipes remain available through an
-explicitly gated child helper, which runs no SQL in ordinary tests without a
-requested mode; canonical checks clear that internal mode.
+Separate recovery and exact native member launch/readiness/cleanup retries
+remain mandatory for the three active signal cases. They no longer claim
+successful public configuration or same-root semantic history recovery.
+Public happy/restart/fault/hosted-witness journeys are explicitly blocked.
+Their manual recipes fail a prerequisite preflight before provisioning;
+raw ignored cases remain compiled but are not passing aliases for unreachable
+checkpoints. Internal child helpers run no SQL without an explicit mode, and
+canonical checks clear that mode.
 
 The same commands run locally when fixture prerequisites are available:
 
@@ -565,22 +581,27 @@ untouched.
 
 ### Three-replica licensed happy path
 
+**Public path blocked:** role-specific SQL/public history mapping is not
+implemented. Happy-path and same-root public restart recipes refuse their
+prerequisite before launch. The following describes the historical licensed
+journey and existing native-only seams, not a currently qualified public path.
+
 The dedicated three-replica fixture complements the one-replica observer/CLI
 path above. It starts three real SQL Server processes and creates
 certificate-authenticated endpoints and peer authentication. Explicit
-bootstrap-capable public `ReplicaHost` applications then create one managed
-database and external AG, join both secondaries, perform one group-level
-automatic-seeding dispatch through Kuberic build authority, and prove a marker
-is readable from every member. Database create, full recovery, ownership,
+bootstrap-capable public `ReplicaHost` applications previously created one managed
+database and external AG, joined both secondaries, performed one group-level
+automatic-seeding dispatch through Kuberic build authority, and proved a marker
+was readable from every member. Database create, full recovery, ownership,
 marker schema, full/log backup readiness, backup verification, AG intent,
 create, GUID binding, local join, seeding grant, and its SQL-owned completion
 marker are independently observed typed steps; a retry executes only the next
 missing safe step.
 
 The live path is ignored by default and is not part of `just`, `just check`, or
-direct Cargo test runs. The full live profile explicitly selects happy-path,
-fault, signal, recovery and experiment cases in `just ci`; narrow recipes remain
-available. It requires
+direct Cargo test runs. Canonical `just ci` reports blocked public journeys
+separately and selects only active licensed cases; removing a ledger entry
+alone cannot restore semantic qualification. Native-only execution requires
 local Linux x86-64 with cgroup v2, a local Docker engine
 that enforces memory/no-additional-swap/CPU limits, `setfacl`/`getfacl`, at
 least 10 GiB effective available memory, two effective CPUs, 15 GiB free on the
@@ -644,9 +665,10 @@ The separate [live hosted witness](docs/kuberic-progress.md#live-hosted-witness)
 has demonstrated one licensed sampled native association using the no-control
 commit probe and actual observe-only public hosts. Startup validates exact
 accepted lifecycle evidence without requiring serving report roles; public
-coverage remains blocked. Its ignored case adds
-no SUSPEND/RESUME controls and is included in the explicit nextest live CI
-profile; the guide also gives its exact individual selection command.
+coverage remains blocked. That result is historical: its compiled ignored case
+is now one of the 49 blocked public journeys, not active live CI coverage.
+The guide provides a no-fixture prerequisite explanation rather than a
+currently supported individual execution recipe.
 
 The lease/fence recipe uses separate `expiry` and `active-restart` scenario
 roots and verifies native lease behavior, cancelled-response uncertainty,
@@ -654,7 +676,7 @@ fresh-session write readback, and exact owned-container fencing. See the
 [foundation design and observed limitations](docs/design.md#lease-and-fence-foundation).
 Production lease renewal and failover remain disabled.
 
-For example:
+The public-ready commands below currently fail their semantic preflight:
 
 ```bash
 just test-live-three-replica
@@ -691,9 +713,15 @@ just test-live-three-replica-target-evidence target/my-mssql-three-replica-targe
 
 Cleanup removes only exactly journaled resources. Foreign, replaced, or
 otherwise unverifiable resources remain untouched and block reuse. The signal
-recipe interrupts an owned launch with SIGTERM, recovers it, reruns the
-complete happy path, and verifies idempotent cleanup. The recovery recipe also
+recipe interrupts an owned launch with SIGTERM, recovers it, reruns native
+member launch/readiness only, and verifies idempotent cleanup. It does not
+claim public readiness or semantic history recovery. The recovery recipe also
 executes real SIGINT and SIGKILL subprocess cases.
+
+The following fault/seed/conflict/terminal/target descriptions record
+historical and requested checks in compiled blocked journeys. Their recipes
+now refuse at preflight; these downstream checks are not current CI
+qualification, and active native predicates do not requalify them.
 
 The fault recipe uses a test-only observation seam to lose the callback reply
 after each separately classified database, backup, AG-create/bind, local-join,
