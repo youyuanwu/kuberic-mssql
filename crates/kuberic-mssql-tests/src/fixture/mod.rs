@@ -8,4 +8,5 @@ pub(crate) mod ownership;
 pub(crate) mod preflight;
 pub(crate) mod process;
 pub(crate) mod secrets;
+pub(crate) mod startup_diagnostics;
 pub(crate) mod tls;

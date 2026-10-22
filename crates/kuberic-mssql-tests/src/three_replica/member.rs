@@ -46,6 +46,7 @@ use crate::fixture::ownership::{
 use crate::fixture::preflight::{CommandAclProbe, LocalHostProbe, run_preflight_with_deadline};
 use crate::fixture::process::{BoundedProcessRunner, CommandSpec, ProcessRunner};
 use crate::fixture::secrets::{PrivateFile, SecretError, SecretValue};
+use crate::fixture::startup_diagnostics::with_startup_diagnostics;
 use crate::fixture::tls::{TlsAssetRecorder, TlsError};
 
 use super::model::{
@@ -634,8 +635,22 @@ pub async fn launch_three_members(
             members,
         }),
         Err(primary) => {
+            let failure = with_startup_diagnostics(
+                primary.sanitized(),
+                &context.docker,
+                &context.image_id,
+                context.store.root(),
+                &context.private_files,
+                context.containers.iter().map(|container| {
+                    (
+                        &container.request,
+                        container.data_directory.as_ref(),
+                        container.id.as_deref(),
+                    )
+                }),
+            );
             let report = context.cleanup_report();
-            combine_with_cleanup::<()>(Err(primary.sanitized()), &report).map(|_| unreachable!())
+            combine_with_cleanup::<()>(Err(failure), &report).map(|_| unreachable!())
         }
     };
     timing.result(&result);
