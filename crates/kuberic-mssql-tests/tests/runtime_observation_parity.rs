@@ -11,7 +11,6 @@ use kuberic_mssql::runtime_config::ObserverConfig;
 use kuberic_mssql::runtime_error::RuntimeError;
 use kuberic_mssql::tds::{testing_classify_driver_error, testing_classify_server_error};
 use kuberic_mssql::{AvailabilityGroupName, Observation, ObservationFailureKind};
-use kuberic_runtime::RuntimeError as KubericRuntimeError;
 use kuberic_runtime::replicator::Replicator;
 
 const OBSERVED_AT: u64 = 1_000;
@@ -183,7 +182,7 @@ fn expected_kind(case: FailureCase) -> ObservationFailureKind {
 }
 
 #[tokio::test]
-async fn observer_and_runtime_share_actual_failure_classification() {
+async fn observer_and_native_api_share_actual_failure_classification() {
     for case in [
         FailureCase::Authentication,
         FailureCase::Tls,
@@ -209,10 +208,11 @@ async fn observer_and_runtime_share_actual_failure_classification() {
             Arc::new(FixedClock),
         ));
         replicator.open().await.unwrap();
-        let error = replicator.current_progress().await.unwrap_err();
-        let KubericRuntimeError::Application(message) = error else {
-            panic!("runtime application error expected");
-        };
+        let error = replicator
+            .native_configuration_sequence()
+            .await
+            .unwrap_err();
+        let message = error.to_string();
         assert!(message.contains(&format!("{:?}", expected_kind(case))));
 
         let serialized = serde_json::to_string(&report).unwrap();

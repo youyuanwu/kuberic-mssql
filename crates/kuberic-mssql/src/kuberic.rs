@@ -11,7 +11,7 @@ mod owned_work;
 
 use async_trait::async_trait;
 use kuberic_runtime::application::{
-    INVALID_LSN, OpenContext, RoleChange, StateProvider, StatefulServiceReplica,
+    OpenContext, RoleChange, StateProvider, StatefulServiceReplica,
 };
 use kuberic_runtime::protocol::types::{
     ConfigurationDescriptor, Epoch, PartitionId, ProcessSessionId, ReplicaId,
@@ -77,6 +77,7 @@ const ABORTED: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObserveOnlyOperation {
+    CurrentProgress,
     CatchUpCapability,
     DataLoss,
     CatchUpConfiguration,
@@ -89,6 +90,7 @@ pub enum ObserveOnlyOperation {
 impl fmt::Display for ObserveOnlyOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::CurrentProgress => "current_progress",
             Self::CatchUpCapability => "catch_up_capability",
             Self::DataLoss => "on_data_loss",
             Self::CatchUpConfiguration => "update_catch_up_replica_set_configuration",
@@ -4708,87 +4710,15 @@ impl Replicator for SqlServerReplicator {
     }
 
     async fn current_progress(&self) -> KubericResult<i64> {
-        // Preserve the hosted compatibility projection, not a data-history claim.
-        Ok(self
-            .native_configuration_sequence()
-            .await?
-            .map_or(0, ConfigurationSequence::value))
+        let (generation, _operation) = self.begin_operation()?;
+        let _lifecycle = self.finish_operation(generation)?;
+        self.unsupported(ObserveOnlyOperation::CurrentProgress)
     }
 
     async fn catch_up_capability(&self) -> KubericResult<i64> {
         let (generation, _operation) = self.begin_operation()?;
-        let admitted = self.admitted_topology();
-        let native = self.native_progress_binding();
-        if admitted.is_none() && native.is_none() {
-            if self.expectation.is_some() {
-                if self.bootstrap.is_none()
-                    && self.published_role() == Some(ReplicaRole::ActiveSecondary)
-                    && let Some((topology, sequence, observed_at)) =
-                        self.observe_secondary_association(generation).await?
-                {
-                    let _lifecycle = self.finish_operation(generation)?;
-                    #[cfg(feature = "kuberic-testing")]
-                    self.wait_for_testing_lifecycle_publication()?;
-                    self.ensure_observation_fresh(observed_at)?;
-                    self.publish_native_progress(topology, sequence)?;
-                    return Ok(sequence.value());
-                }
-                let _lifecycle = self.finish_operation(generation)?;
-                #[cfg(feature = "kuberic-testing")]
-                self.wait_for_testing_lifecycle_publication()?;
-                return Ok(INVALID_LSN);
-            }
-            return self.unsupported(ObserveOnlyOperation::CatchUpCapability);
-        }
-
-        {
-            let _lifecycle = self.finish_operation(generation)?;
-            let role_matches = if let Some(binding) = &admitted {
-                self.published_role()
-                    .is_some_and(|role| published_role_matches(binding, role))
-            } else {
-                self.published_role().is_some_and(|role| {
-                    native
-                        .as_ref()
-                        .is_some_and(|binding| role == binding.topology.local_stable_role)
-                })
-            };
-            if !role_matches {
-                return Err(KubericAdapterError::TopologyBindingMismatch(
-                    "capability requires the bound stable local role to be published",
-                )
-                .into());
-            }
-        }
-        let (group, observed_at) = self.observed_group(generation, true, None).await?;
-        let value = group.configuration_sequence.value();
-        self.ensure_observation_fresh(observed_at)?;
         let _lifecycle = self.finish_operation(generation)?;
-        #[cfg(feature = "kuberic-testing")]
-        self.wait_for_testing_lifecycle_publication()?;
-        let role_matches = if let Some(binding) = &admitted {
-            self.published_role()
-                .is_some_and(|role| published_role_matches(binding, role))
-        } else {
-            self.published_role().is_some_and(|role| {
-                native
-                    .as_ref()
-                    .is_some_and(|binding| role == binding.topology.local_stable_role)
-            })
-        };
-        if !role_matches {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "capability requires the bound stable local role to be published",
-            )
-            .into());
-        }
-        self.ensure_observation_fresh(observed_at)?;
-        if let Some(binding) = admitted {
-            self.publish_native_progress(binding.native_topology(), group.configuration_sequence)?;
-        } else if let Some(binding) = native {
-            self.publish_native_progress(binding.topology, group.configuration_sequence)?;
-        }
-        Ok(value)
+        self.unsupported(ObserveOnlyOperation::CatchUpCapability)
     }
 }
 
@@ -4840,8 +4770,8 @@ impl PrimaryReplicator for SqlServerReplicator {
         };
         let (generation, _operation) = self.begin_operation()?;
         if bootstrap_scope == BootstrapConvergenceScope::Deferred {
-            drop(self.finish_operation(generation)?);
-            return Ok(());
+            let _lifecycle = self.finish_operation(generation)?;
+            return self.unsupported(ObserveOnlyOperation::CurrentConfiguration);
         }
         if self.bootstrap.is_some()
             && let Some(binding) = self.admitted_topology()
@@ -4880,13 +4810,20 @@ impl PrimaryReplicator for SqlServerReplicator {
             }
         }
 
+        if bootstrap_scope == BootstrapConvergenceScope::SourceFoundation {
+            let _lifecycle = self.finish_operation(generation)?;
+            return self.unsupported(ObserveOnlyOperation::CurrentConfiguration);
+        }
+
         let (instance, group, observed_at, bootstrap_database, bootstrap_deadline) =
             if self.bootstrap.is_some() {
                 match self
                     .converge_bootstrap_configuration(generation, &current, bootstrap_scope)
                     .await?
                 {
-                    BootstrapConvergenceResult::SourceFoundation => return Ok(()),
+                    BootstrapConvergenceResult::SourceFoundation => {
+                        return self.unsupported(ObserveOnlyOperation::CurrentConfiguration);
+                    }
                     BootstrapConvergenceResult::FullTopology(converged) => {
                         let BootstrapConvergedTopology {
                             instance,
