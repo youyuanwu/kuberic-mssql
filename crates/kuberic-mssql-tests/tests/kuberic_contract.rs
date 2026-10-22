@@ -36,6 +36,7 @@ use kuberic_mssql::{
     source_database_creation_token, testing_current_pin_bootstrap_descriptors,
 };
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
+use kuberic_runtime::application::INVALID_LSN;
 use kuberic_runtime::protocol::types::{
     AgentGeneration, ConfigurationDescriptor, ConfigurationId, ConfigurationMember, Epoch,
     OperationId, PartitionId, ProcessSessionId, ReplicaId,
@@ -60,6 +61,8 @@ const DATABASE_GUID: &str = "66666666-6666-4666-8666-666666666666";
 const FAMILY_GUID: &str = "77777777-7777-4777-8777-777777777777";
 const FORK_ID: &str = "88888888-8888-4888-8888-888888888888";
 
+#[path = "kuberic_contract/native_foundation.rs"]
+mod native_foundation;
 #[path = "kuberic_contract/readiness.rs"]
 mod readiness;
 
@@ -3523,10 +3526,7 @@ async fn public_queries_never_project_missing_zero_or_positive_native_metadata()
             replicator.current_progress().await.unwrap_err(),
             ObserveOnlyOperation::CurrentProgress,
         );
-        assert_unsupported(
-            replicator.catch_up_capability().await.unwrap_err(),
-            ObserveOnlyOperation::CatchUpCapability,
-        );
+        assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
         assert_eq!(source.observations.load(Ordering::SeqCst), 0);
         assert_eq!(source.inner.samples.lock().unwrap().len(), 1);
         assert!(replicator.admitted_topology().is_none());
@@ -3543,7 +3543,7 @@ async fn public_queries_never_project_missing_zero_or_positive_native_metadata()
 }
 
 #[tokio::test]
-async fn public_queries_refuse_in_every_open_role_without_reobserving() {
+async fn public_queries_keep_current_unsupported_and_capability_unknown_without_reobserving() {
     for (role, native_role) in [
         (None, NativeRole::Primary),
         (Some(ReplicaRole::Primary), NativeRole::Primary),
@@ -3578,17 +3578,14 @@ async fn public_queries_refuse_in_every_open_role_without_reobserving() {
             replicator.current_progress().await.unwrap_err(),
             ObserveOnlyOperation::CurrentProgress,
         );
-        assert_unsupported(
-            replicator.catch_up_capability().await.unwrap_err(),
-            ObserveOnlyOperation::CatchUpCapability,
-        );
+        assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
         assert_eq!(source.observations.load(Ordering::SeqCst), observations);
         assert!(replicator.admitted_topology().is_none());
     }
 }
 
 #[tokio::test]
-async fn public_query_refusals_do_not_wait_on_native_publication_gates() {
+async fn public_query_outcomes_do_not_wait_on_native_publication_gates() {
     let replicator = opened_bound_replicator(Vec::new(), Vec::new()).await;
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -3616,13 +3613,10 @@ async fn public_query_refusals_do_not_wait_on_native_publication_gates() {
     let _ = release_tx.send(());
     callback.join().unwrap();
     let (current, capability) =
-        completed.expect("unsupported public queries must not enter native publication gates");
+        completed.expect("public query outcomes must not enter native publication gates");
     assert!(matches!(entered, Err(mpsc::TryRecvError::Empty)));
     assert_unsupported(current.unwrap_err(), ObserveOnlyOperation::CurrentProgress);
-    assert_unsupported(
-        capability.unwrap_err(),
-        ObserveOnlyOperation::CatchUpCapability,
-    );
+    assert_eq!(capability.unwrap(), INVALID_LSN);
 }
 
 #[tokio::test]
@@ -3682,10 +3676,7 @@ async fn native_database_positions_do_not_replace_configuration_evidence() {
         replicator.current_progress().await.unwrap_err(),
         ObserveOnlyOperation::CurrentProgress,
     );
-    assert_unsupported(
-        replicator.catch_up_capability().await.unwrap_err(),
-        ObserveOnlyOperation::CatchUpCapability,
-    );
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
     assert_eq!(
         replicator.native_configuration_sequence().await.unwrap(),
         Some(ConfigurationSequence::parse("42").unwrap())
@@ -4128,18 +4119,12 @@ async fn bound_topology_keeps_kuberic_epoch_independent_from_native_sequence() {
         replicator.current_progress().await.unwrap_err(),
         ObserveOnlyOperation::CurrentProgress,
     );
-    assert_unsupported(
-        replicator.catch_up_capability().await.unwrap_err(),
-        ObserveOnlyOperation::CatchUpCapability,
-    );
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
     replicator
         .update_current_replica_set_configuration(current.clone())
         .await
         .unwrap();
-    assert_unsupported(
-        replicator.catch_up_capability().await.unwrap_err(),
-        ObserveOnlyOperation::CatchUpCapability,
-    );
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
     assert_eq!(
         replicator.native_configuration_sequence().await.unwrap(),
         Some(ConfigurationSequence::parse("7").unwrap())
@@ -4152,10 +4137,7 @@ async fn bound_topology_keeps_kuberic_epoch_independent_from_native_sequence() {
         replicator.native_configuration_sequence().await.unwrap(),
         Some(ConfigurationSequence::parse("7").unwrap())
     );
-    assert_unsupported(
-        replicator.catch_up_capability().await.unwrap_err(),
-        ObserveOnlyOperation::CatchUpCapability,
-    );
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
     replicator
         .update_current_replica_set_configuration(current)
         .await
@@ -4209,10 +4191,7 @@ async fn failed_current_admission_does_not_poison_an_exact_retry() {
         .await
         .unwrap_err();
     assert!(application_error(error).contains("binding mismatch"));
-    assert_unsupported(
-        replicator.catch_up_capability().await.unwrap_err(),
-        ObserveOnlyOperation::CatchUpCapability,
-    );
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
     assert!(replicator.admitted_topology().is_none());
 
     replicator
@@ -7028,7 +7007,7 @@ async fn native_sequence_revalidates_instead_of_caching_success() {
 }
 
 #[tokio::test]
-async fn native_callbacks_observe_once_while_public_queries_refuse_without_observation() {
+async fn native_callbacks_observe_once_independently_of_public_query_outcomes() {
     let current = bound_replica_set();
     let source = Arc::new(CountingSource {
         inner: ScriptedSource {
@@ -7067,10 +7046,7 @@ async fn native_callbacks_observe_once_while_public_queries_refuse_without_obser
         replicator.current_progress().await.unwrap_err(),
         ObserveOnlyOperation::CurrentProgress,
     );
-    assert_unsupported(
-        replicator.catch_up_capability().await.unwrap_err(),
-        ObserveOnlyOperation::CatchUpCapability,
-    );
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
     assert_eq!(source.observations.load(Ordering::SeqCst), 1);
     replicator
         .change_role(configuration().epoch, ReplicaRole::Primary)
@@ -7081,10 +7057,7 @@ async fn native_callbacks_observe_once_while_public_queries_refuse_without_obser
         replicator.current_progress().await.unwrap_err(),
         ObserveOnlyOperation::CurrentProgress,
     );
-    assert_unsupported(
-        replicator.catch_up_capability().await.unwrap_err(),
-        ObserveOnlyOperation::CatchUpCapability,
-    );
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
     assert_eq!(source.observations.load(Ordering::SeqCst), 2);
     assert_eq!(
         replicator.native_configuration_sequence().await.unwrap(),
@@ -7168,7 +7141,7 @@ async fn every_topology_callback_is_an_explicit_observe_only_error() {
     let replicator = opened_replicator(Vec::new(), Vec::new()).await;
     let mut failures = Vec::new();
     failures.push(replicator.current_progress().await.unwrap_err());
-    failures.push(replicator.catch_up_capability().await.unwrap_err());
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
     failures.push(replicator.on_data_loss().await.unwrap_err());
     failures.push(
         replicator
@@ -7203,7 +7176,6 @@ async fn every_topology_callback_is_an_explicit_observe_only_error() {
 
     let expected = [
         "current_progress",
-        "catch_up_capability",
         "on_data_loss",
         "update_catch_up_replica_set_configuration",
         "wait_for_catch_up_quorum",

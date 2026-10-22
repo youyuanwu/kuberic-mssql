@@ -104,11 +104,25 @@ impl LaunchedMembers {
         self.context.deadline
     }
 
+    pub(crate) fn native_foundation_state_directory(
+        &mut self,
+    ) -> Result<PathBuf, NativeLaunchError> {
+        let path = self.context.store.root().join("native-source-foundation");
+        self.context
+            .create_recorded_directory("native-source-foundation-state", &path)?;
+        Ok(path)
+    }
+
     pub async fn testing_set_primary_model_recovery_simple(&self) -> Result<(), AdminError> {
         let mut session = self.testing_admin_session(0).await?;
         session
             .execute("ALTER DATABASE [model] SET RECOVERY SIMPLE;", &[])
-            .await
+            .await?;
+        drop(session);
+        if self.testing_database_recovery_model("model").await? != "SIMPLE" {
+            return Err(AdminError::MalformedResult);
+        }
+        Ok(())
     }
 
     pub async fn testing_create_unowned_source_database(&self) -> Result<(), AdminError> {
@@ -153,6 +167,10 @@ impl LaunchedMembers {
 
     pub async fn testing_source_recovery_model(&self) -> Result<String, AdminError> {
         let database = database_name(&self.run);
+        self.testing_database_recovery_model(&database).await
+    }
+
+    async fn testing_database_recovery_model(&self, database: &str) -> Result<String, AdminError> {
         let mut session = self.testing_admin_session(0).await?;
         let rows = session
             .query_rows(

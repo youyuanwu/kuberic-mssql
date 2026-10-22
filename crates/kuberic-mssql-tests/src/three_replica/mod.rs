@@ -82,6 +82,7 @@ pub use process::{
     BoundedProcessRunner, ChildDisposition, CommandSpec, ProcessError, ProcessErrorKind,
     ProcessResult, ProcessRunner,
 };
+pub use public_kuberic_group::native_foundation::NativeSourceFoundation;
 pub use public_kuberic_group::{
     LicensedConflictScenario, LiveHostedWitness, PublicBuildCommand, PublicFaultInjection,
     PublicMssqlGroup, PublicMssqlPod, PublicMutationFault, associate_quiet_hosted_witness,

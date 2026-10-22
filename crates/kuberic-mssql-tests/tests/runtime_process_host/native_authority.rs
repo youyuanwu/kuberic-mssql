@@ -75,7 +75,7 @@ async fn secondary_replay_case() {
     }
     let (_, reports) = current_public_reports(&attempts).await;
     for report in &reports {
-        assert_unsupported_queries(report);
+        assert_unavailable_current_and_unknown_capability(report);
         assert!(report.configuration.is_none());
         assert_ne!(report.read_status, AccessStatus::Granted);
         assert_ne!(report.write_status, AccessStatus::Granted);
@@ -99,7 +99,7 @@ async fn partial_startup_ownership_cases() {
         let (running, _, _) = initialize_open_attempts(&mut attempts).await;
         let (_, reports) = current_public_reports(&attempts).await;
         for report in &reports {
-            assert_unsupported_queries(report);
+            assert_unavailable_current_and_unknown_capability(report);
             assert!(report.configuration.is_none());
         }
         let replicators = attempts
@@ -266,20 +266,16 @@ async fn blocked_startup_case() {
         diagnostic.starts_with("configuration peer current progress is unavailable: "),
         "{diagnostic}"
     );
-    for operation in ["current_progress", "catch_up_capability"] {
-        assert!(
-            diagnostic.contains(&format!(
-                "{operation} is disabled by the observe-only SQL Server adapter"
-            )),
-            "{diagnostic}"
-        );
-    }
+    assert!(
+        diagnostic.contains("current_progress is disabled by the observe-only SQL Server adapter"),
+        "{diagnostic}"
+    );
     assert!(
         diagnostic.contains("current_progress: Failed("),
         "{diagnostic}"
     );
     assert!(
-        diagnostic.contains("catch_up_capability: Failed("),
+        diagnostic.contains("catch_up_capability: Value(-1)"),
         "{diagnostic}"
     );
     assert!(!error.agent_termination_unconfirmed(), "{error}");

@@ -37,6 +37,8 @@ const RESTART_OBSERVATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[path = "live_three_replica/hosted_witness.rs"]
 mod hosted_witness;
+#[path = "live_three_replica/native_foundation.rs"]
+mod native_foundation;
 #[path = "live_three_replica/terminal.rs"]
 mod terminal;
 

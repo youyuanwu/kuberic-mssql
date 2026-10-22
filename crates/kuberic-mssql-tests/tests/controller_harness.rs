@@ -17,6 +17,7 @@ use kuberic_mssql::runtime_config::ObserverConfig;
 use kuberic_mssql::runtime_error::RuntimeError;
 use kuberic_mssql::{Observation, ObservationFailure, ObservationFailureKind};
 use kuberic_runtime::StatefulServiceReplica;
+use kuberic_runtime::application::INVALID_LSN;
 use kuberic_runtime::host::ApplicationStorageState;
 use kuberic_runtime::protocol::public_operations::ProgressQueryResult;
 use kuberic_runtime::protocol::types::{AccessStatus, ReplicaIdentity, ReplicaRole, ResourceUid};
@@ -241,9 +242,9 @@ async fn open_observers(
                 "current progress must retain the explicit unsupported MSSQL result",
             )?;
             require(
-                matches!(&report.progress.catch_up_capability, ProgressQueryResult::Failed(message)
-                    if message.contains("catch_up_capability is disabled by the observe-only SQL Server adapter")),
-                "capability must retain the explicit unsupported MSSQL result",
+                matches!(&report.progress.catch_up_capability, ProgressQueryResult::Value(value)
+                    if *value == INVALID_LSN),
+                "capability must remain explicitly unknown, not a retained floor",
             )?;
             require(
                 report.role == ReplicaRole::None
@@ -306,16 +307,16 @@ async fn exercise_controller() {
     let mut retained_child = None;
     let scenario = async {
         let (replica, child) = open_observers(&mut cluster, &factory).await?;
-        for (result, operation) in [
-            (child.current_progress().await, "current_progress"),
-            (child.catch_up_capability().await, "catch_up_capability"),
-        ] {
-            require(
-                matches!(result, Err(kuberic_runtime::RuntimeError::Application(message))
-                    if message == format!("{operation} is disabled by the observe-only SQL Server adapter")),
-                "open public queries must fail with their exact unsupported operation",
-            )?;
-        }
+        require(
+            matches!(child.current_progress().await,
+                Err(kuberic_runtime::RuntimeError::Application(message))
+                    if message == "current_progress is disabled by the observe-only SQL Server adapter"),
+            "open current progress must retain its unsupported operation",
+        )?;
+        require(
+            child.catch_up_capability().await.map_err(application_error)? == INVALID_LSN,
+            "open capability must report unknown without a retained-range claim",
+        )?;
         require(
             factory
                 .replicas

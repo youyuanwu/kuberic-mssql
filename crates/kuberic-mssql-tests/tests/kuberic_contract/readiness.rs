@@ -309,10 +309,7 @@ mod public_v1_lifecycle_evidence {
             replicator.current_progress().await.unwrap_err(),
             ObserveOnlyOperation::CurrentProgress,
         );
-        assert_unsupported(
-            replicator.catch_up_capability().await.unwrap_err(),
-            ObserveOnlyOperation::CatchUpCapability,
-        );
+        assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
         for sequence in ["19", "20"] {
             assert_eq!(
                 replicator.native_configuration_sequence().await.unwrap(),

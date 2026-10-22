@@ -484,6 +484,26 @@ pub fn validate_startup_configuration(
     Ok(())
 }
 
+fn validate_independent_native_anchor(
+    anchor: &NativeDatabaseAnchor,
+    replica: &ReplicaIdentity,
+    native: &NativePrefixEvidence,
+    index: usize,
+) -> DiagnosticResult<()> {
+    let expected = &native.initial_binding.members[index];
+    if anchor.replica != *replica
+        || anchor.database_name.as_str() != native.initial_binding.database_name
+        || anchor.group_database_id.as_str() != native.initial_binding.group_database_id
+        || anchor.local_database_id != expected.local_database_id
+        || anchor.database_guid.as_str() != expected.database_guid
+        || anchor.family_guid.as_str() != native.initial_binding.family_guid
+        || anchor.recovery_fork_id.as_str() != native.initial_binding.recovery_fork_id
+    {
+        return Err("independent hosted native database anchor differs".into());
+    }
+    Ok(())
+}
+
 impl HostedAuthority {
     pub fn new(
         configuration: ConfigurationDescriptor,
@@ -711,16 +731,7 @@ impl HostedAuthority {
             let report = &reports[index];
             let expected = &native.initial_binding.members[index];
             let anchor = &self.native_database_anchors[index];
-            if anchor.replica != report.replica
-                || anchor.database_name.as_str() != native.initial_binding.database_name
-                || anchor.group_database_id.as_str() != native.initial_binding.group_database_id
-                || anchor.local_database_id != expected.local_database_id
-                || anchor.database_guid.as_str() != expected.database_guid
-                || anchor.family_guid.as_str() != native.initial_binding.family_guid
-                || anchor.recovery_fork_id.as_str() != native.initial_binding.recovery_fork_id
-            {
-                return Err("independent hosted native database anchor differs".into());
-            }
+            validate_independent_native_anchor(anchor, &report.replica, native, index)?;
             let local = binding
                 .members()
                 .iter()
@@ -765,6 +776,10 @@ impl HostedAuthority {
                     .map_err(|error| format!("adapter native history/member bridge: {error}"))?;
             }
         }
+
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

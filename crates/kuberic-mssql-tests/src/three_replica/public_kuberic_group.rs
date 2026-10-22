@@ -71,6 +71,8 @@ use super::member::ReadyMember;
 use super::model::{NativeTopologyBinding, TopologyRun};
 
 mod hosted_witness;
+#[path = "native_foundation.rs"]
+pub(super) mod native_foundation;
 mod startup;
 mod startup_probe;
 

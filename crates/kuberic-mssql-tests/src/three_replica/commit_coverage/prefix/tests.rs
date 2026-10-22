@@ -5,7 +5,7 @@ use super::*;
 use crate::three_replica::commit_coverage::TransactionRecordRow;
 use crate::three_replica::commit_coverage::tests::bound_prefix_fixture;
 
-pub(super) fn receipt(
+pub(in crate::three_replica) fn receipt(
     record: Option<&str>,
 ) -> (TransactionAcknowledgement, Vec<TransactionSample>) {
     let ack = TransactionAcknowledgement {

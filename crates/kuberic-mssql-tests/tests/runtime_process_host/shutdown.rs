@@ -230,7 +230,7 @@ async fn open_concrete(attempt: &ConcreteAttempt) -> Arc<SqlServerReplicator> {
     // Deliberately no retry: retain any standalone Open failure as evidence.
     client.execute(authorized(request)).await.unwrap();
     let (_, report) = status(attempt.config.control_address(), 1).await;
-    assert_unsupported_queries(&public_report(&report));
+    assert_unavailable_current_and_unknown_capability(&public_report(&report));
     let session = public_report(&report).process_session_id;
     let replicator = attempt.application.testing_replicator().unwrap();
     let mut replicas = Vec::new();
@@ -268,7 +268,7 @@ async fn open_concrete(attempt: &ConcreteAttempt) -> Arc<SqlServerReplicator> {
         .unwrap();
     let (_, report) = status(attempt.config.control_address(), 1).await;
     let report = public_report(&report);
-    assert_unsupported_queries(&report);
+    assert_unavailable_current_and_unknown_capability(&report);
     assert!(report.configuration.is_none());
     assert_ne!(report.read_status, AccessStatus::Granted);
     assert_ne!(report.write_status, AccessStatus::Granted);

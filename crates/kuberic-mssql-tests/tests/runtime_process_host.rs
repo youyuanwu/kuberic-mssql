@@ -23,7 +23,7 @@ use kuberic_mssql::{
     DatabaseLineage, DecimalProgress, Guid, NativeProgress, NativeRole, Observation,
     ReplicaIdentity as SqlReplicaIdentity, ServerName, SqlIdentifier,
 };
-use kuberic_runtime::application::StatefulServiceReplica;
+use kuberic_runtime::application::{INVALID_LSN, StatefulServiceReplica};
 use kuberic_runtime::control::proto::{self as wire, agent_control_client::AgentControlClient};
 use kuberic_runtime::control::{
     normalize_public_v1_agent_status_report, public_v1_operation_command_to_proto,
@@ -811,20 +811,20 @@ fn open_completed(public: &wire::PublicV1AgentStatus, index: usize, revision: u6
     )
 }
 
-fn assert_unsupported_queries(report: &PublicV1AgentReport) {
+fn assert_unavailable_current_and_unknown_capability(report: &PublicV1AgentReport) {
     report.validate().unwrap();
-    for (query, operation) in [
-        (&report.progress.current_progress, "current_progress"),
-        (&report.progress.catch_up_capability, "catch_up_capability"),
-    ] {
-        assert!(
-            matches!(query, ProgressQueryResult::Failed(message)
-                if message.contains(&format!("{operation} is disabled by the observe-only SQL Server adapter"))),
-            "{query:?}"
-        );
-    }
+    assert!(
+        matches!(&report.progress.current_progress, ProgressQueryResult::Failed(message)
+            if message.contains("current_progress is disabled by the observe-only SQL Server adapter")),
+        "{:?}",
+        report.progress
+    );
+    assert!(matches!(
+        &report.progress.catch_up_capability,
+        ProgressQueryResult::Value(value) if *value == INVALID_LSN
+    ));
     assert!(report.progress.current().is_none());
-    assert!(report.progress.capability().is_none());
+    assert_eq!(report.progress.capability(), Some(INVALID_LSN));
 }
 
 async fn reports(
@@ -854,7 +854,7 @@ async fn reports(
                     let report = public_report(report);
                     assert!(report.has_current_open_endpoint());
                     assert!(report.configuration.is_none());
-                    assert_unsupported_queries(&report);
+                    assert_unavailable_current_and_unknown_capability(&report);
                 }
             }
             return reports;
@@ -1164,7 +1164,7 @@ async fn public_epoch_and_same_role_commands_fence_actual_adapter_work_case() {
             kind
         ));
         let report = public_report(&after);
-        assert_unsupported_queries(&report);
+        assert_unavailable_current_and_unknown_capability(&report);
         assert!(report.configuration.is_none());
         assert_ne!(report.read_status, AccessStatus::Granted);
         assert_ne!(report.write_status, AccessStatus::Granted);

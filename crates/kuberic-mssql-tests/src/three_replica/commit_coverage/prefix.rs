@@ -335,4 +335,4 @@ pub(in crate::three_replica) fn public_coverage_blocker() -> CoverageConclusion 
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::three_replica) mod tests;

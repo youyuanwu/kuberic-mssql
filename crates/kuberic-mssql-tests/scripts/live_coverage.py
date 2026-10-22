@@ -7,8 +7,8 @@ import sys
 
 BINARY = "kuberic-mssql-tests::live_three_replica"
 REASON = (
-    "SQL-native/public history mapping is unimplemented; public current progress "
-    "and catch-up capability refuse unsupported semantics."
+    "SQL-native/public current-history mapping is unimplemented; capability is "
+    "unknown, not a retained floor. Compound public startup remains blocked."
 )
 BLOCKED_FAMILIES = {
     "three_replica_mssql_bootstrap_fault_boundaries": (
@@ -92,9 +92,11 @@ def report():
     print(REASON)
     for family, cases in BLOCKED_FAMILIES.items():
         print(f"  {family}: {len(cases)} blocked")
-    print("Native observation/prefix, owned-launch recovery and lease/fence remain separate evidence.")
+    print("Independent native, validator, owned-launch and lease/fence evidence is accounted separately.")
     print("Passing active CI tests does not complete Stage 6A or qualify these blocked journeys.")
     print("Reactivation needs semantic proof and revised scenario assertions, not just ledger removal.")
+    print("Native join/seed/target/restart subcases also need decoupled harness orchestration;")
+    print("the ledger does not imply every native predicate requires a public history mapping.")
 
 
 def main():
