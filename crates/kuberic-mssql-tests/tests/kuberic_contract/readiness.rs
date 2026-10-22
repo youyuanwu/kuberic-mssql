@@ -281,7 +281,7 @@ mod public_v1_lifecycle_evidence {
     }
 
     #[tokio::test]
-    async fn ordinary_secondary_binds_native_progress_without_primary_configuration() {
+    async fn ordinary_secondary_binds_native_sequence_without_public_progress_or_membership() {
         let mut recreated = bound_snapshot_with_sequence(1, "21");
         if let Observation::Present { value, .. } = &mut recreated.availability_group {
             value.identity.group_id = guid("99999999-9999-4999-8999-999999999999");
@@ -305,15 +305,28 @@ mod public_v1_lifecycle_evidence {
             .unwrap();
         replicator.update_epoch(Epoch::new(7, 43)).await.unwrap();
         assert!(replicator.admitted_topology().is_none());
-        assert_eq!(replicator.current_progress().await.unwrap(), 19);
-        assert_eq!(replicator.catch_up_capability().await.unwrap(), 20);
+        assert_unsupported(
+            replicator.current_progress().await.unwrap_err(),
+            ObserveOnlyOperation::CurrentProgress,
+        );
+        assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
+        for sequence in ["19", "20"] {
+            assert_eq!(
+                replicator.native_configuration_sequence().await.unwrap(),
+                Some(ConfigurationSequence::parse(sequence).unwrap())
+            );
+            assert!(replicator.admitted_topology().is_none());
+        }
 
-        let error = replicator.current_progress().await.unwrap_err();
-        assert!(application_error(error).contains("availability-group identity"));
+        let error = replicator
+            .native_configuration_sequence()
+            .await
+            .unwrap_err();
+        assert!(application_error(error.into()).contains("availability-group identity"));
     }
 
     #[tokio::test]
-    async fn ordinary_secondary_progress_fails_when_bound_evidence_becomes_stale() {
+    async fn ordinary_secondary_native_sequence_fails_when_bound_evidence_becomes_stale() {
         let replicator = bound_replicator_for(
             1,
             vec![
@@ -328,8 +341,11 @@ mod public_v1_lifecycle_evidence {
             .await
             .unwrap();
 
-        let error = replicator.current_progress().await.unwrap_err();
-        assert!(application_error(error).contains("stale"));
+        let error = replicator
+            .native_configuration_sequence()
+            .await
+            .unwrap_err();
+        assert_eq!(error, KubericAdapterError::ObservationStale);
     }
 }
 

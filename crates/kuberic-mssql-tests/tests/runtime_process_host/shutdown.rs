@@ -230,6 +230,7 @@ async fn open_concrete(attempt: &ConcreteAttempt) -> Arc<SqlServerReplicator> {
     // Deliberately no retry: retain any standalone Open failure as evidence.
     client.execute(authorized(request)).await.unwrap();
     let (_, report) = status(attempt.config.control_address(), 1).await;
+    assert_unavailable_current_and_unknown_capability(&public_report(&report));
     let session = public_report(&report).process_session_id;
     let replicator = attempt.application.testing_replicator().unwrap();
     let mut replicas = Vec::new();
@@ -250,10 +251,10 @@ async fn open_concrete(attempt: &ConcreteAttempt) -> Arc<SqlServerReplicator> {
         } else {
             ReplicaRole::ActiveSecondary
         };
-        replica.current_progress = 42;
-        replica.catch_up_capability = 42;
         replicas.push(replica);
     }
+    // Full native topology admission only; the API's unused progress fields
+    // retain their defaults rather than simulating successful public queries.
     replicator
         .update_current_replica_set_configuration(ReplicaSetConfiguration {
             configuration: configuration(),
@@ -265,6 +266,12 @@ async fn open_concrete(attempt: &ConcreteAttempt) -> Arc<SqlServerReplicator> {
         .change_role(configuration().epoch, ReplicaRole::Primary)
         .await
         .unwrap();
+    let (_, report) = status(attempt.config.control_address(), 1).await;
+    let report = public_report(&report);
+    assert_unavailable_current_and_unknown_capability(&report);
+    assert!(report.configuration.is_none());
+    assert_ne!(report.read_status, AccessStatus::Granted);
+    assert_ne!(report.write_status, AccessStatus::Granted);
     replicator
 }
 
@@ -377,7 +384,7 @@ async fn diagnostic(completion: &TestingRuntimeCompletion) -> RuntimeProcessErro
 }
 
 async fn cancelled_close_keeps_real_started_store_case() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir_in(".").unwrap();
     let attempt = start_concrete(root.path()).await;
     let replicator = open_concrete(&attempt).await;
     let gate = hold_store(&replicator).await;
@@ -429,7 +436,7 @@ async fn cancelled_close_keeps_real_started_store_case() {
 }
 
 async fn deadline_keeps_real_started_store_case() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir_in(".").unwrap();
     let attempt = start_concrete(root.path()).await;
     let replicator = open_concrete(&attempt).await;
     let gate = hold_store(&replicator).await;
@@ -474,7 +481,7 @@ async fn deadline_keeps_real_started_store_case() {
 }
 
 async fn successful_shutdown_requires_real_store_join_case() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir_in(".").unwrap();
     let attempt = start_concrete(root.path()).await;
     let replicator = open_concrete(&attempt).await;
     let gate = hold_store(&replicator).await;
@@ -512,7 +519,7 @@ async fn successful_shutdown_requires_real_store_join_case() {
 }
 
 async fn abort_repolls_inflight_application_close_without_self_deadlock_case() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir_in(".").unwrap();
     let attempt = start_concrete(root.path()).await;
     let replicator = open_concrete(&attempt).await;
     let gate = hold_store(&replicator).await;
@@ -549,7 +556,7 @@ async fn abort_repolls_inflight_application_close_without_self_deadlock_case() {
 }
 
 async fn cancellation_joins_entered_submission_without_reconciliation_case() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir_in(".").unwrap();
     let attempt = start_concrete(root.path()).await;
     let replicator = open_concrete(&attempt).await;
     let callback = tokio::spawn({
@@ -610,7 +617,7 @@ async fn cancellation_joins_entered_submission_without_reconciliation_case() {
 
 async fn real_worker_late_failure_is_reported_case() {
     for bounded in [false, true] {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(".").unwrap();
         let attempt = start_concrete(root.path()).await;
         let replicator = open_concrete(&attempt).await;
         let gate = hold_store(&replicator).await;
@@ -678,7 +685,7 @@ async fn real_worker_late_failure_is_reported_case() {
 }
 
 async fn abort_during_actual_open_retains_attempt_until_terminal_refusal_case() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir_in(".").unwrap();
     let attempt = start_concrete(root.path()).await;
     let (entered, held) = std::sync::mpsc::channel();
     let (release, resumed) = std::sync::mpsc::channel();

@@ -77,6 +77,7 @@ const ABORTED: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObserveOnlyOperation {
+    CurrentProgress,
     CatchUpCapability,
     DataLoss,
     CatchUpConfiguration,
@@ -89,6 +90,7 @@ pub enum ObserveOnlyOperation {
 impl fmt::Display for ObserveOnlyOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::CurrentProgress => "current_progress",
             Self::CatchUpCapability => "catch_up_capability",
             Self::DataLoss => "on_data_loss",
             Self::CatchUpConfiguration => "update_catch_up_replica_set_configuration",
@@ -1445,8 +1447,24 @@ enum SourceAssociation {
 }
 
 enum BootstrapConvergenceResult {
-    SourceFoundation,
+    SourceFoundation(Box<BootstrapConvergedSourceFoundation>),
     FullTopology(Box<BootstrapConvergedTopology>),
+}
+
+/// Native source and local-primary facts only; not public configuration or data-history evidence.
+/// Does not certify AG-intent removal, grants, secondary joins, seeding, data prefixes or readiness.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct NativeSourceFoundationEvidence {
+    pub source: crate::bootstrap::StandaloneDatabaseSnapshot,
+    pub instance: crate::observation::InstanceMetadata,
+    pub group: AvailabilityGroupSnapshot,
+    pub group_observed_at_unix_millis: u64,
+}
+
+struct BootstrapConvergedSourceFoundation {
+    evidence: NativeSourceFoundationEvidence,
+    deadline: tokio::time::Instant,
 }
 
 struct BootstrapConvergedTopology {
@@ -1458,6 +1476,58 @@ struct BootstrapConvergedTopology {
 }
 
 impl SqlServerReplicator {
+    /// Prepares only the owned native source/local-primary foundation using existing bootstrap authority.
+    /// This does not admit topology, publish a role or complete a public configuration operation.
+    #[cfg(feature = "kuberic-testing")]
+    #[doc(hidden)]
+    pub async fn testing_prepare_native_source_foundation(
+        &self,
+        current: ReplicaSetConfiguration,
+    ) -> Result<NativeSourceFoundationEvidence, KubericAdapterError> {
+        let (generation, _operation) = self.begin_operation()?;
+        self.bootstrap
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
+        let runtime_identity = self
+            .runtime_identity
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
+        let expectation = self
+            .expectation
+            .as_ref()
+            .ok_or(KubericAdapterError::TopologyNotAdmitted)?;
+        let current = normalize_bootstrap_configuration(current)?;
+        let process_session_id = self.process_session_id(&current)?;
+        let scope = bootstrap_convergence_scope(
+            runtime_identity,
+            &process_session_id,
+            expectation,
+            &self.replication_address,
+            &current,
+        )?;
+        if scope != BootstrapConvergenceScope::SourceFoundation {
+            return Err(KubericAdapterError::InvalidConfiguration(
+                "native source foundation requires primary remote-only configuration",
+            ));
+        }
+        match self
+            .converge_bootstrap_configuration(generation, &current, scope)
+            .await?
+        {
+            BootstrapConvergenceResult::SourceFoundation(converged) => {
+                let _lifecycle = self.finish_operation(generation)?;
+                self.ensure_observation_fresh(converged.evidence.group_observed_at_unix_millis)?;
+                bootstrap_remaining(converged.deadline)?;
+                Ok(converged.evidence)
+            }
+            BootstrapConvergenceResult::FullTopology(_) => {
+                Err(KubericAdapterError::NativeConvergenceUnsafe(
+                    "native source foundation returned full topology",
+                ))
+            }
+        }
+    }
+
     #[cfg(feature = "kuberic-testing")]
     #[doc(hidden)]
     pub fn testing_bind_process_session(
@@ -3217,7 +3287,20 @@ impl SqlServerReplicator {
                         {
                             drop(self.finish_operation(generation)?);
                             bootstrap_remaining(deadline)?;
-                            return Ok(BootstrapConvergenceResult::SourceFoundation);
+                            self.ensure_observation_fresh(observed_at)?;
+                            return Ok(BootstrapConvergenceResult::SourceFoundation(Box::new(
+                                BootstrapConvergedSourceFoundation {
+                                    evidence: NativeSourceFoundationEvidence {
+                                        source: database.expect(
+                                            "complete classifier requires a source database",
+                                        ),
+                                        instance,
+                                        group: group.expect("complete classifier requires a group"),
+                                        group_observed_at_unix_millis: observed_at,
+                                    },
+                                    deadline,
+                                },
+                            )));
                         }
                         NativeConvergenceState::Complete
                             if group.as_ref().is_some_and(|group| {
@@ -4708,87 +4791,16 @@ impl Replicator for SqlServerReplicator {
     }
 
     async fn current_progress(&self) -> KubericResult<i64> {
-        // Preserve the hosted compatibility projection, not a data-history claim.
-        Ok(self
-            .native_configuration_sequence()
-            .await?
-            .map_or(0, ConfigurationSequence::value))
+        let (generation, _operation) = self.begin_operation()?;
+        let _lifecycle = self.finish_operation(generation)?;
+        self.unsupported(ObserveOnlyOperation::CurrentProgress)
     }
 
     async fn catch_up_capability(&self) -> KubericResult<i64> {
         let (generation, _operation) = self.begin_operation()?;
-        let admitted = self.admitted_topology();
-        let native = self.native_progress_binding();
-        if admitted.is_none() && native.is_none() {
-            if self.expectation.is_some() {
-                if self.bootstrap.is_none()
-                    && self.published_role() == Some(ReplicaRole::ActiveSecondary)
-                    && let Some((topology, sequence, observed_at)) =
-                        self.observe_secondary_association(generation).await?
-                {
-                    let _lifecycle = self.finish_operation(generation)?;
-                    #[cfg(feature = "kuberic-testing")]
-                    self.wait_for_testing_lifecycle_publication()?;
-                    self.ensure_observation_fresh(observed_at)?;
-                    self.publish_native_progress(topology, sequence)?;
-                    return Ok(sequence.value());
-                }
-                let _lifecycle = self.finish_operation(generation)?;
-                #[cfg(feature = "kuberic-testing")]
-                self.wait_for_testing_lifecycle_publication()?;
-                return Ok(INVALID_LSN);
-            }
-            return self.unsupported(ObserveOnlyOperation::CatchUpCapability);
-        }
-
-        {
-            let _lifecycle = self.finish_operation(generation)?;
-            let role_matches = if let Some(binding) = &admitted {
-                self.published_role()
-                    .is_some_and(|role| published_role_matches(binding, role))
-            } else {
-                self.published_role().is_some_and(|role| {
-                    native
-                        .as_ref()
-                        .is_some_and(|binding| role == binding.topology.local_stable_role)
-                })
-            };
-            if !role_matches {
-                return Err(KubericAdapterError::TopologyBindingMismatch(
-                    "capability requires the bound stable local role to be published",
-                )
-                .into());
-            }
-        }
-        let (group, observed_at) = self.observed_group(generation, true, None).await?;
-        let value = group.configuration_sequence.value();
-        self.ensure_observation_fresh(observed_at)?;
         let _lifecycle = self.finish_operation(generation)?;
-        #[cfg(feature = "kuberic-testing")]
-        self.wait_for_testing_lifecycle_publication()?;
-        let role_matches = if let Some(binding) = &admitted {
-            self.published_role()
-                .is_some_and(|role| published_role_matches(binding, role))
-        } else {
-            self.published_role().is_some_and(|role| {
-                native
-                    .as_ref()
-                    .is_some_and(|binding| role == binding.topology.local_stable_role)
-            })
-        };
-        if !role_matches {
-            return Err(KubericAdapterError::TopologyBindingMismatch(
-                "capability requires the bound stable local role to be published",
-            )
-            .into());
-        }
-        self.ensure_observation_fresh(observed_at)?;
-        if let Some(binding) = admitted {
-            self.publish_native_progress(binding.native_topology(), group.configuration_sequence)?;
-        } else if let Some(binding) = native {
-            self.publish_native_progress(binding.topology, group.configuration_sequence)?;
-        }
-        Ok(value)
+        // No retained SQL transfer range is established.
+        Ok(INVALID_LSN)
     }
 }
 
@@ -4840,8 +4852,8 @@ impl PrimaryReplicator for SqlServerReplicator {
         };
         let (generation, _operation) = self.begin_operation()?;
         if bootstrap_scope == BootstrapConvergenceScope::Deferred {
-            drop(self.finish_operation(generation)?);
-            return Ok(());
+            let _lifecycle = self.finish_operation(generation)?;
+            return self.unsupported(ObserveOnlyOperation::CurrentConfiguration);
         }
         if self.bootstrap.is_some()
             && let Some(binding) = self.admitted_topology()
@@ -4880,13 +4892,25 @@ impl PrimaryReplicator for SqlServerReplicator {
             }
         }
 
+        if bootstrap_scope == BootstrapConvergenceScope::SourceFoundation {
+            let _lifecycle = self.finish_operation(generation)?;
+            return self.unsupported(ObserveOnlyOperation::CurrentConfiguration);
+        }
+
         let (instance, group, observed_at, bootstrap_database, bootstrap_deadline) =
             if self.bootstrap.is_some() {
                 match self
                     .converge_bootstrap_configuration(generation, &current, bootstrap_scope)
                     .await?
                 {
-                    BootstrapConvergenceResult::SourceFoundation => return Ok(()),
+                    BootstrapConvergenceResult::SourceFoundation(converged) => {
+                        drop(self.finish_operation(generation)?);
+                        bootstrap_remaining(converged.deadline)?;
+                        self.ensure_observation_fresh(
+                            converged.evidence.group_observed_at_unix_millis,
+                        )?;
+                        return self.unsupported(ObserveOnlyOperation::CurrentConfiguration);
+                    }
                     BootstrapConvergenceResult::FullTopology(converged) => {
                         let BootstrapConvergedTopology {
                             instance,

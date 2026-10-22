@@ -85,7 +85,7 @@ Profile version 2 is the Public V1 intake profile. It retains the same
 
 | Version 1 gate | Version 2 gate | Public V1 meaning |
 |---|---|---|
-| `external_progress_contract` | `ag_sequence_history_contract` | Public scalar progress is the exact nonnegative SQL availability-group `sequence_number`; Kuberic epoch and SQL-native decimal database positions remain separate domains. |
+| `external_progress_contract` | `ag_sequence_history_contract` | Historical gate identity, not permission to publish AG sequence as public progress. Current progress is unsupported and capability is honestly unknown/inapplicable; missing native/public correspondence stays blocked, not passed by native election metadata or the unknown sentinel. |
 | `signed_authorization_contract` | `ordinary_mutation_boundary` | Ordinary construction cannot reach any SQL executor path. The released Public V1 transport is not described as authenticated; licensed bootstrap remains a separate bounded test-only construction. |
 
 All other gate identities are unchanged. A version-2 record containing a
@@ -97,12 +97,17 @@ during intake, but it is not checked in as dependency authority. A change to
 `Cargo.toml` must not merge until the candidate computes `ready_to_pin` and the
 required exact PR-head GitHub Actions check `Shared CI validation` passes. That
 gate requires a checked locked test archive, exact-once ordinary/live partition
-coverage and all four isolated test workers to succeed. The producer runs
+coverage with explicit blocked-case accounting and all four isolated test workers to succeed. The producer runs
 formatting, strict Clippy and Cargo doctests; each worker runs an ordinary
 slice and serial ignored-SQL hash partition from the same archive/revision,
 then exact archived-binary cleanup including nested journal recovery.
 The GitHub Actions job log is the run evidence.
 Test logs and evidence artifacts are not committed to this repository.
+The current 49 blocked licensed journeys are listed separately in CI output
+and its summary. Passing the 26 active licensed cases does not qualify those
+journeys, prove history/catch-up support or clear a blocked release-intake gate.
+The profile identifiers/schema are unchanged; unsupported semantic evidence
+must not be reported as a passing gate.
 
 Repository Cargo commands force `ACCEPT_EULA=Y` through `.cargo/config.toml`
 as repository-wide authorization only for the Rust-owned licensed fixtures.
@@ -112,12 +117,12 @@ adapter has no launcher, never accepts an EULA, and never deploys SQL Server.
 The licensed Stage 3 configuration and seed callbacks remain a SQL-native test
 seam, not end-to-end Public V1 Build operations. Public V1 Build evidence is
 ordinary/server-free negative coverage for valid idle-build DTOs and
-effect-free rejection. Configured reports expose the accepted primary/secondary
-roles and typed current-progress/catch-up-capability observations of the native
-AG sequence. Host read/write access is `Granted` on the configured primary and
-`NotPrimary` on secondaries; it is not SQL authorization, a client SQL endpoint,
-or an external write lease. Direct SQL observation separately proves the native
-roles, and the scalar projection does not prove database history or retention.
+effect-free rejection. Observer reports expose actual unsupported current
+and unknown/inapplicable capability, with no progress-based
+configuration or serving admission. The former configured role/access reports
+and AG-sequence projections were not database history or retention proof;
+those public-ready paths are currently blocked. Direct native observation,
+exact topology/replay and local lifecycle evidence remain separately scoped.
 
 Public secondary configuration records host authority without calling the
 primary-only configuration callback. Hosted-native witnesses perform explicit
@@ -125,9 +130,12 @@ MSSQL secondary validation after checking the exact public receipt and label
 that separate evidence in `secondary_native_binding`. A successful public
 receipt alone must not stand in for the callback or native verification.
 
-The same-root run proves contained existing-state Open, fresh sessions,
+The historical licensed same-root run demonstrated contained existing-state Open, fresh sessions,
 stale-session rejection, native seed-record compaction, zero redispatch, and
-marker continuity. It does not prove Public V1 peer-session/lifecycle renewal,
+marker continuity. It is not currently requalified through the blocked public
+startup path. Active server-free tests retain fresh-session/storage/Open
+evidence, not native recovered-prefix continuity. The historical run did not
+prove Public V1 peer-session/lifecycle renewal,
 replay a Public V1 Build operation, or establish a client SQL write path.
 
 `cancel_before_remove` uses two-part evidence. Kuberic release conformance
@@ -153,8 +161,9 @@ callback task has settled; it is not host-ordering evidence.
    carry Kuberic authorization tokens.
 5. Run the complete exact-head pipeline through the required GitHub Actions
    job `Shared CI validation`. Its producer builds once, shard 1 validates
-   all four partitions, and four isolated workers run the complete ordinary
-   and licensed coverage without rebuilding. Other shards do not wait for
+   all four active partitions and exact blocked-case accounting, and four
+   isolated workers run complete ordinary and active licensed coverage without
+   rebuilding. Other shards do not wait for
    coverage validation; its failure still fails shard 1 and the required gate.
    Local serial rehearsal remains:
 
@@ -162,15 +171,22 @@ callback task has settled; it is not host-ordering evidence.
    just ci
    ```
 
-   The command performs setup, ordinary checks, licensed one-replica,
-   licensed three-replica, and licensed same-root restart validation
-   sequentially. CI workers always attempt exact cleanup with archived
+   The command performs setup, ordinary checks and the 26 active licensed
+   cases sequentially while visibly reporting the 49 blocked public journeys.
+   Public-ready same-root restart, fault and hosted-witness gates are not
+   executed or satisfied by that active success. CI workers always attempt exact cleanup with archived
    binaries, not Cargo rebuilds. The
    exact-head check must pass; local runs are useful before pushing but do not
    replace it. Job logs remain in GitHub Actions and are not checked in or
    uploaded as evidence artifacts. Unavailable or unrun candidate-required
    licensed gates remain `pending`; they are never inferred from server-free
    success.
+   Sixteen active native-source-foundation subcases recover independent
+   recovery/ownership/effect checks through the actual adapter, and 28
+   synthetic-record mutations recover ordinary validator checks. Neither
+   substitutes for the unavailable public association/history gate. Further
+   native join/seed/target/restart harness decoupling is orchestration work,
+   separate from the missing semantic correspondence proof.
 6. Fill one JSON record for the applicable profile version with every
    canonical gate and nonempty evidence. Validate it:
 

@@ -56,7 +56,7 @@ test-nextest-archive archive partition extract root="target/mssql-nextest-live":
 cleanup-nextest-archive extract root="target/mssql-nextest-live":
     bash crates/kuberic-mssql-tests/scripts/cleanup_nextest_fixtures.sh {{quote(root)}} "$(realpath -m {{quote(extract)}})/target/debug"
 
-# Run every existing ignored SQL fixture suite, serially, with no case narrowing.
+# Run all active licensed cases serially and visibly report blocked coverage.
 test-live-nextest root="target/mssql-nextest-live":
     bash crates/kuberic-mssql-tests/scripts/run_live_nextest.sh {{quote(root)}} cargo nextest run --locked --workspace --all-features
 
@@ -67,6 +67,10 @@ cleanup-live-nextest root="target/mssql-nextest-live":
 # Run the server-free future-readiness group without changing the pinned contract.
 test-kuberic-readiness:
     cargo test --locked -p kuberic-mssql-tests --test kuberic_contract readiness:: -- --test-threads=1
+
+# Explain unsupported public journeys before any licensed fixture is launched.
+require-public-replicator-semantics:
+    python3 crates/kuberic-mssql-tests/scripts/live_coverage.py --require-public
 
 # Validate one versioned Kuberic release-intake record.
 validate-kuberic-release-intake record:
@@ -94,7 +98,7 @@ test-live-one-replica-recovery root="target/mssql-one-replica-recovery":
         one_replica_recovery_ -- --ignored --test-threads=1 --nocapture
 
 # Launch, validate, and clean up the dedicated real three-member topology.
-test-live-three-replica root="target/mssql-three-replica":
+test-live-three-replica root="target/mssql-three-replica": require-public-replicator-semantics
     env -u SQLSERVER_TEST_EULA_ACCEPTED \
         KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE=happy-path \
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
@@ -119,7 +123,7 @@ test-live-native-prefix-coverage root="target/mssql-native-prefix-coverage":
         three_replica_mssql_native_prefix_coverage -- --ignored --exact --test-threads=1 --nocapture
 
 # Validate same-root replacement of all three public Kuberic hosts.
-test-live-three-replica-restart root="target/mssql-three-replica-restart":
+test-live-three-replica-restart root="target/mssql-three-replica-restart": require-public-replicator-semantics
     env -u SQLSERVER_TEST_EULA_ACCEPTED \
         KUBERIC_MSSQL_THREE_REPLICA_CHILD_MODE=same-root-restart \
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
@@ -162,7 +166,7 @@ test-live-three-replica-recovery root="target/mssql-three-replica-recovery":
         three_replica_sig -- --ignored --test-threads=1 --nocapture
 
 # Lose callback replies after each classified SQL step and exercise seed/callback seams.
-test-live-three-replica-faults root="target/mssql-three-replica-faults":
+test-live-three-replica-faults root="target/mssql-three-replica-faults": require-public-replicator-semantics
     env -u SQLSERVER_TEST_EULA_ACCEPTED \
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
@@ -170,7 +174,7 @@ test-live-three-replica-faults root="target/mssql-three-replica-faults":
         three_replica_mssql_bootstrap_fault_boundaries -- --ignored --test-threads=1 --nocapture
 
 # Exercise isolated SQL-native cases and callback observation-seam conflicts sequentially.
-test-live-three-replica-conflicts root="target/mssql-three-replica-conflicts":
+test-live-three-replica-conflicts root="target/mssql-three-replica-conflicts": require-public-replicator-semantics
     env -u SQLSERVER_TEST_EULA_ACCEPTED \
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
@@ -178,7 +182,7 @@ test-live-three-replica-conflicts root="target/mssql-three-replica-conflicts":
         three_replica_mssql_conflict_evidence -- --ignored --test-threads=1 --nocapture
 
 # Reject post-compaction association removal and AG recreation without redispatch.
-test-live-three-replica-terminal-seed root="target/mssql-three-replica-terminal-seed":
+test-live-three-replica-terminal-seed root="target/mssql-three-replica-terminal-seed": require-public-replicator-semantics
     env -u SQLSERVER_TEST_EULA_ACCEPTED \
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \
@@ -186,7 +190,7 @@ test-live-three-replica-terminal-seed root="target/mssql-three-replica-terminal-
         three_replica_mssql_terminal_seed_conflicts -- --ignored --test-threads=1 --nocapture
 
 # Revalidate target-local lineage and SQL process incarnation at every build window.
-test-live-three-replica-target-evidence root="target/mssql-three-replica-target-evidence":
+test-live-three-replica-target-evidence root="target/mssql-three-replica-target-evidence": require-public-replicator-semantics
     env -u SQLSERVER_TEST_EULA_ACCEPTED \
         KUBERIC_MSSQL_THREE_REPLICA_ROOT="$(realpath -m {{quote(root)}})" \
         CARGO_BUILD_JOBS=1 \

@@ -71,6 +71,8 @@ use super::member::ReadyMember;
 use super::model::{NativeTopologyBinding, TopologyRun};
 
 mod hosted_witness;
+#[path = "native_foundation.rs"]
+pub(super) mod native_foundation;
 mod startup;
 mod startup_probe;
 
@@ -1681,15 +1683,6 @@ impl PublicMssqlGroup {
             if let Some(common) = common
                 && Some(common) == previous
             {
-                refresh_current_progress(
-                    &self.pods,
-                    &self.resource_uid,
-                    &self.configuration,
-                    rpc_remaining(deadline, "bootstrap progress refresh")?,
-                    self.complete_deadline,
-                    "bootstrap-observed",
-                )
-                .await?;
                 return Ok(common);
             }
             previous = common;
@@ -2104,10 +2097,11 @@ impl PublicMssqlGroup {
             .application
             .testing_replicator()
             .ok_or_else(|| MssqlGroupError::new("bootstrap secondary replicator is unavailable"))?
-            .current_progress()
+            .native_configuration_sequence()
             .await
+            .map_err(|error| MssqlGroupError::new(error.to_string()))?
+            .ok_or_else(|| MssqlGroupError::new("secondary native association is unavailable"))
             .map(|_| ())
-            .map_err(|error| MssqlGroupError::new(error.to_string()))
     }
 
     async fn testing_execute_configuration_callback(
@@ -3833,49 +3827,6 @@ async fn refresh_current_progress(
     complete_deadline: Instant,
     operation_namespace: &str,
 ) -> Result<(), MssqlGroupError> {
-    for pod in pods {
-        let replicator = pod
-            .application
-            .testing_replicator()
-            .ok_or_else(|| MssqlGroupError::new("public progress Replicator is unavailable"))?;
-        let progress = replicator.current_progress().await.map_err(display_error)?;
-        let observed = pod.source.observe().await.map_err(display_error)?;
-        let observed = match observed {
-            Observation::Present { value, .. } => value,
-            Observation::Absent { .. } => {
-                return Err(MssqlGroupError::new(
-                    "public progress observation lacks the availability group",
-                ));
-            }
-            Observation::Failed(failure) => {
-                return Err(MssqlGroupError::new(format!(
-                    "public progress observation failed: {:?}",
-                    failure.kind
-                )));
-            }
-        };
-        let group = match observed.availability_group {
-            Observation::Present { value, .. } => value,
-            Observation::Absent { .. } => {
-                return Err(MssqlGroupError::new(
-                    "public progress observation lacks native group state",
-                ));
-            }
-            Observation::Failed(failure) => {
-                return Err(MssqlGroupError::new(format!(
-                    "public progress native group observation failed: {:?}",
-                    failure.kind
-                )));
-            }
-        };
-        if progress != group.configuration_sequence.value() {
-            return Err(MssqlGroupError::new(format!(
-                "member {} Public V1 progress {progress} differs from native AG sequence {}",
-                pod.ordinal,
-                group.configuration_sequence.value()
-            )));
-        }
-    }
     let deadline = tokio::time::Instant::now()
         + operation_timeout.min(remaining(complete_deadline, "public progress refresh")?);
     let results = join_all((0..3).map(|index| {
@@ -4211,10 +4162,16 @@ fn public_replica_descriptor(
         storage_incarnation: Some(exact_storage_incarnation(pod, report)?),
         role,
         current_progress: report.progress.current().ok_or_else(|| {
-            MssqlGroupError::new("configuration peer current progress is unavailable")
+            MssqlGroupError::new(format!(
+                "configuration peer current progress is unavailable: {:?}",
+                report.progress
+            ))
         })?,
         catch_up_capability: report.progress.capability().ok_or_else(|| {
-            MssqlGroupError::new("configuration peer catch-up capability is unavailable")
+            MssqlGroupError::new(format!(
+                "configuration peer catch-up capability is unavailable: {:?}",
+                report.progress
+            ))
         })?,
         must_catchup: false,
     })

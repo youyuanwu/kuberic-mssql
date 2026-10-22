@@ -70,6 +70,9 @@ jobs:
         if: ${{ matrix.partition == 1 }}
         timeout-minutes: 30
         run: just validate-nextest-archive "$NEXTEST_ARCHIVE"
+      - name: Report blocked licensed coverage
+        if: ${{ matrix.partition == 1 }}
+        run: python3 crates/kuberic-mssql-tests/scripts/live_coverage.py >> "$GITHUB_STEP_SUMMARY"
       - name: Prepare isolated archive extraction
         id: extraction
         run: |

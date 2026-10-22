@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kuberic_mssql::kuberic::{
-    KubericAdapterError, ObservationClock, SqlServerBootstrapConfig, SqlServerObservationSource,
-    SqlServerReplicator, SqlServerReplicatorFactory, SqlServerService, SqlServerServiceConfig,
-    SqlServerStartIncarnation, TargetHostEvidenceExchange, TargetHostEvidenceReport,
-    TargetHostEvidenceRequest, TestingSeedStoreOperation, TestingSeedStoreStage,
+    KubericAdapterError, ObservationClock, ObserveOnlyOperation, SqlServerBootstrapConfig,
+    SqlServerObservationSource, SqlServerReplicator, SqlServerReplicatorFactory, SqlServerService,
+    SqlServerServiceConfig, SqlServerStartIncarnation, TargetHostEvidenceExchange,
+    TargetHostEvidenceReport, TargetHostEvidenceRequest, TestingSeedStoreOperation,
+    TestingSeedStoreStage,
 };
 use kuberic_mssql::observation::{
     AutomaticSeedingSnapshot, AvailabilityGroupSnapshot, DatabaseReplicaSnapshot, DatabaseSnapshot,
@@ -35,6 +36,7 @@ use kuberic_mssql::{
     source_database_creation_token, testing_current_pin_bootstrap_descriptors,
 };
 use kuberic_runtime::RuntimeError as KubericRuntimeError;
+use kuberic_runtime::application::INVALID_LSN;
 use kuberic_runtime::protocol::types::{
     AgentGeneration, ConfigurationDescriptor, ConfigurationId, ConfigurationMember, Epoch,
     OperationId, PartitionId, ProcessSessionId, ReplicaId,
@@ -59,6 +61,8 @@ const DATABASE_GUID: &str = "66666666-6666-4666-8666-666666666666";
 const FAMILY_GUID: &str = "77777777-7777-4777-8777-777777777777";
 const FORK_ID: &str = "88888888-8888-4888-8888-888888888888";
 
+#[path = "kuberic_contract/native_foundation.rs"]
+mod native_foundation;
 #[path = "kuberic_contract/readiness.rs"]
 mod readiness;
 
@@ -1849,7 +1853,10 @@ async fn explicit_bootstrap_path_assigns_exact_effect_ownership_and_replays_from
             .database_lineage()
             .is_none()
     );
-    assert_eq!(primary.current_progress().await.unwrap(), 43);
+    assert_eq!(
+        primary.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("43").unwrap())
+    );
 
     for local_index in [1, 2] {
         let (secondary, mutation) = bootstrap_replicator_for(
@@ -2011,13 +2018,12 @@ async fn current_configuration_replay_revalidates_availability_group_ownership()
 }
 
 #[tokio::test]
-async fn complete_remote_only_configuration_converges_source_foundation_without_admission() {
-    let (replicator, mutation) = bootstrap_replicator_for(
+async fn initial_source_foundation_refuses_without_effects_and_full_topology_can_admit() {
+    let (replicator, mutation, source) = counted_bootstrap_replicator_for(
         0,
         vec![
             Ok(present(bootstrap_absent_snapshot(0))),
             Ok(present(bootstrap_absent_snapshot(0))),
-            Ok(present(bootstrap_foundation_snapshot(0))),
             Ok(present(bootstrap_membership_snapshot(0))),
         ],
         vec![
@@ -2025,27 +2031,27 @@ async fn complete_remote_only_configuration_converges_source_foundation_without_
             Ok(Some(owned_standalone_database_without_group_intent())),
             Ok(Some(owned_standalone_database_with_group_intent())),
             Ok(Some(owned_standalone_database())),
-            Ok(Some(owned_standalone_database())),
         ],
+        observer_config(),
     );
     replicator
         .testing_bind_process_session(ProcessSessionId::new("session-1"))
         .unwrap();
     replicator.open().await.unwrap();
 
-    replicator
+    let observations = source.observations.load(Ordering::SeqCst);
+    let samples = source.inner.samples.lock().unwrap().len();
+    let databases = mutation.databases.lock().unwrap().len();
+    let error = replicator
         .update_current_replica_set_configuration(remote_only_primary_replica_set())
         .await
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(
-        *mutation.effects.lock().unwrap(),
-        vec![
-            "retain source database creation intent",
-            "retain availability group intent",
-            "retain availability group creation intent"
-        ]
-    );
+    assert_unsupported(error, ObserveOnlyOperation::CurrentConfiguration);
+    assert_eq!(source.observations.load(Ordering::SeqCst), observations);
+    assert_eq!(source.inner.samples.lock().unwrap().len(), samples);
+    assert_eq!(mutation.databases.lock().unwrap().len(), databases);
+    assert!(mutation.effects.lock().unwrap().is_empty());
     assert!(replicator.admitted_topology().is_none());
 
     replicator
@@ -3319,6 +3325,13 @@ fn application_error(error: KubericRuntimeError) -> String {
     }
 }
 
+fn assert_unsupported(error: KubericRuntimeError, operation: ObserveOnlyOperation) {
+    assert_eq!(
+        application_error(error),
+        application_error(KubericAdapterError::UnsupportedOperation(operation).into())
+    );
+}
+
 #[tokio::test]
 async fn native_configuration_sequence_distinguishes_unavailable_from_observed_zero() {
     let unbound = bound_replicator_with(Vec::new(), Vec::new());
@@ -3328,7 +3341,10 @@ async fn native_configuration_sequence_distinguishes_unavailable_from_observed_z
     );
     unbound.open().await.unwrap();
     assert_eq!(unbound.native_configuration_sequence().await.unwrap(), None);
-    assert_eq!(unbound.current_progress().await.unwrap(), 0);
+    assert_unsupported(
+        unbound.current_progress().await.unwrap_err(),
+        ObserveOnlyOperation::CurrentProgress,
+    );
     assert!(unbound.admitted_topology().is_none());
     unbound.update_epoch(Epoch::new(7, 99)).await.unwrap();
     assert_eq!(unbound.native_configuration_sequence().await.unwrap(), None);
@@ -3412,7 +3428,7 @@ async fn native_configuration_sequence_keeps_observation_failures_explicit() {
 }
 
 #[tokio::test]
-async fn native_configuration_sequence_shares_nonregression_with_compatibility_progress() {
+async fn native_configuration_sequence_rejects_regression_without_poisoning_later_reads() {
     let replicator = opened_admitted_replicator(
         0,
         vec![
@@ -3428,7 +3444,10 @@ async fn native_configuration_sequence_shares_nonregression_with_compatibility_p
         replicator.native_configuration_sequence().await.unwrap(),
         Some(ConfigurationSequence::parse("43").unwrap())
     );
-    assert_eq!(replicator.current_progress().await.unwrap(), 44);
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("44").unwrap())
+    );
     assert_eq!(
         replicator
             .native_configuration_sequence()
@@ -3467,19 +3486,50 @@ async fn native_configuration_sequence_secondary_discovery_does_not_admit_member
         Some(ConfigurationSequence::parse("17").unwrap())
     );
     assert!(replicator.admitted_topology().is_none());
-    assert_eq!(replicator.current_progress().await.unwrap(), 18);
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("18").unwrap())
+    );
     assert!(replicator.admitted_topology().is_none());
 }
 
 #[tokio::test]
-async fn publishes_only_the_present_configuration_sequence() {
-    for (sequence, expected) in [("0", 0), ("42", 42), ("9223372036854775807", i64::MAX)] {
+async fn public_queries_never_project_missing_zero_or_positive_native_metadata() {
+    for sequence in [None, Some("0"), Some("42"), Some("9223372036854775807")] {
         let mut sample = snapshot(NativeRole::Primary);
-        if let Observation::Present { value, .. } = &mut sample.availability_group {
+        if let Some(sequence) = sequence {
+            let Observation::Present { value, .. } = &mut sample.availability_group else {
+                unreachable!()
+            };
             value.configuration_sequence = ConfigurationSequence::parse(sequence).unwrap();
+        } else {
+            sample.availability_group = Observation::Absent {
+                observed_at_unix_millis: OBSERVED_AT,
+            };
         }
-        let replicator = opened_replicator(vec![Ok(present(sample))], vec![OBSERVED_AT]).await;
-        assert_eq!(replicator.current_progress().await.unwrap(), expected);
+        let source = Arc::new(CountingSource {
+            inner: ScriptedSource {
+                config: observer_config(),
+                samples: Mutex::new(vec![Ok(present(sample))].into()),
+            },
+            observations: AtomicUsize::new(0),
+        });
+        let replicator = SqlServerReplicator::new(
+            "sql-replication.example:5022".into(),
+            source.clone(),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+        );
+        replicator.open().await.unwrap();
+        assert_unsupported(
+            replicator.current_progress().await.unwrap_err(),
+            ObserveOnlyOperation::CurrentProgress,
+        );
+        assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
+        assert_eq!(source.observations.load(Ordering::SeqCst), 0);
+        assert_eq!(source.inner.samples.lock().unwrap().len(), 1);
+        assert!(replicator.admitted_topology().is_none());
     }
 
     let replicator = opened_replicator(Vec::new(), Vec::new()).await;
@@ -3490,6 +3540,83 @@ async fn publishes_only_the_present_configuration_sequence() {
         interfaces.capabilities(),
         kuberic_runtime::replicator::ReplicatorCapabilities::conservative()
     );
+}
+
+#[tokio::test]
+async fn public_queries_keep_current_unsupported_and_capability_unknown_without_reobserving() {
+    for (role, native_role) in [
+        (None, NativeRole::Primary),
+        (Some(ReplicaRole::Primary), NativeRole::Primary),
+        (Some(ReplicaRole::IdleSecondary), NativeRole::Secondary),
+        (Some(ReplicaRole::ActiveSecondary), NativeRole::Secondary),
+        (Some(ReplicaRole::None), NativeRole::NotJoined),
+    ] {
+        let source = Arc::new(CountingSource {
+            inner: ScriptedSource {
+                config: observer_config(),
+                samples: Mutex::new(vec![Ok(present(snapshot(native_role)))].into()),
+            },
+            observations: AtomicUsize::new(0),
+        });
+        let replicator = SqlServerReplicator::new(
+            "sql-replication.example:5022".into(),
+            source.clone(),
+            Arc::new(ScriptedClock {
+                times: Mutex::new(vec![OBSERVED_AT].into()),
+            }),
+        );
+        replicator.open().await.unwrap();
+        if let Some(role) = role {
+            replicator
+                .change_role(Epoch::new(7, 42), role)
+                .await
+                .unwrap();
+        }
+        let observations = source.observations.load(Ordering::SeqCst);
+        assert_eq!(observations, usize::from(role.is_some()));
+        assert_unsupported(
+            replicator.current_progress().await.unwrap_err(),
+            ObserveOnlyOperation::CurrentProgress,
+        );
+        assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
+        assert_eq!(source.observations.load(Ordering::SeqCst), observations);
+        assert!(replicator.admitted_topology().is_none());
+    }
+}
+
+#[tokio::test]
+async fn public_query_outcomes_do_not_wait_on_native_publication_gates() {
+    let replicator = opened_bound_replicator(Vec::new(), Vec::new()).await;
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    replicator
+        .testing_gate_lifecycle_publication(entered_tx, release_rx)
+        .unwrap();
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let callback = std::thread::spawn({
+        let replicator = replicator.clone();
+        move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            completed_tx
+                .send((
+                    runtime.block_on(replicator.current_progress()),
+                    runtime.block_on(replicator.catch_up_capability()),
+                ))
+                .unwrap();
+        }
+    });
+    let completed = completed_rx.recv_timeout(Duration::from_secs(3));
+    let entered = entered_rx.try_recv();
+    let _ = release_tx.send(());
+    callback.join().unwrap();
+    let (current, capability) =
+        completed.expect("public query outcomes must not enter native publication gates");
+    assert!(matches!(entered, Err(mpsc::TryRecvError::Empty)));
+    assert_unsupported(current.unwrap_err(), ObserveOnlyOperation::CurrentProgress);
+    assert_eq!(capability.unwrap(), INVALID_LSN);
 }
 
 #[tokio::test]
@@ -3545,7 +3672,15 @@ async fn native_database_positions_do_not_replace_configuration_evidence() {
             Some(ConfigurationSequence::parse("42").unwrap())
         );
     }
-    assert_eq!(replicator.current_progress().await.unwrap(), 42);
+    assert_unsupported(
+        replicator.current_progress().await.unwrap_err(),
+        ObserveOnlyOperation::CurrentProgress,
+    );
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("42").unwrap())
+    );
 }
 
 #[tokio::test]
@@ -3582,7 +3717,13 @@ async fn absent_failed_and_transport_error_observations_fail_explicitly() {
     ];
     for (sample, expected) in failures {
         let replicator = opened_replicator(vec![sample], vec![OBSERVED_AT]).await;
-        let message = application_error(replicator.current_progress().await.unwrap_err());
+        let message = application_error(
+            replicator
+                .native_configuration_sequence()
+                .await
+                .unwrap_err()
+                .into(),
+        );
         assert!(message.contains(expected), "{message}");
     }
 }
@@ -3597,23 +3738,41 @@ async fn freshness_uses_request_time_and_accepts_the_exact_age_boundary() {
         let replicator =
             opened_replicator(vec![Ok(present(snapshot(NativeRole::Primary)))], vec![now]).await;
         match expected {
-            Ok(progress) => assert_eq!(replicator.current_progress().await.unwrap(), progress),
+            Ok(progress) => assert_eq!(
+                replicator.native_configuration_sequence().await.unwrap(),
+                Some(ConfigurationSequence::parse(&progress.to_string()).unwrap())
+            ),
             Err(message) => assert!(
-                application_error(replicator.current_progress().await.unwrap_err())
-                    .contains(message)
+                application_error(
+                    replicator
+                        .native_configuration_sequence()
+                        .await
+                        .unwrap_err()
+                        .into()
+                )
+                .contains(message)
             ),
         }
     }
 }
 
 #[tokio::test]
-async fn progress_role_and_epoch_recheck_freshness_immediately_before_success() {
+async fn native_sequence_role_and_epoch_recheck_freshness_immediately_before_success() {
     let stale_times = vec![OBSERVED_AT, OBSERVED_AT, OBSERVED_AT + MAX_AGE + 1];
 
     let progress =
         opened_admitted_replicator(0, vec![Ok(present(bound_snapshot()))], stale_times.clone())
             .await;
-    assert!(application_error(progress.current_progress().await.unwrap_err()).contains("stale"));
+    assert!(
+        application_error(
+            progress
+                .native_configuration_sequence()
+                .await
+                .unwrap_err()
+                .into()
+        )
+        .contains("stale")
+    );
 
     let role =
         opened_admitted_replicator(0, vec![Ok(present(bound_snapshot()))], stale_times.clone())
@@ -3652,8 +3811,14 @@ async fn inconsistent_observation_timestamps_are_rejected() {
     for sample in [mismatched_snapshot, mismatched_group] {
         let replicator = opened_replicator(vec![Ok(present(sample))], vec![OBSERVED_AT]).await;
         assert!(
-            application_error(replicator.current_progress().await.unwrap_err())
-                .contains("timestamps differ")
+            application_error(
+                replicator
+                    .native_configuration_sequence()
+                    .await
+                    .unwrap_err()
+                    .into()
+            )
+            .contains("timestamps differ")
         );
     }
 }
@@ -3756,8 +3921,9 @@ async fn adapter_rejects_identity_and_strict_profile_mismatches() {
     for sample in cases {
         let replicator = opened_replicator(vec![Ok(present(sample))], vec![OBSERVED_AT]).await;
         assert!(matches!(
-            replicator.current_progress().await,
-            Err(KubericRuntimeError::Application(_))
+            replicator.native_configuration_sequence().await,
+            Err(KubericAdapterError::UnsupportedProfile(_)
+                | KubericAdapterError::ObservationInconsistent(_))
         ));
     }
 }
@@ -3899,10 +4065,14 @@ fn topology_constructors_reject_local_observer_and_runtime_identity_drift() {
 }
 
 #[tokio::test]
-async fn unopened_closed_and_aborted_progress_have_distinct_errors() {
+async fn unopened_closed_and_aborted_public_queries_have_distinct_errors() {
     let unopened = replicator_with(Vec::new(), Vec::new());
     assert!(matches!(
         unopened.current_progress().await,
+        Err(KubericRuntimeError::NotOpen)
+    ));
+    assert!(matches!(
+        unopened.catch_up_capability().await,
         Err(KubericRuntimeError::NotOpen)
     ));
 
@@ -3912,11 +4082,19 @@ async fn unopened_closed_and_aborted_progress_have_distinct_errors() {
         closed.current_progress().await,
         Err(KubericRuntimeError::Closed)
     ));
+    assert!(matches!(
+        closed.catch_up_capability().await,
+        Err(KubericRuntimeError::Closed)
+    ));
 
     let aborted = opened_replicator(Vec::new(), Vec::new()).await;
     aborted.abort();
     assert!(matches!(
         aborted.current_progress().await,
+        Err(KubericRuntimeError::Closed)
+    ));
+    assert!(matches!(
+        aborted.catch_up_capability().await,
         Err(KubericRuntimeError::Closed)
     ));
 }
@@ -3937,24 +4115,29 @@ async fn bound_topology_keeps_kuberic_epoch_independent_from_native_sequence() {
     )
     .await;
 
-    assert_eq!(replicator.current_progress().await.unwrap(), 0);
-    assert_eq!(
-        replicator.catch_up_capability().await.unwrap(),
-        kuberic_runtime::application::INVALID_LSN
+    assert_unsupported(
+        replicator.current_progress().await.unwrap_err(),
+        ObserveOnlyOperation::CurrentProgress,
     );
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
     replicator
         .update_current_replica_set_configuration(current.clone())
         .await
         .unwrap();
-    assert!(
-        application_error(replicator.catch_up_capability().await.unwrap_err())
-            .contains("stable local role")
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("7").unwrap())
     );
     replicator
         .change_role(configuration().epoch, ReplicaRole::Primary)
         .await
         .unwrap();
-    assert_eq!(replicator.catch_up_capability().await.unwrap(), 7);
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("7").unwrap())
+    );
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
     replicator
         .update_current_replica_set_configuration(current)
         .await
@@ -3976,7 +4159,14 @@ async fn bound_topology_admits_zero_native_sequence_with_nonzero_epoch() {
         .await
         .unwrap();
     assert_eq!(configuration().epoch.configuration_number, 42);
-    assert_eq!(replicator.current_progress().await.unwrap(), 0);
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("0").unwrap())
+    );
+    assert_unsupported(
+        replicator.current_progress().await.unwrap_err(),
+        ObserveOnlyOperation::CurrentProgress,
+    );
 }
 
 #[tokio::test]
@@ -4001,10 +4191,8 @@ async fn failed_current_admission_does_not_poison_an_exact_retry() {
         .await
         .unwrap_err();
     assert!(application_error(error).contains("binding mismatch"));
-    assert_eq!(
-        replicator.catch_up_capability().await.unwrap(),
-        kuberic_runtime::application::INVALID_LSN
-    );
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
+    assert!(replicator.admitted_topology().is_none());
 
     replicator
         .update_current_replica_set_configuration(current)
@@ -4064,7 +4252,10 @@ async fn both_bound_active_secondaries_admit_the_same_frozen_topology() {
             .change_role(configuration().epoch, ReplicaRole::ActiveSecondary)
             .await
             .unwrap();
-        assert_eq!(replicator.catch_up_capability().await.unwrap(), 42);
+        assert_eq!(
+            replicator.native_configuration_sequence().await.unwrap(),
+            Some(ConfigurationSequence::parse("42").unwrap())
+        );
     }
 }
 
@@ -4077,7 +4268,10 @@ async fn secondary_commit_participation_is_not_required_from_direct_observation(
         }
         let replicator =
             opened_admitted_replicator(1, vec![Ok(present(sample))], vec![OBSERVED_AT]).await;
-        assert_eq!(replicator.current_progress().await.unwrap(), 42);
+        assert_eq!(
+            replicator.native_configuration_sequence().await.unwrap(),
+            Some(ConfigurationSequence::parse("42").unwrap())
+        );
     }
 }
 
@@ -4090,7 +4284,13 @@ async fn primary_commit_participation_remains_exact() {
         }
         let replicator =
             opened_admitted_replicator(0, vec![Ok(present(sample))], vec![OBSERVED_AT]).await;
-        let message = application_error(replicator.current_progress().await.unwrap_err());
+        let message = application_error(
+            replicator
+                .native_configuration_sequence()
+                .await
+                .unwrap_err()
+                .into(),
+        );
         assert!(message.contains("binding mismatch"), "{message}");
     }
 }
@@ -4107,7 +4307,10 @@ async fn connected_native_replica_accepts_absent_last_connect_error() {
     }
     let replicator =
         opened_admitted_replicator(0, vec![Ok(present(sample))], vec![OBSERVED_AT]).await;
-    assert_eq!(replicator.current_progress().await.unwrap(), 42);
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("42").unwrap())
+    );
 }
 
 #[tokio::test]
@@ -4269,7 +4472,7 @@ fn remote_only_secondary_requires_complete_exact_peers_and_local_noncollision() 
 }
 
 #[tokio::test]
-async fn short_secondary_bootstrap_still_defers_without_observation_or_mutation() {
+async fn deferred_secondary_bootstrap_refuses_without_observation_or_mutation() {
     let (replicator, executor, source) =
         counted_bootstrap_replicator_for(1, Vec::new(), Vec::new(), observer_config_for(1));
     replicator.open().await.unwrap();
@@ -4278,13 +4481,15 @@ async fn short_secondary_bootstrap_still_defers_without_observation_or_mutation(
     partial
         .replicas
         .retain(|replica| replica.identity.replica_id != ReplicaId::new(1));
-    replicator
+    let error = replicator
         .update_current_replica_set_configuration(partial)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert_unsupported(error, ObserveOnlyOperation::CurrentConfiguration);
     assert!(replicator.admitted_topology().is_none());
     assert_eq!(source.observations.load(Ordering::SeqCst), before);
     assert!(executor.effects.lock().unwrap().is_empty());
+    assert!(executor.databases.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -4328,7 +4533,7 @@ async fn a_new_process_admits_fresh_sessions_for_the_same_stable_topology() {
 }
 
 #[tokio::test]
-async fn incomplete_bootstrap_reports_native_capability_and_allows_one_way_peer_enrichment() {
+async fn incomplete_peer_transport_allows_native_reads_and_one_way_enrichment() {
     let complete = bound_replica_set();
     let mut incomplete = complete.clone();
     for replica in &mut incomplete.replicas[1..] {
@@ -4356,12 +4561,18 @@ async fn incomplete_bootstrap_reports_native_capability_and_allows_one_way_peer_
         .change_role(configuration().epoch, ReplicaRole::Primary)
         .await
         .unwrap();
-    assert_eq!(replicator.catch_up_capability().await.unwrap(), 42);
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("42").unwrap())
+    );
     replicator
         .update_current_replica_set_configuration(complete)
         .await
         .unwrap();
-    assert_eq!(replicator.catch_up_capability().await.unwrap(), 42);
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("42").unwrap())
+    );
     assert!(
         application_error(
             replicator
@@ -4483,7 +4694,13 @@ async fn bound_evidence_rejects_identity_incarnation_lineage_role_and_health_dri
     for (name, sample) in cases {
         let replicator =
             opened_admitted_replicator(0, vec![Ok(present(sample))], vec![OBSERVED_AT]).await;
-        let message = application_error(replicator.current_progress().await.unwrap_err());
+        let message = application_error(
+            replicator
+                .native_configuration_sequence()
+                .await
+                .unwrap_err()
+                .into(),
+        );
         assert!(
             message.contains("binding mismatch")
                 || message.contains("identities differ")
@@ -4495,7 +4712,7 @@ async fn bound_evidence_rejects_identity_incarnation_lineage_role_and_health_dri
 }
 
 #[tokio::test]
-async fn bound_progress_advances_monotonically_and_rejects_regression() {
+async fn bound_native_sequence_advances_monotonically_and_rejects_regression() {
     let replicator = opened_bound_replicator(
         vec![
             Ok(present(bound_snapshot_with_sequence(0, "7"))),
@@ -4515,11 +4732,23 @@ async fn bound_progress_advances_monotonically_and_rejects_regression() {
         .change_role(configuration().epoch, ReplicaRole::Primary)
         .await
         .unwrap();
-    assert_eq!(replicator.current_progress().await.unwrap(), 9);
-    assert_eq!(replicator.catch_up_capability().await.unwrap(), 10);
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("9").unwrap())
+    );
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("10").unwrap())
+    );
     assert!(
-        application_error(replicator.current_progress().await.unwrap_err())
-            .contains("configuration sequence regressed")
+        application_error(
+            replicator
+                .native_configuration_sequence()
+                .await
+                .unwrap_err()
+                .into()
+        )
+        .contains("configuration sequence regressed")
     );
 }
 
@@ -4577,7 +4806,7 @@ async fn bound_evidence_rejects_stale_future_failed_closed_and_aborted_calls() {
 }
 
 #[tokio::test]
-async fn accepted_epoch_fences_predecessor_progress_and_same_role_work() {
+async fn accepted_epoch_fences_predecessor_native_sequence_and_same_role_work() {
     for operation in ["epoch", "same-role", "equal", "regressing"] {
         let retired = matches!(operation, "epoch" | "same-role");
         let predecessor = bound_snapshot_with_sequence(0, if retired { "99" } else { "42" });
@@ -4603,7 +4832,7 @@ async fn accepted_epoch_fences_predecessor_progress_and_same_role_work() {
             .unwrap();
         let callback = tokio::spawn({
             let replicator = replicator.clone();
-            async move { replicator.current_progress().await }
+            async move { replicator.native_configuration_sequence().await }
         });
         entered.await.unwrap();
         match operation {
@@ -4629,13 +4858,20 @@ async fn accepted_epoch_fences_predecessor_progress_and_same_role_work() {
         let result = callback.await.unwrap();
         if retired {
             assert!(
-                matches!(result, Err(KubericRuntimeError::Closed)),
+                matches!(result, Err(KubericAdapterError::Closed)),
                 "{operation}"
             );
         } else {
-            assert_eq!(result.unwrap(), 42, "{operation}");
+            assert_eq!(
+                result.unwrap(),
+                Some(ConfigurationSequence::parse("42").unwrap()),
+                "{operation}"
+            );
         }
-        assert_eq!(replicator.current_progress().await.unwrap(), 42);
+        assert_eq!(
+            replicator.native_configuration_sequence().await.unwrap(),
+            Some(ConfigurationSequence::parse("42").unwrap())
+        );
     }
 }
 
@@ -4987,8 +5223,8 @@ async fn native_configuration_sequence_is_fenced_by_close_and_abort() {
 }
 
 #[tokio::test]
-async fn abort_during_fresh_observation_fences_progress_role_and_epoch_results() {
-    for operation in ["progress", "role", "epoch"] {
+async fn abort_during_fresh_observation_fences_native_sequence_role_and_epoch_results() {
+    for operation in ["native", "role", "epoch"] {
         let (replicator, entered, release) = gated_bound_replicator(
             vec![Ok(present(bound_snapshot())), Ok(present(bound_snapshot()))],
             vec![OBSERVED_AT; 2],
@@ -5004,7 +5240,11 @@ async fn abort_during_fresh_observation_fences_progress_role_and_epoch_results()
             let epoch = configuration().epoch;
             async move {
                 match operation {
-                    "progress" => replicator.current_progress().await.map(|_| ()),
+                    "native" => replicator
+                        .native_configuration_sequence()
+                        .await
+                        .map(|_| ())
+                        .map_err(KubericRuntimeError::from),
                     "role" => replicator.change_role(epoch, ReplicaRole::Primary).await,
                     "epoch" => replicator.update_epoch(epoch).await,
                     _ => unreachable!(),
@@ -5022,7 +5262,7 @@ async fn abort_during_fresh_observation_fences_progress_role_and_epoch_results()
 }
 
 #[tokio::test]
-async fn abort_during_capability_observation_cannot_return_fresh_progress() {
+async fn abort_during_primary_native_observation_cannot_return_fresh_sequence() {
     let current = bound_replica_set();
     let (replicator, entered, release) = gated_bound_replicator(
         vec![
@@ -5044,14 +5284,14 @@ async fn abort_during_capability_observation_cannot_return_fresh_progress() {
         .unwrap();
     let task = tokio::spawn({
         let replicator = replicator.clone();
-        async move { replicator.catch_up_capability().await }
+        async move { replicator.native_configuration_sequence().await }
     });
     entered.await.unwrap();
     replicator.abort();
     release.send(()).unwrap();
     assert!(matches!(
         task.await.unwrap(),
-        Err(KubericRuntimeError::Closed)
+        Err(KubericAdapterError::Closed)
     ));
 }
 
@@ -5109,66 +5349,52 @@ async fn close_waits_for_preadmission_role_publication_guard() {
 }
 
 #[tokio::test]
-async fn abort_does_not_wait_for_preadmission_progress_result_guard() {
-    for operation in ["progress", "capability", "native"] {
-        let replicator =
-            opened_bound_replicator(vec![Ok(present(bound_snapshot()))], vec![OBSERVED_AT; 2])
-                .await;
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        replicator
-            .testing_gate_lifecycle_publication(entered_tx, release_rx)
-            .unwrap();
+async fn abort_does_not_wait_for_preadmission_native_result_guard() {
+    let replicator =
+        opened_bound_replicator(vec![Ok(present(bound_snapshot()))], vec![OBSERVED_AT; 2]).await;
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    replicator
+        .testing_gate_lifecycle_publication(entered_tx, release_rx)
+        .unwrap();
 
-        let callback = std::thread::spawn({
-            let replicator = replicator.clone();
-            move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(async {
-                        match operation {
-                            "progress" => replicator.current_progress().await.map(Some),
-                            "capability" => replicator.catch_up_capability().await.map(Some),
-                            "native" => replicator
-                                .native_configuration_sequence()
-                                .await
-                                .map(|sequence| sequence.map(ConfigurationSequence::value))
-                                .map_err(KubericRuntimeError::from),
-                            _ => unreachable!(),
-                        }
-                    })
-            }
-        });
-        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let callback = std::thread::spawn({
+        let replicator = replicator.clone();
+        move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(replicator.native_configuration_sequence())
+        }
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
-        let (abort_started_tx, abort_started_rx) = mpsc::channel();
-        let (aborted_tx, aborted_rx) = mpsc::channel();
-        let abort = std::thread::spawn({
-            let replicator = replicator.clone();
-            move || {
-                abort_started_tx.send(()).unwrap();
-                replicator.abort();
-                aborted_tx.send(()).unwrap();
-            }
-        });
-        abort_started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap();
-        aborted_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        release_tx.send(()).unwrap();
+    let (abort_started_tx, abort_started_rx) = mpsc::channel();
+    let (aborted_tx, aborted_rx) = mpsc::channel();
+    let abort = std::thread::spawn({
+        let replicator = replicator.clone();
+        move || {
+            abort_started_tx.send(()).unwrap();
+            replicator.abort();
+            aborted_tx.send(()).unwrap();
+        }
+    });
+    abort_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    aborted_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    release_tx.send(()).unwrap();
 
-        assert!(matches!(
-            callback.join().unwrap(),
-            Err(KubericRuntimeError::Closed)
-        ));
-        abort.join().unwrap();
-        assert!(matches!(
-            replicator.current_progress().await,
-            Err(KubericRuntimeError::Closed)
-        ));
-    }
+    assert!(matches!(
+        callback.join().unwrap(),
+        Err(KubericAdapterError::Closed)
+    ));
+    abort.join().unwrap();
+    assert!(matches!(
+        replicator.current_progress().await,
+        Err(KubericRuntimeError::Closed)
+    ));
 }
 
 #[tokio::test]
@@ -6740,7 +6966,7 @@ async fn bound_role_and_epoch_callbacks_require_fresh_evidence_and_monotonic_epo
 }
 
 #[tokio::test]
-async fn capability_revalidates_instead_of_caching_success() {
+async fn native_sequence_revalidates_instead_of_caching_success() {
     let current = bound_replica_set();
     let mut drifted = bound_snapshot();
     if let Observation::Present { value: group, .. } = &mut drifted.availability_group {
@@ -6764,23 +6990,30 @@ async fn capability_revalidates_instead_of_caching_success() {
         .change_role(configuration().epoch, ReplicaRole::Primary)
         .await
         .unwrap();
-    assert_eq!(replicator.catch_up_capability().await.unwrap(), 42);
+    assert_eq!(
+        replicator.native_configuration_sequence().await.unwrap(),
+        Some(ConfigurationSequence::parse("42").unwrap())
+    );
     assert!(
-        application_error(replicator.catch_up_capability().await.unwrap_err())
-            .contains("binding mismatch")
+        application_error(
+            replicator
+                .native_configuration_sequence()
+                .await
+                .unwrap_err()
+                .into()
+        )
+        .contains("binding mismatch")
     );
 }
 
 #[tokio::test]
-async fn supported_bound_callbacks_use_one_fresh_observation_and_no_mutation_interface() {
+async fn native_callbacks_observe_once_independently_of_public_query_outcomes() {
     let current = bound_replica_set();
     let source = Arc::new(CountingSource {
         inner: ScriptedSource {
             config: observer_config(),
             samples: Mutex::new(
                 vec![
-                    Ok(present(bound_snapshot())),
-                    Ok(present(bound_snapshot())),
                     Ok(present(bound_snapshot())),
                     Ok(present(bound_snapshot())),
                     Ok(present(bound_snapshot())),
@@ -6795,7 +7028,7 @@ async fn supported_bound_callbacks_use_one_fresh_observation_and_no_mutation_int
             "replica-1.example:5022".into(),
             source.clone(),
             Arc::new(ScriptedClock {
-                times: Mutex::new(vec![OBSERVED_AT; 5].into()),
+                times: Mutex::new(vec![OBSERVED_AT; 3].into()),
             }),
             kuberic_identity(1),
             topology_expectation(),
@@ -6808,17 +7041,29 @@ async fn supported_bound_callbacks_use_one_fresh_observation_and_no_mutation_int
         .update_current_replica_set_configuration(current)
         .await
         .unwrap();
-    assert_eq!(replicator.current_progress().await.unwrap(), 42);
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
+    assert_unsupported(
+        replicator.current_progress().await.unwrap_err(),
+        ObserveOnlyOperation::CurrentProgress,
+    );
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
+    assert_eq!(source.observations.load(Ordering::SeqCst), 1);
     replicator
         .change_role(configuration().epoch, ReplicaRole::Primary)
         .await
         .unwrap();
-    assert_eq!(replicator.catch_up_capability().await.unwrap(), 42);
+    assert_eq!(source.observations.load(Ordering::SeqCst), 2);
+    assert_unsupported(
+        replicator.current_progress().await.unwrap_err(),
+        ObserveOnlyOperation::CurrentProgress,
+    );
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
+    assert_eq!(source.observations.load(Ordering::SeqCst), 2);
     assert_eq!(
         replicator.native_configuration_sequence().await.unwrap(),
         Some(ConfigurationSequence::parse("42").unwrap())
     );
-    assert_eq!(source.observations.load(Ordering::SeqCst), 5);
+    assert_eq!(source.observations.load(Ordering::SeqCst), 3);
     assert!(source.inner.samples.lock().unwrap().is_empty());
 }
 
@@ -6895,7 +7140,8 @@ fn replica_information() -> ReplicaInformation {
 async fn every_topology_callback_is_an_explicit_observe_only_error() {
     let replicator = opened_replicator(Vec::new(), Vec::new()).await;
     let mut failures = Vec::new();
-    failures.push(replicator.catch_up_capability().await.unwrap_err());
+    failures.push(replicator.current_progress().await.unwrap_err());
+    assert_eq!(replicator.catch_up_capability().await.unwrap(), INVALID_LSN);
     failures.push(replicator.on_data_loss().await.unwrap_err());
     failures.push(
         replicator
@@ -6929,7 +7175,7 @@ async fn every_topology_callback_is_an_explicit_observe_only_error() {
     );
 
     let expected = [
-        "catch_up_capability",
+        "current_progress",
         "on_data_loss",
         "update_catch_up_replica_set_configuration",
         "wait_for_catch_up_quorum",
