@@ -191,6 +191,10 @@ pub fn complete_remote_configuration(
                 process_session_id: report.process_session_id.clone(),
                 storage_incarnation: Some(report.storage_incarnation.clone()),
                 role: member.role,
+                is_up: report.has_current_open_endpoint(),
+                is_ready: report.has_current_open_endpoint()
+                    && report.progress.current().is_some()
+                    && report.progress.capability().is_some(),
                 current_progress: report
                     .progress
                     .current()
@@ -423,11 +427,16 @@ fn validate_peer_descriptors(
                     && descriptor.storage_incarnation.as_ref() == Some(&report.storage_incarnation)
                     && Some(&descriptor.replication_address) == report.replication_address.as_ref()
                     && descriptor.role == peer.role
+                    && descriptor.is_up == report.has_current_open_endpoint()
+                    && descriptor.is_ready
+                        == (report.has_current_open_endpoint()
+                            && report.progress.current().is_some()
+                            && report.progress.capability().is_some())
             })
             .count()
             != 1
         {
-            return Err("configuration peer session/storage/address differs".into());
+            return Err("configuration peer session/storage/address/availability differs".into());
         }
     }
     Ok(())

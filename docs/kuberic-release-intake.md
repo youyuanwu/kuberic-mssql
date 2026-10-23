@@ -109,6 +109,16 @@ journeys, prove history/catch-up support or clear a blocked release-intake gate.
 The profile identifiers/schema are unchanged; unsupported semantic evidence
 must not be reported as a passing gate.
 
+The selected upstream public protocol is version 13 and replacement host
+metadata is schema 14. Old host stores reject rather than migrate; mixed
+protocol versions are not supported. This is not permission to remove or
+reinterpret SQL/application binding, seed, ownership or fixture records.
+Descriptors now carry explicit up/ready observations, and reports distinguish
+installed voting configuration, optional engine-idle evidence, remote Build
+state and retry-pending operations. Missing engine observations are not empty
+membership or completed Build evidence. See the upstream
+[engine-neutral hosting contract](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/engine-neutral-hosting.md).
+
 Repository Cargo commands force `ACCEPT_EULA=Y` through `.cargo/config.toml`
 as repository-wide authorization only for the Rust-owned licensed fixtures.
 It does not authorize external or borrowed SQL Server instances. The production
@@ -182,7 +192,7 @@ callback task has settled; it is not host-ordering evidence.
    licensed gates remain `pending`; they are never inferred from server-free
    success.
    Sixteen active native-source-foundation subcases recover independent
-   recovery/ownership/effect checks through the actual adapter, and 28
+   recovery/ownership/effect checks through the actual adapter, and 30
    synthetic-record mutations recover ordinary validator checks. Neither
    substitutes for the unavailable public association/history gate. Further
    native join/seed/target/restart harness decoupling is orchestration work,

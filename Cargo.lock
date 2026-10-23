@@ -1328,7 +1328,7 @@ dependencies = [
 [[package]]
 name = "kuberic-controller"
 version = "0.0.1"
-source = "git+https://github.com/youyuanwu/kuberic.git?rev=e2a47b6c631c974aa0135e81c3a7e3a439980ded#e2a47b6c631c974aa0135e81c3a7e3a439980ded"
+source = "git+https://github.com/youyuanwu/kuberic.git?rev=996dc487b85450ca25f68a3b9b9c22869e58f12b#996dc487b85450ca25f68a3b9b9c22869e58f12b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1395,7 +1395,7 @@ dependencies = [
 [[package]]
 name = "kuberic-runtime"
 version = "0.0.1"
-source = "git+https://github.com/youyuanwu/kuberic.git?rev=e2a47b6c631c974aa0135e81c3a7e3a439980ded#e2a47b6c631c974aa0135e81c3a7e3a439980ded"
+source = "git+https://github.com/youyuanwu/kuberic.git?rev=996dc487b85450ca25f68a3b9b9c22869e58f12b#996dc487b85450ca25f68a3b9b9c22869e58f12b"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2199,7 +2199,7 @@ checksum = "7bd22781911de0ca6debda95f073c8f18bec65d1a94f1fa9573f3102e514cea4"
 dependencies = [
  "ahash",
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "getrandom 0.3.4",
  "granit-parser",
