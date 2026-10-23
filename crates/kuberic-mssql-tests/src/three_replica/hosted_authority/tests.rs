@@ -62,6 +62,9 @@ fn synthetic_report_records() -> (ConfigurationDescriptor, [PublicV1AgentReport;
                 catch_up_capability: ProgressQueryResult::Value(INVALID_LSN),
             },
             configuration: None,
+            engine_idle: None,
+            remote_builds: Vec::new(),
+            retry_pending_operations: Vec::new(),
             active_operations: Vec::new(),
             open_mode: OpenMode::New,
             replication_address: Some(format!("synthetic://replica-{index}")),
@@ -117,6 +120,8 @@ fn synthetic_configuration_record(
                     process_session_id: report.process_session_id.clone(),
                     storage_incarnation: Some(report.storage_incarnation.clone()),
                     role: member.role,
+                    is_up: false,
+                    is_ready: false,
                     current_progress: INVALID_LSN,
                     catch_up_capability: INVALID_LSN,
                     must_catchup: false,
@@ -305,7 +310,7 @@ fn synthetic_receipts_require_exact_operation_and_input_report_provenance() {
 #[test]
 fn synthetic_configuration_freezes_peer_descriptors_and_stored_receipts() {
     let (configuration, reports, accepted) = synthetic_configuration_records();
-    for change in 0..3 {
+    for change in 0..5 {
         let mut changed_reports = reports.clone();
         let mut changed_accepted = accepted.clone();
         let input = &mut changed_accepted[0].input;
@@ -325,6 +330,8 @@ fn synthetic_configuration_freezes_peer_descriptors_and_stored_receipts() {
                     .storage_generation = StorageGeneration::new("synthetic-replaced-peer-storage")
             }
             2 => record.replicas[0].replication_address = "synthetic://replaced-peer".into(),
+            3 => record.replicas[0].is_up = true,
+            4 => record.replicas[0].is_ready = true,
             _ => unreachable!(),
         }
         let record = record.clone();
@@ -341,7 +348,7 @@ fn synthetic_configuration_freezes_peer_descriptors_and_stored_receipts() {
         assert_eq!(
             validate_configuration(&configuration, &changed_accepted, &changed_reports)
                 .unwrap_err(),
-            "configuration peer session/storage/address differs",
+            "configuration peer session/storage/address/availability differs",
             "mutation {change}"
         );
     }

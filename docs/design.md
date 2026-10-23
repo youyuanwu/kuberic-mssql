@@ -174,7 +174,7 @@ This does not require a V2 Transactional Replicator or a
 dummy `StateProvider`: SQL Server continues to own native replication.
 
 The [trait contracts](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/replicator/traits.rs),
-[API semantics](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/service-fabric-api-semantics.md),
+[current V1 semantics](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/classic-v1-runtime.md),
 and [custom Replicator boundary](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/replicator-boundary.md)
 define the required integration boundary. The root `Cargo.toml` determines
 which dependency those contracts must be checked against.
@@ -318,11 +318,15 @@ PostgreSQL LSNs fit a 64-bit scalar; SQL Server DMV positions are
 native identity, progress, lease and role evidence, rather than copying
 PostgreSQL recovery or relying on generic scalar election ordering.
 
-The example is an architectural precedent, not a conformance oracle. Kuberic's
-[Service Fabric contract audit](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/service-fabric-contract-audit.md)
-also records upstream implementation gaps. MSSQL must verify the required
-host/planner behavior and track unresolved upstream blockers rather than
-inherit an example's behavior as proof of correctness.
+The current [engine-neutral hosting contract](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/engine-neutral-hosting.md)
+also supports a creation-bound custom companion and controller-driven native
+Build followed by separate voting admission. PostgreSQL exercises that path;
+MSSQL does not yet attach the companion. This is a hosting precedent, not
+SQL-native history/progress or containment proof. Kuberic's
+[port ledger](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/sf-v1-port-ledger.md)
+and [remaining alignment work](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/sf-v1-semantic-alignment-plan.md)
+record the current boundaries. MSSQL must verify the selected host/planner
+behavior rather than inherit an example's behavior as proof of correctness.
 
 ## Native HA Boundary
 
@@ -834,7 +838,7 @@ Independent recovery now includes 16 native source-foundation cases using the
 same capability-gated source converger: three actual recovery/foreign-resource
 checks and 13 precise reply-loss effects. Their result certifies only owned
 source/local-primary facts, not joins, grants, seeding, data prefixes or public
-configuration completion. Five ordinary validator groups exercise 28
+configuration completion. Five ordinary validator groups exercise 30
 synthetic-record mutations through actual receipt/history/peer/startup and
 independent-anchor checks. These do not requalify the blocked hosted
 association journeys. Remaining native harness orchestration and genuinely

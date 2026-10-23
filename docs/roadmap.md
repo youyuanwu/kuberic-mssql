@@ -61,7 +61,7 @@ sessions, storage/history and independent native identity anchors. Real hosted
 supersession, restart, terminal and uncertain-command journeys rejected predecessor
 evidence. Those positive-baseline journeys are now blocked; current server-free
 coverage retains native replay, actual Open ownership/lifecycle/drainage and
-explicit failed startup. Five pure validator groups now recover 28 selected
+explicit failed startup. Five pure validator groups now recover 30 selected
 receipt/history/peer/startup/independent-anchor mutations, not the actual
 accepted hosted association. The historical result
 is bounded diagnostic evidence, not a live hosted witness,
@@ -103,10 +103,19 @@ separate, without restoring fake progress or successful partial callbacks:
 
 | Follow-up | Required result before it is called restored |
 |---|---|
+| Creation-bound host containment | Attach the supported custom-engine companion to the exact MSSQL creation and prove actual descendant joins through real host/controller Close, Abort and interrupted-response paths. Keep callback failure separate from positive containment, and unsupported copy/idle operations explicit. Existing factory/process drainage remains required until that integration is qualified. |
 | Remaining independent native coverage | Decouple secondary join/grant, seed submission/compaction, target evidence and native restart fault drivers from public-ready setup. Exercise the same actual callbacks/effects, exact intended fault and cleanup. These are harness/orchestration gaps, not all intrinsically dependent on a public history mapping. |
 | Minimum positive public path | Establish a supported SQL-native/public history and role-specific queue/quorum/ACK/recovery mapping through fixed APIs, then exercise genuine `ReplicaHost` bootstrap/configuration and hosted association/provenance. Unknown capability may remain where permitted; invented current zero or AG sequence cannot unblock the path. |
 | Advanced transfer/history/admission | Prove retained transfer to an exact peer, recovered-prefix continuity across restart/replacement/forks, justified history changes, nonvoting build admission and current/previous/required-successor catch-up. Restore the corresponding full journeys only when their own evidence/postconditions exist. |
 | Role movement | Complete the separate native lease, exact-incarnation fencing, access and ordering gates before planned switchover or failover. Native source preparation and passing validator tests do not supply this authority. |
+
+The selected upstream [engine-neutral hosting path](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/engine-neutral-hosting.md)
+now supplies creation-bound custom authority, retained drainage and
+controller-driven nonvoting Build/admission orchestration. The next bounded
+integration can use that drainage seam without claiming a ready SQL cluster.
+MSSQL does not yet attach it. The fresh-formation exception requires exact
+fresh Open evidence and both queries explicitly unknown; MSSQL's failed
+current query cannot use it. Do not change that query merely to enter formation.
 
 A narrow proven fresh-state public path need not wait for every advanced
 failover/rejoin feature. Conversely, reactivating a compound case requires all

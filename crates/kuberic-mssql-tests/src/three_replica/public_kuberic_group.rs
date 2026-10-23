@@ -4161,6 +4161,10 @@ fn public_replica_descriptor(
         process_session_id: report.process_session_id.clone(),
         storage_incarnation: Some(exact_storage_incarnation(pod, report)?),
         role,
+        is_up: report.has_current_open_endpoint(),
+        is_ready: report.has_current_open_endpoint()
+            && report.progress.current().is_some()
+            && report.progress.capability().is_some(),
         current_progress: report.progress.current().ok_or_else(|| {
             MssqlGroupError::new(format!(
                 "configuration peer current progress is unavailable: {:?}",

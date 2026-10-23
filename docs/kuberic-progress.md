@@ -383,7 +383,7 @@ provide the successful scalar prerequisites used by this diagnostic.
 Four positive association tests were consolidated away and the former
 contained-startup success case now tests actual failed current, unknown
 capability and owned drainage. Their actual hosted association/supersession
-journeys remain blocked. Five separate ordinary validator groups recover 28
+journeys remain blocked. Five separate ordinary validator groups recover 30
 record-level mutations through the existing receipt, baseline, peer, startup
 and independent-anchor checks. Independent native predicates, native
 replay, real lifecycle fencing and concrete worker drainage remain active.
@@ -567,9 +567,9 @@ identify source locations, not another dependency pin:
 
 | Boundary | Selected behavior and remaining constraint |
 |---|---|
-| [Registered host reporting](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/hosting.rs#L67-L101) | The host queries custom `current_progress` and `catch_up_capability` separately. Query errors become explicit `NotReady`/`Failed` outcomes, not necessarily a failed status RPC. The provider-free path no longer synthesizes a first endpoint. |
-| [Typed progress validation](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/protocol/public_operations.rs#L2184-L2263) | `PublicProgress` contains role, current progress, and capability; each query is `Value`, `NotQueried`, `NotReady`, or `Failed`. These are not ordered first/last endpoints. `INVALID_LSN` is a schema-valid unknown/inapplicable query value, not election-eligible progress or an empty-history proof. |
-| [Public history consumers](https://github.com/youyuanwu/kuberic/blob/main/kuberic-controller/src/evaluator/public_v1_topology.rs) | Election still needs nonnegative current progress and compatible accepted history. All-unavailable current progress causes Wait. Ordinary peer descriptors require available current and capability; retained rejoin additionally checks exact storage/session/history/configuration/build evidence. The native-specific descriptor path has separate unknown-capability handling. None supplies SQL history equivalence. |
+| [Registered host reporting](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/hosting.rs) | The host queries custom `current_progress` and `catch_up_capability` separately. Query errors become explicit `NotReady`/`Failed` outcomes, not necessarily a failed status RPC. The provider-free path no longer synthesizes a first endpoint. |
+| [Typed progress validation](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/protocol/public_operations.rs) | `PublicProgress` contains role, current progress, and capability; each query is `Value`, `NotQueried`, `NotReady`, or `Failed`. These are not ordered first/last endpoints. `INVALID_LSN` is a schema-valid unknown/inapplicable query value, not election-eligible progress or an empty-history proof. |
+| [Public history consumers](https://github.com/youyuanwu/kuberic/blob/main/kuberic-controller/src/evaluator/public_v1_topology.rs) | Retained election needs nonnegative current progress and compatible accepted history. A narrow fresh-formation exception requires exact canonical New-Open evidence, no prior work/configuration and both queries explicitly `Value(INVALID_LSN)`. MSSQL's failed current query still causes Wait. Peer descriptors carry exact up/ready observations; retained rejoin additionally checks storage/session/history/configuration/build evidence. None supplies SQL history equivalence. |
 | [Native query semantics](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/replicator/traits.rs#L45-L65) | Primary queue/quorum progress, secondary receiver ACK progress, protected opened-recovery progress, and native catch-up capability are distinct from application durability. MSSQL's AG-sequence projection does not acquire those meanings from the field names. |
 
 The remaining adapter obligation is to establish how SQL-native evidence
@@ -579,7 +579,7 @@ catch-up coverage needed for SQL transitions across restart/history changes.
 No conforming mapping is established by an AG sequence or by fitting a database
 position into `i64`. A wider integer alone would not resolve these semantics.
 
-The selected built-in [classic V1 engine](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/replicator/mod.rs#L1137-L1155)
+The selected built-in [classic V1 engine](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/replicator/mod.rs)
 owns its native queues and transfer evidence.
 MSSQL registers a custom replicator without a StateProvider or StateReplicator
 ([kuberic.rs:925-932](../crates/kuberic-mssql/src/kuberic.rs#L925-L932),
@@ -711,13 +711,16 @@ reporting after cancellation or a bounded response.
   through those callbacks and retains join ownership if a waiter is cancelled.
   A new application-facing drain callback is not needed for this path.
 - **Abort and interrupted-terminal evidence remain limited.** The host's retained
-  terminal cleanup owner drains its built-in runtime and any attached internal
-  witness; it cannot invoke MSSQL's inherent local wait. MSSQL's synchronous
+  terminal cleanup owner can drain a creation-bound custom companion through
+  the supported `CustomReplicatorControl::shutdown_and_drain` boundary.
+  MSSQL does not yet attach that companion, so the generic host cannot invoke
+  MSSQL's inherent local wait. MSSQL's synchronous
   Abort fences admission and requests cancellation but does not join already
-  started store/submission work. This is a remaining custom ownership boundary,
-  not evidence that Kuberic must expose another hook. The concrete process owner
-  now retains and awaits that drainage independently of its caller; a generic
-  terminal receipt alone still cannot certify it.
+  started store/submission work. This is remaining MSSQL integration work,
+  not a missing application-facing trait. The concrete process owner retains
+  and awaits that drainage independently of its caller; a generic terminal
+  receipt alone still cannot certify it. A failed child Close remains failed
+  even if separate containment succeeds; it must not become a successful receipt.
 - **Terminal reporting already preserves failed queries.** A successful terminal
   program skips the nonterminal projection-refresh/reopen path. Its response
   can report the closed custom child's current/capability failures as typed
@@ -726,10 +729,10 @@ reporting after cancellation or a bounded response.
   invented progress. Report success is still separate from actual local joins.
 
 The upstream evidence is the existing
-[Close/Abort program](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/public_lifecycle_program.rs#L531-L573),
-[terminal cleanup owner](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/public_lifecycle_terminal.rs#L41-L76),
-[runtime drainage](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/hosting.rs#L1030-L1067),
-and [execute response reporting](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/service.rs#L721-L787).
+[Close/Abort program](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/public_lifecycle_program.rs),
+[terminal cleanup owner](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/host/public_lifecycle_terminal.rs),
+[custom companion](https://github.com/youyuanwu/kuberic/blob/main/kuberic-runtime/src/replicator/custom.rs),
+and [engine-neutral hosting contract](https://github.com/youyuanwu/kuberic/blob/main/docs/features/kuberic/engine-neutral-hosting.md).
 The concrete MSSQL process wrapper bounds acknowledgement separately from actual
 completion and retains the existing local wait after Abort or interrupted Close.
 It does not expose that method to the generic host through a new interface.
@@ -1265,8 +1268,8 @@ This integration does not yet provide:
 - production endpoint certificate provisioning or rotation;
 - destructive reseed before verified target fencing;
 - a conforming role-specific public progress and retained-history model;
-- generic-host certification of custom-descendant containment after Abort or an
-  interrupted terminal operation;
+- attachment and qualification of the supported creation-bound custom companion
+  for generic-host containment after Abort or an interrupted terminal operation;
 - end-to-end public nonvoting build admission and database-progress catch-up
   proofs;
 - application read/write access fencing;

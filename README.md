@@ -413,7 +413,7 @@ They retain native replay and partial-startup ownership, and prove that actual
 failed current with unknown capability blocks hosted configuration with owned drainage. Former
 positive hosted associations and their downstream provenance checks are
 currently blocked, not requalified by these tests. Five separate ordinary
-validator groups recover 28 synthetic-record rejection cases through the
+validator groups recover 30 synthetic-record rejection cases through the
 actual receipt/history/peer/startup and independent-anchor predicates; these
 are record-consistency checks, not successful hosted execution.
 
